@@ -1,8 +1,10 @@
 import json
+import os
 import tempfile
 import tomllib
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from scripts import ai_workflow as workflow
 
@@ -127,6 +129,191 @@ class FakeRunnerTest(unittest.TestCase):
         self.assertEqual(result["role"], "luna")
         self.assertEqual(result["status"], "SUPPORTED")
         self.assertNotIn("ACCEPTED", result["status"])
+
+
+class CodexCommandTest(unittest.TestCase):
+    def test_luna_command_is_pinned_and_read_only(self):
+        command = workflow.build_codex_command(
+            "luna", ROOT, Path("result.json"), ROOT / "config/ai_workflow_result.schema.json"
+        )
+        self.assertIn("gpt-5.6-luna", command)
+        self.assertIn('model_reasoning_effort="max"', command)
+        self.assertIn("read-only", command)
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", command)
+        self.assertNotIn("--agent", command)
+
+
+class CodexRunnerTest(unittest.TestCase):
+    def valid_task(self):
+        return TaskValidationTest().valid_task()
+
+    def valid_result(self, role="luna", status="SUPPORTED"):
+        return {
+            "schema_version": "ai-result-1",
+            "role": role,
+            "status": status,
+            "summary": "Evidence supports the claim.",
+            "claims": [],
+            "evidence": [],
+            "counter_checks": [],
+            "changed_files": [],
+            "blind_spots": [],
+            "unresolved_questions": [],
+            "recommended_next_state": "EVIDENCE_READY",
+        }
+
+    def test_business_secrets_are_not_forwarded(self):
+        env = workflow.sanitized_environment(
+            {
+                "HOME": "/tmp/home",
+                "PATH": "/usr/bin",
+                "CODEX_HOME": "/tmp/codex",
+                "TUSHARE_TOKEN": "secret",
+                "OPENAI_API_KEY": "secret",
+                "DB_PASSWORD": "secret",
+            }
+        )
+        self.assertEqual(env["HOME"], "/tmp/home")
+        self.assertEqual(env["PATH"], "/usr/bin")
+        self.assertEqual(env["CODEX_HOME"], "/tmp/codex")
+        self.assertNotIn("TUSHARE_TOKEN", env)
+        self.assertNotIn("OPENAI_API_KEY", env)
+        self.assertNotIn("DB_PASSWORD", env)
+
+    def test_role_status_cross_checks_reject_invalid_statuses(self):
+        invalid = (
+            ("luna", "ACCEPTANCE_RECOMMENDED"),
+            ("terra", "SUPPORTED"),
+            ("sol_reviewer", "IMPLEMENTED_CANDIDATE"),
+        )
+        for role, status in invalid:
+            with self.subTest(role=role, status=status):
+                with self.assertRaisesRegex(workflow.WorkflowError, "ROLE_STATUS_MISMATCH"):
+                    workflow.validate_role_result(role, self.valid_result(role, status), set())
+
+    def test_read_only_role_rejects_real_diff_even_when_result_declares_none(self):
+        with self.assertRaisesRegex(workflow.WorkflowError, "READ_ONLY_ROLE_MODIFIED_REPO"):
+            workflow.validate_role_result(
+                "luna", self.valid_result("luna"), {"forbidden/change.py"}
+            )
+
+    def test_result_changed_files_must_match_real_diff(self):
+        result = self.valid_result("terra", "IMPLEMENTED_CANDIDATE")
+        result["changed_files"] = ["declared.py"]
+        with self.assertRaisesRegex(workflow.WorkflowError, "CHANGED_FILES_MISMATCH"):
+            workflow.validate_role_result("terra", result, {"actual.py"})
+
+    def test_result_rejects_incomplete_nested_schema_record(self):
+        result = self.valid_result()
+        result["claims"] = [{"id": "claim-1"}]
+        with self.assertRaisesRegex(workflow.WorkflowError, "INVALID_ROLE_RESULT"):
+            workflow.validate_role_result("luna", result, set())
+
+    def test_prompt_is_limited_to_task_contract_and_named_evidence(self):
+        task = self.valid_task()
+        contract = {"acceptance": "run unit tests"}
+        with tempfile.TemporaryDirectory() as temp:
+            evidence = Path(temp) / "evidence.txt"
+            evidence.write_text("verified fact", encoding="utf-8")
+            prompt = workflow.build_role_prompt("luna", task, contract, [evidence])
+        self.assertIn("Handle only bounded tasks.", prompt)
+        prompt_lines = prompt.splitlines()
+        self.assertEqual(json.loads(prompt_lines[1].removeprefix("Task envelope: ")), task)
+        self.assertEqual(json.loads(prompt_lines[2].removeprefix("Task contract: ")), contract)
+        evidence_manifest = json.loads(prompt_lines[3].removeprefix("Named evidence: "))
+        self.assertEqual(evidence_manifest[0]["path"], str(evidence))
+        self.assertEqual(
+            evidence_manifest[0]["sha256"],
+            "6f9a5b7a0a9ebb03cde5ab869b864795326fb356563618a3ad0b2b0eb1a835bc",
+        )
+        self.assertIn(str(evidence), prompt)
+        self.assertIn("only output ai-result-1 JSON", prompt)
+        self.assertNotIn("registry/", prompt)
+        self.assertNotIn("chat history", prompt)
+
+    @mock.patch("scripts.ai_workflow.subprocess.run")
+    def test_run_codex_passes_sanitized_stdin_and_accepts_valid_output(self, run):
+        result = self.valid_result()
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            output_path = root / "luna-result.json"
+            output_path.write_text(json.dumps(result), encoding="utf-8")
+            paths = workflow.RunPaths(
+                repo=ROOT,
+                output_path=output_path,
+                schema_path=ROOT / "config/ai_workflow_result.schema.json",
+                logs_dir=root / "logs",
+            )
+            run.return_value = mock.Mock(returncode=0, stdout='{"event":"done"}\n', stderr="")
+            with mock.patch.dict(
+                os.environ,
+                {"OPENAI_API_KEY": "secret", "TUSHARE_TOKEN": "secret", "PATH": "/usr/bin"},
+                clear=True,
+            ):
+                actual = workflow.run_codex("luna", self.valid_task(), "task contract", paths)
+
+            self.assertEqual(actual, result)
+            self.assertEqual((root / "logs/luna-events.jsonl").read_text(), '{"event":"done"}\n')
+
+        _, kwargs = run.call_args
+        self.assertFalse(kwargs["shell"])
+        self.assertEqual(kwargs["input"], "task contract")
+        self.assertTrue(kwargs["text"])
+        self.assertNotIn("OPENAI_API_KEY", kwargs["env"])
+        self.assertNotIn("TUSHARE_TOKEN", kwargs["env"])
+
+    @mock.patch("scripts.ai_workflow.subprocess.run")
+    def test_run_codex_rejects_timeout_exit_and_invalid_json(self, run):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            paths = workflow.RunPaths(
+                repo=ROOT,
+                output_path=root / "luna-result.json",
+                schema_path=ROOT / "config/ai_workflow_result.schema.json",
+                logs_dir=root / "logs",
+            )
+            run.side_effect = __import__("subprocess").TimeoutExpired("codex", 30)
+            with self.assertRaisesRegex(workflow.WorkflowError, "CODEX_TIMEOUT"):
+                workflow.run_codex("luna", self.valid_task(), "task contract", paths)
+
+            run.side_effect = None
+            run.return_value = mock.Mock(returncode=23, stdout="", stderr="failed")
+            with self.assertRaisesRegex(workflow.WorkflowError, "CODEX_EXIT_NONZERO"):
+                workflow.run_codex("luna", self.valid_task(), "task contract", paths)
+
+            run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+            paths.output_path.write_text("not json", encoding="utf-8")
+            with self.assertRaisesRegex(workflow.WorkflowError, "INVALID_ROLE_RESULT"):
+                workflow.run_codex("luna", self.valid_task(), "task contract", paths)
+
+    @mock.patch("scripts.ai_workflow.subprocess.run")
+    def test_run_codex_redacts_secret_assignments_and_long_tokens_from_events(self, run):
+        result = self.valid_result()
+        long_token = "Ab3d" * 32
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            output_path = root / "luna-result.json"
+            output_path.write_text(json.dumps(result), encoding="utf-8")
+            paths = workflow.RunPaths(
+                repo=ROOT,
+                output_path=output_path,
+                schema_path=ROOT / "config/ai_workflow_result.schema.json",
+                logs_dir=root / "logs",
+            )
+            run.return_value = mock.Mock(
+                returncode=0,
+                stdout=f"TUSHARE_TOKEN=abc123 OPENAI_API_KEY=sk-test-value {long_token}",
+                stderr="",
+            )
+            workflow.run_codex("luna", self.valid_task(), "task contract", paths)
+            events = (root / "logs/luna-events.jsonl").read_text(encoding="utf-8")
+
+        self.assertIn("[REDACTED]", events)
+        self.assertIn("TUSHARE_TOKEN=[REDACTED]", events)
+        self.assertIn("OPENAI_API_KEY=[REDACTED]", events)
+        self.assertNotIn("abc123", events)
+        self.assertNotIn("sk-test-value", events)
+        self.assertNotIn(long_token, events)
 
 
 if __name__ == "__main__":

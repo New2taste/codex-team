@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import errno
 import fcntl
 import json
 import os
 import re
+import subprocess
 import tempfile
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Sequence
 
 
 TASK_FIELDS = frozenset(
@@ -59,6 +63,29 @@ HUMAN_GATES = frozenset(
     }
 )
 TASK_ID_PATTERN = re.compile(r"^AWF-[0-9]{8}-[0-9]{3,}$")
+ROLE_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "ai_workflow.toml"
+RESULT_REQUIRED_FIELDS = frozenset(
+    {
+        "schema_version",
+        "role",
+        "status",
+        "summary",
+        "claims",
+        "evidence",
+        "counter_checks",
+        "changed_files",
+        "blind_spots",
+        "unresolved_questions",
+        "recommended_next_state",
+    }
+)
+READ_ONLY_ROLES = frozenset({"luna", "sol_planner", "sol_reviewer", "sol_xhigh"})
+SAFE_ENVIRONMENT_KEYS = frozenset({"HOME", "PATH", "CODEX_HOME", "LANG", "LC_ALL", "TERM", "TMPDIR"})
+CODEX_TIMEOUT_SECONDS = 120
+_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)\b([A-Z][A-Z0-9_]*(?:TOKEN|KEY|PASSWORD|SECRET)[A-Z0-9_]*)\s*=\s*([^\s,;]+)"
+)
+_LONG_HIGH_ENTROPY = re.compile(r"(?<![A-Za-z0-9_])[A-Za-z0-9+/=_-]{48,}(?![A-Za-z0-9_])")
 
 
 class WorkflowError(RuntimeError):
@@ -70,6 +97,247 @@ class WorkflowError(RuntimeError):
 
 def _fail(code: str, message: str) -> None:
     raise WorkflowError(code, message)
+
+
+def _load_role_config(role: str) -> dict[str, object]:
+    """Return the pinned configuration for one named workflow role."""
+
+    try:
+        import tomllib
+
+        with ROLE_CONFIG_PATH.open("rb") as handle:
+            config = tomllib.load(handle)
+        role_config = config["roles"][role]
+    except (OSError, KeyError, TypeError, tomllib.TOMLDecodeError) as exc:
+        raise WorkflowError("INVALID_ROLE", f"unsupported or unreadable role {role}") from exc
+    if not isinstance(role_config, dict):
+        raise WorkflowError("INVALID_ROLE", f"unsupported role {role}")
+    return role_config
+
+
+def build_role_prompt(
+    role: str,
+    task: Mapping[str, object],
+    contract: Mapping[str, object],
+    evidence_paths: Sequence[Path],
+) -> str:
+    """Build the bounded prompt from only the supplied task, contract, and evidence."""
+
+    role_config = _load_role_config(role)
+    validate_task(task)
+    if not isinstance(contract, Mapping):
+        _fail("INVALID_CONTRACT", "contract must be an object")
+    evidence = []
+    for evidence_path in evidence_paths:
+        path = Path(evidence_path)
+        try:
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError as exc:
+            raise WorkflowError("EVIDENCE_READ_ERROR", f"cannot read evidence {path}") from exc
+        evidence.append({"path": str(path), "sha256": digest})
+    return "\n".join(
+        (
+            f"Role instructions: {role_config['instructions']}",
+            f"Task envelope: {_canonical_json(dict(task))}",
+            f"Task contract: {_canonical_json(dict(contract))}",
+            f"Named evidence: {_canonical_json(evidence)}",
+            "Use only the task contract and named evidence above; no additional source material is authorized.",
+            "only output ai-result-1 JSON",
+        )
+    )
+
+
+def build_codex_command(role: str, repo: Path, output_path: Path, schema_path: Path) -> list[str]:
+    """Build the fixed, list-form command for a pinned Codex role."""
+
+    role_config = _load_role_config(role)
+    model = role_config.get("model")
+    effort = role_config.get("reasoning_effort")
+    sandbox = role_config.get("sandbox")
+    if not all(isinstance(value, str) and value for value in (model, effort, sandbox)):
+        _fail("INVALID_ROLE", f"role {role} has incomplete pinned configuration")
+    return [
+        "codex",
+        "exec",
+        "-m",
+        model,
+        "-c",
+        f'model_reasoning_effort="{effort}"',
+        "-s",
+        sandbox,
+        "-C",
+        str(Path(repo)),
+        "--json",
+        "--output-schema",
+        str(Path(schema_path)),
+        "-o",
+        str(Path(output_path)),
+        "-",
+    ]
+
+
+def sanitized_environment(source: Mapping[str, str]) -> dict[str, str]:
+    """Pass only execution essentials, never business secrets, to Codex."""
+
+    return {
+        key: value
+        for key, value in source.items()
+        if key in SAFE_ENVIRONMENT_KEYS and isinstance(value, str)
+    }
+
+
+def _redact_log_text(value: str) -> str:
+    redacted = _SECRET_ASSIGNMENT.sub(r"\1=[REDACTED]", value)
+    return _LONG_HIGH_ENTROPY.sub("[REDACTED]", redacted)
+
+
+@dataclass(frozen=True)
+class RunPaths:
+    repo: Path
+    output_path: Path
+    schema_path: Path
+    logs_dir: Path
+
+
+def _validate_result_records(
+    value: list[object],
+    field: str,
+    required: frozenset[str],
+    *,
+    type_values: frozenset[str] | None = None,
+) -> None:
+    for item in value:
+        if not isinstance(item, Mapping) or set(item) != required:
+            _fail("INVALID_ROLE_RESULT", f"{field} contains an incomplete record")
+        for name in required:
+            if name == "evidence_ids":
+                identifiers = item[name]
+                if (
+                    not isinstance(identifiers, list)
+                    or any(not isinstance(identifier, str) or not identifier for identifier in identifiers)
+                    or len(identifiers) != len(set(identifiers))
+                ):
+                    _fail("INVALID_ROLE_RESULT", "evidence_ids must be unique non-empty strings")
+                continue
+            item_value = item[name]
+            if not isinstance(item_value, str) or not item_value.strip():
+                _fail("INVALID_ROLE_RESULT", f"{field}.{name} must be a non-empty string")
+        if type_values is not None and item["type"] not in type_values:
+            _fail("INVALID_ROLE_RESULT", f"{field}.type is not supported")
+
+
+def validate_role_result(
+    role: str, result: Mapping[str, object], changed_files: set[str]
+) -> None:
+    """Reject malformed output, role/status confusion, and untrusted change claims."""
+
+    role_config = _load_role_config(role)
+    if not isinstance(result, Mapping):
+        _fail("INVALID_ROLE_RESULT", "role result must be an object")
+    fields = set(result)
+    missing = sorted(RESULT_REQUIRED_FIELDS - fields)
+    unknown = sorted(fields - RESULT_REQUIRED_FIELDS)
+    if missing or unknown:
+        field = missing[0] if missing else unknown[0]
+        _fail("INVALID_ROLE_RESULT", f"unexpected result field {field}")
+    if result["schema_version"] != "ai-result-1":
+        _fail("INVALID_ROLE_RESULT", "schema_version must be ai-result-1")
+    if result["role"] != role:
+        _fail("ROLE_MISMATCH", f"result role does not match {role}")
+    status = result["status"]
+    allowed_statuses = role_config.get("allowed_statuses")
+    if not isinstance(status, str) or not isinstance(allowed_statuses, list) or status not in allowed_statuses:
+        _fail("ROLE_STATUS_MISMATCH", f"status is not allowed for {role}")
+    if not isinstance(result["summary"], str) or not result["summary"].strip():
+        _fail("INVALID_ROLE_RESULT", "summary must be a non-empty string")
+    if not isinstance(result["recommended_next_state"], str) or not result["recommended_next_state"].strip():
+        _fail("INVALID_ROLE_RESULT", "recommended_next_state must be a non-empty string")
+    for field in (
+        "claims",
+        "evidence",
+        "counter_checks",
+        "changed_files",
+        "blind_spots",
+        "unresolved_questions",
+    ):
+        if not isinstance(result[field], list):
+            _fail("INVALID_ROLE_RESULT", f"{field} must be an array")
+    _validate_result_records(
+        result["claims"],
+        "claims",
+        frozenset({"id", "kind", "text", "evidence_ids"}),
+    )
+    for claim in result["claims"]:
+        if claim["kind"] not in {"FACT", "INFERENCE", "RECOMMENDATION"}:
+            _fail("INVALID_ROLE_RESULT", "claims.kind is not supported")
+    _validate_result_records(
+        result["evidence"],
+        "evidence",
+        frozenset({"id", "type", "locator", "observation"}),
+        type_values=frozenset({"FILE", "COMMAND", "HASH", "TEST"}),
+    )
+    _validate_result_records(
+        result["counter_checks"],
+        "counter_checks",
+        frozenset({"target_claim_id", "method", "result"}),
+    )
+    declared_changes = result["changed_files"]
+    if any(not isinstance(path, str) for path in declared_changes) or len(declared_changes) != len(set(declared_changes)):
+        _fail("INVALID_ROLE_RESULT", "changed_files must be unique strings")
+    for field in ("blind_spots", "unresolved_questions"):
+        values = result[field]
+        if any(not isinstance(value, str) for value in values) or len(values) != len(set(values)):
+            _fail("INVALID_ROLE_RESULT", f"{field} must contain unique strings")
+    if not isinstance(changed_files, set) or any(not isinstance(path, str) for path in changed_files):
+        _fail("INVALID_CHANGED_FILES", "changed_files must be a set of strings")
+    if role in READ_ONLY_ROLES and changed_files:
+        _fail("READ_ONLY_ROLE_MODIFIED_REPO", f"read-only role {role} changed the repository")
+    if set(declared_changes) != changed_files:
+        _fail("CHANGED_FILES_MISMATCH", "declared changed_files differ from the real diff")
+
+
+def _write_role_events(log_path: Path, stdout: object) -> None:
+    if isinstance(stdout, bytes):
+        stdout = stdout.decode("utf-8", errors="replace")
+    text = stdout if isinstance(stdout, str) else ""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(_redact_log_text(text), encoding="utf-8")
+
+
+def run_codex(role: str, task: dict, prompt: str, paths: RunPaths) -> dict:
+    """Run one pinned Codex role and accept only a validated output document."""
+
+    validate_task(task)
+    if not isinstance(prompt, str):
+        _fail("INVALID_PROMPT", "prompt must be a string")
+    command = build_codex_command(role, paths.repo, paths.output_path, paths.schema_path)
+    events_path = Path(paths.logs_dir) / f"{role}-events.jsonl"
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            input=prompt,
+            text=True,
+            timeout=CODEX_TIMEOUT_SECONDS,
+            env=sanitized_environment(os.environ),
+            cwd=str(paths.repo),
+            shell=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        _write_role_events(events_path, exc.stdout)
+        raise WorkflowError("CODEX_TIMEOUT", f"{role} exceeded {CODEX_TIMEOUT_SECONDS} seconds") from exc
+    _write_role_events(events_path, completed.stdout)
+    if completed.returncode != 0:
+        raise WorkflowError("CODEX_EXIT_NONZERO", f"{role} exited with code {completed.returncode}")
+    try:
+        result = json.loads(Path(paths.output_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise WorkflowError("INVALID_ROLE_RESULT", f"{role} did not produce valid JSON") from exc
+    if not isinstance(result, dict):
+        _fail("INVALID_ROLE_RESULT", "role output must be an object")
+    validate_role_result(role, result, set(result.get("changed_files", [])))
+    return result
 
 
 def _require_nonempty_string(task: Mapping[str, object], field: str) -> None:
