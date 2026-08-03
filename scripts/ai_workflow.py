@@ -12,6 +12,7 @@ import math
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -20,6 +21,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol, Sequence
+
+
+if __name__ == "__main__":
+    # Keep direct-script imports on the same public exception/module object.
+    sys.modules.setdefault("ai_workflow", sys.modules[__name__])
 
 
 TASK_FIELDS = frozenset(
@@ -968,6 +974,44 @@ class WorkflowStore:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         finally:
             handle.close()
+
+
+try:
+    from .ai_workflow_routing import (
+        RuntimeRouteDecision,
+        decide_route as _decide_route,
+        record_route_decision as _record_route_decision,
+    )
+except ImportError:  # direct script execution
+    from ai_workflow_routing import (
+        RuntimeRouteDecision,
+        decide_route as _decide_route,
+        record_route_decision as _record_route_decision,
+    )
+
+
+def legacy_roles(task: Mapping[str, object]) -> tuple[str, ...]:
+    """Expose the unchanged legacy route chain to the routing policy layer."""
+
+    validate_task(task)
+    return route(task)
+
+
+def decide_route(
+    task: Mapping[str, object], request: object, mode: str
+) -> RuntimeRouteDecision:
+    """Make a validated local route decision without executing a model."""
+
+    validate_task(task)
+    return _decide_route(task, request, mode, legacy_router=route)
+
+
+def record_route_decision(
+    store: WorkflowStore, task_id: str, decision: RuntimeRouteDecision
+) -> Path:
+    """Persist a strict route artifact and its append-only decision event."""
+
+    return _record_route_decision(store, task_id, decision)
 
 
 def _parse_metric_number(value: object) -> int | float | None:
@@ -1993,6 +2037,14 @@ def build_parser() -> argparse.ArgumentParser:
     decide.add_argument("--by", default="owner")
     decide.add_argument("--root", type=Path, default=Path("data/state/ai-workflow"))
 
+    route_command = sub.add_parser("route")
+    route_command.add_argument("--task", type=Path, required=True)
+    route_command.add_argument("--request", type=Path, required=True)
+    route_command.add_argument(
+        "--mode", choices=("legacy", "shadow", "enforced"), default="legacy"
+    )
+    route_command.add_argument("--root", type=Path, default=Path("data/state/ai-workflow"))
+
     for name in ("resume", "abort"):
         sub.add_parser(name)
     report = sub.add_parser("report")
@@ -2074,6 +2126,16 @@ def _run_command(args: argparse.Namespace) -> int:
     if args.command == "validate":
         task = load_task(_task_path_from_args(args))
         print(f"VALID {task['task_id']}")
+        return 0
+    if args.command == "route":
+        task = load_task(args.task)
+        try:
+            request = load_artifact(args.request)
+        except ArtifactError as exc:
+            raise WorkflowError(exc.code, exc.message) from exc
+        decision = decide_route(task, request, args.mode)
+        record_route_decision(WorkflowStore(args.root), task["task_id"], decision)
+        print(_canonical_json(decision.to_dict()))
         return 0
     if args.command == "status":
         if not args.task_id:

@@ -8,6 +8,9 @@ automatic_xhigh = false
 automatic_merge = false
 automatic_push = false
 
+[routing]
+mode = "legacy"
+
 [roles.luna]
 model = "gpt-5.6-luna"
 reasoning_effort = "max"
