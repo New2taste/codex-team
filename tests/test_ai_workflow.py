@@ -15,6 +15,15 @@ from scripts import ai_workflow as workflow
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def write_codex_result(command, result):
+    """Model the Codex ``-o`` contract by writing the requested fresh output."""
+
+    output_path = Path(command[command.index("-o") + 1])
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(result), encoding="utf-8")
+    return subprocess.CompletedProcess(command, 0, stdout='{"event":"done"}\n', stderr="")
+
+
 class ContractFilesTest(unittest.TestCase):
     def test_role_models_and_efforts_are_pinned(self):
         with (ROOT / "config/ai_workflow.toml").open("rb") as handle:
@@ -514,10 +523,10 @@ class GatedPipelineTest(unittest.TestCase):
             with mock.patch("scripts.ai_workflow.create_worktree") as create_worktree:
                 self.assertEqual(
                     workflow.run_until_gate(task_id, runner=runner, allow_live_model=True),
-                    "AWAITING_OWNER_DECISION",
+                    "BLOCKED",
                 )
 
-        create_worktree.assert_called_once_with(task, owner_authorized=True)
+        create_worktree.assert_called_once_with(task, owner_authorized=True, store=mock.ANY)
 
     def test_owner_decision_uses_closed_set_and_records_complete_audit_fields(self):
         task_id = self._create_task(self._task("REMEDIATION"))
@@ -744,8 +753,9 @@ class CodexRunnerTest(unittest.TestCase):
         "scripts.ai_workflow.capture_repo",
         return_value=workflow.RepoSnapshot("pinned-head", ()),
     )
+    @mock.patch("scripts.ai_workflow.working_tree_paths", return_value=set())
     @mock.patch("scripts.ai_workflow.subprocess.run")
-    def test_run_codex_enforces_luna_l1_evidence_package(self, run, _capture_repo):
+    def test_run_codex_enforces_luna_l1_evidence_package(self, run, _working_tree_paths, _capture_repo):
         task = self.valid_task()
         cases = [
             ("five claims and one check", self.l1_result(5, 1), None),
@@ -760,21 +770,20 @@ class CodexRunnerTest(unittest.TestCase):
         cases.append(("dangling claim", dangling_claim, "INVALID_VERIFICATION_PACKAGE"))
         blocked = self.l1_result(0, 0, status="BLOCKED")
         cases.append(("blocked without invented evidence", blocked, None))
-        terra = self.valid_result("terra", "IMPLEMENTED_CANDIDATE")
-        cases.append(("non-luna role", terra, None))
+        reviewer = self.valid_result("sol_reviewer", "ACCEPTANCE_RECOMMENDED")
+        cases.append(("non-luna role", reviewer, None))
 
         for name, result, error in cases:
             with self.subTest(name=name), tempfile.TemporaryDirectory() as temp:
                 root = Path(temp)
                 output_path = root / "result.json"
-                output_path.write_text(json.dumps(result), encoding="utf-8")
                 paths = workflow.RunPaths(
                     repo=ROOT,
                     output_path=output_path,
                     schema_path=ROOT / "config/ai_workflow_result.schema.json",
                     logs_dir=root / "logs",
                 )
-                run.return_value = mock.Mock(returncode=0, stdout='{"event":"done"}\n', stderr="")
+                run.side_effect = lambda command, *args, **kwargs: write_codex_result(command, result)
                 if error:
                     with self.assertRaisesRegex(workflow.WorkflowError, error):
                         workflow.run_codex(result["role"], task, "task contract", paths)
@@ -788,20 +797,20 @@ class CodexRunnerTest(unittest.TestCase):
         "scripts.ai_workflow.capture_repo",
         return_value=workflow.RepoSnapshot("pinned-head", ()),
     )
+    @mock.patch("scripts.ai_workflow.working_tree_paths", return_value=set())
     @mock.patch("scripts.ai_workflow.subprocess.run")
-    def test_run_codex_passes_sanitized_stdin_and_accepts_valid_output(self, run, _capture_repo):
+    def test_run_codex_passes_sanitized_stdin_and_accepts_valid_output(self, run, _working_tree_paths, _capture_repo):
         result = self.valid_result()
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             output_path = root / "luna-result.json"
-            output_path.write_text(json.dumps(result), encoding="utf-8")
             paths = workflow.RunPaths(
                 repo=ROOT,
                 output_path=output_path,
                 schema_path=ROOT / "config/ai_workflow_result.schema.json",
                 logs_dir=root / "logs",
             )
-            run.return_value = mock.Mock(returncode=0, stdout='{"event":"done"}\n', stderr="")
+            run.side_effect = lambda command, *args, **kwargs: write_codex_result(command, result)
             with mock.patch.dict(
                 os.environ,
                 {"OPENAI_API_KEY": "secret", "TUSHARE_TOKEN": "secret", "PATH": "/usr/bin"},
@@ -810,7 +819,10 @@ class CodexRunnerTest(unittest.TestCase):
                 actual = workflow.run_codex("luna", self.valid_task(), "task contract", paths)
 
             self.assertEqual(actual, result)
-            self.assertEqual((root / "logs/luna-events.jsonl").read_text(), '{"event":"done"}\n')
+            self.assertEqual(
+                next((root / "logs").glob("luna-*.jsonl")).read_text(),
+                '{"event":"done"}\n',
+            )
 
         _, kwargs = run.call_args
         self.assertFalse(kwargs["shell"])
@@ -823,8 +835,9 @@ class CodexRunnerTest(unittest.TestCase):
         "scripts.ai_workflow.capture_repo",
         return_value=workflow.RepoSnapshot("pinned-head", ()),
     )
+    @mock.patch("scripts.ai_workflow.working_tree_paths", return_value=set())
     @mock.patch("scripts.ai_workflow.subprocess.run")
-    def test_run_codex_rejects_timeout_exit_and_invalid_json(self, run, _capture_repo):
+    def test_run_codex_rejects_timeout_exit_and_invalid_json(self, run, _working_tree_paths, _capture_repo):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             paths = workflow.RunPaths(
@@ -842,8 +855,13 @@ class CodexRunnerTest(unittest.TestCase):
             with self.assertRaisesRegex(workflow.WorkflowError, "CODEX_EXIT_NONZERO"):
                 workflow.run_codex("luna", self.valid_task(), "task contract", paths)
 
-            run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
-            paths.output_path.write_text("not json", encoding="utf-8")
+            def write_invalid_output(command, *args, **kwargs):
+                output_path = Path(command[command.index("-o") + 1])
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_text("not json", encoding="utf-8")
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+            run.side_effect = write_invalid_output
             with self.assertRaisesRegex(workflow.WorkflowError, "INVALID_ROLE_RESULT"):
                 workflow.run_codex("luna", self.valid_task(), "task contract", paths)
 
@@ -851,27 +869,32 @@ class CodexRunnerTest(unittest.TestCase):
         "scripts.ai_workflow.capture_repo",
         return_value=workflow.RepoSnapshot("pinned-head", ()),
     )
+    @mock.patch("scripts.ai_workflow.working_tree_paths", return_value=set())
     @mock.patch("scripts.ai_workflow.subprocess.run")
-    def test_run_codex_redacts_secret_assignments_and_long_tokens_from_events(self, run, _capture_repo):
+    def test_run_codex_redacts_secret_assignments_and_long_tokens_from_events(self, run, _working_tree_paths, _capture_repo):
         result = self.valid_result()
         long_token = "Ab3d" * 32
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             output_path = root / "luna-result.json"
-            output_path.write_text(json.dumps(result), encoding="utf-8")
             paths = workflow.RunPaths(
                 repo=ROOT,
                 output_path=output_path,
                 schema_path=ROOT / "config/ai_workflow_result.schema.json",
                 logs_dir=root / "logs",
             )
-            run.return_value = mock.Mock(
-                returncode=0,
-                stdout=f"TUSHARE_TOKEN=abc123 OPENAI_API_KEY=sk-test-value {long_token}",
-                stderr="",
-            )
+            def write_redacted_result(command, *args, **kwargs):
+                write_codex_result(command, result)
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    stdout=f"TUSHARE_TOKEN=abc123 OPENAI_API_KEY=sk-test-value {long_token}",
+                    stderr="",
+                )
+
+            run.side_effect = write_redacted_result
             workflow.run_codex("luna", self.valid_task(), "task contract", paths)
-            events = (root / "logs/luna-events.jsonl").read_text(encoding="utf-8")
+            events = next((root / "logs").glob("luna-*.jsonl")).read_text(encoding="utf-8")
 
         self.assertIn("[REDACTED]", events)
         self.assertIn("TUSHARE_TOKEN=[REDACTED]", events)
@@ -1000,6 +1023,8 @@ class GitSafetyTest(unittest.TestCase):
         (self.repo / "tracked.txt").write_text("first\n", encoding="utf-8")
         self._git("add", "tracked.txt")
         self._git("commit", "-m", "initial")
+        self.state_root = Path(self.temporary_directory.name) / "state"
+        self.store = workflow.WorkflowStore(self.state_root)
 
     def tearDown(self):
         self.temporary_directory.cleanup()
@@ -1022,7 +1047,9 @@ class GitSafetyTest(unittest.TestCase):
             "task_type": "REMEDIATION",
             "objective": "Apply a bounded workflow change",
             "repository_root": str(self.repo),
-            "source_worktree": None,
+            "source_worktree": str(
+                self.repo / ".codex-worktrees" / "awf-20260803-001"
+            ),
             "base_commit": self._git("rev-parse", "HEAD"),
             "candidate_commit": None,
             "authoritative_files": ["tracked.txt"],
@@ -1095,10 +1122,7 @@ class GitSafetyTest(unittest.TestCase):
     def test_read_only_luna_and_sol_runs_reject_real_repository_mutations(self):
         for role, status in (("luna", "SUPPORTED"), ("sol_reviewer", "ACCEPTANCE_RECOMMENDED")):
             with self.subTest(role=role):
-                output_path = self.repo / f"{role}-result.json"
-                output_path.write_text(
-                    json.dumps(self._valid_role_result(role, status)), encoding="utf-8"
-                )
+                output_path = Path(self.temporary_directory.name) / "outputs" / f"{role}-result.json"
                 paths = workflow.RunPaths(
                     repo=self.repo,
                     output_path=output_path,
@@ -1116,6 +1140,7 @@ class GitSafetyTest(unittest.TestCase):
                 with mock.patch("scripts.ai_workflow.subprocess.run", side_effect=run_with_real_git):
                     with self.assertRaisesRegex(workflow.WorkflowError, "READ_ONLY_ROLE_MODIFIED_REPO"):
                         workflow.run_codex(role, self._task(), "bounded task", paths)
+                (self.repo / f"{role}-mutation.txt").unlink()
 
     def test_create_worktree_rejects_an_unauthorized_owner_before_running_git(self):
         task = self._task()
@@ -1126,30 +1151,292 @@ class GitSafetyTest(unittest.TestCase):
         run.assert_not_called()
 
     def test_create_worktree_requires_an_execution_approval_record(self):
+        task = self._task()
+        self.store.create_task(task)
         with self.assertRaisesRegex(workflow.WorkflowError, "APPROVED_FOR_EXECUTION_REQUIRED"):
-            workflow.create_worktree(self._task(), owner_authorized=True)
+            workflow.create_worktree(task, owner_authorized=True, store=self.store)
 
     def test_create_worktree_uses_the_approved_branch_and_directory(self):
         task = self._task()
-        decision_path = (
-            self.repo
-            / "data/state/ai-workflow"
-            / task["task_id"]
-            / "human-decisions.jsonl"
+        self.store.create_task(task)
+        self.store.append_event(
+            task["task_id"],
+            {
+                "event_type": "STATE_TRANSITION",
+                "new_state": "AWAITING_OWNER_DECISION",
+                "task_sha256": workflow._task_sha256(self.store, task["task_id"]),
+            },
         )
-        decision_path.parent.mkdir(parents=True)
-        decision_path.write_text(
-            json.dumps({"decision": "APPROVED_FOR_EXECUTION", "by": "owner"}) + "\n",
-            encoding="utf-8",
-        )
+        workflow._apply_owner_decision(self.store, task["task_id"], "approve_execution", "owner")
+        (self.repo / "tracked.txt").write_text("new root head\n", encoding="utf-8")
+        self._git("add", "tracked.txt")
+        self._git("commit", "-m", "unrelated root head")
 
-        worktree = workflow.create_worktree(task, owner_authorized=True)
+        worktree = workflow.create_worktree(task, owner_authorized=True, store=self.store)
 
         self.assertEqual(
             worktree,
-            self.repo / ".codex-worktrees" / "awf-20260803-001",
+            (self.repo / ".codex-worktrees" / "awf-20260803-001").resolve(),
         )
         self.assertEqual(self._git("-C", str(worktree), "branch", "--show-current"), "aiwf/awf-20260803-001")
+        self.assertEqual(self._git("-C", str(worktree), "rev-parse", "HEAD"), task["base_commit"])
+
+
+class FinalSafetyRegressionTest(unittest.TestCase):
+    """Regressions reproduced during the final runtime safety review."""
+
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.repo = Path(self.temporary_directory.name) / "repository"
+        self.repo.mkdir()
+        self._git("init")
+        self._git("config", "user.email", "test@example.com")
+        self._git("config", "user.name", "Workflow Test")
+        (self.repo / "tracked.txt").write_text("initial\n", encoding="utf-8")
+        self._git("add", "tracked.txt")
+        self._git("commit", "-m", "initial")
+        self.base_commit = self._git("rev-parse", "HEAD")
+
+    def tearDown(self):
+        self.temporary_directory.cleanup()
+
+    def _git(self, *args):
+        completed = subprocess.run(
+            ["git", "-C", str(self.repo), *args],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        return completed.stdout.strip()
+
+    def _task(self, task_type="PLAN"):
+        task = TaskValidationTest().valid_task()
+        task.update(
+            {
+                "task_type": task_type,
+                "repository_root": str(self.repo),
+                "base_commit": self.base_commit,
+                "candidate_commit": None,
+                "authoritative_files": ["tracked.txt"],
+            }
+        )
+        if task_type == "REMEDIATION":
+            task["allowed_write_paths"] = ["allowed/"]
+        return task
+
+    @staticmethod
+    def _result(role, status):
+        return {
+            "schema_version": "ai-result-1",
+            "role": role,
+            "status": status,
+            "summary": "The bounded run completed.",
+            "claims": [],
+            "evidence": [],
+            "counter_checks": [],
+            "changed_files": [],
+            "blind_spots": [],
+            "unresolved_questions": [],
+            "recommended_next_state": "EVIDENCE_READY",
+        }
+
+    def _luna_result(self, status="SUPPORTED"):
+        result = self._result("luna", status)
+        if status != "BLOCKED":
+            result["claims"] = [
+                {
+                    "id": "claim-1",
+                    "kind": "FACT",
+                    "text": "The authorized fixture was examined.",
+                    "evidence_ids": ["evidence-1"],
+                }
+            ]
+            result["evidence"] = [
+                {
+                    "id": "evidence-1",
+                    "type": "FILE",
+                    "locator": "tracked.txt",
+                    "observation": "The fixture is present.",
+                }
+            ]
+            result["counter_checks"] = [
+                {
+                    "target_claim_id": "claim-1",
+                    "method": "Check the fixture once more.",
+                    "result": "No contradiction found.",
+                }
+            ]
+        return result
+
+    def _paths(self, output_path):
+        return workflow.RunPaths(
+            repo=self.repo,
+            output_path=output_path,
+            schema_path=ROOT / "config" / "ai_workflow_result.schema.json",
+            logs_dir=Path(self.temporary_directory.name) / "logs",
+        )
+
+    def test_acceptance_rejects_a_head_other_than_the_resolved_candidate_before_model_run(self):
+        (self.repo / "tracked.txt").write_text("candidate\n", encoding="utf-8")
+        self._git("add", "tracked.txt")
+        self._git("commit", "-m", "candidate")
+        candidate = self._git("rev-parse", "HEAD")
+        self._git("checkout", self.base_commit)
+        task = self._task("ACCEPTANCE")
+        task["candidate_commit"] = candidate
+        task["base_commit"] = self.base_commit
+
+        real_run = subprocess.run
+
+        def run_git_only(command, *args, **kwargs):
+            if command[0] == "git":
+                return real_run(command, *args, **kwargs)
+            self.fail("the candidate mismatch must stop before the Codex process starts")
+
+        with mock.patch("scripts.ai_workflow.subprocess.run", side_effect=run_git_only):
+            with self.assertRaisesRegex(workflow.WorkflowError, "ACCEPTANCE_CANDIDATE_HEAD_MISMATCH"):
+                workflow.run_codex("luna", task, "bounded", self._paths(Path(self.temporary_directory.name) / "result.json"))
+
+    def test_read_only_role_rejects_a_preexisting_dirty_repository_before_model_run(self):
+        (self.repo / "tracked.txt").write_text("dirty\n", encoding="utf-8")
+
+        real_run = subprocess.run
+
+        def run_git_only(command, *args, **kwargs):
+            if command[0] == "git":
+                return real_run(command, *args, **kwargs)
+            self.fail("a dirty read-only input must stop before the Codex process starts")
+
+        with mock.patch("scripts.ai_workflow.subprocess.run", side_effect=run_git_only):
+            with self.assertRaisesRegex(workflow.WorkflowError, "DIRTY_READ_ONLY_REPOSITORY"):
+                workflow.run_codex(
+                    "luna",
+                    self._task(),
+                    "bounded",
+                    self._paths(Path(self.temporary_directory.name) / "result.json"),
+                )
+
+    def test_acceptance_rechecks_the_candidate_after_the_model_run(self):
+        (self.repo / "tracked.txt").write_text("candidate\n", encoding="utf-8")
+        self._git("add", "tracked.txt")
+        self._git("commit", "-m", "candidate")
+        candidate = self._git("rev-parse", "HEAD")
+        task = self._task("ACCEPTANCE")
+        task["candidate_commit"] = candidate
+        task["base_commit"] = self.base_commit
+        output_path = Path(self.temporary_directory.name) / "result.json"
+        real_run = subprocess.run
+
+        def write_then_move_head(command, *args, **kwargs):
+            if command[0] == "git":
+                return real_run(command, *args, **kwargs)
+            completed = write_codex_result(command, self._luna_result())
+            self._git("checkout", self.base_commit)
+            return completed
+
+        with mock.patch("scripts.ai_workflow.subprocess.run", side_effect=write_then_move_head):
+            with self.assertRaisesRegex(workflow.WorkflowError, "HEAD_DRIFT"):
+                workflow.run_codex("luna", task, "bounded", self._paths(output_path))
+
+    def test_stale_canonical_output_is_not_accepted_when_this_attempt_creates_no_output(self):
+        output_path = Path(self.temporary_directory.name) / "luna-result.json"
+        output_path.write_text(json.dumps(self._luna_result()), encoding="utf-8")
+        real_run = subprocess.run
+
+        def run_without_output(command, *args, **kwargs):
+            if command[0] == "git":
+                return real_run(command, *args, **kwargs)
+            return subprocess.CompletedProcess(command, 0, stdout='{"event":"done"}\n', stderr="")
+
+        with mock.patch("scripts.ai_workflow.subprocess.run") as run:
+            run.side_effect = run_without_output
+            with self.assertRaisesRegex(workflow.WorkflowError, "MISSING_FRESH_ROLE_OUTPUT"):
+                workflow.run_codex("luna", self._task(), "bounded", self._paths(output_path))
+
+    def test_each_role_attempt_uses_a_new_output_and_log_path(self):
+        output_path = Path(self.temporary_directory.name) / "luna-result.json"
+        paths = self._paths(output_path)
+        real_run = subprocess.run
+
+        def write_fresh_output(command, *args, **kwargs):
+            if command[0] == "git":
+                return real_run(command, *args, **kwargs)
+            return write_codex_result(command, self._luna_result())
+
+        with mock.patch("scripts.ai_workflow.subprocess.run", side_effect=write_fresh_output):
+            workflow.run_codex("luna", self._task(), "bounded", paths)
+            workflow.run_codex("luna", self._task(), "bounded", paths)
+
+        self.assertEqual(len(list((output_path.parent / "attempts").glob("luna-*.json"))), 2)
+        self.assertEqual(len(list(paths.logs_dir.glob("luna-*.jsonl"))), 2)
+        self.assertEqual(json.loads(output_path.read_text(encoding="utf-8")), self._luna_result())
+
+    def test_luna_blocked_stops_the_pipeline_without_running_the_next_role(self):
+        state_root = Path(self.temporary_directory.name) / "state"
+        store = workflow.WorkflowStore(state_root)
+        task = self._task()
+        store.create_task(task)
+        runner = ScriptedRunner([self._luna_result("BLOCKED")])
+
+        with mock.patch.object(workflow, "WORKFLOW_STATE_ROOT", state_root):
+            state = workflow.run_until_gate(task["task_id"], runner=runner, allow_live_model=False)
+
+        self.assertEqual(state, "BLOCKED")
+        self.assertEqual(runner.calls, ["luna"])
+
+    def test_terra_actual_forbidden_file_is_blocked_even_when_the_model_declares_no_changes(self):
+        task = self._task("REMEDIATION")
+        source_worktree = self.repo / ".codex-worktrees" / task["task_id"].lower()
+        source_worktree.parent.mkdir()
+        self._git(
+            "worktree",
+            "add",
+            "-b",
+            f"aiwf/{task['task_id'].lower()}",
+            str(source_worktree),
+            self.base_commit,
+        )
+        task["source_worktree"] = str(source_worktree)
+        state_root = Path(self.temporary_directory.name) / "state"
+        store = workflow.WorkflowStore(state_root)
+        store.create_task(task)
+        store.append_event(
+            task["task_id"],
+            {
+                "event_type": "OWNER_DECISION",
+                "new_state": "WORKTREE_READY",
+                "task_sha256": workflow._task_sha256(store, task["task_id"]),
+            },
+        )
+        store.record_decision(
+            task["task_id"],
+            {
+                "decision": "approve_execution",
+                "actor": "owner",
+                "new_state": "APPROVED_FOR_EXECUTION",
+                "task_sha256": workflow._task_sha256(store, task["task_id"]),
+            },
+        )
+
+        class ForbiddenWriterRunner:
+            is_live_model = True
+
+            def __init__(self):
+                self.calls = []
+
+            def run(self, role, unused_task):
+                self.calls.append(role)
+                (source_worktree / "forbidden.txt").write_text("forbidden\n", encoding="utf-8")
+                return FinalSafetyRegressionTest._result("terra", "BLOCKED")
+
+        runner = ForbiddenWriterRunner()
+        with mock.patch.object(workflow, "WORKFLOW_STATE_ROOT", state_root):
+            state = workflow.run_until_gate(task["task_id"], runner=runner, allow_live_model=True)
+
+        self.assertEqual(state, "BLOCKED")
+        self.assertEqual(runner.calls, ["terra"])
 
 
 if __name__ == "__main__":

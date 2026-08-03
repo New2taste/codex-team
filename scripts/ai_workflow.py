@@ -14,6 +14,7 @@ import re
 import subprocess
 import tempfile
 import time
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -83,6 +84,23 @@ RESULT_REQUIRED_FIELDS = frozenset(
     }
 )
 READ_ONLY_ROLES = frozenset({"luna", "sol_planner", "sol_reviewer", "sol_xhigh"})
+ROLE_GUARD_FAILURES = frozenset(
+    {
+        "ACCEPTANCE_CANDIDATE_HEAD_MISMATCH",
+        "ACCEPTANCE_COMMIT_UNRESOLVED",
+        "DIRTY_ACCEPTANCE_REPOSITORY",
+        "DIRTY_READ_ONLY_REPOSITORY",
+        "DIRTY_TERRA_WORKTREE",
+        "HEAD_DRIFT",
+        "OUT_OF_SCOPE_CHANGE",
+        "READ_ONLY_ROLE_MODIFIED_REPO",
+        "ROLE_REPOSITORY_MISMATCH",
+        "SOURCE_WORKTREE_REQUIRED",
+        "TERRA_STATE_NOT_AUTHORIZED",
+        "UNAUTHORIZED_SOURCE_WORKTREE",
+        "WORKFLOW_STORE_REQUIRED",
+    }
+)
 SAFE_ENVIRONMENT_KEYS = frozenset({"HOME", "PATH", "CODEX_HOME", "LANG", "LC_ALL", "TERM", "TMPDIR"})
 CODEX_TIMEOUT_SECONDS = 120
 WORKFLOW_STATE_ROOT = Path(__file__).resolve().parents[1] / "data" / "state" / "ai-workflow"
@@ -181,6 +199,72 @@ def changed_paths(repo: Path, base: str, candidate: str) -> set[str]:
 
     output = git(repo, "diff", "--name-only", "-z", "--no-renames", base, candidate, "--")
     return {path for path in output.split("\0") if path}
+
+
+def working_tree_paths(repo: Path) -> set[str]:
+    """Return every current path whose working-tree content differs from HEAD."""
+
+    output = git(
+        repo,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+        "--no-renames",
+        "-z",
+    )
+    paths: set[str] = set()
+    for record in output.split("\0"):
+        if not record:
+            continue
+        if len(record) < 4:
+            _fail("GIT_STATUS_INVALID", "cannot parse repository status")
+        paths.add(record[3:])
+    return paths
+
+
+def _resolve_commit(repo: Path, value: object, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        _fail("COMMIT_REQUIRED", f"{field} must name a commit")
+    try:
+        return git(repo, "rev-parse", "--verify", f"{value}^{{commit}}")
+    except WorkflowError as exc:
+        if exc.code == "GIT_COMMAND_FAILED":
+            _fail("ACCEPTANCE_COMMIT_UNRESOLVED", f"cannot resolve {field}")
+        raise
+
+
+def _execution_repo(task: Mapping[str, object], role: str) -> Path:
+    repository_root = Path(task["repository_root"]).resolve()
+    source_worktree = task.get("source_worktree")
+    if role == "terra":
+        if task.get("task_type") != "REMEDIATION":
+            _fail("TERRA_TASK_TYPE_INVALID", "Terra may run only for REMEDIATION tasks")
+        if not isinstance(source_worktree, str) or not source_worktree.strip():
+            _fail("SOURCE_WORKTREE_REQUIRED", "Terra requires an authorized source_worktree")
+        return Path(source_worktree).resolve()
+    if task.get("task_type") == "ACCEPTANCE" and isinstance(source_worktree, str):
+        return Path(source_worktree).resolve()
+    return repository_root
+
+
+def assert_acceptance_candidate(task: Mapping[str, object], repo: Path) -> tuple[str, str] | None:
+    """Resolve both acceptance revisions and require the candidate to be checked out."""
+
+    if task.get("task_type") != "ACCEPTANCE":
+        return None
+    base = _resolve_commit(repo, task.get("base_commit"), "base_commit")
+    candidate = _resolve_commit(repo, task.get("candidate_commit"), "candidate_commit")
+    if git(repo, "rev-parse", "HEAD") != candidate:
+        _fail(
+            "ACCEPTANCE_CANDIDATE_HEAD_MISMATCH",
+            "acceptance repository HEAD must equal the resolved candidate_commit",
+        )
+    return base, candidate
+
+
+def _reject_dirty_input(repo: Path, code: str, detail: str) -> None:
+    if working_tree_paths(repo):
+        _fail(code, detail)
 
 
 def assert_allowed_changes(changed: set[str], allowed: Sequence[str]) -> None:
@@ -314,6 +398,7 @@ class RunPaths:
     output_path: Path
     schema_path: Path
     logs_dir: Path
+    state_root: Path | None = None
 
 
 def _validate_result_records(
@@ -453,7 +538,8 @@ def _write_role_events(log_path: Path, stdout: object) -> None:
         stdout = stdout.decode("utf-8", errors="replace")
     text = stdout if isinstance(stdout, str) else ""
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_path.write_text(_redact_log_text(text), encoding="utf-8")
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(_redact_log_text(text))
 
 
 def run_codex(role: str, task: dict, prompt: str, paths: RunPaths) -> dict:
@@ -462,10 +548,29 @@ def run_codex(role: str, task: dict, prompt: str, paths: RunPaths) -> dict:
     validate_task(task)
     if not isinstance(prompt, str):
         _fail("INVALID_PROMPT", "prompt must be a string")
-    before_run = capture_repo(paths.repo)
+    repo = Path(paths.repo).resolve()
+    if repo != _execution_repo(task, role):
+        _fail("ROLE_REPOSITORY_MISMATCH", "role repository does not match the task execution repository")
+    if role == "terra":
+        _assert_terra_worktree_authorized(task, repo, paths.state_root)
+    if role in READ_ONLY_ROLES:
+        _reject_dirty_input(repo, "DIRTY_READ_ONLY_REPOSITORY", "read-only role requires a clean repository")
+    if task["task_type"] == "ACCEPTANCE":
+        _reject_dirty_input(repo, "DIRTY_ACCEPTANCE_REPOSITORY", "acceptance requires a clean repository")
+        assert_acceptance_candidate(task, repo)
+    if role == "terra":
+        _reject_dirty_input(repo, "DIRTY_TERRA_WORKTREE", "Terra requires a clean source_worktree")
+    before_run = capture_repo(repo)
+    before_changes = working_tree_paths(repo)
+    attempt_id = f"{role}-{time.time_ns()}-{uuid.uuid4().hex}"
+    attempt_output = Path(paths.output_path).parent / "attempts" / f"{attempt_id}.json"
+    attempt_events = Path(paths.logs_dir) / f"{attempt_id}.jsonl"
+    attempt_started_ns = time.time_ns()
+    if attempt_output.exists():
+        _fail("ATTEMPT_OUTPUT_COLLISION", "role attempt output path already exists")
+    result: dict | None = None
     try:
-        command = build_codex_command(role, paths.repo, paths.output_path, paths.schema_path)
-        events_path = Path(paths.logs_dir) / f"{role}-events.jsonl"
+        command = build_codex_command(role, repo, attempt_output, paths.schema_path)
         try:
             completed = subprocess.run(
                 command,
@@ -475,30 +580,47 @@ def run_codex(role: str, task: dict, prompt: str, paths: RunPaths) -> dict:
                 text=True,
                 timeout=CODEX_TIMEOUT_SECONDS,
                 env=sanitized_environment(os.environ),
-                cwd=str(paths.repo),
+                cwd=str(repo),
                 shell=False,
             )
         except subprocess.TimeoutExpired as exc:
-            _write_role_events(events_path, exc.stdout)
+            _write_role_events(attempt_events, exc.stdout)
             raise WorkflowError("CODEX_TIMEOUT", f"{role} exceeded {CODEX_TIMEOUT_SECONDS} seconds") from exc
-        _write_role_events(events_path, completed.stdout)
+        _write_role_events(attempt_events, completed.stdout)
         if completed.returncode != 0:
             raise WorkflowError("CODEX_EXIT_NONZERO", f"{role} exited with code {completed.returncode}")
         try:
-            result = json.loads(Path(paths.output_path).read_text(encoding="utf-8"))
+            output_stat = attempt_output.stat()
+        except OSError as exc:
+            raise WorkflowError("MISSING_FRESH_ROLE_OUTPUT", f"{role} did not produce a fresh JSON result") from exc
+        if output_stat.st_mtime_ns < attempt_started_ns:
+            _fail("MISSING_FRESH_ROLE_OUTPUT", "role attempt output predates the attempt")
+        try:
+            result = json.loads(attempt_output.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise WorkflowError("INVALID_ROLE_RESULT", f"{role} did not produce valid JSON") from exc
         if not isinstance(result, dict):
             _fail("INVALID_ROLE_RESULT", "role output must be an object")
-        validate_role_result(role, result, set(result.get("changed_files", [])))
-        validate_verification_package(role, task, result)
-        return result
     finally:
-        after_run = capture_repo(paths.repo)
-        if role in READ_ONLY_ROLES and before_run != after_run:
-            _fail("READ_ONLY_ROLE_MODIFIED_REPO", f"read-only role {role} changed the repository")
+        after_run = capture_repo(repo)
+        after_changes = working_tree_paths(repo)
         if before_run.head != after_run.head:
             _fail("HEAD_DRIFT", "repository HEAD changed during the role run")
+        if role in READ_ONLY_ROLES and before_run != after_run:
+            _fail("READ_ONLY_ROLE_MODIFIED_REPO", f"read-only role {role} changed the repository")
+        if task["task_type"] == "ACCEPTANCE":
+            assert_acceptance_candidate(task, repo)
+        if role == "terra":
+            actual_changes = after_changes - before_changes
+            assert_allowed_changes(actual_changes, task["allowed_write_paths"])
+        else:
+            actual_changes = after_changes - before_changes
+    if result is None:
+        _fail("INVALID_ROLE_RESULT", "role did not return a result")
+    validate_role_result(role, result, actual_changes)
+    validate_verification_package(role, task, result)
+    atomic_write_json(paths.output_path, result)
+    return result
 
 
 def _require_nonempty_string(task: Mapping[str, object], field: str) -> None:
@@ -581,56 +703,6 @@ def validate_task(task: Mapping[str, object]) -> None:
             _fail("COMMIT_REQUIRED", "ACCEPTANCE requires base_commit and candidate_commit")
     if task_type == "REMEDIATION" and not task["allowed_write_paths"]:
         _fail("WRITE_PATH_REQUIRED", "REMEDIATION requires allowed_write_paths")
-
-
-def _has_execution_approval(repo: Path, task_id: str) -> bool:
-    decision_path = repo / "data/state/ai-workflow" / task_id / "human-decisions.jsonl"
-    try:
-        records = decision_path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return False
-    for line in records:
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(record, dict) and (
-            record.get("decision") == "APPROVED_FOR_EXECUTION"
-            or (
-                record.get("decision") == "approve_execution"
-                and record.get("new_state") == "APPROVED_FOR_EXECUTION"
-            )
-        ):
-            return True
-    return False
-
-
-def create_worktree(task: dict, owner_authorized: bool) -> Path:
-    """Create the one owner-approved, task-scoped worktree without deletion support."""
-
-    if not owner_authorized:
-        _fail("OWNER_AUTHORIZATION_REQUIRED", "owner authorization is required before creating a worktree")
-    validate_task(task)
-    task_id = task["task_id"]
-    repository_root = Path(task["repository_root"])
-    if not _has_execution_approval(repository_root, task_id):
-        _fail(
-            "APPROVED_FOR_EXECUTION_REQUIRED",
-            f"task {task_id} has no APPROVED_FOR_EXECUTION decision record",
-        )
-    normalized_task_id = task_id.lower()
-    worktree = repository_root / ".codex-worktrees" / normalized_task_id
-    worktree.parent.mkdir(parents=True, exist_ok=True)
-    git(
-        repository_root,
-        "worktree",
-        "add",
-        "-b",
-        f"aiwf/{normalized_task_id}",
-        str(worktree),
-        "HEAD",
-    )
-    return worktree
 
 
 def load_task(path: Path) -> dict[str, object]:
@@ -1404,6 +1476,77 @@ def _authorization_is_recorded(
     )
 
 
+def _expected_worktree(task: Mapping[str, object]) -> Path:
+    return Path(task["repository_root"]).resolve() / ".codex-worktrees" / str(task["task_id"]).lower()
+
+
+def _assert_terra_worktree_authorized(
+    task: Mapping[str, object], repo: Path, state_root: Path | None
+) -> None:
+    """Require Terra to use the one worktree bound to a verified owner decision."""
+
+    expected_worktree = _expected_worktree(task)
+    if Path(repo).resolve() != expected_worktree:
+        _fail("UNAUTHORIZED_SOURCE_WORKTREE", "Terra source_worktree is not task-scoped")
+    if state_root is None:
+        _fail("WORKFLOW_STORE_REQUIRED", "Terra requires the verified workflow store")
+    store = WorkflowStore(state_root)
+    task_id = str(task["task_id"])
+    stored_task = load_task(store._require_task(task_id) / "task.json")
+    if stored_task != dict(task):
+        _fail("TASK_STORE_MISMATCH", "Terra task does not match the stored task envelope")
+    if not _authorization_is_recorded(
+        store, task_id, "APPROVED_FOR_EXECUTION", "approve_execution"
+    ):
+        _fail("APPROVED_FOR_EXECUTION_REQUIRED", "Terra has no verified execution authorization")
+    if _current_state(store, task_id) not in {
+        "APPROVED_FOR_EXECUTION",
+        "WORKTREE_READY",
+        "IMPLEMENTATION_RUNNING",
+    }:
+        _fail("TERRA_STATE_NOT_AUTHORIZED", "Terra is not in an implementation state")
+
+
+def create_worktree(
+    task: dict, owner_authorized: bool, *, store: WorkflowStore | None = None
+) -> Path:
+    """Create the approved worktree at the frozen task base, never at current HEAD."""
+
+    if not owner_authorized:
+        _fail("OWNER_AUTHORIZATION_REQUIRED", "owner authorization is required before creating a worktree")
+    validate_task(task)
+    if task["task_type"] != "REMEDIATION":
+        _fail("WORKTREE_TASK_TYPE_INVALID", "only remediation tasks may create a worktree")
+    task_id = task["task_id"]
+    verified_store = store or WorkflowStore(WORKFLOW_STATE_ROOT)
+    stored_task = load_task(verified_store._require_task(task_id) / "task.json")
+    if stored_task != task:
+        _fail("TASK_STORE_MISMATCH", "worktree task does not match the stored task envelope")
+    if _current_state(verified_store, task_id) != "APPROVED_FOR_EXECUTION":
+        _fail("APPROVED_FOR_EXECUTION_REQUIRED", "worktree creation requires APPROVED_FOR_EXECUTION")
+    if not _authorization_is_recorded(
+        verified_store, task_id, "APPROVED_FOR_EXECUTION", "approve_execution"
+    ):
+        _fail("APPROVED_FOR_EXECUTION_REQUIRED", "worktree requires a verified execution decision")
+    repository_root = Path(task["repository_root"]).resolve()
+    base_commit = _resolve_commit(repository_root, task["base_commit"], "base_commit")
+    worktree = _expected_worktree(task)
+    source_worktree = task["source_worktree"]
+    if not isinstance(source_worktree, str) or Path(source_worktree).resolve() != worktree:
+        _fail("SOURCE_WORKTREE_MISMATCH", "task source_worktree must be the task-scoped worktree")
+    worktree.parent.mkdir(parents=True, exist_ok=True)
+    git(
+        repository_root,
+        "worktree",
+        "add",
+        "-b",
+        f"aiwf/{str(task_id).lower()}",
+        str(worktree),
+        base_commit,
+    )
+    return worktree
+
+
 def _role_for_plan_or_review(
     store: WorkflowStore, task_id: str, task: Mapping[str, object]
 ) -> str:
@@ -1435,8 +1578,54 @@ def _run_role_with_technical_retry(
 
     while True:
         try:
+            guarded_repo: Path | None = None
+            before_snapshot: RepoSnapshot | None = None
+            before_changes: set[str] | None = None
+            if getattr(runner, "is_live_model", False):
+                guarded_repo = _execution_repo(task, role)
+                if role == "terra":
+                    _assert_terra_worktree_authorized(task, guarded_repo, WORKFLOW_STATE_ROOT)
+                    _reject_dirty_input(
+                        guarded_repo,
+                        "DIRTY_TERRA_WORKTREE",
+                        "Terra requires a clean source_worktree",
+                    )
+                if role in READ_ONLY_ROLES:
+                    _reject_dirty_input(
+                        guarded_repo,
+                        "DIRTY_READ_ONLY_REPOSITORY",
+                        "read-only role requires a clean repository",
+                    )
+                if task["task_type"] == "ACCEPTANCE":
+                    _reject_dirty_input(
+                        guarded_repo,
+                        "DIRTY_ACCEPTANCE_REPOSITORY",
+                        "acceptance requires a clean repository",
+                    )
+                    assert_acceptance_candidate(task, guarded_repo)
+                before_snapshot = capture_repo(guarded_repo)
+                before_changes = working_tree_paths(guarded_repo)
             started_monotonic = time.monotonic()
-            result = runner.run(role, task)
+            try:
+                result = runner.run(role, task)
+            finally:
+                if guarded_repo is not None and before_snapshot is not None and before_changes is not None:
+                    after_snapshot = capture_repo(guarded_repo)
+                    after_changes = working_tree_paths(guarded_repo)
+                    if before_snapshot.head != after_snapshot.head:
+                        _fail("HEAD_DRIFT", "repository HEAD changed during the role run")
+                    if role in READ_ONLY_ROLES and before_snapshot != after_snapshot:
+                        _fail(
+                            "READ_ONLY_ROLE_MODIFIED_REPO",
+                            f"read-only role {role} changed the repository",
+                        )
+                    if task["task_type"] == "ACCEPTANCE":
+                        assert_acceptance_candidate(task, guarded_repo)
+                    actual_changes = after_changes - before_changes
+                    if role == "terra":
+                        assert_allowed_changes(actual_changes, task["allowed_write_paths"])
+                else:
+                    actual_changes = set(result.get("changed_files", [])) if "result" in locals() and isinstance(result, Mapping) else set()
             metric_run = dict(result) if isinstance(result, Mapping) else {}
             metric_run.update(
                 {
@@ -1446,8 +1635,7 @@ def _run_role_with_technical_retry(
                 }
             )
             record_metrics(task_id, metric_run)
-            declared = result.get("changed_files", []) if isinstance(result, Mapping) else []
-            validate_role_result(role, result, set(declared))
+            validate_role_result(role, result, actual_changes)
             validate_verification_package(role, task, result)
             return result, state
         except (WorkflowError, ValueError, json.JSONDecodeError) as exc:
@@ -1462,6 +1650,15 @@ def _run_role_with_technical_retry(
                 role=role,
                 error_code=error_code,
             )
+            if error_code in ROLE_GUARD_FAILURES:
+                return None, _transition(
+                    store,
+                    task_id,
+                    state,
+                    "BLOCKED",
+                    budget,
+                    event_type="ROLE_GUARD_BLOCKED",
+                )
             try:
                 budget.consume_technical()
             except WorkflowError:
@@ -1485,6 +1682,28 @@ def _role_state_after_result(
 ) -> str:
     status = result["status"]
     if role == "luna":
+        if status == "BLOCKED":
+            return _transition(
+                store,
+                task_id,
+                state,
+                "BLOCKED",
+                budget,
+                event_type="LUNA_BLOCKED",
+            )
+        if status == "NOT_SUPPORTED":
+            return _transition(
+                store,
+                task_id,
+                state,
+                "BLOCKED",
+                budget,
+                event_type="LUNA_NOT_SUPPORTED",
+            )
+        if status == "PARTIALLY_SUPPORTED":
+            event_type = "LUNA_PARTIALLY_SUPPORTED"
+        else:
+            event_type = "ROLE_RESULT"
         target = "EVIDENCE_READY" if state == "EVIDENCE_RUNNING" else "PRECHECK_READY"
     elif role == "terra":
         if status == "IMPLEMENTED_CANDIDATE":
@@ -1514,7 +1733,7 @@ def _role_state_after_result(
     state = _append_state_event(
         store,
         task_id,
-        event_type="ROLE_RESULT",
+        event_type=event_type if role == "luna" else "ROLE_RESULT",
         previous_state=state,
         new_state=target,
         budget=budget,
@@ -1566,6 +1785,8 @@ def run_until_gate(task_id: str, *, runner: Runner, allow_live_model: bool) -> s
         state = _current_state(store, task_id)
         budget = _budget_from_events(store, task_id)
         while True:
+            if getattr(runner, "is_live_model", False) and task["task_type"] == "ACCEPTANCE":
+                assert_acceptance_candidate(task, _execution_repo(task, "luna"))
             if state in {"BLOCKED", "CLOSED", "ABORTED", "DEFERRED", "AWAITING_OWNER_DECISION"}:
                 return state
             if state == "DRAFT":
@@ -1592,7 +1813,7 @@ def run_until_gate(task_id: str, *, runner: Runner, allow_live_model: bool) -> s
                 ):
                     return state
                 if task["task_type"] == "REMEDIATION" and getattr(runner, "is_live_model", False):
-                    create_worktree(task, owner_authorized=True)
+                    create_worktree(task, owner_authorized=True, store=store)
                 state = _transition(
                     store, task_id, state, "WORKTREE_READY", budget, owner_authorized=True
                 )
