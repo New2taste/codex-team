@@ -33,8 +33,7 @@
       ]
     },
     "summary": {
-      "type": "string",
-      "minLength": 1
+      "type": "string"
     },
     "claims": {
       "type": "array",
@@ -43,24 +42,20 @@
         "additionalProperties": false,
         "properties": {
           "id": {
-            "type": "string",
-            "minLength": 1
+            "type": "string"
           },
           "kind": {
             "type": "string",
             "enum": ["FACT", "INFERENCE", "RECOMMENDATION"]
           },
           "text": {
-            "type": "string",
-            "minLength": 1
+            "type": "string"
           },
           "evidence_ids": {
             "type": "array",
             "items": {
-              "type": "string",
-              "minLength": 1
-            },
-            "uniqueItems": true
+              "type": "string"
+            }
           }
         },
         "required": ["id", "kind", "text", "evidence_ids"]
@@ -73,20 +68,17 @@
         "additionalProperties": false,
         "properties": {
           "id": {
-            "type": "string",
-            "minLength": 1
+            "type": "string"
           },
           "type": {
             "type": "string",
             "enum": ["FILE", "COMMAND", "HASH", "TEST"]
           },
           "locator": {
-            "type": "string",
-            "minLength": 1
+            "type": "string"
           },
           "observation": {
-            "type": "string",
-            "minLength": 1
+            "type": "string"
           }
         },
         "required": ["id", "type", "locator", "observation"]
@@ -99,16 +91,13 @@
         "additionalProperties": false,
         "properties": {
           "target_claim_id": {
-            "type": "string",
-            "minLength": 1
+            "type": "string"
           },
           "method": {
-            "type": "string",
-            "minLength": 1
+            "type": "string"
           },
           "result": {
-            "type": "string",
-            "minLength": 1
+            "type": "string"
           }
         },
         "required": ["target_claim_id", "method", "result"]
@@ -118,26 +107,22 @@
       "type": "array",
       "items": {
         "type": "string"
-      },
-      "uniqueItems": true
+      }
     },
     "blind_spots": {
       "type": "array",
       "items": {
         "type": "string"
-      },
-      "uniqueItems": true
+      }
     },
     "unresolved_questions": {
       "type": "array",
       "items": {
         "type": "string"
-      },
-      "uniqueItems": true
+      }
     },
     "recommended_next_state": {
-      "type": "string",
-      "minLength": 1
+      "type": "string"
     }
   },
   "required": [

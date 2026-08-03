@@ -53,6 +53,18 @@ class ContractFilesTest(unittest.TestCase):
             {"type": "string", "const": "ai-result-1"},
         )
 
+    def test_codex_response_schema_avoids_unsupported_keywords(self):
+        result_schema = json.loads((ROOT / "config/ai_workflow_result.schema.json").read_text())
+
+        def collect_keys(value):
+            if isinstance(value, dict):
+                return set(value).union(*(collect_keys(item) for item in value.values()))
+            if isinstance(value, list):
+                return set().union(*(collect_keys(item) for item in value))
+            return set()
+
+        self.assertTrue({"uniqueItems", "minLength"}.isdisjoint(collect_keys(result_schema)))
+
 
 class TaskValidationTest(unittest.TestCase):
     def valid_task(self):
