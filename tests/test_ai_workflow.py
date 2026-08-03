@@ -1373,6 +1373,21 @@ class FinalSafetyRegressionTest(unittest.TestCase):
         self.assertEqual(len(list(paths.logs_dir.glob("luna-*.jsonl"))), 2)
         self.assertEqual(json.loads(output_path.read_text(encoding="utf-8")), self._luna_result())
 
+    def test_role_runner_creates_the_attempt_output_directory_before_codex(self):
+        output_path = Path(self.temporary_directory.name) / "luna-result.json"
+        real_run = subprocess.run
+
+        def require_parent_then_write(command, *args, **kwargs):
+            if command[0] == "git":
+                return real_run(command, *args, **kwargs)
+            attempt_output = Path(command[command.index("-o") + 1])
+            self.assertTrue(attempt_output.parent.is_dir())
+            attempt_output.write_text(json.dumps(self._luna_result()), encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, stdout='{"event":"done"}\n', stderr="")
+
+        with mock.patch("scripts.ai_workflow.subprocess.run", side_effect=require_parent_then_write):
+            workflow.run_codex("luna", self._task(), "bounded", self._paths(output_path))
+
     def test_luna_blocked_stops_the_pipeline_without_running_the_next_role(self):
         state_root = Path(self.temporary_directory.name) / "state"
         store = workflow.WorkflowStore(state_root)

@@ -566,6 +566,7 @@ def run_codex(role: str, task: dict, prompt: str, paths: RunPaths) -> dict:
     attempt_output = Path(paths.output_path).parent / "attempts" / f"{attempt_id}.json"
     attempt_events = Path(paths.logs_dir) / f"{attempt_id}.jsonl"
     attempt_started_ns = time.time_ns()
+    attempt_output.parent.mkdir(parents=True, exist_ok=True)
     if attempt_output.exists():
         _fail("ATTEMPT_OUTPUT_COLLISION", "role attempt output path already exists")
     result: dict | None = None
