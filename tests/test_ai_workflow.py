@@ -650,6 +650,12 @@ class CodexRunnerTest(unittest.TestCase):
             "6f9a5b7a0a9ebb03cde5ab869b864795326fb356563618a3ad0b2b0eb1a835bc",
         )
         self.assertIn(str(evidence), prompt)
+        self.assertIn('Output "role" exactly as "luna".', prompt)
+        self.assertIn(
+            'Output "status" as exactly one of: SUPPORTED, PARTIALLY_SUPPORTED, NOT_SUPPORTED, BLOCKED.',
+            prompt,
+        )
+        self.assertIn("Read the named evidence files at the listed paths", prompt)
         self.assertIn("only output ai-result-1 JSON", prompt)
         self.assertNotIn("registry/", prompt)
         self.assertNotIn("chat history", prompt)

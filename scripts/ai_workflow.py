@@ -244,6 +244,11 @@ def build_role_prompt(
             f"Task envelope: {_canonical_json(dict(task))}",
             f"Task contract: {_canonical_json(dict(contract))}",
             f"Named evidence: {_canonical_json(evidence)}",
+            f'Output "role" exactly as "{role}".',
+            'Output "status" as exactly one of: '
+            + ", ".join(role_config["allowed_statuses"])
+            + ".",
+            "Read the named evidence files at the listed paths before evaluating the task.",
             "Use only the task contract and named evidence above; no additional source material is authorized.",
             "only output ai-result-1 JSON",
         )
