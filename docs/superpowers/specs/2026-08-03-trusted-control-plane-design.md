@@ -4,7 +4,7 @@
 >
 > 状态：`APPROVED_FOR_SPECIFICATION`
 >
-> 目标：在不削弱现有人工门、证据门和 Git 安全边界的前提下，通过最小委派、可证明调度和可归因成本证据降低模型消耗并缩短交付时间。
+> 目标：在不削弱现有人工门、证据门和 Git 安全边界的前提下，通过最小委派、可证明调度、可归因成本证据和可复现角色安装降低模型消耗并缩短交付时间。
 
 ## 1. 背景与取舍
 
@@ -21,7 +21,7 @@
 2. 建设可信控制平面：同时补齐确定性路由、结构化计划、调度、运行时验真和成本证据；
 3. 优先插件化和跨平台安装：扩大发布面，但核心合同尚未稳定。
 
-采用方案 2。插件化、跨平台安装和 UI 延后到控制平面合同稳定之后。
+采用方案 2，并把 Luna 纳管与最小开源发布面作为可信控制平面的组成部分：本期提供项目级 Agent、Codex Plugin、companion installer 和调用文档；通用公共目录投稿、跨平台完整生命周期和 UI 延后到控制平面合同稳定之后。
 
 ## 2. 设计原则与边界
 
@@ -32,6 +32,7 @@
 - 人工继续控制方案批准、整改授权、Sol xhigh、最终验收、merge 和 push；
 - 固定 candidate、HEAD 漂移检查、dirty tree 检查、changed-path 守卫和独立 worktree 不得放宽；
 - L0/L1/L2 证据要求、append-only 事件与决策账本、重试上限继续有效；
+- 仓库内规范模板是 `luna_worker` 的版本事实来源，个人全局文件只能是可校验的安装副本；
 - 缺失或冲突的信息一律失败关闭，不允许模型、角色或权限静默替代；
 - 不自动 merge、push、删除 worktree，不扩大 sandbox 或外部副作用权限。
 
@@ -39,7 +40,7 @@
 
 - 机器学习路由、自由文本复杂度评分或按工作量比例强制分配；
 - 共享 worktree 的并行写入、固定 worker 数或嵌套子代理；
-- 插件市场包装、Windows 生命周期脚本、Web UI 或常驻服务；
+- 通用公共 Plugins Directory 投稿、Windows 生命周期脚本、Web UI 或常驻服务；
 - 用估算 token 冒充实测数据，或宣称固定节省比例；
 - 由 `direct` 路径绕过风险策略、用户授权或现有安全检查。
 
@@ -201,7 +202,115 @@ failure_reasons[]
 
 审查角色若实际权限比请求的 read-only 更宽，只能在任务不要求 OS 强隔离、prompt 明确禁写且主控验证调用前后 repository/artifact 快照完全一致时，标记为“行为只读”；否则阻断。
 
-## 8. 成本与效率证据账本
+## 8. Luna 纳管与开源发布
+
+### 8.1 纳管结论
+
+`luna_worker` 即使早于本项目，也必须从个人配置资产转为项目管理资产。纳管完成需同时满足：
+
+- 仓库保存规范 Agent 模板并为每个发布版本固定 SHA256；
+- 项目级 Agent 镜像与规范模板逐字节一致；
+- installer、`--check`、安全升级和安全卸载都有自动测试；
+- 每次真实调用既校验静态模板，也生成第 7 节的运行时身份与权限证据；
+- 交互式原生子代理与自动 `codex exec` 路径在文档、事件和指标中明确区分；
+- 角色行为仍由项目合同约束，不允许个人副本发展为第二套规则。
+
+完成这些条件前，只能宣称 Luna 行为合同和 L1 只读烟测已验证，不能宣称开源用户可以复现同一 `luna_worker` 运行环境。
+
+### 8.2 仓库与 Plugin 结构
+
+第一版开源分发使用一个 Git 仓库内的 repo marketplace 和 Plugin：
+
+```text
+.agents/plugins/marketplace.json
+.codex/agents/luna-worker.toml
+plugins/ai-workflow/
+  .codex-plugin/plugin.json
+  agents/luna-worker.toml
+  skills/orchestration/SKILL.md
+  scripts/install-agents.sh
+  scripts/uninstall-agents.sh
+  scripts/inspect-agent-runtime.sh
+  scripts/verify.sh
+  config/
+  runtime/
+```
+
+首个开源目标版本为 `v0.2.0`，支持当前 Codex CLI/ChatGPT desktop、macOS 和 Linux 的 POSIX shell、Python 3.11+、Git、`jq` 与 SHA256 工具。Windows 原生生命周期属于后续发布门；README 必须显式列为未验证，而不是暗示兼容。
+
+`plugins/ai-workflow/agents/luna-worker.toml` 是发布用规范模板；`.codex/agents/luna-worker.toml` 是方便贡献者在仓库内新建 Codex 任务时直接发现角色的项目级镜像。`verify.sh` 和合同测试必须证明两者逐字节一致，禁止手工维护两套语义。
+
+Plugin ID 固定为 `ai-workflow@ai-workflow`，Skill 调用名固定为 `$ai-workflow:orchestration`。`.codex-plugin/plugin.json` 只声明 Codex 原生支持的 Plugin 组件；custom agent 不伪装成 manifest 原生组件，而是由 companion installer 单独注册。
+
+本地克隆后的安装流程固定为：
+
+```text
+codex plugin marketplace add .
+codex plugin add ai-workflow@ai-workflow
+plugin_dir="$(codex plugin list --json | jq -r '.installed[] | select(.pluginId == "ai-workflow@ai-workflow") | .installedPath')"
+test -n "$plugin_dir" && test -d "$plugin_dir"
+sh "$plugin_dir/scripts/install-agents.sh"
+sh "$plugin_dir/scripts/install-agents.sh" --check
+重新启动 Codex 或新建任务
+```
+
+GitHub 发布使用同一 marketplace 和 Plugin 内容，只把 marketplace 来源从本地路径换成已固定 tag 或 commit 的 Git 来源。README 必须从发布元数据生成准确命令，不在代码中硬编码尚未确定的 GitHub owner。
+
+### 8.3 Companion installer 合同
+
+installer 的默认目标是已设置的 `CODEX_HOME/agents`，否则是 `~/.codex/agents`。它不得编辑 `config.toml`，也不得改变无关 Agent。
+
+安装前必须把目标分类为：
+
+- `missing`：可以原子安装；
+- `current`：保持不变并报告已是当前版本；
+- `known_legacy`：只有摘要命中发布清单中的已知旧版本时才允许原子升级；
+- `conflict`：内容被用户修改或来自未知版本，拒绝覆盖；
+- `unsafe`：目标或父目录是符号链接、非普通文件或异常路径，拒绝操作；
+- `unreadable`：无法取得可靠摘要，拒绝操作。
+
+`--check` 必须完全只读，验证规范模板、安装副本、文件类型、SHA256、TOML 字段和当前版本。普通安装先完成全量 preflight，再使用同目录临时文件与原子替换；preflight 后目标发生变化时停止，不能部分更新。
+
+安全卸载只移除安装状态记录为本项目所有、且当前摘要仍等于已安装摘要的文件。摘要不一致时保留文件并报冲突；不得为了卸载执行递归删除。若安装器创建过备份，恢复也必须校验备份是普通文件、摘要已记录且目标状态仍允许替换。
+
+第一版发布清单必须把当前已验证的个人文件摘要登记为已知版本：
+
+```text
+60f7240ea662cd27ea0f51f2e1efa8a2e788e16c76b04a13ab1c1df4f26ef024
+```
+
+### 8.4 开启与调用
+
+安装成功并在新任务中完成 Agent 发现后，交互式主入口是：
+
+```text
+使用 $ai-workflow:orchestration 执行这个任务，按可信控制平面路由。
+```
+
+Skill 只在确定性路由选择 `delegated` 且计划明确分配 Luna 时生成 `agent_type: luna_worker`。用户也可以直接请求“调用 `luna_worker` 做有界只读盘点”，但 Agent 仍必须遵守任务信封、L0/L1/L2 和主控复核。
+
+自动编排继续使用：
+
+```text
+python3 scripts/ai_workflow.py validate --task task.json
+python3 scripts/ai_workflow.py new --task task.json
+python3 scripts/ai_workflow.py run --task task.json --runner live --allow-live-model --role luna
+```
+
+自动路径通过 `codex exec -m gpt-5.6-luna` 注入项目角色合同；在 Codex CLI 提供并验证等价的 custom-agent 非交互选择接口以前，不得把它记录成原生 `luna_worker` 子代理调用。事件与成本账本分别记录 `NATIVE_SUBAGENT` 和 `CODEX_EXEC_ROLE_CONTRACT` 两种 execution surface。
+
+### 8.5 发布与调用验收
+
+- 新 clone 在仓库内新建任务时能发现项目级 `luna_worker`；离开仓库后只有完成 companion install 才能发现全局角色；
+- Plugin 单独安装但 companion agent 缺失时，Skill 必须给出可执行错误并拒绝用默认 worker 替代；
+- `--check` 对 missing、current、known legacy、conflict、unsafe 和 unreadable 六类目标都有正反测试；
+- 安装、重复安装、已知版本升级、冲突拒绝和安全卸载在临时 `CODEX_HOME` 中验证，不污染用户真实配置；
+- Agent TOML 的 name、model、effort 和 developer instructions 与项目合同一致；
+- 启动后实际 `agent_type`、model、effort、sandbox、permission 和 cwd 通过 runtime evidence 门；
+- 原生子代理和自动 exec 的调用数、token、耗时和失败分别计量，不混合成同一身份；
+- README 覆盖本地 clone、Git marketplace、安装检查、重启/新任务、显式 Skill 调用、直接 Agent 调用和卸载恢复。
+
+## 9. 成本与效率证据账本
 
 `cost-evidence-1` 以 attempt 为单位记录：
 
@@ -232,7 +341,7 @@ rate_snapshot_id
 
 只有至少 30 个预注册、按风险和任务类型分层匹配的案例完成后，才评估启用效果。若新流程的首交通过率或最终质量相对基线下降超过 5 个百分点，不得宣称成功；只有质量不越过该非劣界且净成本下降，才能使用“降本”结论。否则只报告观察值、置信边界和缺失数据。
 
-## 9. 错误处理与恢复
+## 10. 错误处理与恢复
 
 新增错误均采用闭集代码并写入现有 append-only 事件流：
 
@@ -244,11 +353,11 @@ rate_snapshot_id
 
 错误不会自动降级为更便宜或相近的角色。恢复只能重放已验证计划和账本状态：未写文件的中断任务可以在新 attempt 下重派；已经写文件的 owner 不得静默替换；候选、计划或 scope 变化后必须生成新 dispatch identity 并重跑受影响验证。
 
-## 10. 测试与验收
+## 11. 测试与验收
 
 所有功能按 RED→GREEN→REFACTOR 实施。最低验收矩阵：
 
-### 10.1 路由
+### 11.1 路由
 
 - 四条路径的补集测试；
 - simple direct 为零编排角色调用；
@@ -256,47 +365,48 @@ rate_snapshot_id
 - 风险任务不能被提示或成本策略降级为 direct；
 - legacy 与 shadow 模式不改变旧执行结果。
 
-### 10.2 计划和调度
+### 11.2 计划和调度
 
 - 缺字段、未知字段、重复 ID、路径越界、scope 重叠、同一路径多 owner、循环依赖和提前跨 stage 全部确定性拒绝；
 - 容量为 `N` 时最多启动 `N` 个 ready tasks；容量变化不改变 owner 和依赖；
 - 相同 dispatch ID 幂等恢复，不重复启动；
 - dirty tree、HEAD 漂移和 candidate 漂移继续阻断。
 
-### 10.3 运行时验真
+### 11.3 运行时验真
 
 - role、model、effort、sandbox、permission、cwd 各自缺失或冲突的故障注入；
 - 零个/多个 rollout、公共与本地证据不一致、allowlist 外泄漏全部失败；
 - reviewer 权限被放宽时验证前后快照，不满足行为只读条件则阻断。
 
-### 10.4 成本证据
+### 11.4 成本证据
 
 - 缺 token 保持 unavailable；NaN、负值、字符串估算和混合证据拒绝；
 - 重试、失败、Sol overhead 和重复上下文都进入同一 paired case；
 - measured 与 projection 分栏，费率快照变化不改写历史原始数据；
 - 30 个案例门和 5 个百分点质量非劣界由确定性测试覆盖。
 
-### 10.5 回归与负向验证
+### 11.5 回归与负向验证
 
 - 现有完整测试套件必须全部通过；
 - 保留并扩展 mutation/failure-injection，确认关闭 risk override、owner guard、runtime identity gate、candidate pin 或 retry limit 时测试会失败；
 - `compileall`、Schema/TOML 解析、`git diff --check` 和工作树清洁检查通过；
 - 真实 lane 启用前，先用 fake runner 完成 Direct、Sol-only、Delegated 和 Blocked 四条闭环。
 
-## 11. 分阶段发布
+## 12. 分阶段发布
 
 1. **基线冻结**：记录旧固定路由的角色调用、耗时、质量和不可用字段；
 2. **合同层**：增加 route、plan、runtime 和 cost 四类版本化 Schema 及兼容适配器；
 3. **Shadow 路由**：只记录新决定，验证与旧行为的差异和风险覆盖；
 4. **计划与调度**：先启用单 stage，再启用动态容量批次；
 5. **身份门**：完成故障注入后才允许真实角色结果进入可信状态；
-6. **Enforced 路由**：由所有者显式开启实际分流；
-7. **配对实验**：完成预注册样本后发布有证据边界的成本与质量报告。
+6. **Luna 发布面**：验证项目级 Agent、Plugin、companion installer、runtime inspector 和两种 execution surface；
+7. **Enforced 路由**：由所有者显式开启实际分流；
+8. **配对实验**：完成预注册样本后发布有证据边界的成本与质量报告。
 
 任何阶段出现安全回归、质量越过非劣界、成本数据无法归因或恢复不幂等，都退回上一模式；回退只改变控制平面模式，不删除历史 artifact 或审计事件。
 
-## 12. 成功定义
+## 13. 成功定义
 
-本优化完成不等于已经证明固定比例的节省。工程完成标准是：四条路由可确定性执行或交接、计划与并行不会发生 owner/scope 冲突、真实角色身份和权限可证明、成本证据可区分实测与投影、现有安全不变量全部保持。
+本优化完成不等于已经证明固定比例的节省。工程完成标准是：四条路由可确定性执行或交接、计划与并行不会发生 owner/scope 冲突、真实角色身份和权限可证明、Luna 可通过项目级或 companion 安装方式复现、原生子代理与自动 exec 身份不混淆、成本证据可区分实测与投影、现有安全不变量全部保持。
 
 业务效果标准是：预注册配对实验中，在质量相对基线不下降超过 5 个百分点的前提下，观察到净成本下降或端到端时间下降；若没有达到，只报告真实结果并调整或关闭对应路由，不包装为成功。
