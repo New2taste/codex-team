@@ -46,6 +46,13 @@ class ContractFilesTest(unittest.TestCase):
             {"L0", "L1", "L2"},
         )
 
+    def test_codex_response_schema_declares_type_for_const(self):
+        result_schema = json.loads((ROOT / "config/ai_workflow_result.schema.json").read_text())
+        self.assertEqual(
+            result_schema["properties"]["schema_version"],
+            {"type": "string", "const": "ai-result-1"},
+        )
+
 
 class TaskValidationTest(unittest.TestCase):
     def valid_task(self):

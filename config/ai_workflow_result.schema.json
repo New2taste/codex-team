@@ -3,6 +3,7 @@
   "additionalProperties": false,
   "properties": {
     "schema_version": {
+      "type": "string",
       "const": "ai-result-1"
     },
     "role": {
