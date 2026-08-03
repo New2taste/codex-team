@@ -179,6 +179,7 @@ stages[][]
 schema_version: runtime-evidence-1
 attempt_id
 requested_role
+execution_surface: NATIVE_SUBAGENT | CODEX_EXEC_ROLE_CONTRACT
 observed_agent_type
 observed_model
 observed_reasoning_effort
@@ -198,7 +199,8 @@ failure_reasons[]
 3. inspector 只输出上述 allowlist 字段，不输出 prompt、消息、环境变量、token、配置内容或任意 payload；
 4. rollout 查找必须以精确 attempt/thread ID 唯一匹配，零个或多个匹配都失败；
 5. 公共证据和本地证据同时存在时必须一致；
-6. role、model、effort、sandbox、permission 或 cwd 任一缺失、冲突或超出合同，调用结果不得进入可信状态。
+6. `NATIVE_SUBAGENT` 必须提供与请求完全一致的 `observed_agent_type`；`CODEX_EXEC_ROLE_CONTRACT` 的 `observed_agent_type` 必须为 `null`，以明确它不是 custom agent；
+7. requested role、model、effort、sandbox、permission 或 cwd 任一缺失、冲突或超出合同，调用结果不得进入可信状态。
 
 审查角色若实际权限比请求的 read-only 更宽，只能在任务不要求 OS 强隔离、prompt 明确禁写且主控验证调用前后 repository/artifact 快照完全一致时，标记为“行为只读”；否则阻断。
 
@@ -306,7 +308,7 @@ python3 scripts/ai_workflow.py run --task task.json --runner live --allow-live-m
 - `--check` 对 missing、current、known legacy、conflict、unsafe 和 unreadable 六类目标都有正反测试；
 - 安装、重复安装、已知版本升级、冲突拒绝和安全卸载在临时 `CODEX_HOME` 中验证，不污染用户真实配置；
 - Agent TOML 的 name、model、effort 和 developer instructions 与项目合同一致；
-- 启动后实际 `agent_type`、model、effort、sandbox、permission 和 cwd 通过 runtime evidence 门；
+- 原生子代理启动后实际 `agent_type`、model、effort、sandbox、permission 和 cwd 通过 runtime evidence 门；自动 exec 路径必须把 `agent_type` 记为不适用并单独验证其 model、effort、sandbox、permission 和 cwd；
 - 原生子代理和自动 exec 的调用数、token、耗时和失败分别计量，不混合成同一身份；
 - README 覆盖本地 clone、Git marketplace、安装检查、重启/新任务、显式 Skill 调用、直接 Agent 调用和卸载恢复。
 
