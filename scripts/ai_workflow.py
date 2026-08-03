@@ -948,6 +948,50 @@ class WorkflowStore:
         task_dir = self._require_task(task_id)
         append_jsonl(task_dir / "human-decisions.jsonl", decision)
 
+    def record_dispatch(
+        self, task_id: str, dispatch_identity: str, payload: Mapping[str, object]
+    ) -> Path:
+        """Append one dispatch launch record, rejecting an identity replay.
+
+        The lock covers both the duplicate scan and the append, so recovery or
+        concurrent callers cannot race into launching the same canonical
+        dispatch identity twice.  The ledger is append-only by construction.
+        """
+
+        if (
+            not isinstance(dispatch_identity, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", dispatch_identity)
+        ):
+            _fail("DISPATCH_IDENTITY_DRIFT", "dispatch identity must be a SHA256 digest")
+        if not isinstance(payload, Mapping):
+            _fail("INVALID_RECORD", "dispatch payload must be an object")
+        record = dict(payload)
+        if "dispatch_id" in record:
+            _fail("INVALID_RECORD", "dispatch payload must not override dispatch_id")
+        with self.lock(task_id):
+            task_dir = self._require_task(task_id)
+            ledger = task_dir / "dispatches.jsonl"
+            try:
+                lines = ledger.read_text(encoding="utf-8").splitlines()
+            except FileNotFoundError:
+                lines = []
+            except OSError as exc:
+                raise WorkflowError("DISPATCH_READ_ERROR", "cannot read dispatch ledger") from exc
+            for line in lines:
+                try:
+                    prior = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise WorkflowError(
+                        "DISPATCH_IDENTITY_DRIFT", "dispatch ledger contains invalid JSON"
+                    ) from exc
+                if not isinstance(prior, dict) or not isinstance(prior.get("dispatch_id"), str):
+                    _fail("DISPATCH_IDENTITY_DRIFT", "dispatch ledger contains an invalid record")
+                if prior["dispatch_id"] == dispatch_identity:
+                    _fail("DUPLICATE_DISPATCH", "dispatch identity has already been recorded")
+            record["dispatch_id"] = dispatch_identity
+            append_jsonl(ledger, record)
+        return ledger
+
     def metrics_path(self, task_id: str) -> Path:
         return self._require_task(task_id) / "metrics.json"
 
@@ -1012,6 +1056,32 @@ def record_route_decision(
     """Persist a strict route artifact and its append-only decision event."""
 
     return _record_route_decision(store, task_id, decision)
+
+
+try:
+    from .ai_workflow_planning import (
+        FrozenPlan,
+        FrozenSubtask,
+        dispatch_id,
+        normalize_scope,
+        ready_batch,
+        record_dispatch,
+        scope_owner_map,
+        scopes_overlap,
+        validate_plan,
+    )
+except ImportError:  # direct script execution
+    from ai_workflow_planning import (
+        FrozenPlan,
+        FrozenSubtask,
+        dispatch_id,
+        normalize_scope,
+        ready_batch,
+        record_dispatch,
+        scope_owner_map,
+        scopes_overlap,
+        validate_plan,
+    )
 
 
 def _parse_metric_number(value: object) -> int | float | None:
