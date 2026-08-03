@@ -1,7 +1,7 @@
 # GPT 多模型协作工作流
 
 > 版本：v0.1  
-> 状态：`DRAFT_FOR_OWNER_REVIEW`  
+> 状态：`APPROVED_FOR_IMPLEMENTATION`  
 > 日期：2026-08-03  
 > 性质：全局、跨项目的实验性 AI 工作流；不属于任何一个业务仓库的宪法或任务卡。
 
