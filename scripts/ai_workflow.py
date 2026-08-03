@@ -8,10 +8,12 @@ import hashlib
 import errno
 import fcntl
 import json
+import math
 import os
 import re
 import subprocess
 import tempfile
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -95,9 +97,10 @@ OWNER_DECISIONS = frozenset(
     }
 )
 _SECRET_ASSIGNMENT = re.compile(
-    r"(?i)\b([A-Z][A-Z0-9_]*(?:TOKEN|KEY|PASSWORD|SECRET)[A-Z0-9_]*)\s*=\s*([^\s,;]+)"
+    r"(?i)\b([A-Z][A-Z0-9_]*(?:TOKEN|KEY|PASSWORD|SECRET)[A-Z0-9_]*)\"?\s*(?:=|:)\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;}\]]+)"
 )
 _LONG_HIGH_ENTROPY = re.compile(r"(?<![A-Za-z0-9_])[A-Za-z0-9+/=_-]{48,}(?![A-Za-z0-9_])")
+METRICS_SCHEMA_VERSION = "ai-metrics-1"
 
 
 class WorkflowError(RuntimeError):
@@ -782,6 +785,9 @@ class WorkflowStore:
         task_dir = self._require_task(task_id)
         append_jsonl(task_dir / "human-decisions.jsonl", decision)
 
+    def metrics_path(self, task_id: str) -> Path:
+        return self._require_task(task_id) / "metrics.json"
+
     @contextlib.contextmanager
     def lock(self, task_id: str):
         task_dir = self._require_task(task_id)
@@ -805,6 +811,304 @@ class WorkflowStore:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         finally:
             handle.close()
+
+
+def _parse_metric_number(value: object) -> int | float | None:
+    """Accept only explicit, finite JSON numbers; never derive usage estimates."""
+
+    parsed = value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+    if isinstance(parsed, bool) or not isinstance(parsed, (int, float)):
+        return None
+    if not math.isfinite(parsed):
+        return None
+    return parsed
+
+
+def _metric_duration(value: object) -> float:
+    parsed = _parse_metric_number(value)
+    if parsed is None or parsed < 0:
+        return 0.0
+    return float(parsed)
+
+
+def _metric_identifiers(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return list(dict.fromkeys(item for item in value if isinstance(item, str) and item.strip()))
+
+
+def _metric_claim_identifiers(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    identifiers = []
+    for item in value:
+        if isinstance(item, Mapping) and isinstance(item.get("id"), str) and item["id"].strip():
+            identifiers.append(item["id"])
+    return list(dict.fromkeys(identifiers))
+
+
+def _normalize_metric_run(run: Mapping[str, object]) -> dict[str, object]:
+    if not isinstance(run, Mapping):
+        _fail("INVALID_METRICS_RUN", "run must be an object")
+    role = run.get("role")
+    if not isinstance(role, str) or not role.strip():
+        _fail("INVALID_METRICS_RUN", "run.role must be a non-empty string")
+    token_usage = _parse_metric_number(run.get("token_usage"))
+    if token_usage is not None and token_usage < 0:
+        token_usage = None
+    finding_ids = _metric_identifiers(run.get("finding_ids"))
+    if not finding_ids:
+        finding_ids = _metric_identifiers(run.get("findings"))
+    if not finding_ids and role == "luna":
+        finding_ids = _metric_claim_identifiers(run.get("claims"))
+    adopted_ids = _metric_identifiers(run.get("adopted_luna_finding_ids"))
+    if not adopted_ids:
+        adopted_ids = _metric_identifiers(run.get("adopted_finding_ids"))
+    period = run.get("period")
+    if period not in {"calibration", "experiment"}:
+        period = "experiment"
+    workflow_state = run.get("workflow_state")
+    activity = run.get("activity")
+    status = run.get("status")
+    return {
+        "role": role,
+        "timestamp_utc": _utc_timestamp(),
+        "duration_seconds": _metric_duration(run.get("duration_seconds")),
+        "token_usage": token_usage,
+        "period": period,
+        "finding_ids": finding_ids,
+        "adopted_luna_finding_ids": adopted_ids,
+        "luna_self_check": role == "luna"
+        and (activity == "self_check" or workflow_state == "PRECHECK_RUNNING"),
+        "sol_verification": role in {"sol_reviewer", "sol_xhigh"},
+        "semantic_rework": run.get("semantic_rework") is True,
+        "full_suite_run": run.get("full_suite_run") is True,
+        "status": status if isinstance(status, str) else None,
+    }
+
+
+def _load_metrics_document(path: Path, task_id: str) -> dict[str, object]:
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {
+            "schema_version": METRICS_SCHEMA_VERSION,
+            "task_id": task_id,
+            "token_usage": None,
+            "runs": [],
+        }
+    except OSError as exc:
+        raise WorkflowError("METRICS_READ_ERROR", f"cannot read metrics for {task_id}") from exc
+    except json.JSONDecodeError as exc:
+        raise WorkflowError("INVALID_METRICS_RECORD", f"invalid metrics JSON for {task_id}") from exc
+    if (
+        not isinstance(document, dict)
+        or document.get("schema_version") != METRICS_SCHEMA_VERSION
+        or document.get("task_id") != task_id
+        or not isinstance(document.get("runs"), list)
+    ):
+        _fail("INVALID_METRICS_RECORD", f"invalid metrics document for {task_id}")
+    return document
+
+
+def record_metrics(task_id: str, run: Mapping[str, object]) -> None:
+    """Record one measured role attempt in the task's existing workflow store."""
+
+    store = WorkflowStore(WORKFLOW_STATE_ROOT)
+    path = store.metrics_path(task_id)
+    document = _load_metrics_document(path, task_id)
+    normalized_run = _normalize_metric_run(run)
+    document["runs"].append(normalized_run)
+    # The top-level value describes this newest raw attempt. It is null when
+    # Codex JSONL did not explicitly provide a parseable usage number.
+    document["token_usage"] = normalized_run["token_usage"]
+    atomic_write_json(path, document)
+
+
+def _read_metrics_runs(task_dir: Path, task_id: str) -> list[dict[str, object]]:
+    document = _load_metrics_document(task_dir / "metrics.json", task_id)
+    runs = document["runs"]
+    records: list[dict[str, object]] = []
+    for run in runs:
+        if isinstance(run, dict):
+            records.append(run)
+    return records
+
+
+def _read_task_events(task_dir: Path, task_id: str) -> list[dict[str, object]]:
+    path = task_dir / "events.jsonl"
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        raise WorkflowError("EVENT_READ_ERROR", f"cannot read events for {task_id}") from exc
+    records: list[dict[str, object]] = []
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise WorkflowError("INVALID_EVENT_RECORD", f"invalid event JSON for {task_id}") from exc
+        if not isinstance(record, dict):
+            _fail("INVALID_EVENT_RECORD", "event record must be an object")
+        records.append(record)
+    return records
+
+
+def _is_stop_line_event(record: Mapping[str, object]) -> bool:
+    event_type = record.get("event_type")
+    if isinstance(event_type, str) and any(
+        marker in event_type.upper() for marker in ("STOP", "EXHAUSTED", "ABORT")
+    ):
+        return True
+    return record.get("new_state") == "BLOCKED"
+
+
+def aggregate_metrics(root: Path) -> dict:
+    """Aggregate task-local metrics and events without creating another store."""
+
+    root = Path(root)
+    role_calls: dict[str, int] = {}
+    periods: dict[str, set[str]] = {}
+    terra_first_status: dict[str, str | None] = {}
+    luna_finding_ids: set[tuple[str, str]] = set()
+    adopted_luna_finding_ids: set[tuple[str, str]] = set()
+    luna_self_check_seconds = 0.0
+    sol_verification_seconds = 0.0
+    semantic_reworks = 0
+    full_suite_runs = 0
+    end_to_end_seconds = 0.0
+    stop_line_events: list[dict[str, object]] = []
+    try:
+        task_dirs = sorted(
+            (path for path in root.iterdir() if path.is_dir() and TASK_ID_PATTERN.fullmatch(path.name)),
+            key=lambda path: path.name,
+        )
+    except FileNotFoundError:
+        task_dirs = []
+    except OSError as exc:
+        raise WorkflowError("METRICS_READ_ERROR", f"cannot read metrics root {root}") from exc
+    for task_dir in task_dirs:
+        task_id = task_dir.name
+        for run in _read_metrics_runs(task_dir, task_id):
+            role = run.get("role")
+            if not isinstance(role, str):
+                continue
+            role_calls[role] = role_calls.get(role, 0) + 1
+            period = run.get("period")
+            if period in {"calibration", "experiment"}:
+                periods.setdefault(task_id, set()).add(period)
+            duration = _metric_duration(run.get("duration_seconds"))
+            end_to_end_seconds += duration
+            if run.get("luna_self_check") is True:
+                luna_self_check_seconds += duration
+            if run.get("sol_verification") is True:
+                sol_verification_seconds += duration
+            if run.get("semantic_rework") is True:
+                semantic_reworks += 1
+            if run.get("full_suite_run") is True:
+                full_suite_runs += 1
+            if role == "luna":
+                luna_finding_ids.update(
+                    (task_id, finding_id) for finding_id in _metric_identifiers(run.get("finding_ids"))
+                )
+            if role.startswith("sol_"):
+                adopted_luna_finding_ids.update(
+                    (task_id, finding_id)
+                    for finding_id in _metric_identifiers(run.get("adopted_luna_finding_ids"))
+                )
+            if role == "terra" and task_id not in terra_first_status:
+                status = run.get("status")
+                terra_first_status[task_id] = status if isinstance(status, str) else None
+        for event in _read_task_events(task_dir, task_id):
+            if event.get("new_state") == "NEEDS_REPLAN" or event.get("event_type") == "SEMANTIC_REWORK":
+                semantic_reworks += 1
+            if event.get("event_type") == "FULL_SUITE_COMPLETED":
+                full_suite_runs += 1
+            if _is_stop_line_event(event):
+                stop_line_events.append({"task_id": task_id, "event": event})
+    calibration_tasks = sum("calibration" in task_periods for task_periods in periods.values())
+    experiment_tasks = sum("experiment" in task_periods for task_periods in periods.values())
+    first_delivery_passes = sum(
+        status == "IMPLEMENTED_CANDIDATE" for status in terra_first_status.values()
+    )
+    first_delivery_total = len(terra_first_status)
+    return {
+        "calibration_task_count": calibration_tasks,
+        "experiment_task_count": experiment_tasks,
+        "role_calls": dict(sorted(role_calls.items())),
+        "sol_participation_count": sum(
+            count for role, count in role_calls.items() if role.startswith("sol_")
+        ),
+        "first_delivery_pass_rate": (
+            first_delivery_passes / first_delivery_total if first_delivery_total else None
+        ),
+        "luna_unique_findings": len(luna_finding_ids),
+        "luna_findings_adopted_by_sol": len(luna_finding_ids & adopted_luna_finding_ids),
+        "luna_self_check_seconds": luna_self_check_seconds,
+        "sol_verification_seconds": sol_verification_seconds,
+        "semantic_reworks": semantic_reworks,
+        "full_suite_runs": full_suite_runs,
+        "end_to_end_seconds": end_to_end_seconds,
+        "stop_line_events": stop_line_events,
+    }
+
+
+def render_report(metrics: Mapping[str, object]) -> str:
+    """Render the one human-facing experiment report from aggregate metrics."""
+
+    if not isinstance(metrics, Mapping):
+        _fail("INVALID_METRICS", "metrics must be an object")
+    role_calls = metrics.get("role_calls")
+    if not isinstance(role_calls, Mapping):
+        _fail("INVALID_METRICS", "metrics.role_calls must be an object")
+    lines = [
+        "# AI Workflow Experiment Report",
+        "",
+        "## Cohorts",
+        "",
+        f"- Calibration tasks: {metrics.get('calibration_task_count', 0)}",
+        f"- Experiment tasks: {metrics.get('experiment_task_count', 0)}",
+        "",
+        "## Role calls",
+        "",
+    ]
+    lines.extend(f"- {role}: {count}" for role, count in sorted(role_calls.items()))
+    pass_rate = metrics.get("first_delivery_pass_rate")
+    pass_rate_text = "n/a" if pass_rate is None else f"{float(pass_rate):.1%}"
+    lines.extend(
+        (
+            f"- Sol participation: {metrics.get('sol_participation_count', 0)}",
+            "",
+            "## Outcomes",
+            "",
+            f"- First delivery pass rate: {pass_rate_text}",
+            f"- Repeated full-suite runs: {metrics.get('full_suite_runs', 0)}",
+            f"- Semantic reworks: {metrics.get('semantic_reworks', 0)}",
+            f"- End-to-end seconds: {float(metrics.get('end_to_end_seconds', 0.0)):.3f}",
+            "",
+            "## Luna value and review cost",
+            "",
+            f"- Luna unique findings: {metrics.get('luna_unique_findings', 0)}",
+            f"- Luna findings adopted by Sol: {metrics.get('luna_findings_adopted_by_sol', 0)}",
+            f"- Luna self-check seconds: {float(metrics.get('luna_self_check_seconds', 0.0)):.3f}",
+            f"- Sol verification seconds: {float(metrics.get('sol_verification_seconds', 0.0)):.3f}",
+            "",
+            "## Stop-line events",
+            "",
+        )
+    )
+    stop_line_events = metrics.get("stop_line_events", [])
+    if isinstance(stop_line_events, list) and stop_line_events:
+        lines.extend(f"- {_canonical_json(event)}" for event in stop_line_events)
+    else:
+        lines.append("- None")
+    return _redact_log_text("\n".join(lines) + "\n")
 
 
 FAKE_ROLE_RESULTS = {
@@ -1054,7 +1358,17 @@ def _run_role_with_technical_retry(
 
     while True:
         try:
+            started_monotonic = time.monotonic()
             result = runner.run(role, task)
+            metric_run = dict(result) if isinstance(result, Mapping) else {}
+            metric_run.update(
+                {
+                    "role": role,
+                    "workflow_state": state,
+                    "duration_seconds": time.monotonic() - started_monotonic,
+                }
+            )
+            record_metrics(task_id, metric_run)
             declared = result.get("changed_files", []) if isinstance(result, Mapping) else []
             validate_role_result(role, result, set(declared))
             return result, state
@@ -1343,8 +1657,11 @@ def build_parser() -> argparse.ArgumentParser:
     decide.add_argument("--by", default="owner")
     decide.add_argument("--root", type=Path, default=Path("data/state/ai-workflow"))
 
-    for name in ("resume", "abort", "report"):
+    for name in ("resume", "abort"):
         sub.add_parser(name)
+    report = sub.add_parser("report")
+    report.add_argument("--root", type=Path, default=Path("data/state/ai-workflow"))
+    report.add_argument("--output", type=Path, required=True)
     return parser
 
 
@@ -1356,8 +1673,18 @@ def _task_path_from_args(args: argparse.Namespace) -> Path:
 
 
 def _run_command(args: argparse.Namespace) -> int:
-    if args.command in {"resume", "abort", "report"}:
+    if args.command in {"resume", "abort"}:
         raise WorkflowError("NOT_IMPLEMENTED_IN_CURRENT_STAGE", f"{args.command} is not implemented")
+    if args.command == "report":
+        output_path = Path(args.output)
+        report = render_report(aggregate_metrics(args.root))
+        try:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(report, encoding="utf-8")
+        except OSError as exc:
+            raise WorkflowError("REPORT_WRITE_ERROR", f"cannot write report {output_path}") from exc
+        print(f"REPORT_WRITTEN {output_path}")
+        return 0
     if args.command == "new":
         task = load_task(_task_path_from_args(args))
         path = WorkflowStore(args.root).create_task(task)

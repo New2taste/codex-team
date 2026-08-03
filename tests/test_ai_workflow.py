@@ -126,6 +126,152 @@ class WorkflowStoreTest(unittest.TestCase):
                         pass
 
 
+class MetricsReportTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.state_root = Path(self.temporary_directory.name) / "state"
+        self.store = workflow.WorkflowStore(self.state_root)
+
+    def tearDown(self):
+        self.temporary_directory.cleanup()
+
+    def _create_task(self, task_id):
+        task = TaskValidationTest().valid_task()
+        task["task_id"] = task_id
+        self.store.create_task(task)
+        return task_id
+
+    def _record(self, task_id, run):
+        with mock.patch.object(workflow, "WORKFLOW_STATE_ROOT", self.state_root):
+            workflow.record_metrics(task_id, run)
+
+    def test_record_metrics_never_estimates_missing_or_invalid_token_usage(self):
+        task_id = self._create_task("AWF-20260803-001")
+
+        self._record(task_id, {"role": "luna", "duration_seconds": 1.25})
+        self._record(task_id, {"role": "luna", "duration_seconds": 0.75, "token_usage": "many"})
+
+        document = json.loads(
+            (self.state_root / task_id / "metrics.json").read_text(encoding="utf-8")
+        )
+        self.assertIsNone(document["token_usage"])
+        self.assertEqual([run["token_usage"] for run in document["runs"]], [None, None])
+        self.assertRegex(document["runs"][0]["timestamp_utc"], r"Z$")
+
+    def test_aggregate_metrics_separates_luna_value_and_review_cost(self):
+        calibration_task = self._create_task("AWF-20260803-001")
+        experiment_task = self._create_task("AWF-20260803-002")
+        self._record(
+            calibration_task,
+            {
+                "role": "luna",
+                "duration_seconds": 1.5,
+                "period": "calibration",
+                "activity": "self_check",
+                "finding_ids": ["luna-1", "luna-2"],
+            },
+        )
+        self._record(
+            calibration_task,
+            {
+                "role": "sol_reviewer",
+                "duration_seconds": 2.0,
+                "period": "calibration",
+                "adopted_luna_finding_ids": ["luna-1"],
+                "full_suite_run": True,
+            },
+        )
+        self._record(
+            calibration_task,
+            {
+                "role": "terra",
+                "duration_seconds": 3.0,
+                "period": "calibration",
+                "status": "IMPLEMENTED_CANDIDATE",
+            },
+        )
+        self._record(
+            experiment_task,
+            {
+                "role": "terra",
+                "duration_seconds": 4.0,
+                "period": "experiment",
+                "status": "BLOCKED",
+                "semantic_rework": True,
+            },
+        )
+
+        metrics = workflow.aggregate_metrics(self.state_root)
+
+        self.assertEqual(metrics["calibration_task_count"], 1)
+        self.assertEqual(metrics["experiment_task_count"], 1)
+        self.assertEqual(metrics["role_calls"], {"luna": 1, "sol_reviewer": 1, "terra": 2})
+        self.assertEqual(metrics["sol_participation_count"], 1)
+        self.assertEqual(metrics["first_delivery_pass_rate"], 0.5)
+        self.assertEqual(metrics["luna_unique_findings"], 2)
+        self.assertEqual(metrics["luna_findings_adopted_by_sol"], 1)
+        self.assertEqual(metrics["luna_self_check_seconds"], 1.5)
+        self.assertEqual(metrics["sol_verification_seconds"], 2.0)
+        self.assertEqual(metrics["semantic_reworks"], 1)
+        self.assertEqual(metrics["full_suite_runs"], 1)
+        self.assertEqual(metrics["end_to_end_seconds"], 10.5)
+
+    def test_report_redacts_secrets_and_high_entropy_event_values(self):
+        task_id = self._create_task("AWF-20260803-001")
+        high_entropy = "Ab3d" * 32
+        self._record(task_id, {"role": "luna", "duration_seconds": 1.0, "period": "calibration"})
+        self.store.append_event(
+            task_id,
+            {
+                "event_type": "STOP_LINE",
+                "detail": f"TUSHARE_TOKEN=abc123 OPENAI_API_KEY=sk-test-value {high_entropy}",
+            },
+        )
+
+        report = workflow.render_report(workflow.aggregate_metrics(self.state_root))
+
+        self.assertIn("# AI Workflow Experiment Report", report)
+        self.assertIn("Calibration tasks: 1", report)
+        self.assertIn("Luna unique findings", report)
+        self.assertIn("Stop-line events", report)
+        self.assertIn("[REDACTED]", report)
+        self.assertNotIn("abc123", report)
+        self.assertNotIn("sk-test-value", report)
+        self.assertNotIn(high_entropy, report)
+
+    def test_report_redacts_json_style_secret_fields(self):
+        task_id = self._create_task("AWF-20260803-001")
+        self._record(task_id, {"role": "luna", "duration_seconds": 1.0})
+        self.store.append_event(
+            task_id,
+            {
+                "event_type": "STOP_LINE",
+                "detail": {"OPENAI_API_KEY": "sk-json-test-value"},
+            },
+        )
+
+        report = workflow.render_report(workflow.aggregate_metrics(self.state_root))
+
+        self.assertIn("OPENAI_API_KEY=[REDACTED]", report)
+        self.assertNotIn("sk-json-test-value", report)
+
+    def test_report_command_writes_one_markdown_file_and_prints_its_path(self):
+        task_id = self._create_task("AWF-20260803-001")
+        self._record(task_id, {"role": "luna", "duration_seconds": 1.0, "period": "calibration"})
+        output_path = Path(self.temporary_directory.name) / "workflow-report.md"
+        output = StringIO()
+
+        with redirect_stdout(output):
+            exit_code = workflow.main(
+                ["report", "--root", str(self.state_root), "--output", str(output_path)]
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(output.getvalue(), f"REPORT_WRITTEN {output_path}\n")
+        self.assertEqual(len(list(output_path.parent.glob("*.md"))), 1)
+        self.assertIn("# AI Workflow Experiment Report", output_path.read_text(encoding="utf-8"))
+
+
 class FakeRunnerTest(unittest.TestCase):
     def test_luna_fake_result_never_claims_acceptance(self):
         result = workflow.FakeRunner().run("luna", TaskValidationTest().valid_task())
