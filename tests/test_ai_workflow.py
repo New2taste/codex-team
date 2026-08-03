@@ -732,6 +732,114 @@ class CodexRunnerTest(unittest.TestCase):
         self.assertNotIn(long_token, events)
 
 
+class LiveLunaCliTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.state_root = Path(self.temporary_directory.name) / "state"
+        self.store = workflow.WorkflowStore(self.state_root)
+        self.task = TaskValidationTest().valid_task()
+        self.task_path = self.store.create_task(self.task)
+
+    def tearDown(self):
+        self.temporary_directory.cleanup()
+
+    @staticmethod
+    def _result():
+        return {
+            "schema_version": "ai-result-1",
+            "role": "luna",
+            "status": "SUPPORTED",
+            "summary": "The state machine and gates are coherent.",
+            "claims": [],
+            "evidence": [],
+            "counter_checks": [],
+            "changed_files": [],
+            "blind_spots": [],
+            "unresolved_questions": [],
+            "recommended_next_state": "EVIDENCE_READY",
+        }
+
+    @mock.patch("scripts.ai_workflow.run_codex")
+    def test_live_runner_requires_explicit_authorization(self, run_codex):
+        output = StringIO()
+
+        with redirect_stdout(output):
+            exit_code = workflow.main(
+                ["run", str(self.task_path), "--runner", "live", "--root", str(self.state_root)]
+            )
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("LIVE_MODEL_NOT_AUTHORIZED", output.getvalue())
+        run_codex.assert_not_called()
+
+    @mock.patch("scripts.ai_workflow.run_codex")
+    def test_live_runner_rejects_non_luna_roles(self, run_codex):
+        output = StringIO()
+
+        with redirect_stdout(output):
+            exit_code = workflow.main(
+                [
+                    "run",
+                    str(self.task_path),
+                    "--runner",
+                    "live",
+                    "--allow-live-model",
+                    "--role",
+                    "terra",
+                    "--root",
+                    str(self.state_root),
+                ]
+            )
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("LIVE_ROLE_NOT_ALLOWED", output.getvalue())
+        run_codex.assert_not_called()
+
+    @mock.patch("scripts.ai_workflow.run_codex")
+    def test_authorized_live_luna_uses_only_task_evidence_and_task_directory(self, run_codex):
+        result = self._result()
+        run_codex.return_value = result
+        output = StringIO()
+
+        with redirect_stdout(output):
+            exit_code = workflow.main(
+                [
+                    "run",
+                    str(self.task_path),
+                    "--runner",
+                    "live",
+                    "--allow-live-model",
+                    "--role",
+                    "luna",
+                    "--root",
+                    str(self.state_root),
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(output.getvalue(), workflow._canonical_json(result) + "\n")
+        run_codex.assert_called_once()
+        role, task, prompt, paths = run_codex.call_args.args
+        self.assertEqual(role, "luna")
+        self.assertEqual(task, self.task)
+        self.assertEqual(paths.repo, ROOT)
+        self.assertEqual(paths.output_path, self.state_root / self.task["task_id"] / "luna-result.json")
+        self.assertEqual(paths.schema_path, ROOT / "config/ai_workflow_result.schema.json")
+        self.assertEqual(paths.logs_dir, self.state_root / self.task["task_id"] / "logs")
+        prompt_lines = prompt.splitlines()
+        self.assertEqual(json.loads(prompt_lines[1].removeprefix("Task envelope: ")), self.task)
+        self.assertEqual(
+            json.loads(prompt_lines[2].removeprefix("Task contract: ")),
+            {"acceptance_commands": [], "verification_level": "L1"},
+        )
+        self.assertEqual(
+            json.loads(prompt_lines[3].removeprefix("Named evidence: "))[0]["path"],
+            str(ROOT / "README.md"),
+        )
+        self.assertNotIn("registry/", prompt)
+        self.assertNotIn("chat history", prompt)
+
+
 class GitSafetyTest(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()

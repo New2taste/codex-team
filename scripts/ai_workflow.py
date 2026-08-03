@@ -1643,8 +1643,10 @@ def build_parser() -> argparse.ArgumentParser:
     run = sub.add_parser("run")
     run.add_argument("task_path", nargs="?", type=Path)
     run.add_argument("--task", dest="task_option", type=Path)
-    run.add_argument("--runner", default=None)
+    run.add_argument("--runner", choices=("fake", "live"), default=None)
+    run.add_argument("--allow-live-model", action="store_true")
     run.add_argument("--role", default="luna", choices=tuple(FAKE_ROLE_RESULTS))
+    run.add_argument("--root", type=Path, default=Path("data/state/ai-workflow"))
 
     status = sub.add_parser("status")
     status.add_argument("task_id", nargs="?")
@@ -1670,6 +1672,51 @@ def _task_path_from_args(args: argparse.Namespace) -> Path:
     if path is None:
         raise WorkflowError("TASK_REQUIRED", "a task JSON path is required")
     return path
+
+
+def _authoritative_evidence_paths(task: Mapping[str, object]) -> tuple[Path, ...]:
+    """Resolve only the task's explicitly authorized evidence within its repository."""
+
+    repository = Path(task["repository_root"]).resolve()
+    evidence_paths: list[Path] = []
+    for relative_path in task["authoritative_files"]:
+        candidate = (repository / relative_path).resolve()
+        try:
+            candidate.relative_to(repository)
+        except ValueError as exc:
+            raise WorkflowError(
+                "AUTHORITATIVE_FILE_OUTSIDE_REPO",
+                "authoritative evidence must stay inside repository_root",
+            ) from exc
+        evidence_paths.append(candidate)
+    return tuple(evidence_paths)
+
+
+def _run_live_luna(task: dict[str, object], args: argparse.Namespace) -> dict:
+    """Execute the explicitly authorized, first-stage Luna read-only smoke run."""
+
+    if not args.allow_live_model:
+        _fail("LIVE_MODEL_NOT_AUTHORIZED", "--allow-live-model is required for the live runner")
+    if args.role != "luna":
+        _fail("LIVE_ROLE_NOT_ALLOWED", "the live CLI runner is limited to luna")
+    store = WorkflowStore(args.root)
+    task_dir = store._require_task(task["task_id"])
+    stored_task = load_task(task_dir / "task.json")
+    if stored_task != task:
+        _fail("TASK_STORE_MISMATCH", "live task input does not match the stored task")
+    contract = {
+        "acceptance_commands": task["acceptance_commands"],
+        "verification_level": task["verification_level"],
+    }
+    repository = Path(task["repository_root"])
+    paths = RunPaths(
+        repo=repository,
+        output_path=task_dir / "luna-result.json",
+        schema_path=repository / "config" / "ai_workflow_result.schema.json",
+        logs_dir=task_dir / "logs",
+    )
+    prompt = build_role_prompt("luna", task, contract, _authoritative_evidence_paths(task))
+    return run_codex("luna", task, prompt, paths)
 
 
 def _run_command(args: argparse.Namespace) -> int:
@@ -1711,6 +1758,14 @@ def _run_command(args: argparse.Namespace) -> int:
         print("DECISION_RECORDED")
         return 0
     if args.command == "run":
+        if args.runner == "live":
+            if not args.allow_live_model:
+                _fail("LIVE_MODEL_NOT_AUTHORIZED", "--allow-live-model is required for the live runner")
+            if args.role != "luna":
+                _fail("LIVE_ROLE_NOT_ALLOWED", "the live CLI runner is limited to luna")
+            task = load_task(_task_path_from_args(args))
+            print(_canonical_json(_run_live_luna(task, args)))
+            return 0
         if args.runner != "fake":
             raise WorkflowError("NOT_IMPLEMENTED_IN_CURRENT_STAGE", "only --runner fake is available")
         task = load_task(_task_path_from_args(args))
