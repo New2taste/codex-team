@@ -392,7 +392,7 @@ class RuntimeInspectorTest(unittest.TestCase):
 
 
 class RuntimeLiveIntegrationTest(unittest.TestCase):
-    def _run_paths(self, temporary: str, state_root: Path, sessions: Path):
+    def _run_paths(self, temporary: str, state_root: Path, sessions: Path | None):
         return workflow.RunPaths(
             repo=ROOT,
             output_path=Path(temporary) / "luna-result.json",
@@ -439,13 +439,48 @@ class RuntimeLiveIntegrationTest(unittest.TestCase):
                 workflow.run_codex("luna", task, "Read only.", paths)
             self.assertFalse(paths.output_path.exists())
 
+    def test_runtime_sessions_directory_preflight_blocks_codex_launch(self):
+        # Removing the preflight would let every case call the model before
+        # runtime evidence can be verified.
+        with tempfile.TemporaryDirectory() as temporary:
+            state_root = Path(temporary) / "state"
+            store = workflow.WorkflowStore(state_root)
+            task = valid_task()
+            store.create_task(task)
+            not_a_directory = Path(temporary) / "not-a-directory"
+            not_a_directory.write_text("not a sessions directory", encoding="utf-8")
+            cases = (
+                (None, "RUNTIME_EVIDENCE_MISSING"),
+                (Path("relative-runtime-sessions"), "RUNTIME_EVIDENCE_INVALID"),
+                (Path(temporary) / "absent-sessions", "RUNTIME_EVIDENCE_INVALID"),
+                (not_a_directory, "RUNTIME_EVIDENCE_INVALID"),
+            )
+            for sessions, code in cases:
+                with self.subTest(sessions=sessions):
+                    paths = self._run_paths(temporary, state_root, sessions)
+                    with (
+                        mock.patch(
+                            "scripts.ai_workflow.capture_repo",
+                            return_value=workflow.RepoSnapshot("pinned", ()),
+                        ),
+                        mock.patch(
+                            "scripts.ai_workflow.working_tree_paths", return_value=set()
+                        ),
+                        mock.patch("scripts.ai_workflow.subprocess.run") as model_launch,
+                        self.assertRaisesRegex(workflow.WorkflowError, code),
+                    ):
+                        workflow.run_codex("luna", task, "Read only.", paths)
+                    model_launch.assert_not_called()
+
     def test_live_invalidates_a_prior_canonical_result_when_runtime_evidence_is_missing(self):
         with tempfile.TemporaryDirectory() as temporary:
             state_root = Path(temporary) / "state"
             store = workflow.WorkflowStore(state_root)
             task = valid_task()
             store.create_task(task)
-            paths = self._run_paths(temporary, state_root, Path(temporary) / "no-sessions")
+            sessions = Path(temporary) / "sessions"
+            sessions.mkdir()
+            paths = self._run_paths(temporary, state_root, sessions)
             paths.output_path.write_text(json.dumps(blocked_luna_result()), encoding="utf-8")
             with (
                 mock.patch(

@@ -632,12 +632,39 @@ def _write_role_events(log_path: Path, stdout: object) -> None:
         handle.write(_redact_log_text(text))
 
 
+def _require_runtime_sessions_directory(value: Path | None) -> Path:
+    """Require an explicit, usable local session root before live execution."""
+
+    if value is None:
+        _fail("RUNTIME_EVIDENCE_MISSING", "an absolute runtime sessions directory is required")
+    if not isinstance(value, Path) or not value.is_absolute():
+        _fail(
+            "RUNTIME_EVIDENCE_INVALID",
+            "runtime sessions directory must be an absolute existing directory",
+        )
+    try:
+        if not value.is_dir():
+            _fail(
+                "RUNTIME_EVIDENCE_INVALID",
+                "runtime sessions directory must be an absolute existing directory",
+            )
+    except OSError as exc:
+        raise WorkflowError(
+            "RUNTIME_EVIDENCE_INVALID",
+            "runtime sessions directory cannot be inspected",
+        ) from exc
+    return value
+
+
 def run_codex(role: str, task: dict, prompt: str, paths: RunPaths) -> dict:
     """Run one pinned Codex role and accept only a validated output document."""
 
     validate_task(task)
     if not isinstance(prompt, str):
         _fail("INVALID_PROMPT", "prompt must be a string")
+    runtime_sessions_dir: Path | None = None
+    if paths.runtime_evidence_required:
+        runtime_sessions_dir = _require_runtime_sessions_directory(paths.runtime_sessions_dir)
     repo = Path(paths.repo).resolve()
     if repo != _execution_repo(task, role):
         _fail("ROLE_REPOSITORY_MISMATCH", "role repository does not match the task execution repository")
@@ -730,8 +757,8 @@ def run_codex(role: str, task: dict, prompt: str, paths: RunPaths) -> dict:
     if paths.runtime_evidence_required:
         if runtime_store is None or runtime_task_dir is None or runtime_before_artifacts is None:
             _fail("RUNTIME_EVIDENCE_MISSING", "runtime state was not initialized")
-        if paths.runtime_sessions_dir is None:
-            _fail("RUNTIME_EVIDENCE_MISSING", "an absolute runtime sessions directory is required")
+        if runtime_sessions_dir is None:
+            _fail("RUNTIME_EVIDENCE_MISSING", "runtime sessions directory was not initialized")
         events = parse_codex_jsonl(completed.stdout)
         thread_id = extract_codex_thread_id(events)
         role_config = _load_role_config(role)
@@ -761,7 +788,7 @@ def run_codex(role: str, task: dict, prompt: str, paths: RunPaths) -> dict:
             ),
         )
         rollout_observation = inspect_agent_runtime(
-            Path(paths.runtime_sessions_dir),
+            runtime_sessions_dir,
             thread_id,
             CODEX_EXEC_ROLE_CONTRACT,
             Path(__file__).resolve().parents[1]
@@ -2228,7 +2255,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--runner", choices=("fake", "live"), default=None)
     run.add_argument("--allow-live-model", action="store_true")
     run.add_argument("--role", default="luna", choices=tuple(FAKE_ROLE_RESULTS))
-    run.add_argument("--runtime-sessions-dir", type=Path)
+    run.add_argument(
+        "--runtime-sessions-dir",
+        type=Path,
+        metavar="ABSOLUTE_DIR",
+        help="required with --runner live; an existing absolute Codex sessions directory",
+    )
     run.add_argument("--root", type=Path, default=Path("data/state/ai-workflow"))
 
     status = sub.add_parser("status")
