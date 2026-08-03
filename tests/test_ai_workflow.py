@@ -4,6 +4,8 @@ import subprocess
 import tempfile
 import tomllib
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 from unittest import mock
 
@@ -130,6 +132,261 @@ class FakeRunnerTest(unittest.TestCase):
         self.assertEqual(result["role"], "luna")
         self.assertEqual(result["status"], "SUPPORTED")
         self.assertNotIn("ACCEPTED", result["status"])
+
+
+class RoutingTest(unittest.TestCase):
+    def test_plan_route(self):
+        self.assertEqual(workflow.route({"task_type": "PLAN", "risk_flags": []}), ("luna", "sol_planner"))
+
+    def test_acceptance_route(self):
+        self.assertEqual(
+            workflow.route({"task_type": "ACCEPTANCE", "risk_flags": []}),
+            ("luna", "sol_reviewer"),
+        )
+
+    def test_plain_remediation_route(self):
+        self.assertEqual(
+            workflow.route({"task_type": "REMEDIATION", "risk_flags": []}),
+            ("terra", "luna", "sol_reviewer"),
+        )
+
+    def test_high_risk_remediation_plans_first(self):
+        self.assertEqual(
+            workflow.route({"task_type": "REMEDIATION", "risk_flags": ["PIT"]}),
+            ("sol_planner", "terra", "luna", "sol_reviewer"),
+        )
+
+
+class ScriptedRunner:
+    """Test double whose observable calls and responses model one local runner."""
+
+    is_live_model = False
+
+    def __init__(self, results):
+        self.results = list(results)
+        self.calls = []
+
+    def run(self, role, task):
+        self.calls.append(role)
+        result = self.results.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
+class GatedPipelineTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.state_root = Path(self.temporary_directory.name) / "state"
+        self.store = workflow.WorkflowStore(self.state_root)
+
+    def tearDown(self):
+        self.temporary_directory.cleanup()
+
+    def _task(self, task_type="PLAN", risk_flags=None):
+        task = TaskValidationTest().valid_task()
+        task["task_type"] = task_type
+        task["risk_flags"] = [] if risk_flags is None else risk_flags
+        if task_type == "REMEDIATION":
+            task["allowed_write_paths"] = ["scripts/"]
+        if task_type == "ACCEPTANCE":
+            task["base_commit"] = "a" * 40
+            task["candidate_commit"] = "b" * 40
+        return task
+
+    @staticmethod
+    def _result(role, status, state):
+        return {
+            "schema_version": "ai-result-1",
+            "role": role,
+            "status": status,
+            "summary": "The bounded local stage completed.",
+            "claims": [],
+            "evidence": [],
+            "counter_checks": [],
+            "changed_files": [],
+            "blind_spots": [],
+            "unresolved_questions": [],
+            "recommended_next_state": state,
+        }
+
+    def _create_task(self, task):
+        self.store.create_task(task)
+        return task["task_id"]
+
+    def test_reviewer_escalation_stops_at_owner_gate_without_calling_sol_xhigh(self):
+        task_id = self._create_task(self._task("ACCEPTANCE"))
+        runner = ScriptedRunner(
+            [
+                self._result("luna", "SUPPORTED", "EVIDENCE_READY"),
+                self._result("sol_reviewer", "ESCALATION_PROPOSED", "ESCALATION_PROPOSED"),
+            ]
+        )
+
+        with mock.patch.object(workflow, "WORKFLOW_STATE_ROOT", self.state_root):
+            state = workflow.run_until_gate(task_id, runner=runner, allow_live_model=False)
+
+        self.assertEqual(state, "AWAITING_OWNER_DECISION")
+        self.assertEqual(runner.calls, ["luna", "sol_reviewer"])
+        self.assertNotIn("sol_xhigh", runner.calls)
+
+    def test_authorized_escalation_runs_sol_xhigh_once_and_returns_to_a_gate(self):
+        task_id = self._create_task(self._task("ACCEPTANCE"))
+        first_runner = ScriptedRunner(
+            [
+                self._result("luna", "SUPPORTED", "EVIDENCE_READY"),
+                self._result("sol_reviewer", "ESCALATION_PROPOSED", "ESCALATION_PROPOSED"),
+            ]
+        )
+        escalation_runner = ScriptedRunner(
+            [self._result("sol_xhigh", "OPTION_A", "ESCALATION_PROPOSED")]
+        )
+
+        with mock.patch.object(workflow, "WORKFLOW_STATE_ROOT", self.state_root):
+            self.assertEqual(
+                workflow.run_until_gate(task_id, runner=first_runner, allow_live_model=False),
+                "AWAITING_OWNER_DECISION",
+            )
+            self.assertEqual(
+                workflow.apply_owner_decision(task_id, "authorize_escalation", "owner"),
+                "ESCALATION_AUTHORIZED",
+            )
+            self.assertEqual(
+                workflow.run_until_gate(task_id, runner=escalation_runner, allow_live_model=False),
+                "AWAITING_OWNER_DECISION",
+            )
+
+        self.assertEqual(escalation_runner.calls, ["sol_xhigh"])
+
+    def test_two_malformed_results_use_only_one_technical_retry_then_block(self):
+        task_id = self._create_task(self._task())
+        runner = ScriptedRunner([{"not": "ai-result-1"}, {"not": "ai-result-1"}])
+
+        with mock.patch.object(workflow, "WORKFLOW_STATE_ROOT", self.state_root):
+            state = workflow.run_until_gate(task_id, runner=runner, allow_live_model=False)
+
+        self.assertEqual(state, "BLOCKED")
+        self.assertEqual(runner.calls, ["luna", "luna"])
+
+    def test_second_terra_failure_after_owner_authorized_rework_does_not_run_terra_third_time(self):
+        task_id = self._create_task(self._task("REMEDIATION"))
+        runner = ScriptedRunner(
+            [
+                self._result("terra", "BLOCKED", "BLOCKED"),
+                self._result("terra", "BLOCKED", "BLOCKED"),
+            ]
+        )
+
+        with mock.patch.object(workflow, "WORKFLOW_STATE_ROOT", self.state_root):
+            self.assertEqual(
+                workflow.run_until_gate(task_id, runner=runner, allow_live_model=False),
+                "AWAITING_OWNER_DECISION",
+            )
+            self.assertEqual(
+                workflow.apply_owner_decision(task_id, "approve_execution", "owner"),
+                "APPROVED_FOR_EXECUTION",
+            )
+            self.assertEqual(
+                workflow.run_until_gate(task_id, runner=runner, allow_live_model=False),
+                "AWAITING_OWNER_DECISION",
+            )
+            self.assertEqual(
+                workflow.apply_owner_decision(task_id, "authorize_rework", "owner"),
+                "REWORK_AUTHORIZED",
+            )
+            self.assertEqual(
+                workflow.run_until_gate(task_id, runner=runner, allow_live_model=False),
+                "BLOCKED",
+            )
+            self.assertEqual(
+                workflow.run_until_gate(task_id, runner=runner, allow_live_model=False),
+                "BLOCKED",
+            )
+
+        self.assertEqual(runner.calls, ["terra", "terra"])
+
+    def test_authorized_live_remediation_uses_the_existing_safe_worktree_creator(self):
+        task = self._task("REMEDIATION")
+        task_id = self._create_task(task)
+        runner = ScriptedRunner([self._result("terra", "BLOCKED", "BLOCKED")])
+        runner.is_live_model = True
+
+        with mock.patch.object(workflow, "WORKFLOW_STATE_ROOT", self.state_root):
+            workflow.run_until_gate(task_id, runner=ScriptedRunner([]), allow_live_model=False)
+            workflow.apply_owner_decision(task_id, "approve_execution", "owner")
+            with mock.patch("scripts.ai_workflow.create_worktree") as create_worktree:
+                self.assertEqual(
+                    workflow.run_until_gate(task_id, runner=runner, allow_live_model=True),
+                    "AWAITING_OWNER_DECISION",
+                )
+
+        create_worktree.assert_called_once_with(task, owner_authorized=True)
+
+    def test_owner_decision_uses_closed_set_and_records_complete_audit_fields(self):
+        task_id = self._create_task(self._task("REMEDIATION"))
+        with mock.patch.object(workflow, "WORKFLOW_STATE_ROOT", self.state_root):
+            workflow.run_until_gate(task_id, runner=ScriptedRunner([]), allow_live_model=False)
+            with self.assertRaisesRegex(workflow.WorkflowError, "INVALID_OWNER_DECISION"):
+                workflow.apply_owner_decision(task_id, "merge", "owner")
+            with self.assertRaisesRegex(workflow.WorkflowError, "INVALID_ACTOR"):
+                workflow.apply_owner_decision(task_id, "approve_execution", "")
+            self.assertEqual(
+                workflow.apply_owner_decision(task_id, "defer", "owner"),
+                "DEFERRED",
+            )
+
+        record = json.loads(
+            (self.state_root / task_id / "human-decisions.jsonl").read_text(encoding="utf-8").splitlines()[-1]
+        )
+        self.assertEqual(record["decision"], "defer")
+        self.assertEqual(record["previous_state"], "AWAITING_OWNER_DECISION")
+        self.assertEqual(record["new_state"], "DEFERRED")
+        self.assertRegex(record["timestamp_utc"], r"Z$")
+        self.assertEqual(len(record["task_sha256"]), 64)
+
+    def test_decide_command_records_only_a_complete_closed_set_owner_decision(self):
+        task_id = self._create_task(self._task("REMEDIATION"))
+        with mock.patch.object(workflow, "WORKFLOW_STATE_ROOT", self.state_root):
+            workflow.run_until_gate(task_id, runner=ScriptedRunner([]), allow_live_model=False)
+        output = StringIO()
+        with redirect_stdout(output):
+            exit_code = workflow.main(
+                ["decide", task_id, "defer", "--by", "owner", "--root", str(self.state_root)]
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(output.getvalue(), "DECISION_RECORDED\n")
+
+        record = json.loads(
+            (self.state_root / task_id / "human-decisions.jsonl").read_text(encoding="utf-8").splitlines()[-1]
+        )
+        self.assertEqual(record["new_state"], "DEFERRED")
+        self.assertIn("task_sha256", record)
+
+    def test_owner_authorization_edges_cannot_be_crossed_by_state_table_alone(self):
+        for current, target in (
+            ("DEFERRED", "TASK_VALIDATED"),
+            ("REWORK_AUTHORIZED", "IMPLEMENTATION_RUNNING"),
+            ("ESCALATION_AUTHORIZED", "PLAN_OR_REVIEW_RUNNING"),
+        ):
+            with self.subTest(current=current):
+                with self.assertRaisesRegex(workflow.WorkflowError, "OWNER_AUTHORIZATION_REQUIRED"):
+                    workflow.next_state(current, target, owner_authorized=False)
+
+
+class RetryBudgetTest(unittest.TestCase):
+    def test_each_budget_is_limited_to_one_consumption(self):
+        budget = workflow.RetryBudget()
+        budget.consume_technical()
+        budget.consume_rework()
+        budget.consume_escalation()
+
+        with self.assertRaisesRegex(workflow.WorkflowError, "RETRY_BUDGET_EXHAUSTED"):
+            budget.consume_technical()
+        with self.assertRaisesRegex(workflow.WorkflowError, "RETRY_BUDGET_EXHAUSTED"):
+            budget.consume_rework()
+        with self.assertRaisesRegex(workflow.WorkflowError, "RETRY_BUDGET_EXHAUSTED"):
+            budget.consume_escalation()
 
 
 class CodexCommandTest(unittest.TestCase):

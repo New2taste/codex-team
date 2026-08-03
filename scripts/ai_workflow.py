@@ -14,8 +14,9 @@ import subprocess
 import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Sequence
+from typing import Protocol, Sequence
 
 
 TASK_FIELDS = frozenset(
@@ -82,6 +83,17 @@ RESULT_REQUIRED_FIELDS = frozenset(
 READ_ONLY_ROLES = frozenset({"luna", "sol_planner", "sol_reviewer", "sol_xhigh"})
 SAFE_ENVIRONMENT_KEYS = frozenset({"HOME", "PATH", "CODEX_HOME", "LANG", "LC_ALL", "TERM", "TMPDIR"})
 CODEX_TIMEOUT_SECONDS = 120
+WORKFLOW_STATE_ROOT = Path(__file__).resolve().parents[1] / "data" / "state" / "ai-workflow"
+OWNER_DECISIONS = frozenset(
+    {
+        "approve_execution",
+        "authorize_rework",
+        "authorize_escalation",
+        "defer",
+        "close",
+        "abort",
+    }
+)
 _SECRET_ASSIGNMENT = re.compile(
     r"(?i)\b([A-Z][A-Z0-9_]*(?:TOKEN|KEY|PASSWORD|SECRET)[A-Z0-9_]*)\s*=\s*([^\s,;]+)"
 )
@@ -97,6 +109,28 @@ class WorkflowError(RuntimeError):
 
 def _fail(code: str, message: str) -> None:
     raise WorkflowError(code, message)
+
+
+def route(task: Mapping[str, object]) -> tuple[str, ...]:
+    """Return the deterministic, bounded role order for a task summary."""
+
+    if not isinstance(task, Mapping):
+        _fail("INVALID_TASK", "task must be an object")
+    task_type = task.get("task_type")
+    risk_flags = task.get("risk_flags")
+    if not isinstance(task_type, str) or task_type not in TASK_TYPES:
+        _fail("INVALID_ENUM", "task_type is not supported")
+    if isinstance(risk_flags, str) or not isinstance(risk_flags, Sequence):
+        _fail("INVALID_TYPE", "risk_flags must be an array")
+    if any(not isinstance(flag, str) or flag not in RISK_FLAGS for flag in risk_flags):
+        _fail("INVALID_ENUM", "risk_flags contains an unsupported value")
+    if task_type == "PLAN":
+        return ("luna", "sol_planner")
+    if task_type == "ACCEPTANCE":
+        return ("luna", "sol_reviewer")
+    if risk_flags:
+        return ("sol_planner", "terra", "luna", "sol_reviewer")
+    return ("terra", "luna", "sol_reviewer")
 
 
 @dataclass(frozen=True)
@@ -507,7 +541,13 @@ def _has_execution_approval(repo: Path, task_id: str) -> bool:
             record = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(record, dict) and record.get("decision") == "APPROVED_FOR_EXECUTION":
+        if isinstance(record, dict) and (
+            record.get("decision") == "APPROVED_FOR_EXECUTION"
+            or (
+                record.get("decision") == "approve_execution"
+                and record.get("new_state") == "APPROVED_FOR_EXECUTION"
+            )
+        ):
             return True
     return False
 
@@ -560,12 +600,31 @@ OWNER_ONLY_STATES = frozenset(
         "APPROVED_FOR_EXECUTION",
         "REWORK_AUTHORIZED",
         "ESCALATION_AUTHORIZED",
+        "DEFERRED",
         "CLOSED",
+    }
+)
+OWNER_GATED_TRANSITIONS = frozenset(
+    {
+        ("AWAITING_OWNER_DECISION", "APPROVED_FOR_EXECUTION"),
+        ("AWAITING_OWNER_DECISION", "REWORK_AUTHORIZED"),
+        ("AWAITING_OWNER_DECISION", "ESCALATION_AUTHORIZED"),
+        ("AWAITING_OWNER_DECISION", "DEFERRED"),
+        ("AWAITING_OWNER_DECISION", "CLOSED"),
+        ("AWAITING_OWNER_DECISION", "ABORTED"),
+        ("DEFERRED", "TASK_VALIDATED"),
+        ("DEFERRED", "CLOSED"),
+        ("DEFERRED", "ABORTED"),
+        ("APPROVED_FOR_EXECUTION", "WORKTREE_READY"),
+        ("REWORK_AUTHORIZED", "IMPLEMENTATION_RUNNING"),
+        ("ESCALATION_AUTHORIZED", "PLAN_OR_REVIEW_RUNNING"),
     }
 )
 TRANSITIONS = {
     "DRAFT": frozenset({"TASK_VALIDATED", "ABORTED"}),
-    "TASK_VALIDATED": frozenset({"EVIDENCE_RUNNING", "BLOCKED", "ABORTED"}),
+    "TASK_VALIDATED": frozenset(
+        {"EVIDENCE_RUNNING", "PLAN_OR_REVIEW_RUNNING", "AWAITING_OWNER_DECISION", "BLOCKED", "ABORTED"}
+    ),
     "EVIDENCE_RUNNING": frozenset({"EVIDENCE_READY", "BLOCKED", "ABORTED"}),
     "EVIDENCE_READY": frozenset({"PLAN_OR_REVIEW_RUNNING", "BLOCKED", "ABORTED"}),
     "PLAN_OR_REVIEW_RUNNING": frozenset(
@@ -573,6 +632,7 @@ TRANSITIONS = {
     ),
     "PLAN_READY": frozenset({"AWAITING_OWNER_DECISION"}),
     "REVIEW_READY": frozenset({"AWAITING_OWNER_DECISION"}),
+    "ESCALATION_PROPOSED": frozenset({"AWAITING_OWNER_DECISION"}),
     "AWAITING_OWNER_DECISION": frozenset(
         {
             "APPROVED_FOR_EXECUTION",
@@ -583,7 +643,20 @@ TRANSITIONS = {
             "ABORTED",
         }
     ),
+    "APPROVED_FOR_EXECUTION": frozenset({"WORKTREE_READY", "ABORTED"}),
+    "REWORK_AUTHORIZED": frozenset({"IMPLEMENTATION_RUNNING", "ABORTED"}),
+    "ESCALATION_AUTHORIZED": frozenset({"PLAN_OR_REVIEW_RUNNING", "ABORTED"}),
+    "DEFERRED": frozenset({"TASK_VALIDATED", "CLOSED", "ABORTED"}),
+    "WORKTREE_READY": frozenset({"IMPLEMENTATION_RUNNING", "BLOCKED", "ABORTED"}),
+    "IMPLEMENTATION_RUNNING": frozenset({"IMPLEMENTED_CANDIDATE", "BLOCKED", "NEEDS_REPLAN"}),
+    "IMPLEMENTED_CANDIDATE": frozenset({"PRECHECK_RUNNING", "BLOCKED"}),
+    "PRECHECK_RUNNING": frozenset({"PRECHECK_READY", "BLOCKED"}),
+    "PRECHECK_READY": frozenset({"PLAN_OR_REVIEW_RUNNING", "BLOCKED"}),
+    "NEEDS_REPLAN": frozenset({"AWAITING_OWNER_DECISION", "BLOCKED", "ABORTED"}),
 }
+WORKFLOW_STATES = frozenset(TRANSITIONS) | frozenset(
+    state for targets in TRANSITIONS.values() for state in targets
+)
 
 
 def next_state(current: str, target: str, *, owner_authorized: bool) -> str:
@@ -596,7 +669,7 @@ def next_state(current: str, target: str, *, owner_authorized: bool) -> str:
         _fail("INVALID_STATE", f"unknown current state {current}")
     if target not in allowed:
         _fail("INVALID_TRANSITION", f"cannot transition from {current} to {target}")
-    if target in OWNER_ONLY_STATES and not owner_authorized:
+    if (target in OWNER_ONLY_STATES or (current, target) in OWNER_GATED_TRANSITIONS) and not owner_authorized:
         _fail("OWNER_AUTHORIZATION_REQUIRED", f"owner authorization required for {target}")
     return target
 
@@ -766,6 +839,480 @@ class FakeRunner:
         }
 
 
+class Runner(Protocol):
+    """The small, injectable boundary used by the gated orchestrator."""
+
+    is_live_model: bool
+
+    def run(self, role: str, task: dict[str, object]) -> Mapping[str, object]:
+        """Return one ai-result-1-compatible role result."""
+
+
+@dataclass
+class RetryBudget:
+    """The one-time retry allowances specified by the workflow contract."""
+
+    technical_retries: int = 0
+    implementation_reworks: int = 0
+    cross_model_escalations: int = 0
+
+    def _consume(self, field: str, detail: str) -> None:
+        if getattr(self, field) >= 1:
+            raise WorkflowError("RETRY_BUDGET_EXHAUSTED", detail)
+        setattr(self, field, getattr(self, field) + 1)
+
+    def consume_technical(self) -> None:
+        self._consume("technical_retries", "technical")
+
+    def consume_rework(self) -> None:
+        self._consume("implementation_reworks", "implementation")
+
+    def consume_escalation(self) -> None:
+        self._consume("cross_model_escalations", "escalation")
+
+
+def _utc_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _load_event_records(store: WorkflowStore, task_id: str) -> list[dict[str, object]]:
+    path = store._require_task(task_id) / "events.jsonl"
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        raise WorkflowError("EVENT_READ_ERROR", f"cannot read events for {task_id}") from exc
+    records: list[dict[str, object]] = []
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise WorkflowError("INVALID_EVENT_RECORD", f"invalid event JSON for {task_id}") from exc
+        if not isinstance(record, dict):
+            _fail("INVALID_EVENT_RECORD", "event record must be an object")
+        records.append(record)
+    return records
+
+
+def _current_state(store: WorkflowStore, task_id: str) -> str:
+    state = "DRAFT"
+    for record in _load_event_records(store, task_id):
+        next_value = record.get("new_state")
+        if next_value is not None:
+            if not isinstance(next_value, str) or next_value not in WORKFLOW_STATES:
+                _fail("INVALID_EVENT_RECORD", "event new_state is invalid")
+            state = next_value
+    return state
+
+
+def _budget_from_events(store: WorkflowStore, task_id: str) -> RetryBudget:
+    for record in reversed(_load_event_records(store, task_id)):
+        raw_budget = record.get("retry_budget")
+        if raw_budget is None:
+            continue
+        if not isinstance(raw_budget, Mapping):
+            _fail("INVALID_EVENT_RECORD", "retry_budget must be an object")
+        values = []
+        for field in ("technical_retries", "implementation_reworks", "cross_model_escalations"):
+            value = raw_budget.get(field)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                _fail("INVALID_EVENT_RECORD", f"retry_budget.{field} must be a non-negative integer")
+            values.append(value)
+        return RetryBudget(*values)
+    return RetryBudget()
+
+
+def _budget_record(budget: RetryBudget) -> dict[str, int]:
+    return {
+        "technical_retries": budget.technical_retries,
+        "implementation_reworks": budget.implementation_reworks,
+        "cross_model_escalations": budget.cross_model_escalations,
+    }
+
+
+def _task_sha256(store: WorkflowStore, task_id: str) -> str:
+    task_path = store._require_task(task_id) / "task.json"
+    try:
+        return hashlib.sha256(task_path.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise WorkflowError("TASK_READ_ERROR", f"cannot hash task {task_id}") from exc
+
+
+def _append_state_event(
+    store: WorkflowStore,
+    task_id: str,
+    *,
+    event_type: str,
+    previous_state: str,
+    new_state: str,
+    budget: RetryBudget,
+    role: str | None = None,
+    status: str | None = None,
+    error_code: str | None = None,
+) -> str:
+    event: dict[str, object] = {
+        "event_type": event_type,
+        "timestamp_utc": _utc_timestamp(),
+        "previous_state": previous_state,
+        "new_state": new_state,
+        "task_sha256": _task_sha256(store, task_id),
+        "retry_budget": _budget_record(budget),
+    }
+    if role is not None:
+        event["role"] = role
+    if status is not None:
+        event["status"] = status
+    if error_code is not None:
+        event["error_code"] = error_code
+    store.append_event(task_id, event)
+    return new_state
+
+
+def _transition(
+    store: WorkflowStore,
+    task_id: str,
+    current: str,
+    target: str,
+    budget: RetryBudget,
+    *,
+    event_type: str = "STATE_TRANSITION",
+    owner_authorized: bool = False,
+) -> str:
+    target = next_state(current, target, owner_authorized=owner_authorized)
+    return _append_state_event(
+        store,
+        task_id,
+        event_type=event_type,
+        previous_state=current,
+        new_state=target,
+        budget=budget,
+    )
+
+
+def _load_latest_decision(store: WorkflowStore, task_id: str) -> dict[str, object] | None:
+    path = store._require_task(task_id) / "human-decisions.jsonl"
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise WorkflowError("DECISION_READ_ERROR", f"cannot read decisions for {task_id}") from exc
+    if not lines:
+        return None
+    try:
+        record = json.loads(lines[-1])
+    except json.JSONDecodeError as exc:
+        raise WorkflowError("INVALID_DECISION_RECORD", f"invalid decision JSON for {task_id}") from exc
+    if not isinstance(record, dict):
+        _fail("INVALID_DECISION_RECORD", "decision record must be an object")
+    return record
+
+
+def _authorization_is_recorded(
+    store: WorkflowStore, task_id: str, state: str, decision: str
+) -> bool:
+    record = _load_latest_decision(store, task_id)
+    return bool(
+        record
+        and record.get("decision") == decision
+        and record.get("new_state") == state
+        and isinstance(record.get("actor"), str)
+        and record["actor"].strip()
+        and record.get("task_sha256") == _task_sha256(store, task_id)
+    )
+
+
+def _role_for_plan_or_review(
+    store: WorkflowStore, task_id: str, task: Mapping[str, object]
+) -> str:
+    task_type = task["task_type"]
+    if _authorization_is_recorded(
+        store, task_id, "ESCALATION_AUTHORIZED", "authorize_escalation"
+    ):
+        return "sol_xhigh"
+    if task_type == "PLAN":
+        return "sol_planner"
+    if task_type == "ACCEPTANCE":
+        return "sol_reviewer"
+    roles = {record.get("role") for record in _load_event_records(store, task_id)}
+    if task.get("risk_flags") and "sol_planner" not in roles:
+        return "sol_planner"
+    return "sol_reviewer"
+
+
+def _run_role_with_technical_retry(
+    store: WorkflowStore,
+    task_id: str,
+    task: dict[str, object],
+    state: str,
+    role: str,
+    runner: Runner,
+    budget: RetryBudget,
+) -> tuple[Mapping[str, object] | None, str]:
+    """Run one role, allowing only the single persisted technical retry."""
+
+    while True:
+        try:
+            result = runner.run(role, task)
+            declared = result.get("changed_files", []) if isinstance(result, Mapping) else []
+            validate_role_result(role, result, set(declared))
+            return result, state
+        except (WorkflowError, ValueError, json.JSONDecodeError) as exc:
+            error_code = exc.code if isinstance(exc, WorkflowError) else "INVALID_ROLE_RESULT"
+            _append_state_event(
+                store,
+                task_id,
+                event_type="ROLE_FAILURE",
+                previous_state=state,
+                new_state=state,
+                budget=budget,
+                role=role,
+                error_code=error_code,
+            )
+            try:
+                budget.consume_technical()
+            except WorkflowError:
+                return None, _transition(
+                    store,
+                    task_id,
+                    state,
+                    "BLOCKED",
+                    budget,
+                    event_type="TECHNICAL_RETRY_EXHAUSTED",
+                )
+
+
+def _role_state_after_result(
+    store: WorkflowStore,
+    task_id: str,
+    state: str,
+    role: str,
+    result: Mapping[str, object],
+    budget: RetryBudget,
+) -> str:
+    status = result["status"]
+    if role == "luna":
+        target = "EVIDENCE_READY" if state == "EVIDENCE_RUNNING" else "PRECHECK_READY"
+    elif role == "terra":
+        if status == "IMPLEMENTED_CANDIDATE":
+            target = "IMPLEMENTED_CANDIDATE"
+        else:
+            try:
+                budget.consume_rework()
+            except WorkflowError:
+                return _transition(
+                    store,
+                    task_id,
+                    state,
+                    "BLOCKED",
+                    budget,
+                    event_type="IMPLEMENTATION_REWORK_EXHAUSTED",
+                )
+            target = "NEEDS_REPLAN"
+    elif role == "sol_planner":
+        target = "PLAN_READY"
+    elif role == "sol_reviewer":
+        target = "ESCALATION_PROPOSED" if status == "ESCALATION_PROPOSED" else "REVIEW_READY"
+    elif role == "sol_xhigh":
+        target = "ESCALATION_PROPOSED"
+    else:
+        _fail("INVALID_ROLE", f"unsupported role {role}")
+    target = next_state(state, target, owner_authorized=False)
+    state = _append_state_event(
+        store,
+        task_id,
+        event_type="ROLE_RESULT",
+        previous_state=state,
+        new_state=target,
+        budget=budget,
+        role=role,
+        status=status if isinstance(status, str) else None,
+    )
+    if state in {"PLAN_READY", "REVIEW_READY", "ESCALATION_PROPOSED", "NEEDS_REPLAN"}:
+        return _transition(
+            store,
+            task_id,
+            state,
+            "AWAITING_OWNER_DECISION",
+            budget,
+            event_type="OWNER_GATE_REACHED",
+        )
+    return state
+
+
+def _run_pipeline_role(
+    store: WorkflowStore,
+    task_id: str,
+    task: dict[str, object],
+    state: str,
+    role: str,
+    runner: Runner,
+    budget: RetryBudget,
+) -> str:
+    result, state_after_retry = _run_role_with_technical_retry(
+        store, task_id, task, state, role, runner, budget
+    )
+    if result is None:
+        return state_after_retry
+    return _role_state_after_result(store, task_id, state_after_retry, role, result, budget)
+
+
+def run_until_gate(task_id: str, *, runner: Runner, allow_live_model: bool) -> str:
+    """Advance one bounded pipeline only until its next owner-controlled gate."""
+
+    if not isinstance(allow_live_model, bool):
+        _fail("INVALID_LIVE_MODEL_FLAG", "allow_live_model must be a boolean")
+    if not hasattr(runner, "run"):
+        _fail("INVALID_RUNNER", "runner must provide run(role, task)")
+    if getattr(runner, "is_live_model", False) and not allow_live_model:
+        _fail("LIVE_MODEL_NOT_AUTHORIZED", "live model execution requires explicit authorization")
+    store = WorkflowStore(WORKFLOW_STATE_ROOT)
+    with store.lock(task_id):
+        task_path = store._require_task(task_id) / "task.json"
+        task = load_task(task_path)
+        state = _current_state(store, task_id)
+        budget = _budget_from_events(store, task_id)
+        while True:
+            if state in {"BLOCKED", "CLOSED", "ABORTED", "DEFERRED", "AWAITING_OWNER_DECISION"}:
+                return state
+            if state == "DRAFT":
+                state = _transition(store, task_id, state, "TASK_VALIDATED", budget)
+                continue
+            if state == "TASK_VALIDATED":
+                if task["task_type"] in {"PLAN", "ACCEPTANCE"}:
+                    state = _transition(store, task_id, state, "EVIDENCE_RUNNING", budget)
+                    continue
+                if task["risk_flags"]:
+                    state = _transition(store, task_id, state, "PLAN_OR_REVIEW_RUNNING", budget)
+                    continue
+                state = _transition(store, task_id, state, "AWAITING_OWNER_DECISION", budget)
+                continue
+            if state == "EVIDENCE_RUNNING":
+                state = _run_pipeline_role(store, task_id, task, state, "luna", runner, budget)
+                continue
+            if state == "EVIDENCE_READY":
+                state = _transition(store, task_id, state, "PLAN_OR_REVIEW_RUNNING", budget)
+                continue
+            if state == "APPROVED_FOR_EXECUTION":
+                if not _authorization_is_recorded(
+                    store, task_id, state, "approve_execution"
+                ):
+                    return state
+                if task["task_type"] == "REMEDIATION" and getattr(runner, "is_live_model", False):
+                    create_worktree(task, owner_authorized=True)
+                state = _transition(
+                    store, task_id, state, "WORKTREE_READY", budget, owner_authorized=True
+                )
+                continue
+            if state == "WORKTREE_READY":
+                state = _transition(store, task_id, state, "IMPLEMENTATION_RUNNING", budget)
+                continue
+            if state == "REWORK_AUTHORIZED":
+                if not _authorization_is_recorded(
+                    store, task_id, state, "authorize_rework"
+                ):
+                    return state
+                state = _transition(
+                    store, task_id, state, "IMPLEMENTATION_RUNNING", budget, owner_authorized=True
+                )
+                continue
+            if state == "IMPLEMENTATION_RUNNING":
+                state = _run_pipeline_role(store, task_id, task, state, "terra", runner, budget)
+                continue
+            if state == "IMPLEMENTED_CANDIDATE":
+                state = _transition(store, task_id, state, "PRECHECK_RUNNING", budget)
+                continue
+            if state == "PRECHECK_RUNNING":
+                state = _run_pipeline_role(store, task_id, task, state, "luna", runner, budget)
+                continue
+            if state == "PRECHECK_READY":
+                state = _transition(store, task_id, state, "PLAN_OR_REVIEW_RUNNING", budget)
+                continue
+            if state == "ESCALATION_AUTHORIZED":
+                if not _authorization_is_recorded(
+                    store, task_id, state, "authorize_escalation"
+                ):
+                    return state
+                try:
+                    budget.consume_escalation()
+                except WorkflowError:
+                    return _transition(
+                        store,
+                        task_id,
+                        state,
+                        "BLOCKED",
+                        budget,
+                        event_type="ESCALATION_BUDGET_EXHAUSTED",
+                    )
+                state = _transition(
+                    store,
+                    task_id,
+                    state,
+                    "PLAN_OR_REVIEW_RUNNING",
+                    budget,
+                    owner_authorized=True,
+                )
+                continue
+            if state == "PLAN_OR_REVIEW_RUNNING":
+                role = _role_for_plan_or_review(store, task_id, task)
+                state = _run_pipeline_role(store, task_id, task, state, role, runner, budget)
+                continue
+            _fail("INVALID_STATE", f"cannot run task from state {state}")
+
+
+def apply_owner_decision(task_id: str, decision: str, actor: str) -> str:
+    """Append one complete owner decision and move only along its closed-set edge."""
+
+    return _apply_owner_decision(WorkflowStore(WORKFLOW_STATE_ROOT), task_id, decision, actor)
+
+
+def _apply_owner_decision(
+    store: WorkflowStore, task_id: str, decision: str, actor: str
+) -> str:
+    """Apply one owner decision through the supplied existing workflow store."""
+
+    if not isinstance(decision, str) or decision not in OWNER_DECISIONS:
+        _fail("INVALID_OWNER_DECISION", "decision is not in the approved closed set")
+    if not isinstance(actor, str) or not actor.strip():
+        _fail("INVALID_ACTOR", "actor must be a non-empty string")
+    with store.lock(task_id):
+        store._require_task(task_id)
+        state = _current_state(store, task_id)
+        budget = _budget_from_events(store, task_id)
+        targets = {
+            "approve_execution": "APPROVED_FOR_EXECUTION",
+            "authorize_rework": "REWORK_AUTHORIZED",
+            "authorize_escalation": "ESCALATION_AUTHORIZED",
+            "defer": "DEFERRED",
+            "close": "CLOSED",
+            "abort": "ABORTED",
+        }
+        target = targets[decision]
+        if state == "DEFERRED" and decision == "approve_execution":
+            target = "TASK_VALIDATED"
+        try:
+            target = next_state(state, target, owner_authorized=True)
+        except WorkflowError as exc:
+            if exc.code == "INVALID_TRANSITION":
+                _fail("OWNER_DECISION_NOT_APPLICABLE", f"{decision} is not valid from {state}")
+            raise
+        record: dict[str, object] = {
+            "event_type": "OWNER_DECISION",
+            "decision": decision,
+            "actor": actor.strip(),
+            "timestamp_utc": _utc_timestamp(),
+            "previous_state": state,
+            "new_state": target,
+            "task_sha256": _task_sha256(store, task_id),
+        }
+        store.record_decision(task_id, record)
+        event = dict(record)
+        event["retry_budget"] = _budget_record(budget)
+        store.append_event(task_id, event)
+        return target
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="ai-workflow")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -833,9 +1380,7 @@ def _run_command(args: argparse.Namespace) -> int:
         decision = args.decision_option or args.decision
         if not decision:
             raise WorkflowError("DECISION_REQUIRED", "decision is required")
-        WorkflowStore(args.root).record_decision(
-            args.task_id, {"decision": decision, "by": args.by}
-        )
+        _apply_owner_decision(WorkflowStore(args.root), args.task_id, decision, args.by)
         print("DECISION_RECORDED")
         return 0
     if args.command == "run":
