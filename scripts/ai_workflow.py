@@ -1,0 +1,475 @@
+"""Deterministic validation and state transitions for the local workflow stage."""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import errno
+import fcntl
+import json
+import os
+import re
+import tempfile
+from collections.abc import Mapping
+from pathlib import Path
+
+
+TASK_FIELDS = frozenset(
+    {
+        "schema_version",
+        "task_id",
+        "task_type",
+        "objective",
+        "repository_root",
+        "source_worktree",
+        "base_commit",
+        "candidate_commit",
+        "authoritative_files",
+        "allowed_write_paths",
+        "forbidden_actions",
+        "risk_flags",
+        "acceptance_commands",
+        "verification_level",
+        "human_gates",
+    }
+)
+TASK_TYPES = frozenset({"PLAN", "ACCEPTANCE", "REMEDIATION"})
+VERIFICATION_LEVELS = frozenset({"L0", "L1", "L2"})
+RISK_FLAGS = frozenset(
+    {
+        "CONSTITUTION",
+        "PIT",
+        "SURVIVORSHIP_BIAS",
+        "PUBLIC_SCHEMA",
+        "APPEND_ONLY",
+        "SECURITY",
+        "DATA_CONTAMINATION",
+        "PUBLIC_API",
+        "CROSS_CARD_CONTRACT",
+    }
+)
+HUMAN_GATES = frozenset(
+    {
+        "PLAN_APPROVAL",
+        "EXECUTION_APPROVAL",
+        "FINAL_ACCEPTANCE",
+        "XHIGH_APPROVAL",
+        "MERGE",
+        "PUSH",
+    }
+)
+TASK_ID_PATTERN = re.compile(r"^AWF-[0-9]{8}-[0-9]{3,}$")
+
+
+class WorkflowError(RuntimeError):
+    def __init__(self, code: str, message: str):
+        self.code = str(code)
+        self.message = str(message)
+        super().__init__(f"{self.code}: {self.message}")
+
+
+def _fail(code: str, message: str) -> None:
+    raise WorkflowError(code, message)
+
+
+def _require_nonempty_string(task: Mapping[str, object], field: str) -> None:
+    value = task[field]
+    if not isinstance(value, str):
+        _fail("INVALID_TYPE", f"{field} must be a string")
+    if not value.strip():
+        _fail("EMPTY_FIELD", f"{field} must not be empty")
+
+
+def _require_nullable_string(task: Mapping[str, object], field: str) -> None:
+    value = task[field]
+    if value is not None and not isinstance(value, str):
+        _fail("INVALID_TYPE", f"{field} must be a string or null")
+    if isinstance(value, str) and not value.strip():
+        _fail("EMPTY_FIELD", f"{field} must not be empty when provided")
+
+
+def _require_unique_string_array(
+    task: Mapping[str, object],
+    field: str,
+    *,
+    allowed: frozenset[str] | None = None,
+    nonempty: bool = False,
+) -> None:
+    value = task[field]
+    if not isinstance(value, list):
+        _fail("INVALID_TYPE", f"{field} must be an array")
+    if nonempty and not value:
+        _fail("EMPTY_ARRAY", f"{field} must not be empty")
+    if any(not isinstance(item, str) for item in value):
+        _fail("INVALID_TYPE", f"{field} items must be strings")
+    if len(value) != len(set(value)):
+        _fail("DUPLICATE_ITEM", f"{field} must not contain duplicates")
+    if allowed is not None:
+        unknown = sorted(set(value) - allowed)
+        if unknown:
+            _fail("INVALID_ENUM", f"{field} contains unsupported value {unknown[0]}")
+
+
+def validate_task(task: Mapping[str, object]) -> None:
+    """Validate a task envelope against the frozen ``ai-task-1`` contract."""
+
+    if not isinstance(task, Mapping):
+        _fail("INVALID_TASK", "task must be an object")
+
+    fields = set(task)
+    unknown = sorted(fields - TASK_FIELDS)
+    if unknown:
+        _fail("UNKNOWN_FIELD", f"unsupported field {unknown[0]}")
+    missing = sorted(TASK_FIELDS - fields)
+    if missing:
+        _fail("MISSING_FIELD", f"missing field {missing[0]}")
+
+    if task["schema_version"] != "ai-task-1":
+        _fail("SCHEMA_VERSION", "schema_version must be ai-task-1")
+    for field in ("task_id", "objective", "repository_root"):
+        _require_nonempty_string(task, field)
+    if not TASK_ID_PATTERN.fullmatch(task["task_id"]):
+        _fail("INVALID_TASK_ID", "task_id must match AWF-YYYYMMDD-NNN")
+
+    task_type = task["task_type"]
+    if not isinstance(task_type, str) or task_type not in TASK_TYPES:
+        _fail("INVALID_ENUM", "task_type is not supported")
+    level = task["verification_level"]
+    if not isinstance(level, str) or level not in VERIFICATION_LEVELS:
+        _fail("INVALID_ENUM", "verification_level is not supported")
+
+    for field in ("source_worktree", "base_commit", "candidate_commit"):
+        _require_nullable_string(task, field)
+    _require_unique_string_array(task, "authoritative_files", nonempty=True)
+    _require_unique_string_array(task, "allowed_write_paths")
+    _require_unique_string_array(task, "forbidden_actions")
+    _require_unique_string_array(task, "risk_flags", allowed=RISK_FLAGS)
+    _require_unique_string_array(task, "acceptance_commands")
+    _require_unique_string_array(task, "human_gates", allowed=HUMAN_GATES)
+
+    if task_type == "ACCEPTANCE":
+        if not task["base_commit"] or not task["candidate_commit"]:
+            _fail("COMMIT_REQUIRED", "ACCEPTANCE requires base_commit and candidate_commit")
+    if task_type == "REMEDIATION" and not task["allowed_write_paths"]:
+        _fail("WRITE_PATH_REQUIRED", "REMEDIATION requires allowed_write_paths")
+
+
+def load_task(path: Path) -> dict[str, object]:
+    """Read and validate one JSON task envelope."""
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise WorkflowError("TASK_READ_ERROR", f"cannot read task: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise WorkflowError("INVALID_JSON", f"invalid task JSON at line {exc.lineno}") from exc
+    if not isinstance(payload, dict):
+        _fail("INVALID_TASK", "task JSON must contain an object")
+    validate_task(payload)
+    return payload
+
+
+OWNER_ONLY_STATES = frozenset(
+    {
+        "APPROVED_FOR_EXECUTION",
+        "REWORK_AUTHORIZED",
+        "ESCALATION_AUTHORIZED",
+        "CLOSED",
+    }
+)
+TRANSITIONS = {
+    "DRAFT": frozenset({"TASK_VALIDATED", "ABORTED"}),
+    "TASK_VALIDATED": frozenset({"EVIDENCE_RUNNING", "BLOCKED", "ABORTED"}),
+    "EVIDENCE_RUNNING": frozenset({"EVIDENCE_READY", "BLOCKED", "ABORTED"}),
+    "EVIDENCE_READY": frozenset({"PLAN_OR_REVIEW_RUNNING", "BLOCKED", "ABORTED"}),
+    "PLAN_OR_REVIEW_RUNNING": frozenset(
+        {"PLAN_READY", "REVIEW_READY", "BLOCKED", "ESCALATION_PROPOSED"}
+    ),
+    "PLAN_READY": frozenset({"AWAITING_OWNER_DECISION"}),
+    "REVIEW_READY": frozenset({"AWAITING_OWNER_DECISION"}),
+    "AWAITING_OWNER_DECISION": frozenset(
+        {
+            "APPROVED_FOR_EXECUTION",
+            "REWORK_AUTHORIZED",
+            "ESCALATION_AUTHORIZED",
+            "DEFERRED",
+            "CLOSED",
+            "ABORTED",
+        }
+    ),
+}
+
+
+def next_state(current: str, target: str, *, owner_authorized: bool) -> str:
+    """Return ``target`` when the explicit transition is authorized."""
+
+    if not isinstance(current, str) or not isinstance(target, str):
+        _fail("INVALID_STATE", "states must be strings")
+    allowed = TRANSITIONS.get(current)
+    if allowed is None:
+        _fail("INVALID_STATE", f"unknown current state {current}")
+    if target not in allowed:
+        _fail("INVALID_TRANSITION", f"cannot transition from {current} to {target}")
+    if target in OWNER_ONLY_STATES and not owner_authorized:
+        _fail("OWNER_AUTHORIZATION_REQUIRED", f"owner authorization required for {target}")
+    return target
+
+
+def _canonical_json(value: object) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError) as exc:
+        raise WorkflowError("INVALID_RECORD", f"record is not JSON serializable: {exc}") from exc
+
+
+def atomic_write_json(path: Path, value: object) -> None:
+    """Write JSON through a same-directory fsynced temporary file and replace."""
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(_canonical_json(value))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+        temporary = None
+    except OSError as exc:
+        raise WorkflowError("ATOMIC_WRITE_FAILED", f"cannot write {target.name}") from exc
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def append_jsonl(path: Path, record: Mapping[str, object]) -> None:
+    """Append one compact, fsynced JSON object without rewrite/delete support."""
+
+    if not isinstance(record, Mapping):
+        raise WorkflowError("INVALID_RECORD", "JSONL record must be an object")
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    line = _canonical_json(dict(record)) + "\n"
+    try:
+        with target.open("a", encoding="utf-8") as handle:
+            handle.write(line)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError as exc:
+        raise WorkflowError("APPEND_FAILED", f"cannot append {target.name}") from exc
+
+
+class WorkflowStore:
+    """Filesystem-backed task store with append-only event and decision ledgers."""
+
+    def __init__(self, root: Path):
+        self.root = Path(root)
+
+    @staticmethod
+    def _validate_task_id(task_id: str) -> None:
+        if not isinstance(task_id, str) or not TASK_ID_PATTERN.fullmatch(task_id):
+            raise WorkflowError("INVALID_TASK_ID", "task_id must match AWF-YYYYMMDD-NNN")
+
+    def _task_dir(self, task_id: str) -> Path:
+        self._validate_task_id(task_id)
+        return self.root / task_id
+
+    def _require_task(self, task_id: str) -> Path:
+        task_dir = self._task_dir(task_id)
+        if not task_dir.is_dir():
+            raise WorkflowError("TASK_NOT_FOUND", f"task {task_id} does not exist")
+        return task_dir
+
+    def create_task(self, task: dict) -> Path:
+        if not isinstance(task, dict):
+            raise WorkflowError("INVALID_TASK", "task must be an object")
+        validate_task(task)
+        task_id = task["task_id"]
+        task_dir = self._task_dir(task_id)
+        self.root.mkdir(parents=True, exist_ok=True)
+        try:
+            task_dir.mkdir()
+        except FileExistsError as exc:
+            raise WorkflowError("TASK_EXISTS", f"task {task_id} already exists") from exc
+        try:
+            task_path = task_dir / "task.json"
+            atomic_write_json(task_path, task)
+            return task_path
+        except Exception:
+            # Leave no partial task directory when initial canonical write fails.
+            try:
+                task_dir.rmdir()
+            except OSError:
+                pass
+            raise
+
+    def append_event(self, task_id: str, event: dict) -> None:
+        task_dir = self._require_task(task_id)
+        append_jsonl(task_dir / "events.jsonl", event)
+
+    def record_decision(self, task_id: str, decision: dict) -> None:
+        task_dir = self._require_task(task_id)
+        append_jsonl(task_dir / "human-decisions.jsonl", decision)
+
+    @contextlib.contextmanager
+    def lock(self, task_id: str):
+        task_dir = self._require_task(task_id)
+        lock_path = task_dir / ".lock"
+        try:
+            handle = lock_path.open("a+b")
+        except OSError as exc:
+            raise WorkflowError("LOCK_FAILED", f"cannot open lock for {task_id}") from exc
+        try:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise WorkflowError("TASK_ALREADY_RUNNING", f"task {task_id} is already running") from exc
+            except OSError as exc:
+                if exc.errno in (errno.EACCES, errno.EAGAIN):
+                    raise WorkflowError("TASK_ALREADY_RUNNING", f"task {task_id} is already running") from exc
+                raise WorkflowError("LOCK_FAILED", f"cannot lock task {task_id}") from exc
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
+FAKE_ROLE_RESULTS = {
+    "luna": ("SUPPORTED", "EVIDENCE_READY"),
+    "terra": ("IMPLEMENTED_CANDIDATE", "PRECHECK_RUNNING"),
+    "sol_planner": ("PLAN_READY", "AWAITING_OWNER_DECISION"),
+    "sol_reviewer": ("ACCEPTANCE_RECOMMENDED", "AWAITING_OWNER_DECISION"),
+    "sol_xhigh": ("OPTION_A", "ESCALATION_PROPOSED"),
+}
+
+
+class FakeRunner:
+    """Deterministic local runner used by tests; it never calls a model."""
+
+    def run(self, role: str, task: dict) -> dict[str, object]:
+        if role not in FAKE_ROLE_RESULTS:
+            raise WorkflowError("INVALID_ROLE", f"unsupported role {role}")
+        validate_task(task)
+        status, next_state_value = FAKE_ROLE_RESULTS[role]
+        return {
+            "schema_version": "ai-result-1",
+            "role": role,
+            "status": status,
+            "summary": f"Fake {role} result for {task['task_id']}",
+            "claims": [],
+            "evidence": [],
+            "counter_checks": [],
+            "changed_files": [],
+            "blind_spots": [],
+            "unresolved_questions": [],
+            "recommended_next_state": next_state_value,
+        }
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="ai-workflow")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    new = sub.add_parser("new")
+    new.add_argument("task_path", nargs="?", type=Path)
+    new.add_argument("--task", dest="task_option", type=Path)
+    new.add_argument("--root", type=Path, default=Path("data/state/ai-workflow"))
+
+    validate = sub.add_parser("validate")
+    validate.add_argument("task_path", nargs="?", type=Path)
+    validate.add_argument("--task", dest="task_option", type=Path)
+
+    run = sub.add_parser("run")
+    run.add_argument("task_path", nargs="?", type=Path)
+    run.add_argument("--task", dest="task_option", type=Path)
+    run.add_argument("--runner", default=None)
+    run.add_argument("--role", default="luna", choices=tuple(FAKE_ROLE_RESULTS))
+
+    status = sub.add_parser("status")
+    status.add_argument("task_id", nargs="?")
+    status.add_argument("--root", type=Path, default=Path("data/state/ai-workflow"))
+
+    decide = sub.add_parser("decide")
+    decide.add_argument("task_id", nargs="?")
+    decide.add_argument("decision", nargs="?")
+    decide.add_argument("--decision", dest="decision_option")
+    decide.add_argument("--by", default="owner")
+    decide.add_argument("--root", type=Path, default=Path("data/state/ai-workflow"))
+
+    for name in ("resume", "abort", "report"):
+        sub.add_parser(name)
+    return parser
+
+
+def _task_path_from_args(args: argparse.Namespace) -> Path:
+    path = args.task_option or args.task_path
+    if path is None:
+        raise WorkflowError("TASK_REQUIRED", "a task JSON path is required")
+    return path
+
+
+def _run_command(args: argparse.Namespace) -> int:
+    if args.command in {"resume", "abort", "report"}:
+        raise WorkflowError("NOT_IMPLEMENTED_IN_CURRENT_STAGE", f"{args.command} is not implemented")
+    if args.command == "new":
+        task = load_task(_task_path_from_args(args))
+        path = WorkflowStore(args.root).create_task(task)
+        print(path)
+        return 0
+    if args.command == "validate":
+        task = load_task(_task_path_from_args(args))
+        print(f"VALID {task['task_id']}")
+        return 0
+    if args.command == "status":
+        if not args.task_id:
+            raise WorkflowError("TASK_REQUIRED", "task_id is required")
+        path = WorkflowStore(args.root)._require_task(args.task_id) / "task.json"
+        task = load_task(path)
+        print(f"PRESENT {task['task_id']}")
+        return 0
+    if args.command == "decide":
+        if not args.task_id:
+            raise WorkflowError("TASK_REQUIRED", "task_id is required")
+        decision = args.decision_option or args.decision
+        if not decision:
+            raise WorkflowError("DECISION_REQUIRED", "decision is required")
+        WorkflowStore(args.root).record_decision(
+            args.task_id, {"decision": decision, "by": args.by}
+        )
+        print("DECISION_RECORDED")
+        return 0
+    if args.command == "run":
+        if args.runner != "fake":
+            raise WorkflowError("NOT_IMPLEMENTED_IN_CURRENT_STAGE", "only --runner fake is available")
+        task = load_task(_task_path_from_args(args))
+        print(_canonical_json(FakeRunner().run(args.role, task)))
+        return 0
+    raise WorkflowError("UNKNOWN_COMMAND", f"unsupported command {args.command}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return _run_command(args)
+    except WorkflowError as exc:
+        print(f"{exc.code}: {exc.message}")
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
