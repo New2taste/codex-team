@@ -167,6 +167,37 @@ except ImportError:  # direct script execution
         validate_runtime_evidence,
     )
 
+try:
+    from .ai_workflow_runtime import (
+        CODEX_EXEC_ROLE_CONTRACT,
+        NATIVE_SUBAGENT,
+        RuntimeObservation,
+        codex_exec_contract,
+        codex_exec_observation,
+        extract_codex_thread_id,
+        extract_codex_usage,
+        merge_runtime_observations,
+        parse_codex_jsonl,
+        permission_is_within_contract,
+        verify_runtime_identity,
+        write_runtime_evidence,
+    )
+except ImportError:  # direct script execution
+    from ai_workflow_runtime import (
+        CODEX_EXEC_ROLE_CONTRACT,
+        NATIVE_SUBAGENT,
+        RuntimeObservation,
+        codex_exec_contract,
+        codex_exec_observation,
+        extract_codex_thread_id,
+        extract_codex_usage,
+        merge_runtime_observations,
+        parse_codex_jsonl,
+        permission_is_within_contract,
+        verify_runtime_identity,
+        write_runtime_evidence,
+    )
+
 
 def _fail(code: str, message: str) -> None:
     raise WorkflowError(code, message)
@@ -381,6 +412,13 @@ def build_role_prompt(
                 if role == "luna" and task["verification_level"] == "L1"
                 else ()
             ),
+            *(
+                (
+                    "Do not write, modify, delete, stage, commit, merge, or push repository files.",
+                )
+                if role in READ_ONLY_ROLES
+                else ()
+            ),
             "Read the named evidence files at the listed paths before evaluating the task.",
             "Use only the task contract and named evidence above; no additional source material is authorized.",
             "only output ai-result-1 JSON",
@@ -439,6 +477,7 @@ class RunPaths:
     schema_path: Path
     logs_dir: Path
     state_root: Path | None = None
+    runtime_evidence_required: bool = False
 
 
 def _validate_result_records(
@@ -658,6 +697,47 @@ def run_codex(role: str, task: dict, prompt: str, paths: RunPaths) -> dict:
             actual_changes = after_changes - before_changes
     if result is None:
         _fail("INVALID_ROLE_RESULT", "role did not return a result")
+    if paths.runtime_evidence_required:
+        if paths.state_root is None:
+            _fail("RUNTIME_EVIDENCE_MISSING", "live execution requires a workflow state root")
+        events = parse_codex_jsonl(completed.stdout)
+        thread_id = extract_codex_thread_id(events)
+        role_config = _load_role_config(role)
+        model = role_config.get("model")
+        effort = role_config.get("reasoning_effort")
+        sandbox = role_config.get("sandbox")
+        if not all(isinstance(item, str) and item for item in (model, effort, sandbox)):
+            _fail("RUNTIME_EVIDENCE_MISSING", "role configuration is incomplete")
+        expected_runtime = codex_exec_contract(
+            attempt_id=attempt_id,
+            requested_role=role,
+            model=model,
+            reasoning_effort=effort,
+            sandbox_policy=sandbox,
+            cwd=str(repo),
+        )
+        observed_runtime = codex_exec_observation(
+            expected_runtime,
+            before_repository_snapshot=before_run,
+            after_repository_snapshot=after_run,
+            prompt_forbids_writes=(
+                "Do not write, modify, delete, stage, commit, merge, or push repository files."
+                in prompt
+            ),
+        )
+        runtime_evidence = verify_runtime_identity(expected_runtime, observed_runtime)
+        runtime_store = WorkflowStore(paths.state_root)
+        write_runtime_evidence(runtime_store, task["task_id"], runtime_evidence)
+        runtime_store.append_event(
+            task["task_id"],
+            {
+                "event_type": "RUNTIME_EVIDENCE_RECORDED",
+                "attempt_id": attempt_id,
+                "thread_id": thread_id,
+                "execution_surface": CODEX_EXEC_ROLE_CONTRACT,
+                "usage": extract_codex_usage(events),
+            },
+        )
     validate_role_result(role, result, actual_changes)
     validate_verification_package(role, task, result)
     atomic_write_json(paths.output_path, result)
@@ -2174,6 +2254,8 @@ def _run_live_luna(task: dict[str, object], args: argparse.Namespace) -> dict:
         output_path=task_dir / "luna-result.json",
         schema_path=repository / "config" / "ai_workflow_result.schema.json",
         logs_dir=task_dir / "logs",
+        state_root=args.root,
+        runtime_evidence_required=True,
     )
     prompt = build_role_prompt("luna", task, contract, _authoritative_evidence_paths(task))
     return run_codex("luna", task, prompt, paths)

@@ -1,0 +1,11 @@
+{
+  "thread_id": "019fc73c-4d40-7c20-a82a-c5a9ae078bcf",
+  "agent_type": "luna_worker",
+  "model": "gpt-5.6-luna",
+  "reasoning_effort": "max",
+  "sandbox_policy": "read-only",
+  "permission_profile": "read-only",
+  "prompt": "PROMPT_SECRET",
+  "environment": "ENV_SECRET",
+  "token": "TOKEN_SECRET"
+}

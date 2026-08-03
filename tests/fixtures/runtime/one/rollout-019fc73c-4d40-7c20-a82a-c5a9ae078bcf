@@ -1,0 +1,14 @@
+{
+  "thread_id": "019fc73c-4d40-7c20-a82a-c5a9ae078bcf",
+  "agent_type": "luna_worker",
+  "runtime": {
+    "model": "gpt-5.6-luna",
+    "reasoning_effort": "max",
+    "sandbox_policy": "read-only",
+    "permission_profile": "read-only",
+    "cwd": "/tmp/ai-workflow"
+  },
+  "prompt": "PROMPT_SECRET",
+  "environment": {"service_token": "ENV_SECRET"},
+  "usage": {"token": "TOKEN_SECRET"}
+}
