@@ -44,8 +44,18 @@
       "type": "array",
       "items": {
         "type": "string",
-        "minLength": 1
+        "minLength": 1,
+        "enum": [
+          "PROMPT_SUFFICIENT",
+          "PLAN_IS_DELIVERABLE",
+          "SOURCE_INSPECTION_REQUIRED",
+          "STATE_CHANGE_REQUIRED",
+          "DEPENDENT_STEPS_REQUIRED",
+          "INDEPENDENT_WORKSTREAMS_PRESENT",
+          "MATERIAL_CONSEQUENCE_PRESENT"
+        ]
       },
+      "minItems": 1,
       "uniqueItems": true
     }
   },

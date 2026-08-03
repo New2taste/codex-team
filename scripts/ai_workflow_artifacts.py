@@ -11,11 +11,9 @@ import dataclasses
 import hashlib
 import json
 import math
-import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 
 class ArtifactError(RuntimeError):
@@ -50,6 +48,17 @@ ROUTE_WORK_CLASSES = frozenset(
     {"SIMPLE", "PLANNING_ONLY", "BOUNDED", "MULTI_STAGE", "HIGH_CONSEQUENCE"}
 )
 ROUTE_EXECUTION_NEEDS = frozenset({"NONE", "READ_ONLY", "WRITE"})
+REASON_CODES = frozenset(
+    {
+        "PROMPT_SUFFICIENT",
+        "PLAN_IS_DELIVERABLE",
+        "SOURCE_INSPECTION_REQUIRED",
+        "STATE_CHANGE_REQUIRED",
+        "DEPENDENT_STEPS_REQUIRED",
+        "INDEPENDENT_WORKSTREAMS_PRESENT",
+        "MATERIAL_CONSEQUENCE_PRESENT",
+    }
+)
 RISK_FLAGS = frozenset(
     {
         "CONSTITUTION",
@@ -74,7 +83,6 @@ ROLES = frozenset(
 )
 RUNTIME_EVIDENCE_SOURCES = frozenset({"NATIVE_METADATA", "LOCAL_ROLLOUT"})
 RUNTIME_STATUSES = frozenset({"VERIFIED", "FAILED"})
-_IDENTIFIER = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
 
 ROUTE_REQUEST_FIELDS = frozenset(
@@ -141,6 +149,7 @@ COST_EVIDENCE_FIELDS = frozenset(
         "schema_version",
         "route",
         "role",
+        "execution_surface",
         "duration_seconds",
         "prompt_bytes",
         "input_tokens",
@@ -260,11 +269,6 @@ class RouteDecision:
     decided_at_utc: str = ""
     routing_mode: str = ""
     evidence_class: str = ""
-    # Runtime-only compatibility attributes populated by the routing layer.
-    # They are intentionally not emitted by the Task 1 wire contract.
-    roles: tuple[str, ...] = ()
-    shadow_route: str | None = None
-    effective_roles: tuple[str, ...] = ()
 
     @property
     def mode(self) -> str:
@@ -284,8 +288,6 @@ class RouteDecision:
         }
 
     def __getitem__(self, key: str) -> object:
-        if key in {"roles", "shadow_route", "effective_roles"}:
-            return getattr(self, key)
         return self.to_dict()[key]
 
 
@@ -358,6 +360,7 @@ class CostEvidence:
     schema_version: str = "cost-evidence-1"
     route: str = ""
     role: str = ""
+    execution_surface: str = ""
     duration_seconds: int | float = 0
     prompt_bytes: int = 0
     input_tokens: int | float | None = None
@@ -375,6 +378,7 @@ class CostEvidence:
             "schema_version": self.schema_version,
             "route": self.route,
             "role": self.role,
+            "execution_surface": self.execution_surface,
             "duration_seconds": self.duration_seconds,
             "prompt_bytes": self.prompt_bytes,
             "input_tokens": self.input_tokens,
@@ -432,8 +436,8 @@ def validate_route_request(value: object, task: Mapping[str, object]) -> None:
         _raise("INVALID_ENUM", "task.risk_flags contains an unsupported value")
     if request_flags != task_flags:
         _raise("ROUTE_CONFLICT", "route request risk_flags do not match task")
-    reasons = _string_array(request["reason_codes"], "reason_codes")
-    if any(not _IDENTIFIER.fullmatch(reason) for reason in reasons):
+    reasons = _string_array(request["reason_codes"], "reason_codes", allow_empty=False)
+    if any(reason not in REASON_CODES for reason in reasons):
         _raise("INVALID_ENUM", "reason_codes contains an unsupported value")
 
 
@@ -516,6 +520,7 @@ def validate_cost_evidence(value: object) -> None:
     evidence = _check_fields(value, COST_EVIDENCE_FIELDS, "cost-evidence-1")
     _enum(evidence["route"], "route", ROUTES)
     _enum(evidence["role"], "role", ROLES - {"host"})
+    _enum(evidence["execution_surface"], "execution_surface", EXECUTION_SURFACES)
     _finite_number(evidence["duration_seconds"], "duration_seconds")
     _finite_number(evidence["prompt_bytes"], "prompt_bytes", integer=True)
     for field in ("input_tokens", "cached_input_tokens", "output_tokens"):
@@ -528,5 +533,11 @@ def validate_cost_evidence(value: object) -> None:
         if evidence[field] is not None:
             _string(evidence[field], field)
     evidence_class = _enum(evidence["evidence_class"], "evidence_class", EVIDENCE_CLASSES)
+    token_values = tuple(
+        evidence[field]
+        for field in ("input_tokens", "cached_input_tokens", "output_tokens")
+    )
+    if evidence_class == "measured" and any(value is None for value in token_values):
+        _raise("COST_EVIDENCE_INVALID", "measured evidence requires all token fields")
     if evidence_class == "sample_validated_projection" and evidence["rate_snapshot_id"] is None:
         _raise("COST_EVIDENCE_INVALID", "projection evidence requires rate_snapshot_id")

@@ -62,6 +62,41 @@
       "uniqueItems": true
     }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "execution_surface": {
+            "const": "NATIVE_SUBAGENT"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "observed_agent_type": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "execution_surface": {
+            "const": "CODEX_EXEC_ROLE_CONTRACT"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "observed_agent_type": {
+            "type": "null"
+          }
+        }
+      }
+    }
+  ],
   "required": [
     "schema_version",
     "attempt_id",

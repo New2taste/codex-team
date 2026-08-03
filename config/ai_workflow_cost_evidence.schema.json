@@ -14,6 +14,10 @@
       "type": "string",
       "enum": ["luna", "terra", "sol_planner", "sol_reviewer", "sol_xhigh"]
     },
+    "execution_surface": {
+      "type": "string",
+      "enum": ["NATIVE_SUBAGENT", "CODEX_EXEC_ROLE_CONTRACT"]
+    },
     "duration_seconds": {
       "type": "number",
       "minimum": 0
@@ -63,6 +67,7 @@
     "schema_version",
     "route",
     "role",
+    "execution_surface",
     "duration_seconds",
     "prompt_bytes",
     "input_tokens",
