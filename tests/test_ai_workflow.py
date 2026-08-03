@@ -288,7 +288,12 @@ class MetricsReportTest(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(output.getvalue(), f"REPORT_WRITTEN {output_path}\n")
         self.assertEqual(len(list(output_path.parent.glob("*.md"))), 1)
-        self.assertIn("# AI Workflow Experiment Report", output_path.read_text(encoding="utf-8"))
+        report = output_path.read_text(encoding="utf-8")
+        self.assertIn("# AI Workflow Experiment Report", report)
+        self.assertIn(
+            "This calibration report proves only that the Luna read-only path can run",
+            report,
+        )
 
 
 class FakeRunnerTest(unittest.TestCase):

@@ -1120,6 +1120,8 @@ def render_report(metrics: Mapping[str, object]) -> str:
     lines = [
         "# AI Workflow Experiment Report",
         "",
+        "> This calibration report proves only that the Luna read-only path can run; it does not demonstrate cost reduction or efficiency gains.",
+        "",
         "## Cohorts",
         "",
         f"- Calibration tasks: {metrics.get('calibration_task_count', 0)}",
