@@ -1,0 +1,117 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": "ai-task-1"
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "task_type": {
+      "type": "string",
+      "enum": ["PLAN", "ACCEPTANCE", "REMEDIATION"]
+    },
+    "objective": {
+      "type": "string",
+      "minLength": 1
+    },
+    "repository_root": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_worktree": {
+      "type": ["string", "null"]
+    },
+    "base_commit": {
+      "type": ["string", "null"]
+    },
+    "candidate_commit": {
+      "type": ["string", "null"]
+    },
+    "authoritative_files": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "allowed_write_paths": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "uniqueItems": true
+    },
+    "forbidden_actions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "uniqueItems": true
+    },
+    "risk_flags": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "CONSTITUTION",
+          "PIT",
+          "SURVIVORSHIP_BIAS",
+          "PUBLIC_SCHEMA",
+          "APPEND_ONLY",
+          "SECURITY",
+          "DATA_CONTAMINATION",
+          "PUBLIC_API",
+          "CROSS_CARD_CONTRACT"
+        ]
+      },
+      "uniqueItems": true
+    },
+    "acceptance_commands": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "uniqueItems": true
+    },
+    "verification_level": {
+      "type": "string",
+      "enum": ["L0", "L1", "L2"]
+    },
+    "human_gates": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "PLAN_APPROVAL",
+          "EXECUTION_APPROVAL",
+          "FINAL_ACCEPTANCE",
+          "XHIGH_APPROVAL",
+          "MERGE",
+          "PUSH"
+        ]
+      },
+      "uniqueItems": true
+    }
+  },
+  "required": [
+    "schema_version",
+    "task_id",
+    "task_type",
+    "objective",
+    "repository_root",
+    "source_worktree",
+    "base_commit",
+    "candidate_commit",
+    "authoritative_files",
+    "allowed_write_paths",
+    "forbidden_actions",
+    "risk_flags",
+    "acceptance_commands",
+    "verification_level",
+    "human_gates"
+  ]
+}

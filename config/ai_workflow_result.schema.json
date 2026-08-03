@@ -1,0 +1,155 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": "ai-result-1"
+    },
+    "role": {
+      "type": "string",
+      "enum": ["luna", "terra", "sol_planner", "sol_reviewer", "sol_xhigh"]
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "SUPPORTED",
+        "PARTIALLY_SUPPORTED",
+        "NOT_SUPPORTED",
+        "BLOCKED",
+        "IMPLEMENTED_CANDIDATE",
+        "NEEDS_CLARIFICATION",
+        "PLAN_READY",
+        "NEEDS_OWNER_DECISION",
+        "INSUFFICIENT_EVIDENCE",
+        "ACCEPTANCE_RECOMMENDED",
+        "ACCEPTANCE_WITH_NOTES_RECOMMENDED",
+        "REWORK_RECOMMENDED",
+        "REJECT_RECOMMENDED",
+        "ESCALATION_PROPOSED",
+        "OPTION_A",
+        "OPTION_B",
+        "OPTION_C"
+      ]
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "claims": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "kind": {
+            "type": "string",
+            "enum": ["FACT", "INFERENCE", "RECOMMENDATION"]
+          },
+          "text": {
+            "type": "string",
+            "minLength": 1
+          },
+          "evidence_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "uniqueItems": true
+          }
+        },
+        "required": ["id", "kind", "text", "evidence_ids"]
+      }
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "type": {
+            "type": "string",
+            "enum": ["FILE", "COMMAND", "HASH", "TEST"]
+          },
+          "locator": {
+            "type": "string",
+            "minLength": 1
+          },
+          "observation": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": ["id", "type", "locator", "observation"]
+      }
+    },
+    "counter_checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "target_claim_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "method": {
+            "type": "string",
+            "minLength": 1
+          },
+          "result": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": ["target_claim_id", "method", "result"]
+      }
+    },
+    "changed_files": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "uniqueItems": true
+    },
+    "blind_spots": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "uniqueItems": true
+    },
+    "unresolved_questions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "uniqueItems": true
+    },
+    "recommended_next_state": {
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "required": [
+    "schema_version",
+    "role",
+    "status",
+    "summary",
+    "claims",
+    "evidence",
+    "counter_checks",
+    "changed_files",
+    "blind_spots",
+    "unresolved_questions",
+    "recommended_next_state"
+  ]
+}
