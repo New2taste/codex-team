@@ -171,14 +171,19 @@ try:
     from .ai_workflow_runtime import (
         CODEX_EXEC_ROLE_CONTRACT,
         NATIVE_SUBAGENT,
+        RuntimeArtifactSnapshot,
         RuntimeObservation,
+        RuntimeRepositorySnapshot,
         codex_exec_contract,
         codex_exec_observation,
         extract_codex_thread_id,
         extract_codex_usage,
+        inspect_agent_runtime,
         merge_runtime_observations,
         parse_codex_jsonl,
         permission_is_within_contract,
+        runtime_artifact_snapshot,
+        runtime_repository_snapshot,
         verify_runtime_identity,
         write_runtime_evidence,
     )
@@ -186,14 +191,19 @@ except ImportError:  # direct script execution
     from ai_workflow_runtime import (
         CODEX_EXEC_ROLE_CONTRACT,
         NATIVE_SUBAGENT,
+        RuntimeArtifactSnapshot,
         RuntimeObservation,
+        RuntimeRepositorySnapshot,
         codex_exec_contract,
         codex_exec_observation,
         extract_codex_thread_id,
         extract_codex_usage,
+        inspect_agent_runtime,
         merge_runtime_observations,
         parse_codex_jsonl,
         permission_is_within_contract,
+        runtime_artifact_snapshot,
+        runtime_repository_snapshot,
         verify_runtime_identity,
         write_runtime_evidence,
     )
@@ -478,6 +488,7 @@ class RunPaths:
     logs_dir: Path
     state_root: Path | None = None
     runtime_evidence_required: bool = False
+    runtime_sessions_dir: Path | None = None
 
 
 def _validate_result_records(
@@ -639,6 +650,25 @@ def run_codex(role: str, task: dict, prompt: str, paths: RunPaths) -> dict:
         assert_acceptance_candidate(task, repo)
     if role == "terra":
         _reject_dirty_input(repo, "DIRTY_TERRA_WORKTREE", "Terra requires a clean source_worktree")
+    runtime_store: WorkflowStore | None = None
+    runtime_task_dir: Path | None = None
+    runtime_before_artifacts: RuntimeArtifactSnapshot | None = None
+    if paths.runtime_evidence_required:
+        if paths.state_root is None:
+            _fail("RUNTIME_EVIDENCE_MISSING", "live execution requires a workflow state root")
+        runtime_store = WorkflowStore(paths.state_root)
+        runtime_task_dir = runtime_store._require_task(task["task_id"])
+        # A new attempt must never leave an old canonical answer consumable if
+        # this attempt later has missing, stale, or conflicting runtime facts.
+        try:
+            Path(paths.output_path).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise WorkflowError("RUNTIME_EVIDENCE_INVALID", "cannot invalidate prior canonical output") from exc
+        runtime_before_artifacts = runtime_artifact_snapshot(
+            {"task.json": runtime_task_dir / "task.json"}
+        )
     before_run = capture_repo(repo)
     before_changes = working_tree_paths(repo)
     attempt_id = f"{role}-{time.time_ns()}-{uuid.uuid4().hex}"
@@ -698,8 +728,10 @@ def run_codex(role: str, task: dict, prompt: str, paths: RunPaths) -> dict:
     if result is None:
         _fail("INVALID_ROLE_RESULT", "role did not return a result")
     if paths.runtime_evidence_required:
-        if paths.state_root is None:
-            _fail("RUNTIME_EVIDENCE_MISSING", "live execution requires a workflow state root")
+        if runtime_store is None or runtime_task_dir is None or runtime_before_artifacts is None:
+            _fail("RUNTIME_EVIDENCE_MISSING", "runtime state was not initialized")
+        if paths.runtime_sessions_dir is None:
+            _fail("RUNTIME_EVIDENCE_MISSING", "an absolute runtime sessions directory is required")
         events = parse_codex_jsonl(completed.stdout)
         thread_id = extract_codex_thread_id(events)
         role_config = _load_role_config(role)
@@ -716,17 +748,32 @@ def run_codex(role: str, task: dict, prompt: str, paths: RunPaths) -> dict:
             sandbox_policy=sandbox,
             cwd=str(repo),
         )
-        observed_runtime = codex_exec_observation(
-            expected_runtime,
-            before_repository_snapshot=before_run,
-            after_repository_snapshot=after_run,
-            prompt_forbids_writes=(
+        controller_observation = codex_exec_observation(
+            before_repository_snapshot=runtime_repository_snapshot(before_run),
+            after_repository_snapshot=runtime_repository_snapshot(after_run),
+            before_artifact_snapshot=runtime_before_artifacts,
+            after_artifact_snapshot=runtime_artifact_snapshot(
+                {"task.json": runtime_task_dir / "task.json"}
+            ),
+            controller_prompt_forbids_writes=(
                 "Do not write, modify, delete, stage, commit, merge, or push repository files."
                 in prompt
             ),
         )
+        rollout_observation = inspect_agent_runtime(
+            Path(paths.runtime_sessions_dir),
+            thread_id,
+            CODEX_EXEC_ROLE_CONTRACT,
+            Path(__file__).resolve().parents[1]
+            / "plugins"
+            / "ai-workflow"
+            / "scripts"
+            / "inspect-agent-runtime.sh",
+        )
+        observed_runtime = merge_runtime_observations(
+            controller_observation, rollout_observation
+        )
         runtime_evidence = verify_runtime_identity(expected_runtime, observed_runtime)
-        runtime_store = WorkflowStore(paths.state_root)
         write_runtime_evidence(runtime_store, task["task_id"], runtime_evidence)
         runtime_store.append_event(
             task["task_id"],
@@ -736,6 +783,9 @@ def run_codex(role: str, task: dict, prompt: str, paths: RunPaths) -> dict:
                 "thread_id": thread_id,
                 "execution_surface": CODEX_EXEC_ROLE_CONTRACT,
                 "usage": extract_codex_usage(events),
+                "result_sha256": hashlib.sha256(
+                    _canonical_json(result).encode("utf-8")
+                ).hexdigest(),
             },
         )
     validate_role_result(role, result, actual_changes)
@@ -2178,6 +2228,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--runner", choices=("fake", "live"), default=None)
     run.add_argument("--allow-live-model", action="store_true")
     run.add_argument("--role", default="luna", choices=tuple(FAKE_ROLE_RESULTS))
+    run.add_argument("--runtime-sessions-dir", type=Path)
     run.add_argument("--root", type=Path, default=Path("data/state/ai-workflow"))
 
     status = sub.add_parser("status")
@@ -2256,6 +2307,7 @@ def _run_live_luna(task: dict[str, object], args: argparse.Namespace) -> dict:
         logs_dir=task_dir / "logs",
         state_root=args.root,
         runtime_evidence_required=True,
+        runtime_sessions_dir=args.runtime_sessions_dir,
     )
     prompt = build_role_prompt("luna", task, contract, _authoritative_evidence_paths(task))
     return run_codex("luna", task, prompt, paths)

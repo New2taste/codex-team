@@ -88,6 +88,23 @@ def blocked_luna_result():
     }
 
 
+def write_exec_rollout(sessions: Path, *, model="gpt-5.6-luna", agent_type=None):
+    sessions.mkdir(parents=True, exist_ok=True)
+    rollout = {
+        "thread_id": THREAD_ID,
+        "agent_type": agent_type,
+        "model": model,
+        "reasoning_effort": "max",
+        "sandbox_policy": "read-only",
+        "permission_profile": "read-only",
+        "cwd": str(ROOT),
+        "prompt": "PROMPT_SECRET",
+        "environment": "ENV_SECRET",
+        "token": "TOKEN_SECRET",
+    }
+    (sessions / f"rollout-{THREAD_ID}").write_text(json.dumps(rollout), encoding="utf-8")
+
+
 class RuntimeIdentityTest(unittest.TestCase):
     def test_every_native_identity_field_is_required(self):
         # Removing any one identity fact must stop native-agent verification.
@@ -156,15 +173,19 @@ class RuntimeIdentityTest(unittest.TestCase):
             )
 
     def test_broadened_reviewer_needs_opt_in_prompt_guard_and_unchanged_snapshots(self):
-        expected = runtime_expected(hard_read_only=False)
+        expected = runtime_expected(requested_role="sol_reviewer", hard_read_only=False)
         guarded = runtime_observation(
             sandbox_policy="workspace-write",
             permission_profile="workspace-write",
-            prompt_forbids_writes=True,
-            before_repository_snapshot={"head": "a", "status": []},
-            after_repository_snapshot={"head": "a", "status": []},
-            before_artifact_snapshot={"task": "a"},
-            after_artifact_snapshot={"task": "a"},
+            controller_prompt_forbids_writes=True,
+            before_repository_snapshot=workflow.RuntimeRepositorySnapshot("a", ()),
+            after_repository_snapshot=workflow.RuntimeRepositorySnapshot("a", ()),
+            before_artifact_snapshot=workflow.RuntimeArtifactSnapshot(
+                (("task.json", "a" * 64),)
+            ),
+            after_artifact_snapshot=workflow.RuntimeArtifactSnapshot(
+                (("task.json", "a" * 64),)
+            ),
         )
         self.assertEqual(
             "VERIFIED", workflow.verify_runtime_identity(expected, guarded).verification_status
@@ -179,6 +200,61 @@ class RuntimeIdentityTest(unittest.TestCase):
                 runtime_observation(model="gpt-5.6-luna"),
                 runtime_observation(model="gpt-5.6-sol"),
             )
+
+    def test_conflicting_canonical_and_observed_aliases_fail_closed(self):
+        observed = runtime_observation(observed_model="gpt-5.6-sol")
+        with self.assertRaisesRegex(workflow.WorkflowError, "RUNTIME_IDENTITY_CONFLICT"):
+            workflow.verify_runtime_identity(runtime_expected(), observed)
+
+    def test_exec_rejects_a_nonnull_observed_agent_type_alias(self):
+        observed = runtime_observation(
+            surface="CODEX_EXEC_ROLE_CONTRACT",
+            observed_agent_type="luna_worker",
+        )
+        with self.assertRaisesRegex(workflow.WorkflowError, "RUNTIME_IDENTITY_CONFLICT"):
+            workflow.verify_runtime_identity(
+                runtime_expected(surface="CODEX_EXEC_ROLE_CONTRACT"), observed
+            )
+
+    def test_native_metadata_and_rollout_can_complete_one_consistent_identity(self):
+        native = {
+            "execution_surface": "NATIVE_SUBAGENT",
+            "agent_type": "luna_worker",
+            "model": "gpt-5.6-luna",
+            "sandbox_policy": "read-only",
+            "permission_profile": "read-only",
+            "cwd": str(ROOT),
+            "evidence_source": "NATIVE_METADATA",
+        }
+        rollout = {
+            "execution_surface": "NATIVE_SUBAGENT",
+            "model": "gpt-5.6-luna",
+            "reasoning_effort": "max",
+            "evidence_source": "LOCAL_ROLLOUT",
+        }
+        merged = workflow.merge_runtime_observations(native, rollout)
+        evidence = workflow.verify_runtime_identity(runtime_expected(), merged)
+        self.assertEqual("LOCAL_ROLLOUT", evidence.evidence_source)
+        self.assertEqual(
+            ("LOCAL_ROLLOUT", "NATIVE_METADATA"), merged.evidence_sources
+        )
+
+    def test_broadened_exception_is_limited_to_read_only_reviewer_with_real_snapshots(self):
+        expected = runtime_expected(
+            requested_role="terra",
+            hard_read_only=False,
+        )
+        observed = runtime_observation(
+            sandbox_policy="workspace-write",
+            permission_profile="workspace-write",
+            prompt_forbids_writes=True,
+            before_repository_snapshot={},
+            after_repository_snapshot={},
+            before_artifact_snapshot={},
+            after_artifact_snapshot={},
+        )
+        with self.assertRaisesRegex(workflow.WorkflowError, "RUNTIME_PERMISSION_MISMATCH"):
+            workflow.verify_runtime_identity(expected, observed)
 
 
 class RuntimeUsageTest(unittest.TestCase):
@@ -222,6 +298,19 @@ class RuntimeUsageTest(unittest.TestCase):
             records = [json.loads(line) for line in path.read_text().splitlines()]
             self.assertEqual([evidence.to_dict()], records)
             with self.assertRaisesRegex(workflow.WorkflowError, "RUNTIME_EVIDENCE_STALE"):
+                workflow.write_runtime_evidence(store, task["task_id"], evidence)
+
+    def test_write_runtime_evidence_rejects_a_native_source_for_exec(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = workflow.WorkflowStore(Path(temporary) / "state")
+            task = valid_task()
+            store.create_task(task)
+            evidence = workflow.verify_runtime_identity(
+                runtime_expected(surface="CODEX_EXEC_ROLE_CONTRACT"),
+                runtime_observation(surface="CODEX_EXEC_ROLE_CONTRACT"),
+            ).to_dict()
+            evidence["evidence_source"] = "NATIVE_METADATA"
+            with self.assertRaisesRegex(workflow.WorkflowError, "RUNTIME_IDENTITY_CONFLICT"):
                 workflow.write_runtime_evidence(store, task["task_id"], evidence)
 
 
@@ -282,14 +371,105 @@ class RuntimeInspectorTest(unittest.TestCase):
         self.assertNotEqual(0, relative.returncode)
         self.assertNotEqual(0, invalid.returncode)
 
+    def test_inspector_allows_null_agent_type_for_an_exec_role_contract(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            sessions = Path(temporary) / "sessions"
+            write_exec_rollout(sessions)
+            completed = self.run_inspector(sessions)
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertIsNone(json.loads(completed.stdout)["agent_type"])
+
+    def test_inspector_rejects_a_same_suffix_symlink_without_leaking_its_content(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            sessions = Path(temporary) / "sessions"
+            sessions.mkdir()
+            target = Path(temporary) / "PROMPT_SECRET_ENV_SECRET_TOKEN_SECRET.json"
+            target.write_text('{"prompt":"PROMPT_SECRET"}', encoding="utf-8")
+            (sessions / f"rollout-{THREAD_ID}").symlink_to(target)
+            completed = self.run_inspector(sessions)
+        self.assertNotEqual(0, completed.returncode)
+        self.assertNotIn("PROMPT_SECRET", completed.stdout + completed.stderr)
+
 
 class RuntimeLiveIntegrationTest(unittest.TestCase):
+    def _run_paths(self, temporary: str, state_root: Path, sessions: Path):
+        return workflow.RunPaths(
+            repo=ROOT,
+            output_path=Path(temporary) / "luna-result.json",
+            schema_path=ROOT / "config" / "ai_workflow_result.schema.json",
+            logs_dir=Path(temporary) / "logs",
+            state_root=state_root,
+            runtime_evidence_required=True,
+            runtime_sessions_dir=sessions,
+        )
+
+    @staticmethod
+    def _write_codex_result(command, *args, **kwargs):
+        attempt_output = Path(command[command.index("-o") + 1])
+        attempt_output.write_text(json.dumps(blocked_luna_result()), encoding="utf-8")
+        events = "\n".join(
+            (
+                json.dumps({"type": "thread.started", "thread_id": THREAD_ID}),
+                json.dumps({"type": "turn.completed"}),
+            )
+        )
+        return subprocess.CompletedProcess(command, 0, stdout=events + "\n", stderr="")
+
+    def test_live_rejects_independent_rollout_identity_conflict_before_promotion(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state_root = Path(temporary) / "state"
+            store = workflow.WorkflowStore(state_root)
+            task = valid_task()
+            store.create_task(task)
+            sessions = Path(temporary) / "sessions"
+            write_exec_rollout(sessions, model="gpt-5.6-sol")
+            paths = self._run_paths(temporary, state_root, sessions)
+            with (
+                mock.patch(
+                    "scripts.ai_workflow.capture_repo",
+                    return_value=workflow.RepoSnapshot("pinned", ()),
+                ),
+                mock.patch("scripts.ai_workflow.working_tree_paths", return_value=set()),
+                mock.patch(
+                    "scripts.ai_workflow.subprocess.run",
+                    side_effect=self._write_codex_result,
+                ),
+                self.assertRaisesRegex(workflow.WorkflowError, "RUNTIME_IDENTITY_CONFLICT"),
+            ):
+                workflow.run_codex("luna", task, "Read only.", paths)
+            self.assertFalse(paths.output_path.exists())
+
+    def test_live_invalidates_a_prior_canonical_result_when_runtime_evidence_is_missing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state_root = Path(temporary) / "state"
+            store = workflow.WorkflowStore(state_root)
+            task = valid_task()
+            store.create_task(task)
+            paths = self._run_paths(temporary, state_root, Path(temporary) / "no-sessions")
+            paths.output_path.write_text(json.dumps(blocked_luna_result()), encoding="utf-8")
+            with (
+                mock.patch(
+                    "scripts.ai_workflow.capture_repo",
+                    return_value=workflow.RepoSnapshot("pinned", ()),
+                ),
+                mock.patch("scripts.ai_workflow.working_tree_paths", return_value=set()),
+                mock.patch(
+                    "scripts.ai_workflow.subprocess.run",
+                    side_effect=self._write_codex_result,
+                ),
+                self.assertRaisesRegex(workflow.WorkflowError, "RUNTIME_EVIDENCE_MISSING"),
+            ):
+                workflow.run_codex("luna", task, "Read only.", paths)
+            self.assertFalse(paths.output_path.exists())
+
     def test_live_execution_requires_fresh_thread_evidence_before_canonical_output(self):
         with tempfile.TemporaryDirectory() as temporary:
             state_root = Path(temporary) / "state"
             store = workflow.WorkflowStore(state_root)
             task = valid_task()
             store.create_task(task)
+            sessions = Path(temporary) / "sessions"
+            write_exec_rollout(sessions)
             output_path = Path(temporary) / "luna-result.json"
             paths = workflow.RunPaths(
                 repo=ROOT,
@@ -298,6 +478,7 @@ class RuntimeLiveIntegrationTest(unittest.TestCase):
                 logs_dir=Path(temporary) / "logs",
                 state_root=state_root,
                 runtime_evidence_required=True,
+                runtime_sessions_dir=sessions,
             )
 
             def write_result(command, *args, **kwargs):

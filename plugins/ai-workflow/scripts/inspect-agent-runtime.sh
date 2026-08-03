@@ -25,10 +25,14 @@ command -v jq >/dev/null 2>&1 || fail
 
 # A newline in a candidate name makes this conservatively reject rather than
 # risk treating an attacker-controlled path as a single match.
-matches=$(find "$sessions_dir" -type f -name "*$thread_id" -print 2>/dev/null) || fail
+# Enumerate every matching directory entry before deciding whether it is a
+# regular file.  ``find -type f`` alone would silently ignore a same-suffix
+# symlink and could therefore turn an ambiguous rollout set into one match.
+matches=$(find "$sessions_dir" -name "*$thread_id" -print 2>/dev/null) || fail
 [ -n "$matches" ] || fail
 match_count=$(printf '%s\n' "$matches" | awk 'END { print NR }')
 [ "$match_count" -eq 1 ] || fail
+[ ! -L "$matches" ] || fail
 [ -f "$matches" ] || fail
 
 umask 077
@@ -51,11 +55,19 @@ jq -ce --arg requested_thread "$thread_id" '
         else ($values | unique)
              | if length == 1 then .[0] else error("invalid runtime rollout") end
         end;
+    def nullable_agent_type:
+      [.. | objects | select(has("agent_type")) | .agent_type] as $values
+      | if ($values | length) == 0
+           or any($values[]; (type != "string" and type != "null") or (type == "string" and length == 0))
+        then error("invalid runtime rollout")
+        else ($values | unique)
+             | if length == 1 then .[0] else error("invalid runtime rollout") end
+        end;
     field("thread_id") as $thread_id
     | if $thread_id != $requested_thread then error("invalid runtime rollout") else . end
     | {
         thread_id: $thread_id,
-        agent_type: field("agent_type"),
+        agent_type: nullable_agent_type,
         model: field("model"),
         reasoning_effort: field("reasoning_effort"),
         sandbox_policy: field("sandbox_policy"),
@@ -69,7 +81,8 @@ jq -ce --arg requested_thread "$thread_id" '
 jq -e '
     type == "object"
     and (keys | sort == ["agent_type", "cwd", "model", "permission_profile", "reasoning_effort", "sandbox_policy", "thread_id"])
-    and all(.[]; type == "string" and length > 0)
+    and (.agent_type == null or (.agent_type | type == "string" and length > 0))
+    and all(del(.agent_type)[]; type == "string" and length > 0)
 ' "$temporary" >/dev/null 2>&1 || fail
 
 cat "$temporary"
