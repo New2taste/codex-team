@@ -99,6 +99,72 @@ def _fail(code: str, message: str) -> None:
     raise WorkflowError(code, message)
 
 
+@dataclass(frozen=True)
+class RepoSnapshot:
+    """The repository state that a bounded workflow operation is pinned to."""
+
+    head: str
+    status: tuple[str, ...]
+
+
+def git(repo: Path, *args: str) -> str:
+    """Run one fixed-form Git command in ``repo`` without a shell."""
+
+    completed = subprocess.run(
+        ["git", "-C", str(Path(repo)), *args],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        shell=False,
+    )
+    if completed.returncode != 0:
+        raise WorkflowError("GIT_COMMAND_FAILED", completed.stderr.strip())
+    return completed.stdout.strip()
+
+
+def capture_repo(repo: Path) -> RepoSnapshot:
+    """Capture the current commit and porcelain status of ``repo``."""
+
+    return RepoSnapshot(
+        head=git(repo, "rev-parse", "HEAD"),
+        status=tuple(git(repo, "status", "--porcelain=v1", "--untracked-files=all").splitlines()),
+    )
+
+
+def assert_pinned(snapshot: RepoSnapshot, repo: Path) -> None:
+    """Reject an operation when the repository HEAD differs from its snapshot."""
+
+    if snapshot.head != capture_repo(repo).head:
+        _fail("HEAD_DRIFT", "repository HEAD changed after the snapshot was captured")
+
+
+def changed_paths(repo: Path, base: str, candidate: str) -> set[str]:
+    """Return the repository-relative paths changed between two revisions."""
+
+    output = git(repo, "diff", "--name-only", "-z", "--no-renames", base, candidate, "--")
+    return {path for path in output.split("\0") if path}
+
+
+def assert_allowed_changes(changed: set[str], allowed: Sequence[str]) -> None:
+    """Reject changed paths that do not fall under an approved file or prefix."""
+
+    if not isinstance(changed, set) or any(not isinstance(path, str) for path in changed):
+        _fail("INVALID_CHANGED_FILES", "changed paths must be a set of strings")
+    if isinstance(allowed, str) or any(not isinstance(path, str) for path in allowed):
+        _fail("INVALID_ALLOWED_PATHS", "allowed paths must be a sequence of strings")
+
+    def is_allowed(path: str) -> bool:
+        return any(
+            path == scope or (scope.endswith("/") and path.startswith(scope))
+            for scope in allowed
+        )
+
+    outside = sorted(path for path in changed if not is_allowed(path))
+    if outside:
+        _fail("OUT_OF_SCOPE_CHANGE", f"changed path is outside the allowed scope: {outside[0]}")
+
+
 def _load_role_config(role: str) -> dict[str, object]:
     """Return the pinned configuration for one named workflow role."""
 
@@ -310,34 +376,42 @@ def run_codex(role: str, task: dict, prompt: str, paths: RunPaths) -> dict:
     validate_task(task)
     if not isinstance(prompt, str):
         _fail("INVALID_PROMPT", "prompt must be a string")
-    command = build_codex_command(role, paths.repo, paths.output_path, paths.schema_path)
-    events_path = Path(paths.logs_dir) / f"{role}-events.jsonl"
+    before_run = capture_repo(paths.repo)
     try:
-        completed = subprocess.run(
-            command,
-            check=False,
-            capture_output=True,
-            input=prompt,
-            text=True,
-            timeout=CODEX_TIMEOUT_SECONDS,
-            env=sanitized_environment(os.environ),
-            cwd=str(paths.repo),
-            shell=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        _write_role_events(events_path, exc.stdout)
-        raise WorkflowError("CODEX_TIMEOUT", f"{role} exceeded {CODEX_TIMEOUT_SECONDS} seconds") from exc
-    _write_role_events(events_path, completed.stdout)
-    if completed.returncode != 0:
-        raise WorkflowError("CODEX_EXIT_NONZERO", f"{role} exited with code {completed.returncode}")
-    try:
-        result = json.loads(Path(paths.output_path).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise WorkflowError("INVALID_ROLE_RESULT", f"{role} did not produce valid JSON") from exc
-    if not isinstance(result, dict):
-        _fail("INVALID_ROLE_RESULT", "role output must be an object")
-    validate_role_result(role, result, set(result.get("changed_files", [])))
-    return result
+        command = build_codex_command(role, paths.repo, paths.output_path, paths.schema_path)
+        events_path = Path(paths.logs_dir) / f"{role}-events.jsonl"
+        try:
+            completed = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                input=prompt,
+                text=True,
+                timeout=CODEX_TIMEOUT_SECONDS,
+                env=sanitized_environment(os.environ),
+                cwd=str(paths.repo),
+                shell=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            _write_role_events(events_path, exc.stdout)
+            raise WorkflowError("CODEX_TIMEOUT", f"{role} exceeded {CODEX_TIMEOUT_SECONDS} seconds") from exc
+        _write_role_events(events_path, completed.stdout)
+        if completed.returncode != 0:
+            raise WorkflowError("CODEX_EXIT_NONZERO", f"{role} exited with code {completed.returncode}")
+        try:
+            result = json.loads(Path(paths.output_path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise WorkflowError("INVALID_ROLE_RESULT", f"{role} did not produce valid JSON") from exc
+        if not isinstance(result, dict):
+            _fail("INVALID_ROLE_RESULT", "role output must be an object")
+        validate_role_result(role, result, set(result.get("changed_files", [])))
+        return result
+    finally:
+        after_run = capture_repo(paths.repo)
+        if role in READ_ONLY_ROLES and before_run != after_run:
+            _fail("READ_ONLY_ROLE_MODIFIED_REPO", f"read-only role {role} changed the repository")
+        if before_run.head != after_run.head:
+            _fail("HEAD_DRIFT", "repository HEAD changed during the role run")
 
 
 def _require_nonempty_string(task: Mapping[str, object], field: str) -> None:
@@ -420,6 +494,50 @@ def validate_task(task: Mapping[str, object]) -> None:
             _fail("COMMIT_REQUIRED", "ACCEPTANCE requires base_commit and candidate_commit")
     if task_type == "REMEDIATION" and not task["allowed_write_paths"]:
         _fail("WRITE_PATH_REQUIRED", "REMEDIATION requires allowed_write_paths")
+
+
+def _has_execution_approval(repo: Path, task_id: str) -> bool:
+    decision_path = repo / "data/state/ai-workflow" / task_id / "human-decisions.jsonl"
+    try:
+        records = decision_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+    for line in records:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, dict) and record.get("decision") == "APPROVED_FOR_EXECUTION":
+            return True
+    return False
+
+
+def create_worktree(task: dict, owner_authorized: bool) -> Path:
+    """Create the one owner-approved, task-scoped worktree without deletion support."""
+
+    if not owner_authorized:
+        _fail("OWNER_AUTHORIZATION_REQUIRED", "owner authorization is required before creating a worktree")
+    validate_task(task)
+    task_id = task["task_id"]
+    repository_root = Path(task["repository_root"])
+    if not _has_execution_approval(repository_root, task_id):
+        _fail(
+            "APPROVED_FOR_EXECUTION_REQUIRED",
+            f"task {task_id} has no APPROVED_FOR_EXECUTION decision record",
+        )
+    normalized_task_id = task_id.lower()
+    worktree = repository_root / ".codex-worktrees" / normalized_task_id
+    worktree.parent.mkdir(parents=True, exist_ok=True)
+    git(
+        repository_root,
+        "worktree",
+        "add",
+        "-b",
+        f"aiwf/{normalized_task_id}",
+        str(worktree),
+        "HEAD",
+    )
+    return worktree
 
 
 def load_task(path: Path) -> dict[str, object]:

@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 import tempfile
 import tomllib
 import unittest
@@ -231,8 +232,12 @@ class CodexRunnerTest(unittest.TestCase):
         self.assertNotIn("registry/", prompt)
         self.assertNotIn("chat history", prompt)
 
+    @mock.patch(
+        "scripts.ai_workflow.capture_repo",
+        return_value=workflow.RepoSnapshot("pinned-head", ()),
+    )
     @mock.patch("scripts.ai_workflow.subprocess.run")
-    def test_run_codex_passes_sanitized_stdin_and_accepts_valid_output(self, run):
+    def test_run_codex_passes_sanitized_stdin_and_accepts_valid_output(self, run, _capture_repo):
         result = self.valid_result()
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -262,8 +267,12 @@ class CodexRunnerTest(unittest.TestCase):
         self.assertNotIn("OPENAI_API_KEY", kwargs["env"])
         self.assertNotIn("TUSHARE_TOKEN", kwargs["env"])
 
+    @mock.patch(
+        "scripts.ai_workflow.capture_repo",
+        return_value=workflow.RepoSnapshot("pinned-head", ()),
+    )
     @mock.patch("scripts.ai_workflow.subprocess.run")
-    def test_run_codex_rejects_timeout_exit_and_invalid_json(self, run):
+    def test_run_codex_rejects_timeout_exit_and_invalid_json(self, run, _capture_repo):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             paths = workflow.RunPaths(
@@ -286,8 +295,12 @@ class CodexRunnerTest(unittest.TestCase):
             with self.assertRaisesRegex(workflow.WorkflowError, "INVALID_ROLE_RESULT"):
                 workflow.run_codex("luna", self.valid_task(), "task contract", paths)
 
+    @mock.patch(
+        "scripts.ai_workflow.capture_repo",
+        return_value=workflow.RepoSnapshot("pinned-head", ()),
+    )
     @mock.patch("scripts.ai_workflow.subprocess.run")
-    def test_run_codex_redacts_secret_assignments_and_long_tokens_from_events(self, run):
+    def test_run_codex_redacts_secret_assignments_and_long_tokens_from_events(self, run, _capture_repo):
         result = self.valid_result()
         long_token = "Ab3d" * 32
         with tempfile.TemporaryDirectory() as temp:
@@ -314,6 +327,169 @@ class CodexRunnerTest(unittest.TestCase):
         self.assertNotIn("abc123", events)
         self.assertNotIn("sk-test-value", events)
         self.assertNotIn(long_token, events)
+
+
+class GitSafetyTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.repo = Path(self.temporary_directory.name) / "repository"
+        self.repo.mkdir()
+        self._git("init")
+        self._git("config", "user.email", "test@example.com")
+        self._git("config", "user.name", "Workflow Test")
+        (self.repo / "tracked.txt").write_text("first\n", encoding="utf-8")
+        self._git("add", "tracked.txt")
+        self._git("commit", "-m", "initial")
+
+    def tearDown(self):
+        self.temporary_directory.cleanup()
+
+    def _git(self, *args):
+        completed = subprocess.run(
+            ["git", "-C", str(self.repo), *args],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        return completed.stdout.strip()
+
+    def _task(self):
+        return {
+            "schema_version": "ai-task-1",
+            "task_id": "AWF-20260803-001",
+            "task_type": "REMEDIATION",
+            "objective": "Apply a bounded workflow change",
+            "repository_root": str(self.repo),
+            "source_worktree": None,
+            "base_commit": self._git("rev-parse", "HEAD"),
+            "candidate_commit": None,
+            "authoritative_files": ["tracked.txt"],
+            "allowed_write_paths": ["allowed/"],
+            "forbidden_actions": ["merge", "push"],
+            "risk_flags": [],
+            "acceptance_commands": [],
+            "verification_level": "L1",
+            "human_gates": ["EXECUTION_APPROVAL"],
+        }
+
+    @staticmethod
+    def _valid_role_result(role, status):
+        return {
+            "schema_version": "ai-result-1",
+            "role": role,
+            "status": status,
+            "summary": "The bounded run completed.",
+            "claims": [],
+            "evidence": [],
+            "counter_checks": [],
+            "changed_files": [],
+            "blind_spots": [],
+            "unresolved_questions": [],
+            "recommended_next_state": "EVIDENCE_READY",
+        }
+
+    def test_assert_pinned_rejects_a_repository_head_that_moved(self):
+        snapshot = workflow.capture_repo(self.repo)
+
+        (self.repo / "tracked.txt").write_text("second\n", encoding="utf-8")
+        self._git("add", "tracked.txt")
+        self._git("commit", "-m", "second")
+
+        with self.assertRaisesRegex(workflow.WorkflowError, "HEAD_DRIFT"):
+            workflow.assert_pinned(snapshot, self.repo)
+
+    def test_changed_paths_reports_the_files_between_two_commits(self):
+        base = self._git("rev-parse", "HEAD")
+        (self.repo / "allowed").mkdir()
+        (self.repo / "allowed/a.py").write_text("allowed\n", encoding="utf-8")
+        (self.repo / "forbidden").mkdir()
+        (self.repo / "forbidden/b.py").write_text("forbidden\n", encoding="utf-8")
+        self._git("add", "allowed/a.py", "forbidden/b.py")
+        self._git("commit", "-m", "changed paths")
+        candidate = self._git("rev-parse", "HEAD")
+
+        self.assertEqual(
+            workflow.changed_paths(self.repo, base, candidate),
+            {"allowed/a.py", "forbidden/b.py"},
+        )
+
+    def test_assert_allowed_changes_rejects_a_path_outside_the_allowed_prefix(self):
+        with self.assertRaisesRegex(workflow.WorkflowError, "OUT_OF_SCOPE_CHANGE"):
+            workflow.assert_allowed_changes(
+                {"allowed/a.py", "forbidden/b.py"},
+                ["allowed/"],
+            )
+
+    @mock.patch("scripts.ai_workflow.subprocess.run")
+    def test_git_uses_a_list_command_without_a_shell(self, run):
+        run.return_value = subprocess.CompletedProcess([], 0, stdout="pinned-head\n", stderr="")
+
+        self.assertEqual(workflow.git(self.repo, "rev-parse", "HEAD"), "pinned-head")
+
+        command, kwargs = run.call_args
+        self.assertEqual(command[0], ["git", "-C", str(self.repo), "rev-parse", "HEAD"])
+        self.assertFalse(kwargs["shell"])
+
+    def test_read_only_luna_and_sol_runs_reject_real_repository_mutations(self):
+        for role, status in (("luna", "SUPPORTED"), ("sol_reviewer", "ACCEPTANCE_RECOMMENDED")):
+            with self.subTest(role=role):
+                output_path = self.repo / f"{role}-result.json"
+                output_path.write_text(
+                    json.dumps(self._valid_role_result(role, status)), encoding="utf-8"
+                )
+                paths = workflow.RunPaths(
+                    repo=self.repo,
+                    output_path=output_path,
+                    schema_path=ROOT / "config/ai_workflow_result.schema.json",
+                    logs_dir=Path(self.temporary_directory.name) / "logs",
+                )
+                real_subprocess_run = subprocess.run
+
+                def run_with_real_git(command, *args, **kwargs):
+                    if command[0] == "git":
+                        return real_subprocess_run(command, *args, **kwargs)
+                    (self.repo / f"{role}-mutation.txt").write_text("changed\n", encoding="utf-8")
+                    return subprocess.CompletedProcess(command, 0, stdout="{\"event\": \"done\"}\n", stderr="")
+
+                with mock.patch("scripts.ai_workflow.subprocess.run", side_effect=run_with_real_git):
+                    with self.assertRaisesRegex(workflow.WorkflowError, "READ_ONLY_ROLE_MODIFIED_REPO"):
+                        workflow.run_codex(role, self._task(), "bounded task", paths)
+
+    def test_create_worktree_rejects_an_unauthorized_owner_before_running_git(self):
+        task = self._task()
+        with mock.patch("scripts.ai_workflow.subprocess.run") as run:
+            with self.assertRaisesRegex(workflow.WorkflowError, "OWNER_AUTHORIZATION_REQUIRED"):
+                workflow.create_worktree(task, owner_authorized=False)
+
+        run.assert_not_called()
+
+    def test_create_worktree_requires_an_execution_approval_record(self):
+        with self.assertRaisesRegex(workflow.WorkflowError, "APPROVED_FOR_EXECUTION_REQUIRED"):
+            workflow.create_worktree(self._task(), owner_authorized=True)
+
+    def test_create_worktree_uses_the_approved_branch_and_directory(self):
+        task = self._task()
+        decision_path = (
+            self.repo
+            / "data/state/ai-workflow"
+            / task["task_id"]
+            / "human-decisions.jsonl"
+        )
+        decision_path.parent.mkdir(parents=True)
+        decision_path.write_text(
+            json.dumps({"decision": "APPROVED_FOR_EXECUTION", "by": "owner"}) + "\n",
+            encoding="utf-8",
+        )
+
+        worktree = workflow.create_worktree(task, owner_authorized=True)
+
+        self.assertEqual(
+            worktree,
+            self.repo / ".codex-worktrees" / "awf-20260803-001",
+        )
+        self.assertEqual(self._git("-C", str(worktree), "branch", "--show-current"), "aiwf/awf-20260803-001")
 
 
 if __name__ == "__main__":
