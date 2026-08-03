@@ -293,10 +293,12 @@ class MetricsReportTest(unittest.TestCase):
 
 class FakeRunnerTest(unittest.TestCase):
     def test_luna_fake_result_never_claims_acceptance(self):
-        result = workflow.FakeRunner().run("luna", TaskValidationTest().valid_task())
+        task = TaskValidationTest().valid_task()
+        result = workflow.FakeRunner().run("luna", task)
         self.assertEqual(result["role"], "luna")
         self.assertEqual(result["status"], "SUPPORTED")
         self.assertNotIn("ACCEPTED", result["status"])
+        workflow.validate_verification_package("luna", task, result)
 
 
 class RoutingTest(unittest.TestCase):
@@ -361,7 +363,7 @@ class GatedPipelineTest(unittest.TestCase):
 
     @staticmethod
     def _result(role, status, state):
-        return {
+        result = {
             "schema_version": "ai-result-1",
             "role": role,
             "status": status,
@@ -374,6 +376,31 @@ class GatedPipelineTest(unittest.TestCase):
             "unresolved_questions": [],
             "recommended_next_state": state,
         }
+        if role == "luna":
+            result["claims"] = [
+                {
+                    "id": "claim-1",
+                    "kind": "FACT",
+                    "text": "The bounded evidence supports the result.",
+                    "evidence_ids": ["evidence-1"],
+                }
+            ]
+            result["evidence"] = [
+                {
+                    "id": "evidence-1",
+                    "type": "FILE",
+                    "locator": "README.md",
+                    "observation": "The authorized evidence was checked.",
+                }
+            ]
+            result["counter_checks"] = [
+                {
+                    "target_claim_id": "claim-1",
+                    "method": "Check the bounded evidence for a contradiction.",
+                    "result": "No contradiction found.",
+                }
+            ]
+        return result
 
     def _create_task(self, task):
         self.store.create_task(task)
@@ -571,7 +598,7 @@ class CodexRunnerTest(unittest.TestCase):
         return TaskValidationTest().valid_task()
 
     def valid_result(self, role="luna", status="SUPPORTED"):
-        return {
+        result = {
             "schema_version": "ai-result-1",
             "role": role,
             "status": status,
@@ -584,6 +611,50 @@ class CodexRunnerTest(unittest.TestCase):
             "unresolved_questions": [],
             "recommended_next_state": "EVIDENCE_READY",
         }
+        if role == "luna":
+            result.update(self.l1_result(role=role, status=status))
+        return result
+
+    def l1_result(self, claim_count=1, counter_check_count=1, role="luna", status="SUPPORTED"):
+        result = {
+            "schema_version": "ai-result-1",
+            "role": role,
+            "status": status,
+            "summary": "Evidence supports the claim.",
+            "claims": [],
+            "evidence": [],
+            "counter_checks": [],
+            "changed_files": [],
+            "blind_spots": [],
+            "unresolved_questions": [],
+            "recommended_next_state": "EVIDENCE_READY",
+        }
+        result["claims"] = [
+            {
+                "id": f"claim-{index}",
+                "kind": "FACT",
+                "text": f"Supported fact {index}",
+                "evidence_ids": ["evidence-1"],
+            }
+            for index in range(claim_count)
+        ]
+        result["evidence"] = [
+            {
+                "id": "evidence-1",
+                "type": "FILE",
+                "locator": "README.md",
+                "observation": "The authorized document supports the claim.",
+            }
+        ]
+        result["counter_checks"] = [
+            {
+                "target_claim_id": "claim-0",
+                "method": f"Cross-check {index}",
+                "result": "No contradiction found.",
+            }
+            for index in range(counter_check_count)
+        ]
+        return result
 
     def test_business_secrets_are_not_forwarded(self):
         env = workflow.sanitized_environment(
@@ -655,10 +726,58 @@ class CodexRunnerTest(unittest.TestCase):
             'Output "status" as exactly one of: SUPPORTED, PARTIALLY_SUPPORTED, NOT_SUPPORTED, BLOCKED.',
             prompt,
         )
+        self.assertIn(
+            "For Luna L1, output 1 to 5 claims and exactly 1 counter_check unless status is BLOCKED",
+            prompt,
+        )
         self.assertIn("Read the named evidence files at the listed paths", prompt)
         self.assertIn("only output ai-result-1 JSON", prompt)
         self.assertNotIn("registry/", prompt)
         self.assertNotIn("chat history", prompt)
+
+    @mock.patch(
+        "scripts.ai_workflow.capture_repo",
+        return_value=workflow.RepoSnapshot("pinned-head", ()),
+    )
+    @mock.patch("scripts.ai_workflow.subprocess.run")
+    def test_run_codex_enforces_luna_l1_evidence_package(self, run, _capture_repo):
+        task = self.valid_task()
+        cases = [
+            ("five claims and one check", self.l1_result(5, 1), None),
+            ("six claims", self.l1_result(6, 1), "INVALID_VERIFICATION_PACKAGE"),
+            ("two checks", self.l1_result(5, 2), "INVALID_VERIFICATION_PACKAGE"),
+        ]
+        dangling_evidence = self.l1_result()
+        dangling_evidence["claims"][0]["evidence_ids"] = ["missing"]
+        cases.append(("dangling evidence", dangling_evidence, "INVALID_VERIFICATION_PACKAGE"))
+        dangling_claim = self.l1_result()
+        dangling_claim["counter_checks"][0]["target_claim_id"] = "missing"
+        cases.append(("dangling claim", dangling_claim, "INVALID_VERIFICATION_PACKAGE"))
+        blocked = self.l1_result(0, 0, status="BLOCKED")
+        cases.append(("blocked without invented evidence", blocked, None))
+        terra = self.valid_result("terra", "IMPLEMENTED_CANDIDATE")
+        cases.append(("non-luna role", terra, None))
+
+        for name, result, error in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                output_path = root / "result.json"
+                output_path.write_text(json.dumps(result), encoding="utf-8")
+                paths = workflow.RunPaths(
+                    repo=ROOT,
+                    output_path=output_path,
+                    schema_path=ROOT / "config/ai_workflow_result.schema.json",
+                    logs_dir=root / "logs",
+                )
+                run.return_value = mock.Mock(returncode=0, stdout='{"event":"done"}\n', stderr="")
+                if error:
+                    with self.assertRaisesRegex(workflow.WorkflowError, error):
+                        workflow.run_codex(result["role"], task, "task contract", paths)
+                else:
+                    self.assertEqual(
+                        workflow.run_codex(result["role"], task, "task contract", paths),
+                        result,
+                    )
 
     @mock.patch(
         "scripts.ai_workflow.capture_repo",

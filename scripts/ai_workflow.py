@@ -248,6 +248,15 @@ def build_role_prompt(
             'Output "status" as exactly one of: '
             + ", ".join(role_config["allowed_statuses"])
             + ".",
+            *(
+                (
+                    "For Luna L1, output 1 to 5 claims and exactly 1 counter_check unless status is BLOCKED; "
+                    "if BLOCKED, output at most 5 claims and at most 1 counter_check. "
+                    "Every claim must reference existing evidence and every counter_check must target an existing claim.",
+                )
+                if role == "luna" and task["verification_level"] == "L1"
+                else ()
+            ),
             "Read the named evidence files at the listed paths before evaluating the task.",
             "Use only the task contract and named evidence above; no additional source material is authorized.",
             "only output ai-result-1 JSON",
@@ -404,6 +413,41 @@ def validate_role_result(
         _fail("CHANGED_FILES_MISMATCH", "declared changed_files differ from the real diff")
 
 
+def validate_verification_package(
+    role: str, task: Mapping[str, object], result: Mapping[str, object]
+) -> None:
+    """Enforce only the mechanically decidable parts of an evidence level."""
+
+    validate_task(task)
+    if role != "luna" or task["verification_level"] != "L1":
+        return
+    claims = result["claims"]
+    evidence = result["evidence"]
+    counter_checks = result["counter_checks"]
+    blocked = result["status"] == "BLOCKED"
+    if len(claims) > 5 or (not blocked and len(claims) < 1):
+        _fail("INVALID_VERIFICATION_PACKAGE", "Luna L1 requires 1 to 5 claims unless blocked")
+    if len(counter_checks) > 1 or (not blocked and len(counter_checks) != 1):
+        _fail(
+            "INVALID_VERIFICATION_PACKAGE",
+            "Luna L1 requires exactly one counter-check unless blocked",
+        )
+    claim_ids = {claim["id"] for claim in claims}
+    evidence_ids = {record["id"] for record in evidence}
+    for claim in claims:
+        referenced = claim["evidence_ids"]
+        if not referenced or not set(referenced).issubset(evidence_ids):
+            _fail(
+                "INVALID_VERIFICATION_PACKAGE",
+                "each Luna L1 claim must reference existing evidence",
+            )
+    if any(check["target_claim_id"] not in claim_ids for check in counter_checks):
+        _fail(
+            "INVALID_VERIFICATION_PACKAGE",
+            "each Luna L1 counter-check must reference an existing claim",
+        )
+
+
 def _write_role_events(log_path: Path, stdout: object) -> None:
     if isinstance(stdout, bytes):
         stdout = stdout.decode("utf-8", errors="replace")
@@ -447,6 +491,7 @@ def run_codex(role: str, task: dict, prompt: str, paths: RunPaths) -> dict:
         if not isinstance(result, dict):
             _fail("INVALID_ROLE_RESULT", "role output must be an object")
         validate_role_result(role, result, set(result.get("changed_files", [])))
+        validate_verification_package(role, task, result)
         return result
     finally:
         after_run = capture_repo(paths.repo)
@@ -1133,7 +1178,7 @@ class FakeRunner:
             raise WorkflowError("INVALID_ROLE", f"unsupported role {role}")
         validate_task(task)
         status, next_state_value = FAKE_ROLE_RESULTS[role]
-        return {
+        result = {
             "schema_version": "ai-result-1",
             "role": role,
             "status": status,
@@ -1146,6 +1191,31 @@ class FakeRunner:
             "unresolved_questions": [],
             "recommended_next_state": next_state_value,
         }
+        if role == "luna" and task["verification_level"] == "L1":
+            result["claims"] = [
+                {
+                    "id": "claim-1",
+                    "kind": "FACT",
+                    "text": f"Fake bounded evidence for {task['task_id']}",
+                    "evidence_ids": ["evidence-1"],
+                }
+            ]
+            result["evidence"] = [
+                {
+                    "id": "evidence-1",
+                    "type": "FILE",
+                    "locator": task["authoritative_files"][0],
+                    "observation": "Fake runner checked the authorized evidence fixture.",
+                }
+            ]
+            result["counter_checks"] = [
+                {
+                    "target_claim_id": "claim-1",
+                    "method": "Check the fixture for a contradiction.",
+                    "result": "No contradiction found in the fake fixture.",
+                }
+            ]
+        return result
 
 
 class Runner(Protocol):
@@ -1376,6 +1446,7 @@ def _run_role_with_technical_retry(
             record_metrics(task_id, metric_run)
             declared = result.get("changed_files", []) if isinstance(result, Mapping) else []
             validate_role_result(role, result, set(declared))
+            validate_verification_package(role, task, result)
             return result, state
         except (WorkflowError, ValueError, json.JSONDecodeError) as exc:
             error_code = exc.code if isinstance(exc, WorkflowError) else "INVALID_ROLE_RESULT"
