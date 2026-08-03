@@ -1,0 +1,78 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "cost-evidence-1"
+    },
+    "route": {
+      "type": "string",
+      "enum": ["direct", "sol_only", "delegated", "blocked"]
+    },
+    "role": {
+      "type": "string",
+      "enum": ["luna", "terra", "sol_planner", "sol_reviewer", "sol_xhigh"]
+    },
+    "duration_seconds": {
+      "type": "number",
+      "minimum": 0
+    },
+    "prompt_bytes": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "input_tokens": {
+      "type": ["number", "null"],
+      "minimum": 0
+    },
+    "cached_input_tokens": {
+      "type": ["number", "null"],
+      "minimum": 0
+    },
+    "output_tokens": {
+      "type": ["number", "null"],
+      "minimum": 0
+    },
+    "retry_kind": {
+      "type": "string",
+      "minLength": 1
+    },
+    "verification_seconds": {
+      "type": "number",
+      "minimum": 0
+    },
+    "quality_outcome": {
+      "type": "string",
+      "minLength": 1
+    },
+    "paired_case_id": {
+      "type": ["string", "null"],
+      "minLength": 1
+    },
+    "evidence_class": {
+      "type": "string",
+      "enum": ["measured", "sample_validated_projection", "unavailable"]
+    },
+    "rate_snapshot_id": {
+      "type": ["string", "null"],
+      "minLength": 1
+    }
+  },
+  "required": [
+    "schema_version",
+    "route",
+    "role",
+    "duration_seconds",
+    "prompt_bytes",
+    "input_tokens",
+    "cached_input_tokens",
+    "output_tokens",
+    "retry_kind",
+    "verification_seconds",
+    "quality_outcome",
+    "paired_case_id",
+    "evidence_class",
+    "rate_snapshot_id"
+  ]
+}

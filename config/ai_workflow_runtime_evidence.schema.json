@@ -1,0 +1,81 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "runtime-evidence-1"
+    },
+    "attempt_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "requested_role": {
+      "type": "string",
+      "enum": ["luna", "terra", "sol_planner", "sol_reviewer", "sol_xhigh"]
+    },
+    "execution_surface": {
+      "type": "string",
+      "enum": ["NATIVE_SUBAGENT", "CODEX_EXEC_ROLE_CONTRACT"]
+    },
+    "observed_agent_type": {
+      "type": ["string", "null"]
+    },
+    "observed_model": {
+      "type": "string",
+      "minLength": 1
+    },
+    "observed_reasoning_effort": {
+      "type": "string",
+      "minLength": 1
+    },
+    "observed_sandbox_policy": {
+      "type": "string",
+      "minLength": 1
+    },
+    "observed_permission_profile": {
+      "type": "string",
+      "minLength": 1
+    },
+    "observed_cwd": {
+      "type": "string",
+      "minLength": 1
+    },
+    "evidence_source": {
+      "type": "string",
+      "enum": ["NATIVE_METADATA", "LOCAL_ROLLOUT"]
+    },
+    "observed_at_utc": {
+      "type": "string",
+      "minLength": 1
+    },
+    "verification_status": {
+      "type": "string",
+      "enum": ["VERIFIED", "FAILED"]
+    },
+    "failure_reasons": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    }
+  },
+  "required": [
+    "schema_version",
+    "attempt_id",
+    "requested_role",
+    "execution_surface",
+    "observed_agent_type",
+    "observed_model",
+    "observed_reasoning_effort",
+    "observed_sandbox_policy",
+    "observed_permission_profile",
+    "observed_cwd",
+    "evidence_source",
+    "observed_at_utc",
+    "verification_status",
+    "failure_reasons"
+  ]
+}

@@ -1,0 +1,61 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "ai-route-request-1"
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "work_class": {
+      "type": "string",
+      "enum": ["SIMPLE", "PLANNING_ONLY", "BOUNDED", "MULTI_STAGE", "HIGH_CONSEQUENCE"]
+    },
+    "execution_need": {
+      "type": "string",
+      "enum": ["NONE", "READ_ONLY", "WRITE"]
+    },
+    "decomposable": {
+      "type": "boolean"
+    },
+    "risk_flags": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "enum": [
+          "CONSTITUTION",
+          "PIT",
+          "SURVIVORSHIP_BIAS",
+          "PUBLIC_SCHEMA",
+          "APPEND_ONLY",
+          "SECURITY",
+          "DATA_CONTAMINATION",
+          "PUBLIC_API",
+          "CROSS_CARD_CONTRACT"
+        ]
+      },
+      "uniqueItems": true
+    },
+    "reason_codes": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    }
+  },
+  "required": [
+    "schema_version",
+    "task_id",
+    "work_class",
+    "execution_need",
+    "decomposable",
+    "risk_flags",
+    "reason_codes"
+  ]
+}

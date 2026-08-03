@@ -1,0 +1,53 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "ai-route-decision-1"
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "route": {
+      "type": "string",
+      "enum": ["direct", "sol_only", "delegated", "blocked"]
+    },
+    "rule_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "task_sha256": {
+      "type": "string",
+      "minLength": 1
+    },
+    "request_sha256": {
+      "type": "string",
+      "minLength": 1
+    },
+    "decided_at_utc": {
+      "type": "string",
+      "minLength": 1
+    },
+    "routing_mode": {
+      "type": "string",
+      "enum": ["legacy", "shadow", "enforced"]
+    },
+    "evidence_class": {
+      "type": "string",
+      "enum": ["measured", "sample_validated_projection", "unavailable"]
+    }
+  },
+  "required": [
+    "schema_version",
+    "task_id",
+    "route",
+    "rule_id",
+    "task_sha256",
+    "request_sha256",
+    "decided_at_utc",
+    "routing_mode",
+    "evidence_class"
+  ]
+}

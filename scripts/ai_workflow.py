@@ -128,6 +128,40 @@ class WorkflowError(RuntimeError):
         super().__init__(f"{self.code}: {self.message}")
 
 
+try:
+    from .ai_workflow_artifacts import (
+        ArtifactError,
+        CostEvidence,
+        PlanArtifact,
+        RouteDecision,
+        RouteRequest,
+        RuntimeEvidence,
+        artifact_sha256,
+        load_artifact,
+        validate_cost_evidence,
+        validate_plan_shape,
+        validate_route_decision,
+        validate_route_request,
+        validate_runtime_evidence,
+    )
+except ImportError:  # direct script execution
+    from ai_workflow_artifacts import (
+        ArtifactError,
+        CostEvidence,
+        PlanArtifact,
+        RouteDecision,
+        RouteRequest,
+        RuntimeEvidence,
+        artifact_sha256,
+        load_artifact,
+        validate_cost_evidence,
+        validate_plan_shape,
+        validate_route_decision,
+        validate_route_request,
+        validate_runtime_evidence,
+    )
+
+
 def _fail(code: str, message: str) -> None:
     raise WorkflowError(code, message)
 
