@@ -984,7 +984,11 @@ class WorkflowStore:
                     raise WorkflowError(
                         "DISPATCH_IDENTITY_DRIFT", "dispatch ledger contains invalid JSON"
                     ) from exc
-                if not isinstance(prior, dict) or not isinstance(prior.get("dispatch_id"), str):
+                if (
+                    not isinstance(prior, dict)
+                    or not isinstance(prior.get("dispatch_id"), str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", prior["dispatch_id"])
+                ):
                     _fail("DISPATCH_IDENTITY_DRIFT", "dispatch ledger contains an invalid record")
                 if prior["dispatch_id"] == dispatch_identity:
                     _fail("DUPLICATE_DISPATCH", "dispatch identity has already been recorded")

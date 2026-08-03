@@ -427,7 +427,9 @@ def record_dispatch(
         or revalidated_plan.base_commit != plan.base_commit
     ):
         _fail("DISPATCH_IDENTITY_DRIFT", "frozen plan identity does not match its document")
-    if plan.candidate_commit is not None and candidate_commit != plan.candidate_commit:
+    if not isinstance(plan.candidate_commit, str) or not plan.candidate_commit:
+        _fail("DISPATCH_IDENTITY_DRIFT", "frozen plan requires a candidate_commit")
+    if candidate_commit != plan.candidate_commit:
         _fail("DISPATCH_IDENTITY_DRIFT", "candidate_commit does not match frozen parent task")
     task_by_id = {task.id: task for task in plan.tasks}
     selected = task_by_id.get(subtask_id)

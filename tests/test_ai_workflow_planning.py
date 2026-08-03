@@ -90,12 +90,15 @@ class PlanScopeValidationTest(unittest.TestCase):
         with self.assertRaisesRegex(workflow.WorkflowError, "SCOPE_OVERLAP"):
             workflow.validate_plan(plan, remediation_task(["src"]))
 
-    def test_absolute_parent_traversal_glob_and_empty_paths_are_rejected(self):
-        for path in ("/tmp/x", "../x", "src/*.py", ""):
-            with self.subTest(path=path):
-                plan = valid_plan(tasks=[plan_task("a", [path])])
-                with self.assertRaisesRegex(workflow.WorkflowError, "PLAN_INVALID"):
-                    workflow.validate_plan(plan, remediation_task(["src"]))
+    def test_all_scope_kinds_reject_absolute_traversal_glob_and_empty_paths(self):
+        for field in ("read_scope", "write_scope", "do_not_touch"):
+            for path in ("/tmp/x", "../x", "src/*.py", ""):
+                with self.subTest(field=field, path=path):
+                    task = plan_task("a", ["src/a.py"])
+                    task[field] = [path]
+                    plan = valid_plan(tasks=[task])
+                    with self.assertRaisesRegex(workflow.WorkflowError, "PLAN_INVALID"):
+                        workflow.validate_plan(plan, remediation_task(["src"]))
 
     def test_write_scope_must_stay_within_parent_allowed_paths(self):
         plan = valid_plan(tasks=[plan_task("a", ["tests/test_a.py"])])
@@ -263,6 +266,39 @@ class DispatchIdentityTest(unittest.TestCase):
                 1,
                 "d" * 40,
             )
+
+    def test_dispatch_requires_a_nonempty_frozen_candidate_commit(self):
+        task = remediation_task(candidate_commit=None)
+        plan = valid_plan(tasks=[plan_task("task-a", ["src/a.py"])])
+        frozen = workflow.validate_plan(plan, task)
+        with tempfile.TemporaryDirectory() as temporary:
+            store = workflow.WorkflowStore(Path(temporary) / "state")
+            store.create_task(task)
+
+            with self.assertRaisesRegex(workflow.WorkflowError, "DISPATCH_IDENTITY_DRIFT"):
+                workflow.record_dispatch(
+                    store,
+                    task["task_id"],
+                    frozen,
+                    "task-a",
+                    1,
+                    "c" * 40,
+                )
+
+    def test_invalid_historical_dispatch_id_blocks_append_without_rewriting_ledger(self):
+        ledger = self.store.root / self.task["task_id"] / "dispatches.jsonl"
+        original = '{"dispatch_id":"INVALID-HISTORY"}\n'
+        ledger.write_text(original, encoding="utf-8")
+        identity = workflow.dispatch_id("p" * 64, "t" * 64, "task-a", 1, "c" * 40)
+
+        with self.assertRaisesRegex(workflow.WorkflowError, "DISPATCH_IDENTITY_DRIFT"):
+            self.store.record_dispatch(
+                self.task["task_id"],
+                identity,
+                {"event_type": "DISPATCH_RECORDED", "subtask_id": "task-a", "attempt": 1},
+            )
+
+        self.assertEqual(original, ledger.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
