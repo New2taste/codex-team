@@ -1,4 +1,6 @@
-# Terra OS Default Routing Implementation Plan
+# Terra OS Default Routing Implementation Plan — Superseded
+
+> **Superseded on 2026-08-08.** The implemented commits remain historical evidence, but its role allocation, local-review chain, and Luna restriction are replaced by [`2026-08-08-adversarial-acceptance-luna-allocation.md`](2026-08-08-adversarial-acceptance-luna-allocation.md). Do not use the checklist below for new work.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

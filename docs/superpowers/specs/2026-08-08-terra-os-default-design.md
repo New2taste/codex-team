@@ -1,87 +1,58 @@
-# Terra OS 默认调度设计
+# Terra / Luna 任务编排与对抗式验收设计
 
-> 状态：`APPROVED_FOR_IMPLEMENTATION`  
-> 日期：2026-08-08  
-> 授权：项目所有者已明确指定“Terra 常驻、Sol 升级、Luna 降级”为默认，并进一步冻结了轻量项目的推理档和返工交接规则。
+> 状态：`APPROVED_FOR_IMPLEMENTATION`
+> 日期：2026-08-08
+> 授权：项目所有者已明确指定本设计为默认，并授权直接采用 Sol 的规划裁决继续实施。
 
 ## 1. 目标
 
-将当前多模型工作流的默认执行关系固定为：Terra 是常驻执行 OS，Sol 是专家协处理器，Luna 是廉价工具进程。在不削弱原有人工闸门、Git 安全、运行身份、证据合同和重试上限的前提下，减少 Luna 主导实现和同一实现者反复返工。
+以 Terra xhigh 保留复杂软件工程、集成、调试和审查能力，同时把明确、可验证、低风险的 coding、测试、文档和机械同步工作分流给 Luna max。每个 task 的局部质量门由独立 Terra xhigh 对抗式验收；Sol medium 只承担最终整体对抗式验收，除非进入明确的第三次修复例外。
 
 ## 2. 固定角色
 
-- **Terra xhigh / 执行 OS**：常驻且默认持有施工、集成、调试、恢复及两轮修复；写入仍只能发生在已授权独立 worktree 和允许路径中。
-- **Sol medium / 施工监督协处理器**：在已冻结的总体方案内负责任务分解、施工计划、实现监督、语义验收、风险审查和裁决；还承接 Terra xhigh 能力边界外、但无需升级为大型项目总体规划的工作。两轮 Terra 修复的报批仍不通过时，原验收 Sol 才临时取得最小修复所有权，并由另一位 Sol medium 验收。
-- **Sol xhigh / 大型项目规划师**：只为已确认的大型、跨域项目制定整体方案和全局规划书；必须保留所有者授权，不能被普通实施、复审或返工自动调用。
-- **Terra medium、Sol high**：均没有默认调度角色，控制器不得自动选择。
-- **Luna Max / 廉价工具进程**：只执行原方案定义的 L0/L1/L2 有界取证、机械核对、只读盘点和冻结规格窄域反证。Luna 不拥有主实现、跨文件集成、最终验收或开放式裁决。
+- **Terra xhigh / 常驻 OS**：负责复杂或高风险施工、跨文件集成、调试、任务分解、Luna 任务信封、修复升级和每个 task 的独立对抗式验收。施工 Terra 与验收 Terra 必须是不同 actor identity。
+- **Luna max / 中初级 coding 执行器**：默认优先承接具有固定读写范围、可判定输出和可运行测试的低/中复杂度任务；包括机械多文件修改、测试补充、fixture、byte-parity、文档、格式/配置迁移及已定位的局部 bug。它必须在 task 信封内 TDD/验证，不拥有架构、开放式 debug、跨域协议、权限/安全承重变更、普通任务验收或最终验收。
+- **Sol medium / 最终整体验收者**：不参与普通 task 计划、施工或局部验收；只在所有 task 通过 Terra 对抗式验收后，做跨 task 的最终整体对抗式验收。例外：第二次 Terra 验收仍失败时，Sol medium 执行第三次修复，另一独立 Sol medium 验收该例外修复。
+- **Sol xhigh / 大型项目规划师与终局 fixer**：为明确大型/跨域项目编写总体方案和全局规划书。若 Sol-medium 例外修复仍失败，Sol xhigh 直接做一次终局修复，不再有 task-level 验收；最终整体 Sol medium 验收仍在所有任务结束后执行。
+- **Terra medium、Sol high**：没有默认调度角色，控制器必须拒绝自动选择。
 
-模型身份和推理档是本策略的一部分：Terra xhigh 是唯一常驻施工档，Sol medium 是实施监督、任务分解、施工计划和验收档；Sol xhigh 仅用于授权的大型项目全局规划；Terra medium 和 Sol high 没有默认职责。
+## 3. 默认分流
 
-## 3. 默认策略
+Luna 不再只是只读工具。Terra xhigh 的任务分解为每个子任务明确 `owner_role`、允许路径、L0/L1/L2 证据、可复现验证和升级条件。
 
-新增控制器策略名 `terra_os`，并将 Plugin Skill 和新任务的交互式编排默认设为该策略。为兼容历史证据：
+| 子任务特征 | 默认施工 owner | 局部验收 |
+|---|---|---|
+| 固定范围、确定性代码/测试/文档/fixture/parity/config 修改 | Luna max | 独立 Terra xhigh 对抗式验收 |
+| 单模块、已定位 bug，完整负例和测试可描述 | Luna max | 独立 Terra xhigh 对抗式验收 |
+| 跨文件协议、运行时身份、授权、并发/持久化、安全、开放式 debug、架构/集成 | Terra xhigh | 独立 Terra xhigh 对抗式验收 |
+| 大型项目总体方案 | Sol xhigh planner | 不施工；由 Terra xhigh 分解执行 |
+| 最终跨 task 系统验收 | Sol medium | 对抗式整体验收 |
 
-- `legacy` 保留，只在显式回放或兼容测试中使用；
-- `shadow` 同时记录 `terra_os` 选择和旧有效角色链，不改变本次模型调用；
-- `terra_os` 控制新任务的实际角色链；
-- 现有 `ai-task-1`、`ai-result-1` 与 `ai-route-decision-1` wire schema 不扩展字段；策略细节属于运行时兼容元数据和 append-only 事件。
+Luna 的资格必须 fail closed：没有明确 task 信封、范围、确定性 done-when、至少一个负例/变异和可运行验证命令时，任务改派 Terra xhigh。控制器不得因 Luna 空闲自动插入，也不得把 Luna 用作 reviewer。
 
-确定性角色链：
+## 4. 每个 task 的对抗式验收与升级
 
-| 工作类型 | 默认角色链 |
-|---|---|
-| 简单、低风险、无需模型 | host direct |
-| 大型项目的整体方案与全局规划书 | Sol xhigh planner |
-| 总体方案内的任务分解、施工计划、实现监督、语义裁决/验收 | Sol medium supervisor/reviewer |
-| 有界只读证据，明确要求 L0/L1/L2 | Luna → Sol（仅在结果需要语义结论时） |
-| 普通实现/整改 | Sol medium task plan → Terra xhigh → Sol medium reviewer |
-| 已授权大型项目实施 | Sol xhigh global plan → Sol medium task plan → Terra xhigh → Sol medium reviewer |
-| 验收预审需要窄域反证 | Luna 工具步骤 → Sol medium reviewer；Luna 不是验收者 |
-| 无法有界分解或权限不足 | BLOCKED |
+1. 原施工 owner（Luna 或 Terra xhigh）提交候选、命令证据和限定 diff。
+2. **第一次 task 验收**由一位与施工 owner 不同的 Terra xhigh 执行对抗式审查。它必须尝试证伪，而不是复述测试结果：重跑相关验证、检查授权范围和旧契约、构造至少一个现实负例/变异、审计实际 diff 与运行时路径，并登记新发现。
+3. 若失败，原施工 owner 在登记 finding 范围内修复并再次提交。
+4. **第二次 task 验收**由另一位独立 Terra xhigh 对抗式审查；该 reviewer 不得与施工 actor 或第一次 reviewer 相同。
+5. 若第二次验收仍失败，Sol medium 只修复已登记且未关闭的 finding；另一位独立 Sol medium 对抗式验收该修复。
+6. 若该 Sol peer 仍失败，Sol xhigh 执行一次终局修复。此终局修复不再触发 task-level 验收、不会自动扩展范围，也不会产生另一轮修复。
+7. 全部 task 结束后，独立 Sol medium 执行一次最终整体对抗式验收：检查 task 间契约、Plugin/source parity、状态机、运行时身份、报告、测试门和剩余风险。它不重开已关闭 task 的无限返工；若发现承重问题，报告为整体 `BLOCKED` 并列出需要所有者裁决的最小范围。
 
-Sol medium 在每个已批准阶段只产生一次可执行的任务分解/施工计划，随后由 Terra 连续施工；它不得为每个微小修改重复规划。Luna 步骤必须由计划显式列出，控制器不得因为“有空闲 Luna”自动插入。
+每个 acceptance 事件都记录 fixer/reviewer identities、candidate/base commit、finding IDs、allowed paths、负例/变异命令、实际输出和 verdict。验收结论只有 `ACCEPT`、`REWORK` 或 `BLOCKED`；不得由施工 actor 自验。
 
-## 4. 两轮 Terra 返工与最终最小移交
+## 5. 安全与兼容
 
-Terra 自动返工最多两轮；Sol 只在该两轮都未通过后接管一次最小修复：
+- 不改变 `ai-task-1`、`ai-result-1` 与 `ai-route-decision-1` 的字段或版本；角色、repair 和 review 细节记录在运行时事件和兼容元数据。
+- `legacy` 保留历史角色链；`shadow` 只记录新候选；`terra_os` 执行新分流。Luna task ownership 来自经验证的本地计划步骤，而不是 route schema 猜测。
+- 所有写入仍受 worktree、allowed paths、candidate、HEAD/diff、运行时身份、敏感信息和 Git 守卫约束。
+- `automatic_sol_high=false`、`automatic_merge=false`、`automatic_push=false` 保持；Sol xhigh 的规划与终局修复只能由上述显式状态机触发。
 
-1. 初次验收由 Sol medium reviewer 给出发现。
-2. **修复轮 1**：Terra 修复；原验收 Sol 复验。
-3. 若复验仍要求修复，进入 **修复轮 2**：仍由 Terra 修复；原验收 Sol medium 再次复验。
-4. 若第二轮报批仍要求修复，原验收 Sol medium 才切换为最小范围 fixer，只能处理已登记的开放发现；不得扩大规格或自验。
-5. Sol 修复完成后，必须派生另一位 Sol medium reviewer 独立验收。新 reviewer 不继承 fixer 上下文，只读取任务简报、发现、报告和 diff 包。
-6. 同级 reviewer 仍发现承重缺陷时，自动返工停止并进入 `BLOCKED`；只有所有者另行授权且项目已重新界定为大型项目时，Sol xhigh 才可制定新的全局规划。不得出现第三轮 Terra 修复或第二次 Sol 直修。
+## 6. 验收标准
 
-事件必须记录 `repair_round`、`reviewer_identity`、`fixer_identity`、`peer_reviewer_identity`、开放发现和提交范围。Sol fixer 不能输出最终验收状态。
-
-## 5. 安全与失败处理
-
-- Terra、Sol fixer 的写入均受现有 worktree、allowed paths、candidate、HEAD/diff 和 owner authorization 守卫约束。
-- Sol xhigh planner、Sol medium supervisor/reviewer 与 Luna 默认只读；只有两轮 Terra 报批失败后显式 `SOL_REPAIR_AUTHORIZED` 事件能授予原 Sol medium 最小写范围。
-- `automatic_xhigh=false`、`automatic_sol_high=false`、`automatic_merge=false`、`automatic_push=false` 保持不变。
-- 任一角色身份不匹配、复验代理与 fixer 身份相同、Terra 轮次超过 2、事件缺字段或 scope 扩大时 fail closed。
-- `max_implementation_reworks=2` 解释为 Terra 自主返工上限；最终一次 Sol 接管不增加 Terra 重试次数。
-
-## 6. 分发与用户体验
-
-- `$ai-workflow:orchestration` 默认说明 Terra OS 关系并执行确定性 preflight。
-- Agent 模板仍只分发 `luna_worker`；Terra 与 Sol 使用平台模型/子代理选择，不伪装为自定义 Agent。
-- README 同时说明默认策略、显式 legacy 回放、shadow 迁移、两轮 Terra 返工、一次 Sol medium 最小接管和 Sol xhigh 大型规划人工门。
-- Plugin runtime/config 必须继续与仓库源逐字节一致。
-
-## 7. 验收标准
-
-1. 普通写任务默认角色链没有 Luna，且 Terra 是唯一施工所有者。
-2. Luna 只能在明确有界 L0/L1/L2 工具步骤出现，不能替代 Terra 或 Sol。
-3. 两轮修复均由 Terra；只有第二轮报批仍失败后才由原验收 Sol medium 修复，另一位 Sol medium 独立复验。
-4. 第三轮 Terra 修复、第二次 Sol 直修、同一 Sol 自修自验、自动 Sol high/xhigh、自动 merge/push 全部被测试拒绝。
-5. legacy 回放仍保持旧角色链；shadow 不改变本次调用；新 Plugin/Skill 默认展示 `terra_os`。
-6. 全量测试、Plugin/Skill validators、byte-parity verifier 和变异测试通过。
-
-## 8. 非目标
-
-- 不自动批准 Sol 写权限；授权来自当前任务所有者已批准的工作流策略和具体任务范围。
-- 不为轻量任务调用 Sol high 或 Sol xhigh，不改变 Luna 的 L0/L1/L2 内容合同。
-- 不引入第三方运行依赖、数据库、常驻服务或第三轮自动返工。
-- 不在本任务中 merge、push、删除 worktree 或发布到无关 Git remote。
+1. Luna eligible task 能实际施工并交付 L0/L1/L2 证据；没有资格证明时 fail closed 到 Terra xhigh。
+2. 每个 task 都由不同 Terra xhigh 做两次以内的对抗式局部验收；普通 Sol medium 不在该链路。
+3. 第二次 Terra 验收失败后，只有 Sol medium 可进行第三次限定修复，且由不同 Sol medium 验收；再失败只允许一次 Sol xhigh 终局修复。
+4. Terra medium、Sol high、Luna reviewer、施工 actor 自验、未登记修复、自动 merge/push 均被测试拒绝。
+5. 最终 Sol medium 整体验收覆盖跨 task、Plugin parity 和全量验证；最终用户结论不能依赖单 task 的绿色测试。
