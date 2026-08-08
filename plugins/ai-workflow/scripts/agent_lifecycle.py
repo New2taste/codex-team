@@ -269,17 +269,20 @@ def _preserve_tombstone(
 
 
 def _discard_verified_tombstone(
-    target_directory: int, tombstone_name: str, tombstone: int, expected_sha: str
+    target_directory: int,
+    tombstone_name: str,
+    tombstone: int,
+    expected_identity: FileIdentity,
 ) -> bool:
-    """Delete only a re-verified payload; the caller retains descriptor ownership."""
+    """Delete only an exact re-verified payload; retain any replacement."""
 
     try:
-        if _hash_regular(tombstone, "payload") != expected_sha:
+        if _file_identity(tombstone, "payload") != expected_identity:
             return False
         os.unlink("payload", dir_fd=tombstone)
         os.rmdir(tombstone_name, dir_fd=target_directory)
         return True
-    except OSError:
+    except (LifecycleError, OSError):
         return False
 
 
@@ -452,7 +455,7 @@ def _rollback_install_publication(
     *,
     legacy_tombstone_name: str | None = None,
     legacy_tombstone: int | None = None,
-    legacy_sha: str | None = None,
+    legacy_identity: FileIdentity | None = None,
 ) -> None:
     """Best-effort transaction rollback; original failures remain authoritative."""
 
@@ -461,7 +464,7 @@ def _rollback_install_publication(
     if (
         legacy_tombstone_name is None
         or legacy_tombstone is None
-        or legacy_sha is None
+        or legacy_identity is None
     ):
         return
     try:
@@ -473,7 +476,7 @@ def _rollback_install_publication(
                 directory,
                 legacy_tombstone_name,
                 legacy_tombstone,
-                legacy_sha,
+                legacy_identity,
             )
     except BaseException:
         pass
@@ -553,8 +556,8 @@ def install(
             return 1
         _hook(hook, "install.before_retire_known_legacy")
         tombstone_name, tombstone = _retire_to_tombstone(directory, TARGET_FILENAME)
-        moved_sha = _hash_regular(tombstone, "payload")
-        if moved_sha != expected_sha:
+        moved_identity = _file_identity(tombstone, "payload")
+        if moved_identity[2] != expected_sha:
             _preserve_tombstone(directory, TARGET_FILENAME, tombstone)
             return 1
         try:
@@ -571,7 +574,7 @@ def install(
                     published_state,
                     legacy_tombstone_name=tombstone_name,
                     legacy_tombstone=tombstone,
-                    legacy_sha=expected_sha,
+                    legacy_identity=moved_identity,
                 )
                 return 1
         except BaseException:
@@ -581,7 +584,7 @@ def install(
                 published_state,
                 legacy_tombstone_name=tombstone_name,
                 legacy_tombstone=tombstone,
-                legacy_sha=expected_sha,
+                legacy_identity=moved_identity,
             )
             raise
         published_agent = staged_agent_identity
@@ -600,7 +603,7 @@ def install(
                     published_state,
                     legacy_tombstone_name=tombstone_name,
                     legacy_tombstone=tombstone,
-                    legacy_sha=expected_sha,
+                    legacy_identity=moved_identity,
                 )
                 return 1
             published_state = staged_state_identity
@@ -612,11 +615,11 @@ def install(
                 published_state,
                 legacy_tombstone_name=tombstone_name,
                 legacy_tombstone=tombstone,
-                legacy_sha=expected_sha,
+                legacy_identity=moved_identity,
             )
             raise
         discarded = _discard_verified_tombstone(
-            directory, tombstone_name, tombstone, expected_sha
+            directory, tombstone_name, tombstone, moved_identity
         )
         _close_tombstone(tombstone)
         tombstone = None
@@ -650,17 +653,15 @@ def _retire_and_discard(
 ) -> bool:
     tombstone_name, tombstone = _retire_to_tombstone(directory, name)
     try:
-        moved_status = _require_regular(tombstone, "payload")
-        moved_identity = (moved_status.st_dev, moved_status.st_ino)
-        if expected_identity is not None and moved_identity != expected_identity:
+        moved_identity = _file_identity(tombstone, "payload")
+        if expected_identity is not None and moved_identity[:2] != expected_identity:
             _preserve_tombstone(directory, name, tombstone)
             return False
-        moved_sha = _hash_regular(tombstone, "payload")
-        if moved_sha != expected_sha:
+        if moved_identity[2] != expected_sha:
             _preserve_tombstone(directory, name, tombstone)
             return False
         return _discard_verified_tombstone(
-            directory, tombstone_name, tombstone, expected_sha
+            directory, tombstone_name, tombstone, moved_identity
         )
     finally:
         _close_tombstone(tombstone)
@@ -693,8 +694,8 @@ def uninstall(
 
         _hook(hook, "uninstall.before_retire_current")
         tombstone_name, tombstone = _retire_to_tombstone(directory, TARGET_FILENAME)
-        moved_sha = _hash_regular(tombstone, "payload")
-        if moved_sha != RELEASE_SHA256:
+        moved_identity = _file_identity(tombstone, "payload")
+        if moved_identity[2] != RELEASE_SHA256:
             _preserve_tombstone(directory, TARGET_FILENAME, tombstone)
             return 1
 
@@ -709,7 +710,7 @@ def uninstall(
             _preserve_tombstone(directory, TARGET_FILENAME, tombstone)
             return 1
         discarded = _discard_verified_tombstone(
-            directory, tombstone_name, tombstone, RELEASE_SHA256
+            directory, tombstone_name, tombstone, moved_identity
         )
         _close_tombstone(tombstone)
         tombstone = None

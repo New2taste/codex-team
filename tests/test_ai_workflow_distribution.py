@@ -1025,6 +1025,58 @@ class AgentLifecycleTest(unittest.TestCase):
                 os.close(directory)
             self.assertLessEqual(after, before + 2)
 
+    def test_final_discard_preserves_same_digest_replacement_payload(self):
+        lifecycle = load_lifecycle_helper()
+        with temporary_directory() as temporary:
+            root = Path(temporary)
+            target = root / "agents"
+            target.mkdir()
+            owned = target / "owned"
+            content = b"same digest payload\n"
+            owned.write_bytes(content)
+            owned_status = owned.stat()
+            expected_identity = (owned_status.st_dev, owned_status.st_ino)
+            replacement_inode: int | None = None
+            directory = lifecycle._open_target_directory(target, create=False)
+            self.assertIsNotNone(directory)
+            original_discard = lifecycle._discard_verified_tombstone
+
+            def replace_payload_then_discard(*arguments):
+                nonlocal replacement_inode
+                tombstone = arguments[2]
+                replacement = root / "replacement-payload"
+                replacement.write_bytes(content)
+                replacement_inode = replacement.stat().st_ino
+                os.rename(replacement, "payload", dst_dir_fd=tombstone)
+                return original_discard(*arguments)
+
+            try:
+                with mock.patch.object(
+                    lifecycle,
+                    "_discard_verified_tombstone",
+                    side_effect=replace_payload_then_discard,
+                ):
+                    self.assertFalse(
+                        lifecycle._retire_and_discard(
+                            directory,
+                            "owned",
+                            hashlib.sha256(content).hexdigest(),
+                            expected_identity=expected_identity,
+                        )
+                    )
+            finally:
+                os.close(directory)
+
+            self.assertIsNotNone(replacement_inode)
+            recoverable_inodes = []
+            if owned.exists():
+                recoverable_inodes.append(owned.stat().st_ino)
+            recoverable_inodes.extend(
+                payload.stat().st_ino
+                for payload in target.glob(".ai-workflow-tombstone-*/payload")
+            )
+            self.assertIn(replacement_inode, recoverable_inodes)
+
     def test_known_legacy_install_closes_final_discard_failure_descriptors(self):
         lifecycle = load_lifecycle_helper()
         original_discard = lifecycle._discard_verified_tombstone
@@ -1048,7 +1100,7 @@ class AgentLifecycleTest(unittest.TestCase):
         original_discard = lifecycle._discard_verified_tombstone
 
         def fail_only_final_agent_discard(*arguments):
-            if arguments[-1] == KNOWN_LEGACY_SHA256:
+            if arguments[-1][2] == KNOWN_LEGACY_SHA256:
                 return False
             return original_discard(*arguments)
 
