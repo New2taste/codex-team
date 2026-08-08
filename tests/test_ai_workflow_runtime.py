@@ -106,6 +106,36 @@ def write_exec_rollout(sessions: Path, *, model="gpt-5.6-luna", agent_type=None)
 
 
 class RuntimeIdentityTest(unittest.TestCase):
+    def test_each_pinned_terra_os_role_has_a_verifiable_runtime_identity(self):
+        for role in (
+            "sol_medium_supervisor",
+            "terra_xhigh",
+            "sol_medium_reviewer",
+            "sol_xhigh_planner",
+        ):
+            with self.subTest(role=role):
+                pinned = workflow._load_role_config(role)
+                expected = runtime_expected(
+                    surface="CODEX_EXEC_ROLE_CONTRACT",
+                    requested_role=role,
+                    model=pinned["model"],
+                    reasoning_effort=pinned["reasoning_effort"],
+                    sandbox_policy=pinned["sandbox"],
+                    permission_profile=pinned["sandbox"],
+                )
+                observed = runtime_observation(
+                    surface="CODEX_EXEC_ROLE_CONTRACT",
+                    model=pinned["model"],
+                    reasoning_effort=pinned["reasoning_effort"],
+                    sandbox_policy=pinned["sandbox"],
+                    permission_profile=pinned["sandbox"],
+                )
+
+                evidence = workflow.verify_runtime_identity(expected, observed)
+
+                self.assertEqual("VERIFIED", evidence.verification_status)
+                self.assertEqual(role, evidence.requested_role)
+
     def test_every_native_identity_field_is_required(self):
         # Removing any one identity fact must stop native-agent verification.
         for field in (

@@ -42,7 +42,19 @@ _IDENTITY_ALIASES = {
     "cwd": ("cwd", "observed_cwd"),
 }
 USAGE_FIELDS = ("input_tokens", "cached_input_tokens", "output_tokens")
-_RUNTIME_ROLES = frozenset({"luna", "terra", "sol_planner", "sol_reviewer", "sol_xhigh"})
+_RUNTIME_ROLES = frozenset(
+    {
+        "luna",
+        "terra",
+        "sol_planner",
+        "sol_reviewer",
+        "sol_xhigh",
+        "sol_medium_supervisor",
+        "terra_xhigh",
+        "sol_medium_reviewer",
+        "sol_xhigh_planner",
+    }
+)
 _PERMISSION_RANKS = {
     "read-only": 0,
     "read": 0,

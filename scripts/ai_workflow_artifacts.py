@@ -79,7 +79,18 @@ EVIDENCE_CLASSES = frozenset(
     {"measured", "sample_validated_projection", "unavailable"}
 )
 ROLES = frozenset(
-    {"host", "luna", "terra", "sol_planner", "sol_reviewer", "sol_xhigh"}
+    {
+        "host",
+        "luna",
+        "terra",
+        "sol_planner",
+        "sol_reviewer",
+        "sol_xhigh",
+        "sol_medium_supervisor",
+        "terra_xhigh",
+        "sol_medium_reviewer",
+        "sol_xhigh_planner",
+    }
 )
 RUNTIME_EVIDENCE_SOURCES = frozenset({"NATIVE_METADATA", "LOCAL_ROLLOUT"})
 RUNTIME_STATUSES = frozenset({"VERIFIED", "FAILED"})

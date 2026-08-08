@@ -10,7 +10,7 @@ from scripts import ai_workflow_routing as routing
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def valid_task(*, task_type="REMEDIATION"):
+def valid_task(*, task_type="REMEDIATION", risk_flags=None):
     return {
         "schema_version": "ai-task-1",
         "task_id": "AWF-20260808-001",
@@ -23,21 +23,21 @@ def valid_task(*, task_type="REMEDIATION"):
         "authoritative_files": ["README.md"],
         "allowed_write_paths": ["scripts/"],
         "forbidden_actions": ["merge", "push"],
-        "risk_flags": [],
+        "risk_flags": [] if risk_flags is None else risk_flags,
         "acceptance_commands": ["python -m unittest"],
         "verification_level": "L1",
         "human_gates": ["PLAN_APPROVAL", "EXECUTION_APPROVAL"],
     }
 
 
-def route_request(work_class, execution_need):
+def route_request(work_class, execution_need, *, decomposable=True, risk_flags=None):
     return {
         "schema_version": "ai-route-request-1",
         "task_id": "AWF-20260808-001",
         "work_class": work_class,
         "execution_need": execution_need,
-        "decomposable": True,
-        "risk_flags": [],
+        "decomposable": decomposable,
+        "risk_flags": [] if risk_flags is None else risk_flags,
         "reason_codes": ["PLAN_IS_DELIVERABLE"],
     }
 
@@ -135,6 +135,61 @@ class TerraOSRolePolicyTest(unittest.TestCase):
                 valid_task(), route_request("PLANNING_ONLY", "READ_ONLY"), "sol_only", "terra_os"
             ),
         )
+
+    def test_bounded_and_multi_stage_nonwrite_work_are_sol_only(self):
+        for work_class in ("BOUNDED", "MULTI_STAGE"):
+            for execution_need in ("NONE", "READ_ONLY"):
+                with self.subTest(work_class=work_class, execution_need=execution_need):
+                    decision = workflow.decide_route(
+                        valid_task(), route_request(work_class, execution_need), "enforced"
+                    )
+
+                    self.assertEqual("sol_only", decision.route)
+                    self.assertEqual(("sol_medium_supervisor",), decision.roles)
+                    self.assertEqual(
+                        (
+                            "DECOMPOSABLE_READ_ONLY_ROUTE"
+                            if execution_need == "READ_ONLY"
+                            else "DECOMPOSABLE_SOL_ONLY_ROUTE"
+                        ),
+                        decision.rule_id,
+                    )
+
+    def test_bounded_and_multi_stage_writes_use_the_terra_os_construction_chain(self):
+        for work_class in ("BOUNDED", "MULTI_STAGE"):
+            with self.subTest(work_class=work_class):
+                decision = workflow.decide_route(
+                    valid_task(), route_request(work_class, "WRITE"), "enforced"
+                )
+
+                self.assertEqual("delegated", decision.route)
+                self.assertEqual(
+                    ("sol_medium_supervisor", "terra_xhigh", "sol_medium_reviewer"),
+                    decision.roles,
+                )
+
+    def test_non_decomposable_bounded_and_multi_stage_work_is_blocked(self):
+        for work_class in ("BOUNDED", "MULTI_STAGE"):
+            for execution_need in ("NONE", "READ_ONLY", "WRITE"):
+                for risk_flags in ([], ["SECURITY"]):
+                    with self.subTest(
+                        work_class=work_class,
+                        execution_need=execution_need,
+                        risk_flags=risk_flags,
+                    ):
+                        decision = workflow.decide_route(
+                            valid_task(risk_flags=risk_flags),
+                            route_request(
+                                work_class,
+                                execution_need,
+                                decomposable=False,
+                                risk_flags=risk_flags,
+                            ),
+                            "enforced",
+                        )
+
+                        self.assertEqual("blocked", decision.route)
+                        self.assertEqual((), decision.roles)
 
     def test_direct_and_blocked_routes_never_start_a_model(self):
         for route_name in ("direct", "blocked"):

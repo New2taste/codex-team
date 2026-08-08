@@ -237,11 +237,19 @@ def roles_for_policy(
     raise AssertionError("unreachable")
 
 
-def _rule_id_for(route_name: str, risky: bool) -> str:
+def _rule_id_for(
+    route_name: str, risky: bool, work_class: str, execution_need: str
+) -> str:
     if route_name == "direct":
         return "SIMPLE_DIRECT_ROUTE"
     if route_name == "sol_only":
-        return "HIGH_RISK_READ_ONLY_ROUTE" if risky else "PLANNING_ONLY_ROUTE"
+        if risky:
+            return "HIGH_RISK_READ_ONLY_ROUTE"
+        if work_class == "PLANNING_ONLY":
+            return "PLANNING_ONLY_ROUTE"
+        if execution_need == "READ_ONLY":
+            return "DECOMPOSABLE_READ_ONLY_ROUTE"
+        return "DECOMPOSABLE_SOL_ONLY_ROUTE"
     if route_name == "delegated":
         return "HIGH_RISK_WRITE_DELEGATED_ROUTE" if risky else "DECOMPOSABLE_DELEGATED_ROUTE"
     return "ROUTE_BLOCKED"
@@ -276,22 +284,33 @@ def decide_route(
         rule_id = "LEGACY_TASK_TYPE_ROUTE"
     else:
         risky = bool(task_value["risk_flags"]) or request_value["work_class"] == "HIGH_CONSEQUENCE"
-        if risky and request_value["execution_need"] == "WRITE" and not request_value["decomposable"]:
+        bounded_or_multi_stage = request_value["work_class"] in {"BOUNDED", "MULTI_STAGE"}
+        if bounded_or_multi_stage and not request_value["decomposable"]:
+            selected = "blocked"
+        elif risky and request_value["execution_need"] == "WRITE" and not request_value["decomposable"]:
             _fail(
                 "ROUTE_UNDECIDABLE",
                 "high-consequence write lacks bounded decomposition",
             )
-        if risky:
+        elif risky:
             selected = "sol_only" if request_value["execution_need"] != "WRITE" else "delegated"
         elif request_value["work_class"] == "PLANNING_ONLY":
             selected = "sol_only"
         elif request_value["work_class"] == "SIMPLE":
             selected = "direct"
-        elif request_value["work_class"] in {"BOUNDED", "MULTI_STAGE"} and request_value["decomposable"]:
-            selected = "delegated"
+        elif bounded_or_multi_stage:
+            if request_value["execution_need"] == "WRITE":
+                selected = "delegated"
+            else:
+                selected = "sol_only"
         else:
             selected = "blocked"
-        rule_id = _rule_id_for(selected, risky)
+        rule_id = _rule_id_for(
+            selected,
+            risky,
+            str(request_value["work_class"]),
+            str(request_value["execution_need"]),
+        )
     roles = (
         _roles_for(selected, current_legacy_roles)
         if mode == "legacy"

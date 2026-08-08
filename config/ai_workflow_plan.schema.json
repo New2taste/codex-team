@@ -40,7 +40,7 @@
           },
           "owner_role": {
             "type": "string",
-            "enum": ["host", "luna", "terra", "sol_planner", "sol_reviewer", "sol_xhigh"]
+            "enum": ["host", "luna", "terra", "sol_planner", "sol_reviewer", "sol_xhigh", "sol_medium_supervisor", "terra_xhigh", "sol_medium_reviewer", "sol_xhigh_planner"]
           },
           "read_scope": {
             "type": "array",

@@ -67,6 +67,21 @@ def valid_plan(tasks=None, stages=None):
 
 
 class PlanScopeValidationTest(unittest.TestCase):
+    def test_each_new_terra_os_role_is_a_valid_frozen_plan_owner(self):
+        for role in (
+            "sol_medium_supervisor",
+            "terra_xhigh",
+            "sol_medium_reviewer",
+            "sol_xhigh_planner",
+        ):
+            with self.subTest(role=role):
+                frozen = workflow.validate_plan(
+                    valid_plan(tasks=[plan_task("task-a", [], owner_role=role)]),
+                    remediation_task(),
+                )
+
+                self.assertEqual(role, frozen.tasks[0].owner_role)
+
     def test_valid_plan_freezes_scope_ownership_by_subtask_id(self):
         plan = valid_plan(
             tasks=[
