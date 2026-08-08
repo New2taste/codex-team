@@ -235,13 +235,12 @@ def _preserve_tombstone(
 def _discard_verified_tombstone(
     target_directory: int, tombstone_name: str, tombstone: int, expected_sha: str
 ) -> bool:
-    """Delete only a re-verified payload in a private owned tombstone."""
+    """Delete only a re-verified payload; the caller retains descriptor ownership."""
 
     try:
         if _hash_regular(tombstone, "payload") != expected_sha:
             return False
         os.unlink("payload", dir_fd=tombstone)
-        os.close(tombstone)
         os.rmdir(tombstone_name, dir_fd=target_directory)
         return True
     except OSError:
@@ -402,9 +401,18 @@ def install(
             _hook(hook, "install.before_publish_missing")
             if not _publish_no_clobber(directory, staged_agent, directory, TARGET_FILENAME):
                 return 1
+            published_status = _require_regular(directory, staged_agent)
+            published_identity = (published_status.st_dev, published_status.st_ino)
             _unlink_owned(directory, staged_agent)
             staged_agent = None
+            _hook(hook, "install.before_publish_missing_state")
             if not _publish_no_clobber(directory, staged_state, directory, STATE_FILENAME):
+                _retire_and_discard(
+                    directory,
+                    TARGET_FILENAME,
+                    template_sha,
+                    expected_identity=published_identity,
+                )
                 return 1
             _unlink_owned(directory, staged_state)
             staged_state = None
@@ -426,10 +434,13 @@ def install(
             return 1
         _unlink_owned(directory, staged_state)
         staged_state = None
-        if not _discard_verified_tombstone(directory, tombstone_name, tombstone, expected_sha):
-            tombstone = None
-            return 1
+        discarded = _discard_verified_tombstone(
+            directory, tombstone_name, tombstone, expected_sha
+        )
+        _close_tombstone(tombstone)
         tombstone = None
+        if not discarded:
+            return 1
         return 0
     except (LifecycleError, OSError):
         return 1
@@ -446,18 +457,28 @@ def install(
 
 
 def _retire_and_discard(
-    directory: int, name: str, expected_sha: str
+    directory: int,
+    name: str,
+    expected_sha: str,
+    *,
+    expected_identity: tuple[int, int] | None = None,
 ) -> bool:
     tombstone_name, tombstone = _retire_to_tombstone(directory, name)
-    moved_sha = _hash_regular(tombstone, "payload")
-    if moved_sha != expected_sha:
-        _preserve_tombstone(directory, name, tombstone)
+    try:
+        moved_status = _require_regular(tombstone, "payload")
+        moved_identity = (moved_status.st_dev, moved_status.st_ino)
+        if expected_identity is not None and moved_identity != expected_identity:
+            _preserve_tombstone(directory, name, tombstone)
+            return False
+        moved_sha = _hash_regular(tombstone, "payload")
+        if moved_sha != expected_sha:
+            _preserve_tombstone(directory, name, tombstone)
+            return False
+        return _discard_verified_tombstone(
+            directory, tombstone_name, tombstone, expected_sha
+        )
+    finally:
         _close_tombstone(tombstone)
-        return False
-    if not _discard_verified_tombstone(directory, tombstone_name, tombstone, expected_sha):
-        _close_tombstone(tombstone)
-        return False
-    return True
 
 
 def uninstall(
@@ -502,10 +523,13 @@ def uninstall(
         if not _retire_and_discard(directory, STATE_FILENAME, state_sha):
             _preserve_tombstone(directory, TARGET_FILENAME, tombstone)
             return 1
-        if not _discard_verified_tombstone(directory, tombstone_name, tombstone, RELEASE_SHA256):
-            tombstone = None
-            return 1
+        discarded = _discard_verified_tombstone(
+            directory, tombstone_name, tombstone, RELEASE_SHA256
+        )
+        _close_tombstone(tombstone)
         tombstone = None
+        if not discarded:
+            return 1
         return 0
     except (LifecycleError, OSError):
         return 1
@@ -531,7 +555,11 @@ def main(argv: list[str] | None = None) -> int:
     arguments, unknown = parser.parse_known_args(argv)
     if unknown or (arguments.operation == "uninstall" and arguments.check):
         return 1
-    target = arguments.target_dir or _default_target()
+    target = (
+        _default_target()
+        if arguments.target_dir is None
+        else arguments.target_dir
+    )
     if arguments.operation == "install":
         return install(target, check=arguments.check)
     return uninstall(target)

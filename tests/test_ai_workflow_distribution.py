@@ -14,6 +14,7 @@ import tempfile
 import tomllib
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -134,9 +135,16 @@ def write_owned_state(target: Path, backup_sha256: str | None = None) -> None:
 
 
 def temporary_directory():
-    """Use a physical root: `/var` is itself a macOS ancestor symlink."""
+    """Create below the physical system temp root on macOS and Linux."""
 
-    return tempfile.TemporaryDirectory(dir="/private/tmp")
+    return tempfile.TemporaryDirectory(dir=Path(tempfile.gettempdir()).resolve())
+
+
+def open_fd_count() -> int:
+    for candidate in (Path("/dev/fd"), Path("/proc/self/fd")):
+        if candidate.is_dir():
+            return len(os.listdir(candidate))
+    raise unittest.SkipTest("open descriptor inventory is unavailable")
 
 
 class DistributionContractTest(unittest.TestCase):
@@ -200,6 +208,26 @@ class DistributionContractTest(unittest.TestCase):
 
 
 class AgentLifecycleTest(unittest.TestCase):
+    def run_wrapper(
+        self,
+        script: Path,
+        *arguments: str,
+        home: Path,
+    ) -> subprocess.CompletedProcess[str]:
+        environment = dict(os.environ)
+        environment.pop("CODEX_HOME", None)
+        environment["HOME"] = str(home)
+        environment["PYTHON_BIN"] = str(PYTHON311)
+        return subprocess.run(
+            ["sh", str(script), *arguments],
+            cwd=ROOT,
+            env=environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
     def run_script(self, script: Path, target: Path, *extra: str) -> subprocess.CompletedProcess[str]:
         environment = dict(os.environ)
         environment.pop("CODEX_HOME", None)
@@ -409,14 +437,105 @@ class AgentLifecycleTest(unittest.TestCase):
             self.assertEqual(user_bytes, destination.read_bytes())
             self.assertFalse((target / STATE_NAME).exists())
 
+    def test_wrappers_reject_an_explicit_empty_target_without_touching_defaults(self):
+        operations = (
+            ("install", INSTALL, ("--target-dir", "")),
+            ("check", INSTALL, ("--target-dir", "", "--check")),
+            ("uninstall", UNINSTALL, ("--target-dir", "")),
+        )
+        with temporary_directory() as temporary:
+            root = Path(temporary)
+            for name, script, arguments in operations:
+                with self.subTest(operation=name):
+                    home = root / name / "home"
+                    default_target = home / ".codex" / "agents"
+                    default_target.mkdir(parents=True)
+                    (default_target / "luna-worker.toml").write_bytes(TEMPLATE.read_bytes())
+                    write_owned_state(default_target)
+                    before = filesystem_snapshot(home)
+
+                    result = self.run_wrapper(script, *arguments, home=home)
+
+                    self.assertNotEqual(0, result.returncode)
+                    self.assertEqual(before, filesystem_snapshot(home))
+
+    def test_missing_install_rolls_back_its_agent_when_state_publish_races(self):
+        lifecycle = load_lifecycle_helper()
+        with temporary_directory() as temporary:
+            target = Path(temporary) / "agents"
+            raced_state = b'{"owner":"user"}\n'
+
+            def race(point: str) -> None:
+                if point == "install.before_publish_missing_state":
+                    (target / STATE_NAME).write_bytes(raced_state)
+
+            self.assertNotEqual(0, lifecycle.install(target, hook=race))
+            self.assertFalse((target / "luna-worker.toml").exists())
+            self.assertEqual(raced_state, (target / STATE_NAME).read_bytes())
+
+    def test_missing_install_preserves_raced_agent_bytes_when_state_publish_races(self):
+        lifecycle = load_lifecycle_helper()
+        with temporary_directory() as temporary:
+            root = Path(temporary)
+            target = root / "agents"
+            destination = target / "luna-worker.toml"
+            raced_state = b'{"owner":"user"}\n'
+            user_bytes = b'name = "modified_during_state_race"\n'
+
+            def race(point: str) -> None:
+                if point == "install.before_publish_missing_state":
+                    (target / STATE_NAME).write_bytes(raced_state)
+                    replacement = root / "user-replacement.toml"
+                    replacement.write_bytes(user_bytes)
+                    os.replace(replacement, destination)
+
+            self.assertNotEqual(0, lifecycle.install(target, hook=race))
+            recoverable = []
+            if destination.exists():
+                recoverable.append(destination.read_bytes())
+            recoverable.extend(
+                payload.read_bytes()
+                for payload in target.glob(".ai-workflow-tombstone-*/payload")
+            )
+            self.assertIn(user_bytes, recoverable)
+            self.assertEqual(raced_state, (target / STATE_NAME).read_bytes())
+
+    def test_missing_install_preserves_a_same_digest_replacement_inode(self):
+        lifecycle = load_lifecycle_helper()
+        with temporary_directory() as temporary:
+            root = Path(temporary)
+            target = root / "agents"
+            destination = target / "luna-worker.toml"
+            replacement_inode: int | None = None
+
+            def race(point: str) -> None:
+                nonlocal replacement_inode
+                if point == "install.before_publish_missing_state":
+                    (target / STATE_NAME).write_bytes(b'{"owner":"user"}\n')
+                    replacement = root / "same-digest-replacement.toml"
+                    replacement.write_bytes(TEMPLATE.read_bytes())
+                    replacement_inode = replacement.stat().st_ino
+                    os.replace(replacement, destination)
+
+            self.assertNotEqual(0, lifecycle.install(target, hook=race))
+            self.assertIsNotNone(replacement_inode)
+            recoverable_inodes = []
+            if destination.exists():
+                recoverable_inodes.append(destination.stat().st_ino)
+            recoverable_inodes.extend(
+                payload.stat().st_ino
+                for payload in target.glob(".ai-workflow-tombstone-*/payload")
+            )
+            self.assertIn(replacement_inode, recoverable_inodes)
+
     def test_missing_check_closes_its_directory_descriptor(self):
         lifecycle = load_lifecycle_helper()
         with temporary_directory() as temporary:
             target = Path(temporary) / "missing" / "agents"
-            before = len(os.listdir("/dev/fd"))
+            before = open_fd_count()
             for _ in range(16):
                 self.assertNotEqual(0, lifecycle.install(target, check=True))
-            after = len(os.listdir("/dev/fd"))
+            after = open_fd_count()
             self.assertLessEqual(after, before + 2)
 
     def test_retained_tombstone_closes_its_descriptor(self):
@@ -429,7 +548,7 @@ class AgentLifecycleTest(unittest.TestCase):
             original_discard = lifecycle._discard_verified_tombstone
             lifecycle._discard_verified_tombstone = lambda *_: False
             try:
-                before = len(os.listdir("/dev/fd"))
+                before = open_fd_count()
                 for index in range(16):
                     name = f"retained-{index}"
                     content = f"retained {index}".encode("utf-8")
@@ -439,11 +558,65 @@ class AgentLifecycleTest(unittest.TestCase):
                             directory, name, hashlib.sha256(content).hexdigest()
                         )
                     )
-                after = len(os.listdir("/dev/fd"))
+                after = open_fd_count()
             finally:
                 lifecycle._discard_verified_tombstone = original_discard
                 os.close(directory)
             self.assertLessEqual(after, before + 2)
+
+    def test_known_legacy_install_closes_final_discard_failure_descriptors(self):
+        lifecycle = load_lifecycle_helper()
+        original_discard = lifecycle._discard_verified_tombstone
+        lifecycle._discard_verified_tombstone = lambda *_: False
+        try:
+            with temporary_directory() as temporary:
+                root = Path(temporary)
+                before = open_fd_count()
+                for index in range(16):
+                    target = root / str(index) / "agents"
+                    target.mkdir(parents=True)
+                    (target / "luna-worker.toml").write_bytes(KNOWN_LEGACY_TEMPLATE)
+                    self.assertNotEqual(0, lifecycle.install(target))
+                after = open_fd_count()
+        finally:
+            lifecycle._discard_verified_tombstone = original_discard
+        self.assertLessEqual(after, before + 2)
+
+    def test_uninstall_closes_final_discard_failure_descriptors(self):
+        lifecycle = load_lifecycle_helper()
+        original_discard = lifecycle._discard_verified_tombstone
+
+        def fail_only_final_agent_discard(*arguments):
+            if arguments[-1] == KNOWN_LEGACY_SHA256:
+                return False
+            return original_discard(*arguments)
+
+        lifecycle._discard_verified_tombstone = fail_only_final_agent_discard
+        try:
+            with temporary_directory() as temporary:
+                root = Path(temporary)
+                before = open_fd_count()
+                for index in range(16):
+                    target = root / str(index) / "agents"
+                    target.mkdir(parents=True)
+                    (target / "luna-worker.toml").write_bytes(TEMPLATE.read_bytes())
+                    write_owned_state(target)
+                    self.assertNotEqual(0, lifecycle.uninstall(target))
+                after = open_fd_count()
+        finally:
+            lifecycle._discard_verified_tombstone = original_discard
+        self.assertLessEqual(after, before + 2)
+
+    def test_temporary_directory_uses_the_physical_system_temp_root(self):
+        physical_system_temp = Path(tempfile.gettempdir()).resolve()
+        with tempfile.TemporaryDirectory(dir=physical_system_temp) as parent:
+            alternate_temp = Path(parent) / "linux-tmp"
+            alternate_temp.mkdir()
+            with mock.patch.object(tempfile, "gettempdir", return_value=str(alternate_temp)):
+                with temporary_directory() as created:
+                    created_path = Path(created)
+                    self.assertEqual(alternate_temp, created_path.parent)
+                    self.assertEqual(created_path, created_path.resolve())
 
     def test_known_legacy_install_preserves_a_raced_user_replacement(self):
         lifecycle = load_lifecycle_helper()
