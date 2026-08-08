@@ -186,6 +186,84 @@ class MetricsReportTest(unittest.TestCase):
         self.assertEqual([run["token_usage"] for run in document["runs"]], [None, None])
         self.assertRegex(document["runs"][0]["timestamp_utc"], r"Z$")
 
+    def test_controller_appends_native_cost_attempts_for_failures_and_retries(self):
+        task_id = self._create_task("AWF-20260803-003")
+        task = workflow.load_task(self.state_root / task_id / "task.json")
+
+        class RetryRunner:
+            is_live_model = False
+
+            def __init__(self):
+                self.calls = 0
+
+            def run(self, role, task):
+                self.calls += 1
+                if self.calls == 1:
+                    raise workflow.WorkflowError("CODEX_EXIT_NONZERO", "synthetic failure")
+                return workflow.FakeRunner().run(role, task)
+
+        runner = RetryRunner()
+        with mock.patch.object(workflow, "WORKFLOW_STATE_ROOT", self.state_root):
+            result, state = workflow._run_role_with_technical_retry(
+                self.store,
+                task_id,
+                task,
+                "EVIDENCE_RUNNING",
+                "luna",
+                runner,
+                workflow.RetryBudget(),
+            )
+
+        self.assertEqual("luna", result["role"])
+        self.assertEqual("EVIDENCE_RUNNING", state)
+        document = json.loads(
+            (self.state_root / task_id / "metrics.json").read_text(encoding="utf-8")
+        )
+        attempts = [run["cost_evidence"] for run in document["runs"]]
+        self.assertEqual(2, len(attempts))
+        self.assertEqual(
+            ["none", "technical"],
+            [attempt["retry_kind"] for attempt in attempts],
+        )
+        self.assertEqual(
+            ["NATIVE_SUBAGENT", "NATIVE_SUBAGENT"],
+            [attempt["execution_surface"] for attempt in attempts],
+        )
+        self.assertEqual([None, None], [attempt["input_tokens"] for attempt in attempts])
+        self.assertEqual(["unavailable", "unavailable"], [attempt["evidence_class"] for attempt in attempts])
+        self.assertEqual([None, None], [attempt["paired_case_id"] for attempt in attempts])
+
+    def test_unpaired_cost_attempt_is_reported_unavailable_and_not_aggregated(self):
+        task_id = self._create_task("AWF-20260803-004")
+        self._record(
+            task_id,
+            {
+                "role": "luna",
+                "cost_evidence": {
+                    "schema_version": "cost-evidence-1",
+                    "route": "blocked",
+                    "role": "luna",
+                    "execution_surface": "NATIVE_SUBAGENT",
+                    "duration_seconds": 1.0,
+                    "prompt_bytes": 0,
+                    "input_tokens": None,
+                    "cached_input_tokens": None,
+                    "output_tokens": None,
+                    "retry_kind": "none",
+                    "verification_seconds": 0.0,
+                    "quality_outcome": "FAILED",
+                    "paired_case_id": None,
+                    "evidence_class": "unavailable",
+                    "rate_snapshot_id": None,
+                },
+            },
+        )
+        metrics = workflow.aggregate_metrics(self.state_root)
+        self.assertEqual({}, metrics["cost_summary"])
+        self.assertEqual(1, metrics["cost_unavailable_attempt_count"])
+        report = workflow.render_report(metrics)
+        self.assertIn("- unavailable attempts: 1", report)
+
     def test_aggregate_metrics_separates_luna_value_and_review_cost(self):
         calibration_task = self._create_task("AWF-20260803-001")
         experiment_task = self._create_task("AWF-20260803-002")
@@ -830,6 +908,53 @@ class CodexRunnerTest(unittest.TestCase):
         self.assertTrue(kwargs["text"])
         self.assertNotIn("OPENAI_API_KEY", kwargs["env"])
         self.assertNotIn("TUSHARE_TOKEN", kwargs["env"])
+
+    @mock.patch(
+        "scripts.ai_workflow.capture_repo",
+        return_value=workflow.RepoSnapshot("pinned-head", ()),
+    )
+    @mock.patch("scripts.ai_workflow.working_tree_paths", return_value=set())
+    @mock.patch("scripts.ai_workflow.subprocess.run")
+    @mock.patch("scripts.ai_workflow.record_metrics")
+    def test_codex_controller_records_literal_runtime_usage_on_exec_surface(
+        self, record_metrics, run, _working_tree_paths, _capture_repo
+    ):
+        result = self.valid_result()
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            paths = workflow.RunPaths(
+                repo=ROOT,
+                output_path=root / "luna-result.json",
+                schema_path=ROOT / "config/ai_workflow_result.schema.json",
+                logs_dir=root / "logs",
+                state_root=root / "state",
+            )
+
+            def write_usage_result(command, *args, **kwargs):
+                write_codex_result(command, result)
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    stdout=(
+                        '{"type":"turn.completed","usage":'
+                        '{"input_tokens":11,"cached_input_tokens":2,"output_tokens":3}}\n'
+                    ),
+                    stderr="",
+                )
+
+            run.side_effect = write_usage_result
+            workflow.run_codex("luna", self.valid_task(), "task contract", paths)
+
+        record_metrics.assert_called_once()
+        metric_run = record_metrics.call_args.args[1]
+        evidence = metric_run["cost_evidence"]
+        self.assertEqual("CODEX_EXEC_ROLE_CONTRACT", evidence["execution_surface"])
+        self.assertEqual(11, evidence["input_tokens"])
+        self.assertEqual(2, evidence["cached_input_tokens"])
+        self.assertEqual(3, evidence["output_tokens"])
+        self.assertEqual(len("task contract".encode("utf-8")), evidence["prompt_bytes"])
+        self.assertEqual("measured", evidence["evidence_class"])
+        self.assertIsNone(evidence["paired_case_id"])
 
     @mock.patch(
         "scripts.ai_workflow.capture_repo",

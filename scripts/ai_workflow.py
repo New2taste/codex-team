@@ -508,6 +508,94 @@ class RunPaths:
     runtime_sessions_dir: Path | None = None
 
 
+def _verified_cost_route(state_root: Path | None, task_id: str) -> str:
+    """Read one persisted route decision, failing closed when none is present."""
+
+    if state_root is None:
+        return "blocked"
+    try:
+        task_dir = WorkflowStore(state_root)._require_task(task_id)
+        decision = load_artifact(task_dir / "route-decision.json")
+        validate_route_decision(decision)
+        if decision.get("task_id") != task_id:
+            return "blocked"
+    except (WorkflowError, ArtifactError, OSError, json.JSONDecodeError):
+        return "blocked"
+    route_value = decision.get("route")
+    return route_value if isinstance(route_value, str) and route_value in {"direct", "sol_only", "delegated", "blocked"} else "blocked"
+
+
+def _task_paired_case_id(task: Mapping[str, object]) -> str | None:
+    """Use only an explicitly registered pair id; never derive one from task id."""
+
+    value = task.get("paired_case_id")
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _literal_runtime_usage(value: object) -> dict[str, int | None]:
+    """Keep only explicit, finite non-negative integer runtime usage values."""
+
+    usage: dict[str, int | None] = {}
+    for field in ("input_tokens", "cached_input_tokens", "output_tokens"):
+        candidate = value.get(field) if isinstance(value, Mapping) else None
+        usage[field] = (
+            candidate
+            if isinstance(candidate, int) and not isinstance(candidate, bool) and candidate >= 0
+            else None
+        )
+    return usage
+
+
+def _controller_cost_attempt(
+    task_id: str,
+    task: Mapping[str, object],
+    role: str,
+    execution_surface: str,
+    duration_seconds: float,
+    prompt_bytes: int,
+    runtime_usage: object,
+    retry_kind: str,
+    quality_outcome: str,
+    state_root: Path | None,
+    *,
+    attempt_id: str | None = None,
+    verification_seconds: float = 0.0,
+    base_metric_run: Mapping[str, object] | None = None,
+) -> None:
+    """Append controller-owned cost evidence for one success or failed attempt."""
+
+    if state_root is None:
+        return
+    usage = _literal_runtime_usage(runtime_usage)
+    evidence_class = "measured" if any(value is not None for value in usage.values()) else "unavailable"
+    metric_run = dict(base_metric_run) if isinstance(base_metric_run, Mapping) else {}
+    metric_run.update({
+        "role": role,
+        "status": quality_outcome,
+        "duration_seconds": duration_seconds,
+    })
+    metric_run["cost_evidence"] = {
+        "schema_version": "cost-evidence-1",
+        "route": _verified_cost_route(state_root, task_id),
+        "role": role,
+        "execution_surface": execution_surface,
+        "duration_seconds": duration_seconds,
+        "prompt_bytes": prompt_bytes,
+        "input_tokens": usage["input_tokens"],
+        "cached_input_tokens": usage["cached_input_tokens"],
+        "output_tokens": usage["output_tokens"],
+        "retry_kind": retry_kind,
+        "verification_seconds": verification_seconds,
+        "quality_outcome": quality_outcome,
+        "paired_case_id": _task_paired_case_id(task),
+        "evidence_class": evidence_class,
+        "rate_snapshot_id": None,
+    }
+    if attempt_id is not None:
+        metric_run["cost_evidence"]["attempt_id"] = attempt_id
+    record_metrics(task_id, metric_run, state_root=state_root)
+
+
 def _validate_result_records(
     value: list[object],
     field: str,
@@ -723,6 +811,8 @@ def run_codex(role: str, task: dict, prompt: str, paths: RunPaths) -> dict:
     if attempt_output.exists():
         _fail("ATTEMPT_OUTPUT_COLLISION", "role attempt output path already exists")
     result: dict | None = None
+    completed: subprocess.CompletedProcess | None = None
+    attempt_error: BaseException | None = None
     try:
         command = build_codex_command(role, repo, attempt_output, paths.schema_path)
         try:
@@ -755,20 +845,42 @@ def run_codex(role: str, task: dict, prompt: str, paths: RunPaths) -> dict:
             raise WorkflowError("INVALID_ROLE_RESULT", f"{role} did not produce valid JSON") from exc
         if not isinstance(result, dict):
             _fail("INVALID_ROLE_RESULT", "role output must be an object")
+    except BaseException as exc:
+        attempt_error = exc
+        raise
     finally:
-        after_run = capture_repo(repo)
-        after_changes = working_tree_paths(repo)
-        if before_run.head != after_run.head:
-            _fail("HEAD_DRIFT", "repository HEAD changed during the role run")
-        if role in READ_ONLY_ROLES and before_run != after_run:
-            _fail("READ_ONLY_ROLE_MODIFIED_REPO", f"read-only role {role} changed the repository")
-        if task["task_type"] == "ACCEPTANCE":
-            assert_acceptance_candidate(task, repo)
-        if role == "terra":
-            actual_changes = after_changes - before_changes
-            assert_allowed_changes(actual_changes, task["allowed_write_paths"])
-        else:
-            actual_changes = after_changes - before_changes
+        try:
+            after_run = capture_repo(repo)
+            after_changes = working_tree_paths(repo)
+            if before_run.head != after_run.head:
+                _fail("HEAD_DRIFT", "repository HEAD changed during the role run")
+            if role in READ_ONLY_ROLES and before_run != after_run:
+                _fail("READ_ONLY_ROLE_MODIFIED_REPO", f"read-only role {role} changed the repository")
+            if task["task_type"] == "ACCEPTANCE":
+                assert_acceptance_candidate(task, repo)
+            if role == "terra":
+                actual_changes = after_changes - before_changes
+                assert_allowed_changes(actual_changes, task["allowed_write_paths"])
+            else:
+                actual_changes = after_changes - before_changes
+        finally:
+            if paths.state_root is not None:
+                stdout = completed.stdout if completed is not None else ""
+                _controller_cost_attempt(
+                    task["task_id"],
+                    task,
+                    role,
+                    CODEX_EXEC_ROLE_CONTRACT,
+                    (time.time_ns() - attempt_started_ns) / 1_000_000_000,
+                    len(prompt.encode("utf-8")),
+                    extract_codex_usage(parse_codex_jsonl(stdout)),
+                    "none",
+                    str(result.get("status", "FAILED"))
+                    if isinstance(result, Mapping) and attempt_error is None
+                    else "FAILED",
+                    paths.state_root,
+                    attempt_id=attempt_id,
+                )
     if result is None:
         _fail("INVALID_ROLE_RESULT", "role did not return a result")
     if paths.runtime_evidence_required:
@@ -1365,21 +1477,29 @@ def _normalize_metric_run(run: Mapping[str, object]) -> dict[str, object]:
         "net_measured_cost_delta",
         "quality_delta_points",
     )
-    cost_record = {field: run[field] for field in cost_fields if field in run}
+    nested_cost_record = run.get("cost_evidence")
+    cost_record = (
+        dict(nested_cost_record)
+        if isinstance(nested_cost_record, Mapping)
+        else {field: run[field] for field in cost_fields if field in run}
+    )
     if "status" in run and "quality_outcome" not in cost_record:
         cost_record["quality_outcome"] = run["status"]
-    if cost_record and any(
-        field in cost_record
-        for field in (
-            "paired_case_id",
-            "route",
-            "execution_surface",
-            "prompt_bytes",
-            "input_tokens",
-            "cached_input_tokens",
-            "output_tokens",
-            "evidence_class",
-            "rate_snapshot_id",
+    if cost_record and (
+        isinstance(nested_cost_record, Mapping)
+        or any(
+            field in cost_record
+            for field in (
+                "paired_case_id",
+                "route",
+                "execution_surface",
+                "prompt_bytes",
+                "input_tokens",
+                "cached_input_tokens",
+                "output_tokens",
+                "evidence_class",
+                "rate_snapshot_id",
+            )
         )
     ):
         cost_record.setdefault("role", role)
@@ -1411,10 +1531,12 @@ def _load_metrics_document(path: Path, task_id: str) -> dict[str, object]:
     return document
 
 
-def record_metrics(task_id: str, run: Mapping[str, object]) -> None:
+def record_metrics(
+    task_id: str, run: Mapping[str, object], *, state_root: Path | None = None
+) -> None:
     """Record one measured role attempt in the task's existing workflow store."""
 
-    store = WorkflowStore(WORKFLOW_STATE_ROOT)
+    store = WorkflowStore(WORKFLOW_STATE_ROOT if state_root is None else state_root)
     path = store.metrics_path(task_id)
     document = _load_metrics_document(path, task_id)
     normalized_run = _normalize_metric_run(run)
@@ -1480,6 +1602,7 @@ def aggregate_metrics(root: Path) -> dict:
     end_to_end_seconds = 0.0
     stop_line_events: list[dict[str, object]] = []
     cost_records: list[Mapping[str, object]] = []
+    cost_unavailable_attempts = 0
     try:
         task_dirs = sorted(
             (path for path in root.iterdir() if path.is_dir() and TASK_ID_PATTERN.fullmatch(path.name)),
@@ -1524,12 +1647,14 @@ def aggregate_metrics(root: Path) -> dict:
             cost_record = run.get("cost_evidence")
             if not isinstance(cost_record, Mapping) and isinstance(run.get("paired_case_id"), str):
                 cost_record = run
-            if (
-                isinstance(cost_record, Mapping)
-                and isinstance(cost_record.get("paired_case_id"), str)
-                and cost_record["paired_case_id"].strip()
-            ):
-                cost_records.append(dict(cost_record))
+            if isinstance(cost_record, Mapping):
+                paired_case_id = cost_record.get("paired_case_id")
+                if isinstance(paired_case_id, str) and paired_case_id.strip():
+                    cost_records.append(dict(cost_record))
+                elif run.get("cost_evidence") is not None:
+                    # Controller evidence without a pre-registered pair is
+                    # retained as unavailable rather than assigned a pair.
+                    cost_unavailable_attempts += 1
         for event in _read_task_events(task_dir, task_id):
             if event.get("new_state") == "NEEDS_REPLAN" or event.get("event_type") == "SEMANTIC_REWORK":
                 semantic_reworks += 1
@@ -1563,6 +1688,7 @@ def aggregate_metrics(root: Path) -> dict:
         "end_to_end_seconds": end_to_end_seconds,
         "stop_line_events": stop_line_events,
         "cost_summary": cost_summary,
+        "cost_unavailable_attempt_count": cost_unavailable_attempts,
     }
 
 
@@ -1627,6 +1753,7 @@ def render_report(metrics: Mapping[str, object]) -> str:
         metrics.get("cost_claim_summary")
         if isinstance(metrics.get("cost_claim_summary"), Mapping)
         else None,
+        int(metrics.get("cost_unavailable_attempt_count", 0) or 0),
     )
     lines.extend(("", cost_sections.rstrip("\n")))
     return _redact_log_text("\n".join(lines) + "\n")
@@ -1973,6 +2100,7 @@ def _run_role_with_technical_retry(
 ) -> tuple[Mapping[str, object] | None, str]:
     """Run one role, allowing only the single persisted technical retry."""
 
+    retry_kind = "none"
     while True:
         try:
             guarded_repo: Path | None = None
@@ -2003,26 +2131,50 @@ def _run_role_with_technical_retry(
                 before_snapshot = capture_repo(guarded_repo)
                 before_changes = working_tree_paths(guarded_repo)
             started_monotonic = time.monotonic()
+            attempt_error: BaseException | None = None
+            runtime_usage = None
             try:
                 result = runner.run(role, task)
+                runtime_usage = getattr(runner, "runtime_usage", None)
+            except BaseException as exc:
+                attempt_error = exc
+                runtime_usage = getattr(runner, "runtime_usage", runtime_usage)
+                raise
             finally:
-                if guarded_repo is not None and before_snapshot is not None and before_changes is not None:
-                    after_snapshot = capture_repo(guarded_repo)
-                    after_changes = working_tree_paths(guarded_repo)
-                    if before_snapshot.head != after_snapshot.head:
-                        _fail("HEAD_DRIFT", "repository HEAD changed during the role run")
-                    if role in READ_ONLY_ROLES and before_snapshot != after_snapshot:
-                        _fail(
-                            "READ_ONLY_ROLE_MODIFIED_REPO",
-                            f"read-only role {role} changed the repository",
+                try:
+                    if guarded_repo is not None and before_snapshot is not None and before_changes is not None:
+                        after_snapshot = capture_repo(guarded_repo)
+                        after_changes = working_tree_paths(guarded_repo)
+                        if before_snapshot.head != after_snapshot.head:
+                            _fail("HEAD_DRIFT", "repository HEAD changed during the role run")
+                        if role in READ_ONLY_ROLES and before_snapshot != after_snapshot:
+                            _fail(
+                                "READ_ONLY_ROLE_MODIFIED_REPO",
+                                f"read-only role {role} changed the repository",
+                            )
+                        if task["task_type"] == "ACCEPTANCE":
+                            assert_acceptance_candidate(task, guarded_repo)
+                        actual_changes = after_changes - before_changes
+                        if role == "terra":
+                            assert_allowed_changes(actual_changes, task["allowed_write_paths"])
+                    else:
+                        actual_changes = set(result.get("changed_files", [])) if "result" in locals() and isinstance(result, Mapping) else set()
+                finally:
+                    if attempt_error is not None:
+                        _controller_cost_attempt(
+                            task_id,
+                            task,
+                            role,
+                            CODEX_EXEC_ROLE_CONTRACT
+                            if getattr(runner, "is_live_model", False)
+                            else NATIVE_SUBAGENT,
+                            time.monotonic() - started_monotonic,
+                            0,
+                            runtime_usage,
+                            retry_kind,
+                            "FAILED",
+                            WORKFLOW_STATE_ROOT,
                         )
-                    if task["task_type"] == "ACCEPTANCE":
-                        assert_acceptance_candidate(task, guarded_repo)
-                    actual_changes = after_changes - before_changes
-                    if role == "terra":
-                        assert_allowed_changes(actual_changes, task["allowed_write_paths"])
-                else:
-                    actual_changes = set(result.get("changed_files", [])) if "result" in locals() and isinstance(result, Mapping) else set()
             metric_run = dict(result) if isinstance(result, Mapping) else {}
             metric_run.update(
                 {
@@ -2031,7 +2183,21 @@ def _run_role_with_technical_retry(
                     "duration_seconds": time.monotonic() - started_monotonic,
                 }
             )
-            record_metrics(task_id, metric_run)
+            _controller_cost_attempt(
+                task_id,
+                task,
+                role,
+                CODEX_EXEC_ROLE_CONTRACT
+                if getattr(runner, "is_live_model", False)
+                else NATIVE_SUBAGENT,
+                metric_run["duration_seconds"],
+                0,
+                runtime_usage,
+                retry_kind,
+                str(result.get("status", "UNKNOWN")),
+                WORKFLOW_STATE_ROOT,
+                base_metric_run=metric_run,
+            )
             validate_role_result(role, result, actual_changes)
             validate_verification_package(role, task, result)
             return result, state
@@ -2058,6 +2224,7 @@ def _run_role_with_technical_retry(
                 )
             try:
                 budget.consume_technical()
+                retry_kind = "technical"
             except WorkflowError:
                 return None, _transition(
                     store,

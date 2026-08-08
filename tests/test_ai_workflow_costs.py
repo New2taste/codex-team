@@ -162,6 +162,35 @@ class PairingAndClaimGateTest(unittest.TestCase):
             ),
         )
 
+    def test_signed_cost_and_quality_deltas_survive_pairing_and_claim_gate(self):
+        summary = workflow.aggregate_paired_cases(
+            [
+                cost_record(
+                    input_tokens=10,
+                    duration_seconds=1.0,
+                    net_measured_cost_delta=-2.5,
+                    quality_delta_points=-1.5,
+                )
+            ]
+        )
+        self.assertEqual(-2.5, summary["case-01"]["net_measured_cost_delta"])
+        self.assertEqual(-1.5, summary["case-01"]["quality_delta_points"])
+        self.assertEqual(
+            "COST_REDUCTION_SUPPORTED",
+            workflow.evaluate_cost_claim(summary, minimum_cases=1),
+        )
+
+    def test_measured_usage_cannot_carry_projected_price(self):
+        with self.assertRaisesRegex(workflow.WorkflowError, "COST_EVIDENCE_INVALID"):
+            workflow.normalize_cost_evidence(
+                cost_record(
+                    input_tokens=10,
+                    duration_seconds=1.0,
+                    evidence_class="measured",
+                    projected_cost_usd=0.25,
+                )
+            )
+
     def test_paired_fixture_is_stable_stratified_and_has_both_surfaces(self):
         fixture = json.loads(
             (ROOT / "tests" / "fixtures" / "paired-cases.json").read_text(
@@ -181,6 +210,30 @@ class PairingAndClaimGateTest(unittest.TestCase):
             {"NATIVE_SUBAGENT", "CODEX_EXEC_ROLE_CONTRACT"},
             surfaces,
         )
+
+    def test_synthetic_fixture_flows_through_aggregation_and_stays_out_of_metrics(self):
+        fixture = json.loads(
+            (ROOT / "tests" / "fixtures" / "paired-cases.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        records = [
+            attempt
+            for case in fixture["cases"]
+            for attempt in case["attempts"]
+        ]
+        summary = workflow.aggregate_paired_cases(records)
+        self.assertEqual(30, len(summary))
+        self.assertEqual("NO_COST_REDUCTION_PROVEN", workflow.evaluate_cost_claim(summary))
+        metrics = {
+            "calibration_task_count": 0,
+            "experiment_task_count": 0,
+            "role_calls": {},
+            "cost_summary": {},
+        }
+        report = workflow.render_report(metrics)
+        self.assertIn("paired-case count: 0", report)
+        self.assertNotIn("case-01", report)
 
 
 class CostReportTest(unittest.TestCase):
@@ -217,6 +270,42 @@ class CostReportTest(unittest.TestCase):
             "This calibration report proves only that the Luna read-only path can run",
             report,
         )
+
+    def test_report_shows_signed_deltas_and_projection_amounts_without_mixing_classes(self):
+        records = [
+            cost_record(
+                input_tokens=10,
+                duration_seconds=1.0,
+                net_measured_cost_delta=-2.5,
+                quality_delta_points=-1.5,
+            ),
+            cost_record(
+                paired_case_id="case-02",
+                evidence_class="sample_validated_projection",
+                rate_snapshot_id="rates-2026-08-03",
+                duration_seconds=None,
+                input_tokens=None,
+                cached_input_tokens=None,
+                output_tokens=None,
+                projected_cost_usd=0.25,
+            ),
+            cost_record(paired_case_id="case-03"),
+        ]
+        report = workflow.render_report(
+            {
+                "calibration_task_count": 0,
+                "experiment_task_count": 0,
+                "role_calls": {},
+                "cost_summary": workflow.aggregate_paired_cases(records),
+            }
+        )
+        self.assertIn("net measured cost delta: -2.5", report)
+        self.assertIn("quality delta points: -1.5", report)
+        self.assertIn("measured input tokens: 10", report)
+        self.assertIn("measured duration seconds: 1.0", report)
+        self.assertIn("projected cost: 0.25", report)
+        self.assertIn("rate snapshot: rates-2026-08-03", report)
+        self.assertIn("unavailable attempts: 1", report)
 
 
 if __name__ == "__main__":

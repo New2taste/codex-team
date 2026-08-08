@@ -76,6 +76,8 @@ _PRICE_FIELDS = frozenset(
         "projected_price_usd",
         "estimated_cost",
         "estimated_cost_usd",
+        "estimated_price",
+        "estimated_price_usd",
         "input_cost",
         "input_cost_usd",
         "output_cost",
@@ -88,7 +90,18 @@ _PRICE_FIELDS = frozenset(
         "new_cost_usd",
         "baseline_measured_cost",
         "new_measured_cost",
-        "net_measured_cost_delta",
+    }
+)
+_PROJECTED_PRICE_FIELDS = frozenset(
+    {
+        "projected_cost",
+        "projected_cost_usd",
+        "projected_price",
+        "projected_price_usd",
+        "estimated_cost",
+        "estimated_cost_usd",
+        "estimated_price",
+        "estimated_price_usd",
     }
 )
 _OPTIONAL_INPUT_FIELDS = frozenset(
@@ -116,6 +129,7 @@ _OPTIONAL_INPUT_FIELDS = frozenset(
         "baseline_quality_points",
         "new_quality_points",
         "quality_delta_points",
+        "net_measured_cost_delta",
         "_status",
     }
 )
@@ -153,6 +167,20 @@ def finite_nonnegative_or_none(value: object, field: str) -> int | float | None:
         or value < 0
     ):
         _fail("COST_EVIDENCE_INVALID", f"{field} must be a finite non-negative number")
+    return value
+
+
+def finite_signed_or_none(value: object, field: str) -> int | float | None:
+    """Validate one finite numeric delta while allowing either sign."""
+
+    if value is None:
+        return None
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+    ):
+        _fail("COST_EVIDENCE_INVALID", f"{field} must be a finite number")
     return value
 
 
@@ -237,6 +265,21 @@ def _normalize_evidence_class(
         _fail(
             "COST_EVIDENCE_INVALID",
             "measured evidence requires explicit usage or duration",
+        )
+    projected_prices = {
+        field
+        for field in value
+        if field in _PROJECTED_PRICE_FIELDS and value[field] is not None
+    }
+    if projected_prices and evidence_class != "sample_validated_projection":
+        _fail(
+            "COST_EVIDENCE_INVALID",
+            "projected price requires sample_validated_projection evidence",
+        )
+    if projected_prices and measured:
+        _fail(
+            "COST_EVIDENCE_INVALID",
+            "measured usage cannot be mixed with projected price",
         )
     rate_snapshot_id = value.get("rate_snapshot_id")
     if evidence_class == "sample_validated_projection":
@@ -360,6 +403,7 @@ def _case_template(pair_id: str) -> dict[str, object]:
         "verification_seconds": 0,
         "prompt_bytes": 0,
         "projected_cost": None,
+        "rate_snapshot_ids": [],
         "net_measured_cost_delta": None,
         "quality_delta_points": None,
         "routes": [],
@@ -380,6 +424,8 @@ def _append_unique(target: list[object], value: object) -> None:
 def _cost_value(raw: Mapping[str, object], *fields: str) -> int | float | None:
     for field in fields:
         if field in raw:
+            if field in {"net_measured_cost_delta", "quality_delta_points"}:
+                return finite_signed_or_none(raw[field], field)
             return _number_for_sum(raw[field], field)
     return None
 
@@ -440,6 +486,8 @@ def aggregate_paired_cases(records: Iterable[object]) -> dict[str, dict[str, obj
         projected_cost = _cost_value(raw, "projected_cost_usd", "projected_cost", "estimated_cost_usd")
         if projected_cost is not None:
             case["projected_cost"] = (case["projected_cost"] or 0) + projected_cost
+        if evidence.rate_snapshot_id is not None:
+            _append_unique(case["rate_snapshot_ids"], evidence.rate_snapshot_id)
         measured_cost = _cost_value(raw, "net_measured_cost_delta")
         if measured_cost is None:
             baseline = _cost_value(raw, "baseline_measured_cost", "baseline_cost_usd", "baseline_cost")
@@ -587,6 +635,7 @@ def _claim_summary_from_cases(summary: Mapping[str, object]) -> dict[str, object
 def render_cost_sections(
     summary: Mapping[str, object] | Iterable[object] | None,
     claim_summary: Mapping[str, object] | None = None,
+    unavailable_attempts: int = 0,
 ) -> str:
     """Render measured, projection, and unavailable evidence as separate sections."""
 
@@ -618,9 +667,11 @@ def render_cost_sections(
         ]
         if not entries:
             lines.append("- None")
+            if category == "unavailable" and unavailable_attempts:
+                lines.append(f"- unavailable attempts: {unavailable_attempts}")
             continue
         for pair_id, case in entries:
-            lines.append(
+            detail = (
                 "- "
                 + pair_id
                 + ": route="
@@ -633,6 +684,34 @@ def render_cost_sections(
                 + str(case.get("prompt_bytes", case.get("measured_prompt_bytes", 0)))
                 + "; paired-case count=1"
             )
+            if category == "measured":
+                detail += "; measured input tokens: " + str(
+                    case.get("measured_input_tokens", 0)
+                )
+                detail += "; measured cached input tokens: " + str(
+                    case.get("measured_cached_input_tokens", 0)
+                )
+                detail += "; measured output tokens: " + str(
+                    case.get("measured_output_tokens", 0)
+                )
+                detail += "; measured duration seconds: " + str(
+                    case.get("measured_duration_seconds", 0)
+                )
+                detail += "; net measured cost delta: " + str(
+                    case.get("net_measured_cost_delta")
+                )
+                detail += "; quality delta points: " + str(case.get("quality_delta_points"))
+            if category == "projection":
+                detail += "; projected cost: " + str(case.get("projected_cost"))
+                rates = case.get("rate_snapshot_ids", [])
+                detail += "; rate snapshot: " + str(",".join(rates) if rates else None)
+            if category == "unavailable":
+                detail += "; unavailable attempts: " + str(
+                    case.get("unavailable_attempt_count", 0)
+                )
+            lines.append(detail)
+        if category == "unavailable" and unavailable_attempts:
+            lines.append(f"- unavailable attempts: {unavailable_attempts}")
     return "\n".join(lines) + "\n"
 
 
@@ -642,6 +721,7 @@ __all__ = [
     "aggregate_paired_cases",
     "evaluate_cost_claim",
     "finite_nonnegative_or_none",
+    "finite_signed_or_none",
     "normalize_cost_evidence",
     "render_cost_sections",
 ]
