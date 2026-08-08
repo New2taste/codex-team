@@ -11,12 +11,12 @@
 ## 2. 固定角色
 
 - **Terra xhigh / 执行 OS**：常驻且默认持有施工、集成、调试、恢复及两轮修复；写入仍只能发生在已授权独立 worktree 和允许路径中。
-- **Sol medium / 验收协处理器**：负责轻量项目的语义验收、风险审查和裁决。两轮 Terra 修复的报批仍不通过时，原验收 Sol 才临时取得最小修复所有权，并由另一位 Sol medium 验收。
+- **Sol medium / 施工监督协处理器**：在已冻结的总体方案内负责任务分解、施工计划、实现监督、语义验收、风险审查和裁决；还承接 Terra xhigh 能力边界外、但无需升级为大型项目总体规划的工作。两轮 Terra 修复的报批仍不通过时，原验收 Sol 才临时取得最小修复所有权，并由另一位 Sol medium 验收。
 - **Sol xhigh / 大型项目规划师**：只为已确认的大型、跨域项目制定整体方案和全局规划书；必须保留所有者授权，不能被普通实施、复审或返工自动调用。
 - **Terra medium、Sol high**：均没有默认调度角色，控制器不得自动选择。
 - **Luna Max / 廉价工具进程**：只执行原方案定义的 L0/L1/L2 有界取证、机械核对、只读盘点和冻结规格窄域反证。Luna 不拥有主实现、跨文件集成、最终验收或开放式裁决。
 
-模型身份和推理档是本策略的一部分：Terra xhigh 是唯一常驻施工档，Sol medium 是轻量验收档；Sol xhigh 仅用于授权的大型项目全局规划；Terra medium 和 Sol high 没有默认职责。
+模型身份和推理档是本策略的一部分：Terra xhigh 是唯一常驻施工档，Sol medium 是实施监督、任务分解、施工计划和验收档；Sol xhigh 仅用于授权的大型项目全局规划；Terra medium 和 Sol high 没有默认职责。
 
 ## 3. 默认策略
 
@@ -33,20 +33,20 @@
 |---|---|
 | 简单、低风险、无需模型 | host direct |
 | 大型项目的整体方案与全局规划书 | Sol xhigh planner |
-| 轻量语义裁决/验收 | Sol medium reviewer |
+| 总体方案内的任务分解、施工计划、实现监督、语义裁决/验收 | Sol medium supervisor/reviewer |
 | 有界只读证据，明确要求 L0/L1/L2 | Luna → Sol（仅在结果需要语义结论时） |
-| 普通实现/整改 | Terra xhigh → Sol medium reviewer |
-| 已授权大型项目实施 | Sol xhigh planner → Terra xhigh → Sol medium reviewer |
-| 验收预审需要窄域反证 | Luna 工具步骤 → Sol reviewer；Luna 不是验收者 |
+| 普通实现/整改 | Sol medium task plan → Terra xhigh → Sol medium reviewer |
+| 已授权大型项目实施 | Sol xhigh global plan → Sol medium task plan → Terra xhigh → Sol medium reviewer |
+| 验收预审需要窄域反证 | Luna 工具步骤 → Sol medium reviewer；Luna 不是验收者 |
 | 无法有界分解或权限不足 | BLOCKED |
 
-Luna 步骤必须由计划显式列出，控制器不得因为“有空闲 Luna”自动插入。
+Sol medium 在每个已批准阶段只产生一次可执行的任务分解/施工计划，随后由 Terra 连续施工；它不得为每个微小修改重复规划。Luna 步骤必须由计划显式列出，控制器不得因为“有空闲 Luna”自动插入。
 
 ## 4. 两轮 Terra 返工与最终最小移交
 
 Terra 自动返工最多两轮；Sol 只在该两轮都未通过后接管一次最小修复：
 
-1. 初次验收由 Sol reviewer 给出发现。
+1. 初次验收由 Sol medium reviewer 给出发现。
 2. **修复轮 1**：Terra 修复；原验收 Sol 复验。
 3. 若复验仍要求修复，进入 **修复轮 2**：仍由 Terra 修复；原验收 Sol medium 再次复验。
 4. 若第二轮报批仍要求修复，原验收 Sol medium 才切换为最小范围 fixer，只能处理已登记的开放发现；不得扩大规格或自验。
@@ -58,7 +58,7 @@ Terra 自动返工最多两轮；Sol 只在该两轮都未通过后接管一次�
 ## 5. 安全与失败处理
 
 - Terra、Sol fixer 的写入均受现有 worktree、allowed paths、candidate、HEAD/diff 和 owner authorization 守卫约束。
-- Sol planner/reviewer 与 Luna 默认只读；只有两轮 Terra 报批失败后显式 `SOL_REPAIR_AUTHORIZED` 事件能授予原 Sol medium 最小写范围。
+- Sol xhigh planner、Sol medium supervisor/reviewer 与 Luna 默认只读；只有两轮 Terra 报批失败后显式 `SOL_REPAIR_AUTHORIZED` 事件能授予原 Sol medium 最小写范围。
 - `automatic_xhigh=false`、`automatic_sol_high=false`、`automatic_merge=false`、`automatic_push=false` 保持不变。
 - 任一角色身份不匹配、复验代理与 fixer 身份相同、Terra 轮次超过 2、事件缺字段或 scope 扩大时 fail closed。
 - `max_implementation_reworks=2` 解释为 Terra 自主返工上限；最终一次 Sol 接管不增加 Terra 重试次数。
