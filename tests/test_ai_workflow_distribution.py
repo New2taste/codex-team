@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import tomllib
 import unittest
@@ -19,6 +22,7 @@ PLUGIN = ROOT / "plugins" / "ai-workflow"
 TEMPLATE = PLUGIN / "agents" / "luna-worker.toml"
 INSTALL = PLUGIN / "scripts" / "install-agents.sh"
 UNINSTALL = PLUGIN / "scripts" / "uninstall-agents.sh"
+LIFECYCLE_HELPER = PLUGIN / "scripts" / "agent_lifecycle.py"
 STATE_NAME = ".ai-workflow-luna-worker.state"
 BACKUP_NAME = ".ai-workflow-luna-worker.backup"
 KNOWN_LEGACY_SHA256 = "60f7240ea662cd27ea0f51f2e1efa8a2e788e16c76b04a13ab1c1df4f26ef024"
@@ -55,14 +59,84 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def tree_hashes(root: Path) -> dict[str, str]:
-    if not root.exists():
+def filesystem_snapshot(root: Path) -> dict[str, dict[str, object]]:
+    """Capture every entry type and content without following symlinks."""
+
+    if not root.exists() and not root.is_symlink():
         return {}
+    result: dict[str, dict[str, object]] = {}
+
+    def visit(path: Path, name: str) -> None:
+        status = path.lstat()
+        if path.is_symlink():
+            result[name] = {"type": "symlink", "target": os.readlink(path)}
+            return
+        if path.is_dir():
+            result[name] = {"type": "directory", "mode": status.st_mode & 0o777}
+            for child in sorted(path.iterdir(), key=lambda item: item.name):
+                visit(child, f"{name}/{child.name}" if name else child.name)
+            return
+        if path.is_file():
+            try:
+                content = path.read_bytes()
+            except OSError as exc:
+                result[name] = {
+                    "type": "regular-unreadable",
+                    "mode": status.st_mode & 0o777,
+                    "error": type(exc).__name__,
+                }
+            else:
+                result[name] = {
+                    "type": "regular",
+                    "mode": status.st_mode & 0o777,
+                    "content": content,
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                }
+            return
+        result[name] = {"type": "other", "mode": status.st_mode & 0o777}
+
+    visit(root, "")
+    return result
+
+
+def tree_hashes(root: Path) -> dict[str, str]:
     return {
-        str(path.relative_to(root)): sha256(path)
-        for path in sorted(root.rglob("*"))
-        if path.is_file() and not path.is_symlink()
+        name: value["sha256"]
+        for name, value in filesystem_snapshot(root).items()
+        if value["type"] == "regular"
     }
+
+
+def load_lifecycle_helper():
+    spec = importlib.util.spec_from_file_location("ai_workflow_lifecycle", LIFECYCLE_HELPER)
+    if spec is None or spec.loader is None:
+        raise AssertionError("lifecycle helper is not importable")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def write_owned_state(target: Path, backup_sha256: str | None = None) -> None:
+    (target / STATE_NAME).write_text(
+        json.dumps(
+            {
+                "plugin_version": "0.2.0",
+                "target_filename": "luna-worker.toml",
+                "installed_sha256": KNOWN_LEGACY_SHA256,
+                "installed_at_utc": "2026-08-08T06:38:00Z",
+                "backup_sha256": backup_sha256,
+            },
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+
+
+def temporary_directory():
+    """Use a physical root: `/var` is itself a macOS ancestor symlink."""
+
+    return tempfile.TemporaryDirectory(dir="/private/tmp")
 
 
 class DistributionContractTest(unittest.TestCase):
@@ -121,6 +195,9 @@ class DistributionContractTest(unittest.TestCase):
     def test_known_legacy_fixture_matches_the_registered_digest(self):
         self.assertEqual(KNOWN_LEGACY_SHA256, hashlib.sha256(KNOWN_LEGACY_TEMPLATE).hexdigest())
 
+    def test_release_template_digest_is_pinned(self):
+        self.assertEqual(KNOWN_LEGACY_SHA256, sha256(TEMPLATE))
+
 
 class AgentLifecycleTest(unittest.TestCase):
     def run_script(self, script: Path, target: Path, *extra: str) -> subprocess.CompletedProcess[str]:
@@ -145,7 +222,7 @@ class AgentLifecycleTest(unittest.TestCase):
         return self.run_script(UNINSTALL, target)
 
     def test_missing_install_and_check_are_isolated_and_idempotent(self):
-        with tempfile.TemporaryDirectory() as temporary:
+        with temporary_directory() as temporary:
             root = Path(temporary)
             target = root / "agents"
             before = tree_hashes(root)
@@ -158,6 +235,12 @@ class AgentLifecycleTest(unittest.TestCase):
             destination = target / "luna-worker.toml"
             self.assertEqual(TEMPLATE.read_bytes(), destination.read_bytes())
             self.assertTrue((target / STATE_NAME).is_file())
+            state = json.loads((target / STATE_NAME).read_text())
+            self.assertEqual(sha256(destination), state["installed_sha256"])
+            self.assertRegex(
+                state["installed_at_utc"],
+                r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$",
+            )
 
             before_check = tree_hashes(target)
             current = self.install(target, check=True)
@@ -168,7 +251,7 @@ class AgentLifecycleTest(unittest.TestCase):
             self.assertEqual(before_check, tree_hashes(target))
 
     def test_known_legacy_is_migrated_without_touching_unrelated_files(self):
-        with tempfile.TemporaryDirectory() as temporary:
+        with temporary_directory() as temporary:
             target = Path(temporary) / "agents"
             target.mkdir()
             destination = target / "luna-worker.toml"
@@ -184,7 +267,7 @@ class AgentLifecycleTest(unittest.TestCase):
             self.assertTrue((target / STATE_NAME).is_file())
 
     def test_conflict_is_preserved_and_check_does_not_write(self):
-        with tempfile.TemporaryDirectory() as temporary:
+        with temporary_directory() as temporary:
             target = Path(temporary) / "agents"
             target.mkdir()
             destination = target / "luna-worker.toml"
@@ -201,7 +284,7 @@ class AgentLifecycleTest(unittest.TestCase):
             self.assertEqual(before_hashes, tree_hashes(target))
 
     def test_unsafe_symlink_destination_and_target_directory_are_preserved(self):
-        with tempfile.TemporaryDirectory() as temporary:
+        with temporary_directory() as temporary:
             root = Path(temporary)
             target = root / "agents"
             target.mkdir()
@@ -219,7 +302,7 @@ class AgentLifecycleTest(unittest.TestCase):
             self.assertEqual(before, tree_hashes(root))
 
     def test_unreadable_destination_is_preserved(self):
-        with tempfile.TemporaryDirectory() as temporary:
+        with temporary_directory() as temporary:
             target = Path(temporary) / "agents"
             target.mkdir()
             destination = target / "luna-worker.toml"
@@ -231,8 +314,241 @@ class AgentLifecycleTest(unittest.TestCase):
             finally:
                 destination.chmod(0o600)
 
+    def test_check_preserves_complete_filesystem_snapshot_for_every_class(self):
+        with temporary_directory() as temporary:
+            root = Path(temporary)
+            cases: dict[str, Path] = {}
+
+            cases["missing"] = root / "missing" / "agents"
+
+            current = root / "current" / "agents"
+            self.assertEqual(0, self.install(current).returncode)
+            cases["current"] = current
+
+            legacy = root / "legacy" / "agents"
+            legacy.mkdir(parents=True)
+            (legacy / "luna-worker.toml").write_bytes(KNOWN_LEGACY_TEMPLATE)
+            cases["known_legacy"] = legacy
+
+            conflict = root / "conflict" / "agents"
+            conflict.mkdir(parents=True)
+            (conflict / "luna-worker.toml").write_bytes(b'user = "owned"\n')
+            cases["conflict"] = conflict
+
+            unsafe = root / "unsafe" / "agents"
+            unsafe.mkdir(parents=True)
+            protected = root / "unsafe" / "protected.toml"
+            protected.write_bytes(b"protected\n")
+            (unsafe / "luna-worker.toml").symlink_to(protected)
+            cases["unsafe"] = unsafe
+
+            unreadable = root / "unreadable" / "agents"
+            unreadable.mkdir(parents=True)
+            unreadable_file = unreadable / "luna-worker.toml"
+            unreadable_file.write_bytes(b"unreadable\n")
+            unreadable_file.chmod(0)
+            cases["unreadable"] = unreadable
+            try:
+                for name, target in cases.items():
+                    with self.subTest(name=name):
+                        before = filesystem_snapshot(root)
+                        checked = self.install(target, check=True)
+                        self.assertEqual(name == "current", checked.returncode == 0)
+                        self.assertEqual(before, filesystem_snapshot(root))
+            finally:
+                unreadable_file.chmod(0o600)
+
+    def test_rejects_symlink_ancestor_for_install_and_uninstall(self):
+        with temporary_directory() as temporary:
+            root = Path(temporary)
+            real_parent = root / "real-parent"
+            target = real_parent / "agents"
+            link_parent = root / "link-parent"
+            real_parent.mkdir()
+            link_parent.symlink_to(real_parent, target_is_directory=True)
+            linked_target = link_parent / "agents"
+
+            before_install = filesystem_snapshot(root)
+            self.assertNotEqual(0, self.install(linked_target).returncode)
+            self.assertEqual(before_install, filesystem_snapshot(root))
+
+            self.assertEqual(0, self.install(target).returncode)
+            before_uninstall = filesystem_snapshot(root)
+            self.assertNotEqual(0, self.uninstall(linked_target).returncode)
+            self.assertEqual(before_uninstall, filesystem_snapshot(root))
+
+    def test_rejects_a_toml_valid_template_with_the_wrong_digest_before_mutation(self):
+        with temporary_directory() as temporary:
+            target = Path(temporary) / "agents"
+            original = TEMPLATE.read_bytes()
+            try:
+                TEMPLATE.write_bytes(original + b"\n")
+                before = filesystem_snapshot(Path(temporary))
+                result = self.install(target)
+                self.assertNotEqual(0, result.returncode)
+                self.assertEqual(before, filesystem_snapshot(Path(temporary)))
+            finally:
+                TEMPLATE.write_bytes(original)
+
+    def test_missing_install_does_not_clobber_a_file_created_after_preflight(self):
+        lifecycle = load_lifecycle_helper()
+        with temporary_directory() as temporary:
+            root = Path(temporary)
+            target = root / "agents"
+            destination = target / "luna-worker.toml"
+            user_bytes = b'name = "created_after_preflight"\n'
+
+            def race(point: str) -> None:
+                if point == "install.before_publish_missing":
+                    target.mkdir(exist_ok=True)
+                    replacement = root / "user-replacement.toml"
+                    replacement.write_bytes(user_bytes)
+                    os.replace(replacement, destination)
+
+            self.assertNotEqual(0, lifecycle.install(target, hook=race))
+            self.assertEqual(user_bytes, destination.read_bytes())
+            self.assertFalse((target / STATE_NAME).exists())
+
+    def test_missing_check_closes_its_directory_descriptor(self):
+        lifecycle = load_lifecycle_helper()
+        with temporary_directory() as temporary:
+            target = Path(temporary) / "missing" / "agents"
+            before = len(os.listdir("/dev/fd"))
+            for _ in range(16):
+                self.assertNotEqual(0, lifecycle.install(target, check=True))
+            after = len(os.listdir("/dev/fd"))
+            self.assertLessEqual(after, before + 2)
+
+    def test_retained_tombstone_closes_its_descriptor(self):
+        lifecycle = load_lifecycle_helper()
+        with temporary_directory() as temporary:
+            target = Path(temporary) / "agents"
+            target.mkdir()
+            directory = lifecycle._open_target_directory(target, create=False)
+            self.assertIsNotNone(directory)
+            original_discard = lifecycle._discard_verified_tombstone
+            lifecycle._discard_verified_tombstone = lambda *_: False
+            try:
+                before = len(os.listdir("/dev/fd"))
+                for index in range(16):
+                    name = f"retained-{index}"
+                    content = f"retained {index}".encode("utf-8")
+                    (target / name).write_bytes(content)
+                    self.assertFalse(
+                        lifecycle._retire_and_discard(
+                            directory, name, hashlib.sha256(content).hexdigest()
+                        )
+                    )
+                after = len(os.listdir("/dev/fd"))
+            finally:
+                lifecycle._discard_verified_tombstone = original_discard
+                os.close(directory)
+            self.assertLessEqual(after, before + 2)
+
+    def test_known_legacy_install_preserves_a_raced_user_replacement(self):
+        lifecycle = load_lifecycle_helper()
+        with temporary_directory() as temporary:
+            root = Path(temporary)
+            target = root / "agents"
+            target.mkdir()
+            destination = target / "luna-worker.toml"
+            destination.write_bytes(KNOWN_LEGACY_TEMPLATE)
+            user_bytes = b'name = "replaced_after_preflight"\n'
+
+            def race(point: str) -> None:
+                if point == "install.before_retire_known_legacy":
+                    replacement = root / "user-replacement.toml"
+                    replacement.write_bytes(user_bytes)
+                    os.replace(replacement, destination)
+
+            self.assertNotEqual(0, lifecycle.install(target, hook=race))
+            self.assertEqual(user_bytes, destination.read_bytes())
+            self.assertFalse((target / STATE_NAME).exists())
+
+    def test_uninstall_preserves_a_raced_user_replacement(self):
+        lifecycle = load_lifecycle_helper()
+        with temporary_directory() as temporary:
+            root = Path(temporary)
+            target = root / "agents"
+            target.mkdir()
+            destination = target / "luna-worker.toml"
+            destination.write_bytes(TEMPLATE.read_bytes())
+            write_owned_state(target)
+            user_bytes = b'name = "raced_uninstall_user"\n'
+
+            def race(point: str) -> None:
+                if point == "uninstall.before_retire_current":
+                    replacement = root / "user-replacement.toml"
+                    replacement.write_bytes(user_bytes)
+                    os.replace(replacement, destination)
+
+            self.assertNotEqual(0, lifecycle.uninstall(target, hook=race))
+            self.assertEqual(user_bytes, destination.read_bytes())
+            self.assertTrue((target / STATE_NAME).exists())
+
+    def test_owned_backup_is_restored_only_when_current_and_backup_hashes_match(self):
+        lifecycle = load_lifecycle_helper()
+        with temporary_directory() as temporary:
+            target = Path(temporary) / "agents"
+            target.mkdir()
+            destination = target / "luna-worker.toml"
+            backup = target / BACKUP_NAME
+            backup_bytes = b'name = "known_legacy_backup"\n'
+            destination.write_bytes(TEMPLATE.read_bytes())
+            backup.write_bytes(backup_bytes)
+            write_owned_state(target, sha256(backup))
+            self.assertEqual(0, lifecycle.uninstall(target))
+            self.assertEqual(backup_bytes, destination.read_bytes())
+            self.assertFalse(backup.exists())
+            self.assertFalse((target / STATE_NAME).exists())
+
+    def test_tampered_owned_backup_or_current_is_preserved(self):
+        lifecycle = load_lifecycle_helper()
+        with temporary_directory() as temporary:
+            root = Path(temporary)
+            for name, tamper in (("backup", "backup"), ("current", "current")):
+                with self.subTest(name=name):
+                    target = root / name / "agents"
+                    target.mkdir(parents=True)
+                    destination = target / "luna-worker.toml"
+                    backup = target / BACKUP_NAME
+                    destination.write_bytes(TEMPLATE.read_bytes())
+                    backup.write_bytes(b'name = "known_legacy_backup"\n')
+                    write_owned_state(target, sha256(backup))
+                    if tamper == "backup":
+                        backup.write_bytes(b'name = "tampered_backup"\n')
+                    else:
+                        destination.write_bytes(b'name = "tampered_current"\n')
+                    before = filesystem_snapshot(target)
+                    self.assertNotEqual(0, lifecycle.uninstall(target))
+                    self.assertEqual(before, filesystem_snapshot(target))
+
+    def test_backup_restore_does_not_clobber_a_raced_user_replacement(self):
+        lifecycle = load_lifecycle_helper()
+        with temporary_directory() as temporary:
+            root = Path(temporary)
+            target = root / "agents"
+            target.mkdir()
+            destination = target / "luna-worker.toml"
+            backup = target / BACKUP_NAME
+            destination.write_bytes(TEMPLATE.read_bytes())
+            backup.write_bytes(b'name = "known_legacy_backup"\n')
+            write_owned_state(target, sha256(backup))
+            user_bytes = b'name = "raced_restore_user"\n'
+
+            def race(point: str) -> None:
+                if point == "uninstall.before_retire_current":
+                    replacement = root / "user-replacement.toml"
+                    replacement.write_bytes(user_bytes)
+                    os.replace(replacement, destination)
+
+            self.assertNotEqual(0, lifecycle.uninstall(target, hook=race))
+            self.assertEqual(user_bytes, destination.read_bytes())
+            self.assertTrue(backup.exists())
+            self.assertTrue((target / STATE_NAME).exists())
+
     def test_uninstall_requires_owned_unchanged_state_and_never_recurses(self):
-        with tempfile.TemporaryDirectory() as temporary:
+        with temporary_directory() as temporary:
             target = Path(temporary) / "agents"
             target.mkdir()
             unrelated = target / "keep.toml"
