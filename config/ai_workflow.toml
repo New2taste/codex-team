@@ -2,14 +2,23 @@ version = "ai-workflow-1"
 
 [policy]
 max_technical_retries = 1
-max_implementation_reworks = 1
+max_implementation_reworks = 2
 max_cross_model_escalations = 1
 automatic_xhigh = false
+automatic_sol_high = false
 automatic_merge = false
 automatic_push = false
 
 [routing]
-mode = "legacy"
+mode = "enforced"
+role_policy = "terra_os"
+
+[repair]
+terra_max_rounds = 2
+round_1_fixer = "terra"
+round_2_fixer = "terra"
+post_terra_fixer = "original_sol_medium_reviewer"
+post_terra_reviewer = "distinct_sol_medium_peer"
 
 [roles.luna]
 model = "gpt-5.6-luna"
@@ -46,3 +55,32 @@ sandbox = "read-only"
 requires_owner_approval = true
 allowed_statuses = ["OPTION_A", "OPTION_B", "OPTION_C", "INSUFFICIENT_EVIDENCE"]
 instructions = """Decide only the closed-set dispute in the authorized case file. Do not implement or invent an unlisted option."""
+
+[roles.terra_xhigh]
+model = "gpt-5.6-terra"
+reasoning_effort = "xhigh"
+sandbox = "workspace-write"
+allowed_statuses = ["IMPLEMENTED_CANDIDATE", "NEEDS_CLARIFICATION", "BLOCKED"]
+instructions = """Own implementation only inside the authorized worktree and paths. Stop on semantic ambiguity. Never merge, push, or self-approve."""
+
+[roles.sol_medium_supervisor]
+model = "gpt-5.6-sol"
+reasoning_effort = "medium"
+sandbox = "read-only"
+allowed_statuses = ["PLAN_READY", "NEEDS_OWNER_DECISION", "INSUFFICIENT_EVIDENCE"]
+instructions = """Produce one bounded task decomposition and construction plan for each approved stage, then supervise its semantic and risk constraints. Do not implement."""
+
+[roles.sol_medium_reviewer]
+model = "gpt-5.6-sol"
+reasoning_effort = "medium"
+sandbox = "read-only"
+allowed_statuses = ["ACCEPTANCE_RECOMMENDED", "ACCEPTANCE_WITH_NOTES_RECOMMENDED", "REWORK_RECOMMENDED", "REJECT_RECOMMENDED", "ESCALATION_PROPOSED"]
+instructions = """Review the pinned candidate against the frozen task contract and evidence. Recommend a semantic verdict but never enact owner decisions."""
+
+[roles.sol_xhigh_planner]
+model = "gpt-5.6-sol"
+reasoning_effort = "xhigh"
+sandbox = "read-only"
+requires_owner_approval = true
+allowed_statuses = ["OPTION_A", "OPTION_B", "OPTION_C", "INSUFFICIENT_EVIDENCE"]
+instructions = """Plan only an owner-authorized large project in its closed case file. Do not implement or invent an unlisted option."""

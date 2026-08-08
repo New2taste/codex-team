@@ -92,7 +92,18 @@ RESULT_REQUIRED_FIELDS = frozenset(
         "recommended_next_state",
     }
 )
-READ_ONLY_ROLES = frozenset({"luna", "sol_planner", "sol_reviewer", "sol_xhigh"})
+READ_ONLY_ROLES = frozenset(
+    {
+        "luna",
+        "sol_planner",
+        "sol_reviewer",
+        "sol_xhigh",
+        "sol_medium_supervisor",
+        "sol_medium_reviewer",
+        "sol_xhigh_planner",
+    }
+)
+TERRA_WRITE_ROLES = frozenset({"terra", "terra_xhigh"})
 ROLE_GUARD_FAILURES = frozenset(
     {
         "ACCEPTANCE_CANDIDATE_HEAD_MISMATCH",
@@ -337,7 +348,7 @@ def _resolve_commit(repo: Path, value: object, field: str) -> str:
 def _execution_repo(task: Mapping[str, object], role: str) -> Path:
     repository_root = Path(task["repository_root"]).resolve()
     source_worktree = task.get("source_worktree")
-    if role == "terra":
+    if role in TERRA_WRITE_ROLES:
         if task.get("task_type") != "REMEDIATION":
             _fail("TERRA_TASK_TYPE_INVALID", "Terra may run only for REMEDIATION tasks")
         if not isinstance(source_worktree, str) or not source_worktree.strip():
@@ -387,16 +398,27 @@ def assert_allowed_changes(changed: set[str], allowed: Sequence[str]) -> None:
         _fail("OUT_OF_SCOPE_CHANGE", f"changed path is outside the allowed scope: {outside[0]}")
 
 
-def _load_role_config(role: str) -> dict[str, object]:
-    """Return the pinned configuration for one named workflow role."""
+def _load_workflow_config() -> dict[str, object]:
+    """Load the one pinned workflow configuration document."""
 
     try:
         import tomllib
 
         with ROLE_CONFIG_PATH.open("rb") as handle:
             config = tomllib.load(handle)
-        role_config = config["roles"][role]
-    except (OSError, KeyError, TypeError, tomllib.TOMLDecodeError) as exc:
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise WorkflowError("INVALID_ROLE", "workflow configuration is unreadable") from exc
+    if not isinstance(config, dict):
+        raise WorkflowError("INVALID_ROLE", "workflow configuration must be an object")
+    return config
+
+
+def _load_role_config(role: str) -> dict[str, object]:
+    """Return the pinned configuration for one named workflow role."""
+
+    try:
+        role_config = _load_workflow_config()["roles"][role]
+    except (KeyError, TypeError) as exc:
         raise WorkflowError("INVALID_ROLE", f"unsupported or unreadable role {role}") from exc
     if not isinstance(role_config, dict):
         raise WorkflowError("INVALID_ROLE", f"unsupported role {role}")
@@ -874,14 +896,14 @@ def run_codex(
     repo = Path(paths.repo).resolve()
     if repo != _execution_repo(task, role):
         _fail("ROLE_REPOSITORY_MISMATCH", "role repository does not match the task execution repository")
-    if role == "terra":
+    if role in TERRA_WRITE_ROLES:
         _assert_terra_worktree_authorized(task, repo, paths.state_root)
     if role in READ_ONLY_ROLES:
         _reject_dirty_input(repo, "DIRTY_READ_ONLY_REPOSITORY", "read-only role requires a clean repository")
     if task["task_type"] == "ACCEPTANCE":
         _reject_dirty_input(repo, "DIRTY_ACCEPTANCE_REPOSITORY", "acceptance requires a clean repository")
         assert_acceptance_candidate(task, repo)
-    if role == "terra":
+    if role in TERRA_WRITE_ROLES:
         _reject_dirty_input(repo, "DIRTY_TERRA_WORKTREE", "Terra requires a clean source_worktree")
     _claim_attempt_context(paths, accounting_context)
     runtime_store: WorkflowStore | None = None
@@ -982,7 +1004,7 @@ def run_codex(
                     _fail("READ_ONLY_ROLE_MODIFIED_REPO", f"read-only role {role} changed the repository")
                 if task["task_type"] == "ACCEPTANCE":
                     assert_acceptance_candidate(task, repo)
-                if role == "terra":
+                if role in TERRA_WRITE_ROLES:
                     actual_changes = after_changes - before_changes
                     assert_allowed_changes(actual_changes, task["allowed_write_paths"])
                 else:
@@ -1443,12 +1465,14 @@ try:
         RuntimeRouteDecision,
         decide_route as _decide_route,
         record_route_decision as _record_route_decision,
+        resolve_role_policy as _resolve_role_policy,
     )
 except ImportError:  # direct script execution
     from ai_workflow_routing import (
         RuntimeRouteDecision,
         decide_route as _decide_route,
         record_route_decision as _record_route_decision,
+        resolve_role_policy as _resolve_role_policy,
     )
 
 
@@ -1459,13 +1483,31 @@ def legacy_roles(task: Mapping[str, object]) -> tuple[str, ...]:
     return route(task)
 
 
+def _configured_routing_mode(config: Mapping[str, object]) -> str:
+    routing = config.get("routing")
+    if not isinstance(routing, Mapping):
+        _fail("ROUTE_INPUT_INVALID", "routing configuration is required")
+    mode = routing.get("mode")
+    if mode not in {"legacy", "shadow", "enforced"}:
+        _fail("ROUTE_INPUT_INVALID", "unknown configured routing mode")
+    return mode
+
+
 def decide_route(
-    task: Mapping[str, object], request: object, mode: str
+    task: Mapping[str, object], request: object, mode: str | None = None
 ) -> RuntimeRouteDecision:
     """Make a validated local route decision without executing a model."""
 
     validate_task(task)
-    return _decide_route(task, request, mode, legacy_router=route)
+    config = _load_workflow_config()
+    configured_mode = _configured_routing_mode(config)
+    return _decide_route(
+        task,
+        request,
+        configured_mode if mode is None else mode,
+        legacy_router=route,
+        role_policy=_resolve_role_policy(config),
+    )
 
 
 def record_route_decision(
@@ -1914,9 +1956,13 @@ def render_report(metrics: Mapping[str, object]) -> str:
 FAKE_ROLE_RESULTS = {
     "luna": ("SUPPORTED", "EVIDENCE_READY"),
     "terra": ("IMPLEMENTED_CANDIDATE", "PRECHECK_RUNNING"),
+    "terra_xhigh": ("IMPLEMENTED_CANDIDATE", "PRECHECK_RUNNING"),
     "sol_planner": ("PLAN_READY", "AWAITING_OWNER_DECISION"),
+    "sol_medium_supervisor": ("PLAN_READY", "AWAITING_OWNER_DECISION"),
     "sol_reviewer": ("ACCEPTANCE_RECOMMENDED", "AWAITING_OWNER_DECISION"),
+    "sol_medium_reviewer": ("ACCEPTANCE_RECOMMENDED", "AWAITING_OWNER_DECISION"),
     "sol_xhigh": ("OPTION_A", "ESCALATION_PROPOSED"),
+    "sol_xhigh_planner": ("OPTION_A", "ESCALATION_PROPOSED"),
 }
 
 
@@ -2275,7 +2321,7 @@ def _run_role_with_technical_retry(
             before_changes: set[str] | None = None
             if getattr(runner, "is_live_model", False):
                 guarded_repo = _execution_repo(task, role)
-                if role == "terra":
+                if role in TERRA_WRITE_ROLES:
                     _assert_terra_worktree_authorized(task, guarded_repo, WORKFLOW_STATE_ROOT)
                     _reject_dirty_input(
                         guarded_repo,
@@ -2324,7 +2370,7 @@ def _run_role_with_technical_retry(
                             if task["task_type"] == "ACCEPTANCE":
                                 assert_acceptance_candidate(task, guarded_repo)
                             actual_changes = after_changes - before_changes
-                            if role == "terra":
+                            if role in TERRA_WRITE_ROLES:
                                 assert_allowed_changes(actual_changes, task["allowed_write_paths"])
                         else:
                             actual_changes = set(result.get("changed_files", [])) if "result" in locals() and isinstance(result, Mapping) else set()
@@ -2461,7 +2507,7 @@ def _role_state_after_result(
         else:
             event_type = "ROLE_RESULT"
         target = "EVIDENCE_READY" if state == "EVIDENCE_RUNNING" else "PRECHECK_READY"
-    elif role == "terra":
+    elif role in TERRA_WRITE_ROLES:
         if status == "IMPLEMENTED_CANDIDATE":
             target = "IMPLEMENTED_CANDIDATE"
         else:
@@ -2477,11 +2523,11 @@ def _role_state_after_result(
                     event_type="IMPLEMENTATION_REWORK_EXHAUSTED",
                 )
             target = "NEEDS_REPLAN"
-    elif role == "sol_planner":
+    elif role in {"sol_planner", "sol_medium_supervisor"}:
         target = "PLAN_READY"
-    elif role == "sol_reviewer":
+    elif role in {"sol_reviewer", "sol_medium_reviewer"}:
         target = "ESCALATION_PROPOSED" if status == "ESCALATION_PROPOSED" else "REVIEW_READY"
-    elif role == "sol_xhigh":
+    elif role in {"sol_xhigh", "sol_xhigh_planner"}:
         target = "ESCALATION_PROPOSED"
     else:
         _fail("INVALID_ROLE", f"unsupported role {role}")
@@ -2724,7 +2770,9 @@ def build_parser() -> argparse.ArgumentParser:
     route_command.add_argument("--task", type=Path, required=True)
     route_command.add_argument("--request", type=Path, required=True)
     route_command.add_argument(
-        "--mode", choices=("legacy", "shadow", "enforced"), default="legacy"
+        "--mode",
+        choices=("legacy", "shadow", "enforced"),
+        default=_configured_routing_mode(_load_workflow_config()),
     )
     route_command.add_argument("--root", type=Path, default=Path("data/state/ai-workflow"))
 

@@ -35,6 +35,13 @@ except ImportError:  # direct script execution
     )
 
 
+ROLE_POLICIES = frozenset({"legacy", "terra_os"})
+# This is an in-memory policy marker only.  It is deliberately not a route
+# artifact value: selecting it requires verified local owner-decision context,
+# which the public routing facade does not yet receive.
+OWNER_AUTHORIZED_LARGE_PROJECT_ROUTE = "owner_authorized_large_project"
+
+
 def _workflow_error(code: str, message: str) -> BaseException:
     """Create the public workflow exception without a module import cycle."""
 
@@ -164,6 +171,25 @@ def legacy_roles(task: Mapping[str, object]) -> tuple[str, ...]:
     return route(task)
 
 
+def _checked_role_policy(value: object) -> str:
+    if not isinstance(value, str) or value not in ROLE_POLICIES:
+        _fail("ROLE_POLICY_INVALID", "unknown role policy")
+    return value
+
+
+def resolve_role_policy(config: object, override: object = None) -> str:
+    """Resolve the configured policy or reject missing and unreviewed values."""
+
+    if override is not None:
+        return _checked_role_policy(override)
+    if not isinstance(config, Mapping):
+        _fail("ROLE_POLICY_INVALID", "workflow configuration must be an object")
+    routing = config.get("routing")
+    if not isinstance(routing, Mapping):
+        _fail("ROLE_POLICY_INVALID", "routing policy configuration is required")
+    return _checked_role_policy(routing.get("role_policy"))
+
+
 def _roles_for(route_name: str, legacy_role_chain: tuple[str, ...]) -> tuple[str, ...]:
     if route_name in {"direct", "blocked"}:
         return ()
@@ -171,6 +197,42 @@ def _roles_for(route_name: str, legacy_role_chain: tuple[str, ...]) -> tuple[str
         return ("sol_planner",)
     if route_name == "delegated":
         return legacy_role_chain
+    _fail("ROUTE_INPUT_INVALID", "route is not supported")
+    raise AssertionError("unreachable")
+
+
+def roles_for_policy(
+    task: Mapping[str, object],
+    request: Mapping[str, object],
+    route_name: str,
+    policy: str,
+) -> tuple[str, ...]:
+    """Return the closed runtime role chain for a selected policy route.
+
+    ``OWNER_AUTHORIZED_LARGE_PROJECT_ROUTE`` models only a chain *after* a
+    caller has independently verified local owner authorization.  It never
+    appears in the frozen route-decision wire schema, and ``decide_route``
+    deliberately cannot select it without that context.
+    """
+
+    policy_value = _checked_role_policy(policy)
+    if policy_value == "legacy":
+        return _roles_for(route_name, legacy_roles(task))
+    if route_name in {"direct", "blocked"}:
+        return ()
+    if route_name == "sol_only":
+        return ("sol_medium_supervisor",)
+    if route_name == "delegated":
+        return ("sol_medium_supervisor", "terra_xhigh", "sol_medium_reviewer")
+    if route_name == OWNER_AUTHORIZED_LARGE_PROJECT_ROUTE:
+        if request.get("execution_need") != "WRITE":
+            _fail("ROUTE_INPUT_INVALID", "large-project authorization requires a write route")
+        return (
+            "sol_xhigh_planner",
+            "sol_medium_supervisor",
+            "terra_xhigh",
+            "sol_medium_reviewer",
+        )
     _fail("ROUTE_INPUT_INVALID", "route is not supported")
     raise AssertionError("unreachable")
 
@@ -191,6 +253,7 @@ def decide_route(
     mode: str,
     *,
     legacy_router: Callable[[Mapping[str, object]], tuple[str, ...]] | None = None,
+    role_policy: str = "terra_os",
 ) -> RuntimeRouteDecision:
     """Select one closed-set route without starting a model.
 
@@ -204,6 +267,7 @@ def decide_route(
     validate_route_request(request_value, task_value)
     if not isinstance(mode, str) or mode not in ROUTING_MODES:
         _fail("ROUTE_INPUT_INVALID", "unknown routing mode")
+    policy = _checked_role_policy(role_policy)
     current_legacy_roles = (
         legacy_router(task_value) if legacy_router is not None else legacy_roles(task_value)
     )
@@ -228,7 +292,11 @@ def decide_route(
         else:
             selected = "blocked"
         rule_id = _rule_id_for(selected, risky)
-    roles = _roles_for(selected, current_legacy_roles)
+    roles = (
+        _roles_for(selected, current_legacy_roles)
+        if mode == "legacy"
+        else roles_for_policy(task_value, request_value, selected, policy)
+    )
     wire = RouteDecision(
         task_id=str(task_value["task_id"]),
         route=selected,
