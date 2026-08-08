@@ -10,13 +10,13 @@
 
 ## 2. 固定角色
 
-- **Terra medium / 执行 OS**：常驻且默认持有施工、集成、调试、恢复及两轮修复；写入仍只能发生在已授权独立 worktree 和允许路径中。
+- **Terra xhigh / 执行 OS**：常驻且默认持有施工、集成、调试、恢复及两轮修复；写入仍只能发生在已授权独立 worktree 和允许路径中。
 - **Sol medium / 验收协处理器**：负责轻量项目的语义验收、风险审查和裁决。两轮 Terra 修复的报批仍不通过时，原验收 Sol 才临时取得最小修复所有权，并由另一位 Sol medium 验收。
 - **Sol xhigh / 大型项目规划师**：只为已确认的大型、跨域项目制定整体方案和全局规划书；必须保留所有者授权，不能被普通实施、复审或返工自动调用。
-- **Sol high**：默认没有调度角色，控制器不得自动选择。
+- **Terra medium、Sol high**：均没有默认调度角色，控制器不得自动选择。
 - **Luna Max / 廉价工具进程**：只执行原方案定义的 L0/L1/L2 有界取证、机械核对、只读盘点和冻结规格窄域反证。Luna 不拥有主实现、跨文件集成、最终验收或开放式裁决。
 
-模型身份和推理档是本策略的一部分：Terra medium 和 Sol medium 是轻量任务的唯一常驻模型档；Sol xhigh 仅用于授权的大型项目全局规划；Sol high 没有默认职责。
+模型身份和推理档是本策略的一部分：Terra xhigh 是唯一常驻施工档，Sol medium 是轻量验收档；Sol xhigh 仅用于授权的大型项目全局规划；Terra medium 和 Sol high 没有默认职责。
 
 ## 3. 默认策略
 
@@ -35,8 +35,8 @@
 | 大型项目的整体方案与全局规划书 | Sol xhigh planner |
 | 轻量语义裁决/验收 | Sol medium reviewer |
 | 有界只读证据，明确要求 L0/L1/L2 | Luna → Sol（仅在结果需要语义结论时） |
-| 普通实现/整改 | Terra → Sol reviewer |
-| 已授权大型项目实施 | Sol xhigh planner → Terra → Sol medium reviewer |
+| 普通实现/整改 | Terra xhigh → Sol medium reviewer |
+| 已授权大型项目实施 | Sol xhigh planner → Terra xhigh → Sol medium reviewer |
 | 验收预审需要窄域反证 | Luna 工具步骤 → Sol reviewer；Luna 不是验收者 |
 | 无法有界分解或权限不足 | BLOCKED |
 

@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make Terra medium the default execution owner, Sol medium the light-task reviewer and final bounded fallback fixer, Sol xhigh the owner-authorized large-project planner, and Luna an explicitly requested bounded evidence tool.
+**Goal:** Make Terra xhigh the default execution owner, Sol medium the light-task reviewer and final bounded fallback fixer, Sol xhigh the owner-authorized large-project planner, and Luna an explicitly requested bounded evidence tool.
 
 **Architecture:** Add a runtime role-policy layer beside legacy/shadow/enforced routing without changing the frozen wire modes. Add an append-only two-round Terra repair protocol plus one post-budget Sol medium fallback, then mirror repository runtime/config into the Plugin. Existing owner authorization, Git guards, candidate pinning and runtime identity remain authoritative.
 
@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - Default role policy is `terra_os`; `legacy` is explicit compatibility and `shadow` never changes the current call chain.
-- Terra `gpt-5.6-terra/medium` owns normal implementation, integration, debugging, recovery and repair rounds 1 and 2.
+- Terra `gpt-5.6-terra/xhigh` owns normal implementation, integration, debugging, recovery and repair rounds 1 and 2. Terra medium has no scheduled role.
 - Sol `gpt-5.6-sol/medium` owns light-task review. Only if the second Terra repair is still rejected does the original reviewer own the registered open findings, then a distinct Sol medium peer reviews.
 - Sol `gpt-5.6-sol/xhigh` is an owner-authorized large-project planner only. Sol high has no scheduled role; `automatic_sol_high=false` and `automatic_xhigh=false` remain unchanged.
 - Luna `gpt-5.6-luna/max` runs only as an explicitly planned L0/L1/L2 bounded evidence tool.
@@ -45,7 +45,7 @@
 - [ ] **Step 1: Write failing tests** for default `terra_os`, normal write `("terra", "sol_reviewer")`, risky write `("sol_planner", "terra", "sol_reviewer")`, planning-only Sol, and zero implicit Luna roles.
 - [ ] **Step 2: Run RED:** `/Users/lee/.local/bin/python3.11 -m unittest tests.test_ai_workflow_terra_os -v`; expect missing policy/functions or old Luna-first chains.
 - [ ] **Step 3: Add exact TOML:** set `[routing] mode="enforced"`, `role_policy="terra_os"`; add `[repair] terra_max_rounds=2`, `round_1_fixer="terra"`, `round_2_fixer="terra"`, `post_terra_fixer="original_sol_medium_reviewer"`, `post_terra_reviewer="distinct_sol_medium_peer"`; keep all automatic authority flags false.
-- [ ] **Step 4: Implement closed policy selection:** direct/blocked use no model; light semantic review uses Sol medium; normal writes use Terra medium then Sol medium reviewer; only an owner-authorized large-project request adds Sol xhigh planner first. Sol high is never selected. Luna is scheduled only by a validated plan task with `owner_role="luna"` and L0/L1/L2 evidence.
+- [ ] **Step 4: Implement closed policy selection:** direct/blocked use no model; light semantic review uses Sol medium; normal writes use Terra xhigh then Sol medium reviewer; only an owner-authorized large-project request adds Sol xhigh planner first. Terra medium and Sol high are never selected. Luna is scheduled only by a validated plan task with `owner_role="luna"` and L0/L1/L2 evidence.
 - [ ] **Step 5: Add complement tests:** unknown policy fails closed; legacy chains stay unchanged; shadow keeps legacy effective roles; wire JSON contains no `role_policy`; automatic xhigh/merge/push stay false.
 - [ ] **Step 6: Run focused/full:** `/Users/lee/.local/bin/python3.11 -m unittest tests.test_ai_workflow_terra_os tests.test_ai_workflow_routing_v2 -v && /Users/lee/.local/bin/python3.11 -m unittest discover -s tests -v`.
 - [ ] **Step 7: Commit:** `git add config/ai_workflow.toml scripts/ai_workflow.py scripts/ai_workflow_routing.py tests/test_ai_workflow_terra_os.py && git commit -m "feat: make Terra OS the default role policy"`.
