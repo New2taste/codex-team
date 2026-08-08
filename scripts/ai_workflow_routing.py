@@ -425,6 +425,28 @@ def _atomic_write_json(path: Path, value: Mapping[str, object]) -> None:
                 pass
 
 
+def _write_json_once(path: Path, value: Mapping[str, object]) -> None:
+    """Create one immutable authority artifact without an exists/write race."""
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        descriptor = os.open(
+            target,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+        )
+    except FileExistsError:
+        _fail("ROUTE_ALREADY_FROZEN", "route decision is immutable after first persistence")
+    except OSError as exc:
+        raise _workflow_error("ATOMIC_WRITE_FAILED", f"cannot create {target.name}") from exc
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(_canonical_json(value))
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
 def _stored_task_sha256(task_dir: Path) -> str:
     try:
         value = json.loads((Path(task_dir) / "task.json").read_text(encoding="utf-8"))
@@ -456,7 +478,7 @@ def record_route_decision(
         if _stored_task_sha256(task_dir) != decision.task_sha256:
             _fail("ROUTE_TASK_MISMATCH", "route decision task hash does not match stored task")
         path = Path(task_dir) / "route-decision.json"
-        _atomic_write_json(path, wire)
+        _write_json_once(path, wire)
         store.append_event(
             task_id,
             {

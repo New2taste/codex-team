@@ -11,6 +11,7 @@ import json
 import math
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -819,6 +820,178 @@ def _construction_evidence_observation(check: ConstructionCheck) -> str:
     )
 
 
+def _safe_scope_identity(repository: Path, scope: str) -> tuple[tuple[int, int, int], ...]:
+    """Resolve existing scope components with O_NOFOLLOW and return identities."""
+
+    root = Path(repository)
+    try:
+        root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise WorkflowError("CONSTRUCTION_SCOPE_UNSAFE", "repository root is not safely openable") from exc
+    root_stat = os.fstat(root_fd)
+    identities: list[tuple[int, int, int]] = [
+        (root_stat.st_dev, root_stat.st_ino, root_stat.st_mode)
+    ]
+    current_fd = root_fd
+    parts = normalize_scope(scope).parts
+    try:
+        for index, component in enumerate(parts):
+            flags = os.O_RDONLY | os.O_NOFOLLOW
+            if index < len(parts) - 1:
+                flags |= os.O_DIRECTORY
+            try:
+                next_fd = os.open(component, flags, dir_fd=current_fd)
+            except FileNotFoundError:
+                break
+            except OSError as exc:
+                raise WorkflowError(
+                    "CONSTRUCTION_SCOPE_UNSAFE", f"unsafe scope component: {scope}"
+                ) from exc
+            stat_result = os.fstat(next_fd)
+            identities.append((stat_result.st_dev, stat_result.st_ino, stat_result.st_mode))
+            if current_fd != root_fd:
+                os.close(current_fd)
+            current_fd = next_fd
+        return tuple(identities)
+    finally:
+        if current_fd != root_fd:
+            os.close(current_fd)
+        os.close(root_fd)
+
+
+def _safe_artifact_sha256(repository: Path, artifact: str) -> str:
+    """Hash one regular artifact through a no-follow descriptor."""
+
+    target = normalize_scope(artifact)
+    root_fd = os.open(repository, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    current_fd = root_fd
+    try:
+        for component in target.parts[:-1]:
+            next_fd = os.open(
+                component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current_fd
+            )
+            if current_fd != root_fd:
+                os.close(current_fd)
+            current_fd = next_fd
+        file_fd = os.open(target.parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=current_fd)
+        try:
+            stat_before = os.fstat(file_fd)
+            digest = hashlib.sha256()
+            while True:
+                chunk = os.read(file_fd, 65536)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            stat_after = os.fstat(file_fd)
+            if (stat_before.st_dev, stat_before.st_ino, stat_before.st_size, stat_before.st_mtime_ns) != (
+                stat_after.st_dev, stat_after.st_ino, stat_after.st_size, stat_after.st_mtime_ns
+            ):
+                _fail("CONSTRUCTION_EVIDENCE_DRIFT", "artifact changed while it was hashed")
+            return digest.hexdigest()
+        finally:
+            os.close(file_fd)
+    except OSError as exc:
+        raise WorkflowError("CONSTRUCTION_EVIDENCE_FAILED", f"cannot hash artifact {artifact}") from exc
+    finally:
+        if current_fd != root_fd:
+            os.close(current_fd)
+        os.close(root_fd)
+
+
+def _execute_construction_command(repository: Path, check: ConstructionCheck) -> dict[str, object]:
+    try:
+        argv = shlex.split(str(check.command))
+    except ValueError as exc:
+        raise WorkflowError("CONSTRUCTION_EVIDENCE_FAILED", "invalid evidence argv") from exc
+    executable = Path(argv[0]).name.casefold() if argv else ""
+    if (
+        len(argv) < 2
+        or executable not in {"python", "python3", "python3.11", "grep"}
+        or any(token in str(check.command) for token in (";", "&&", "||", "`", "$(", ">", "<", "\n"))
+        or (executable.startswith("python") and tuple(argv[1:3]) != ("-m", "unittest"))
+    ):
+        _fail("CONSTRUCTION_EVIDENCE_FAILED", "evidence command is not an approved argv")
+    try:
+        completed = subprocess.run(
+            argv,
+            cwd=repository,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=120,
+            check=False,
+            env={"PATH": os.environ.get("PATH", ""), "PYTHONPATH": str(repository)},
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise WorkflowError("CONSTRUCTION_EVIDENCE_FAILED", "evidence argv could not complete") from exc
+    output = completed.stdout[-65536:]
+    observation = {
+        "source": "controller",
+        "argv": argv,
+        "exit_code": completed.returncode,
+        "output": output,
+    }
+    if completed.returncode != check.expected_exit:
+        _fail("CONSTRUCTION_EVIDENCE_FAILED", "evidence command returned an unexpected exit")
+    if check.assertion not in output and str(check.assertion) != f"exit={completed.returncode}":
+        _fail("CONSTRUCTION_EVIDENCE_FAILED", "evidence assertion was not observed")
+    return observation
+
+
+def _bind_controller_construction_evidence(
+    result: Mapping[str, object], task: Mapping[str, object], context: ConstructionExecutionContext
+) -> dict[str, object]:
+    """Replace model attestations with evidence observed by the controller."""
+
+    if context.role != "luna_construction" or context.step.construction_envelope is None:
+        return dict(result)
+    repository = Path(task.get("source_worktree") or task["repository_root"])
+    scopes = set(context.step.read_scope) | set(context.step.write_scope)
+    before = {scope: _safe_scope_identity(repository, scope) for scope in scopes}
+    envelope = context.step.construction_envelope
+    checks = dict(envelope.evidence)
+    evidence: list[dict[str, object]] = []
+    for level in ("L0", "L1", "L2"):
+        check = checks[level]
+        if level == "L0":
+            actual_hash = _safe_artifact_sha256(repository, check.artifact)
+            if actual_hash != check.sha256:
+                _fail("CONSTRUCTION_EVIDENCE_FAILED", "L0 artifact hash does not match the frozen digest")
+            observed: dict[str, object] = {
+                "source": "controller", "sha256": actual_hash,
+                "device_inode": list(_safe_scope_identity(repository, check.artifact)[-1][:2]),
+            }
+        else:
+            observed = _execute_construction_command(repository, check)
+        evidence.append(
+            {
+                "id": level,
+                "type": check.kind,
+                "locator": check.artifact,
+                "observation": _canonical_json(observed),
+            }
+        )
+    negative = envelope.negative_checks[0]
+    negative_observed = _execute_construction_command(repository, negative)
+    after = {scope: _safe_scope_identity(repository, scope) for scope in scopes}
+    if before != after:
+        _fail("CONSTRUCTION_SCOPE_DRIFT", "scope identity changed while evidence was collected")
+    bound = dict(result)
+    bound["evidence"] = evidence
+    claims = bound.get("claims")
+    if not isinstance(claims, list) or len(claims) != 1:
+        _fail("INVALID_VERIFICATION_PACKAGE", "construction result must reference controller evidence")
+    bound["counter_checks"] = [
+        {
+            "target_claim_id": claims[0].get("id"),
+            "method": str(negative.command),
+            "result": _canonical_json(negative_observed),
+        }
+    ]
+    return bound
+
+
 def _validate_luna_construction_verification(
     result: Mapping[str, object], step: FrozenSubtask | None
 ) -> None:
@@ -848,7 +1021,7 @@ def _validate_luna_construction_verification(
         if (
             record["type"] != expected_types[level]
             or record["locator"] != check.artifact
-            or record["observation"] != _construction_evidence_observation(check)
+            or not isinstance(record["observation"], str)
         ):
             _fail(
                 "INVALID_VERIFICATION_PACKAGE",
@@ -861,12 +1034,21 @@ def _validate_luna_construction_verification(
     if len(counter_checks) != 1 or counter_checks[0]["target_claim_id"] != claims[0]["id"]:
         _fail("INVALID_VERIFICATION_PACKAGE", "luna construction requires one bound negative check")
     negative = envelope.negative_checks
-    if not any(
-        counter_checks[0]["method"] == check.command
-        and counter_checks[0]["result"] == _construction_evidence_observation(check)
-        for check in negative
-    ):
+    if not any(counter_checks[0]["method"] == check.command for check in negative):
         _fail("INVALID_VERIFICATION_PACKAGE", "luna construction negative check is not frozen")
+    for record in evidence:
+        try:
+            observation = json.loads(record["observation"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise WorkflowError("INVALID_VERIFICATION_PACKAGE", "construction evidence is not controller JSON") from exc
+        if observation.get("source") != "controller":
+            _fail("INVALID_VERIFICATION_PACKAGE", "construction evidence is not controller-produced")
+    try:
+        negative_observation = json.loads(counter_checks[0]["result"])
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise WorkflowError("INVALID_VERIFICATION_PACKAGE", "negative evidence is not controller JSON") from exc
+    if negative_observation.get("source") != "controller":
+        _fail("INVALID_VERIFICATION_PACKAGE", "negative evidence is not controller-produced")
 
 
 def validate_verification_package(
@@ -1423,6 +1605,28 @@ def atomic_write_json(path: Path, value: object) -> None:
                 temporary.unlink()
             except FileNotFoundError:
                 pass
+
+
+def write_json_once(path: Path, value: object, *, conflict_code: str) -> None:
+    """Create a frozen JSON artifact with O_EXCL/O_NOFOLLOW semantics."""
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        descriptor = os.open(
+            target,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+        )
+    except FileExistsError:
+        _fail(conflict_code, f"{target.name} is already frozen")
+    except OSError as exc:
+        raise WorkflowError("ATOMIC_WRITE_FAILED", f"cannot create {target.name}") from exc
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(_canonical_json(value))
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def append_jsonl(path: Path, record: Mapping[str, object]) -> None:
@@ -2665,6 +2869,21 @@ def _run_role_with_technical_retry(
                     result = runner.run(role, task)
                 else:
                     result = runner.run(role, task, attempt_context=attempt_context)
+                if construction_context is not None:
+                    result = _bind_controller_construction_evidence(
+                        result, task, construction_context
+                    )
+                    if construction_context.role == "luna_construction":
+                        store.append_event(
+                            task_id,
+                            {
+                                "event_type": "CONSTRUCTION_EVIDENCE_RECORDED",
+                                "timestamp_utc": _utc_timestamp(),
+                                "dispatch_id": construction_context.dispatch_id,
+                                "evidence": result.get("evidence"),
+                                "counter_checks": result.get("counter_checks"),
+                            },
+                        )
             except BaseException as exc:
                 attempt_error = exc
                 raise
@@ -2903,7 +3122,7 @@ def _load_enforced_construction_artifacts(
     construction_plan: object,
     request: object,
     step_id: object,
-) -> tuple[dict[str, object], FrozenPlan, FrozenSubtask, str, str]:
+) -> tuple[dict[str, object], FrozenPlan, FrozenSubtask, str, dict[str, object]]:
     """Revalidate the exact plan and persisted enforced route before launch."""
 
     task = load_task(store._require_task(task_id) / "task.json")
@@ -2933,12 +3152,61 @@ def _load_enforced_construction_artifacts(
     selected = next((candidate for candidate in frozen.tasks if candidate.id == step_id), None)
     if selected is None:
         _fail("CONSTRUCTION_CONTEXT_INVALID", "construction step is not present in the frozen plan")
-    expected_role = (
-        "luna_construction" if selected.owner_role == "luna_construction" else "terra_xhigh"
-    )
+    if selected.owner_role not in {"luna_construction", "terra_xhigh"}:
+        _fail("CONSTRUCTION_OWNER_INVALID", "enforced construction owner is not executable")
+    expected_role = selected.owner_role
     if recomputed.effective_roles != (expected_role,):
         _fail("CONSTRUCTION_ROUTE_MISMATCH", "frozen route owner is not eligible for this step")
-    return task, frozen, selected, expected_role, str(expected_wire["request_sha256"])
+    return task, frozen, selected, expected_role, expected_wire
+
+
+def _construction_scope_sha256(step: FrozenSubtask) -> str:
+    return artifact_sha256(
+        {
+            "read_scope": list(step.read_scope),
+            "write_scope": list(step.write_scope),
+            "do_not_touch": list(step.do_not_touch),
+        }
+    )
+
+
+def _construction_authority(
+    frozen: FrozenPlan,
+    step: FrozenSubtask,
+    role: str,
+    route_wire: Mapping[str, object],
+) -> dict[str, object]:
+    return {
+        "task_sha256": frozen.task_sha256,
+        "plan_sha256": frozen.plan_sha256,
+        "request_sha256": route_wire["request_sha256"],
+        "route": route_wire["route"],
+        "rule_id": route_wire["rule_id"],
+        "routing_mode": route_wire["routing_mode"],
+        "step_id": step.id,
+        "role": role,
+        "candidate_commit": frozen.candidate_commit,
+        "scope_sha256": _construction_scope_sha256(step),
+    }
+
+
+def _frozen_construction_authority(store: WorkflowStore, task_id: str) -> dict[str, object]:
+    records = [
+        record for record in _load_event_records(store, task_id)
+        if record.get("event_type") == "CONSTRUCTION_PLAN_FROZEN"
+    ]
+    if len(records) != 1:
+        _fail("CONSTRUCTION_AUTHORITY_DRIFT", "construction authority must have exactly one freeze event")
+    record = dict(records[0])
+    record.pop("event_type", None)
+    record.pop("timestamp_utc", None)
+    expected = {
+        "task_sha256", "plan_sha256", "request_sha256", "route", "rule_id",
+        "routing_mode", "step_id", "role", "candidate_commit", "scope_sha256",
+    }
+    if set(record) != expected:
+        _fail("CONSTRUCTION_AUTHORITY_DRIFT", "construction freeze event has invalid fields")
+    return record
 
 
 def _freeze_or_require_construction_plan(
@@ -2946,6 +3214,9 @@ def _freeze_or_require_construction_plan(
     task_id: str,
     task: Mapping[str, object],
     frozen: FrozenPlan,
+    step: FrozenSubtask,
+    role: str,
+    route_wire: Mapping[str, object],
     state: str,
 ) -> FrozenPlan:
     """Persist the plan before the owner gate and reject post-gate substitution."""
@@ -2964,20 +3235,25 @@ def _freeze_or_require_construction_plan(
                 "CONSTRUCTION_PLAN_MISMATCH",
                 "supplied construction plan differs from the owner-gated frozen plan",
             )
+        authority = _construction_authority(recorded_frozen, step, role, route_wire)
+        if _frozen_construction_authority(store, task_id) != authority:
+            _fail("CONSTRUCTION_AUTHORITY_DRIFT", "construction state differs from first freeze")
         return recorded_frozen
     if state not in {"DRAFT", "TASK_VALIDATED"}:
         _fail(
             "CONSTRUCTION_PLAN_MISSING",
             "construction plan must be frozen before owner execution approval",
         )
-    atomic_write_json(plan_path, frozen.to_dict())
+    write_json_once(
+        plan_path, frozen.to_dict(), conflict_code="CONSTRUCTION_PLAN_MISMATCH"
+    )
+    authority = _construction_authority(frozen, step, role, route_wire)
     store.append_event(
         task_id,
         {
             "event_type": "CONSTRUCTION_PLAN_FROZEN",
             "timestamp_utc": _utc_timestamp(),
-            "task_sha256": frozen.task_sha256,
-            "plan_sha256": frozen.plan_sha256,
+            **authority,
         },
     )
     return frozen
@@ -3006,13 +3282,13 @@ def run_enforced_construction(
         _fail("DISPATCH_IDENTITY_DRIFT", "construction attempt must be a positive integer")
     store = WorkflowStore(state_root or WORKFLOW_STATE_ROOT)
     with store.lock(task_id):
-        task, frozen, step, role, request_sha256 = _load_enforced_construction_artifacts(
+        task, frozen, step, role, route_wire = _load_enforced_construction_artifacts(
             store, task_id, construction_plan, request, step_id
         )
         state = _current_state(store, task_id)
         budget = _budget_from_events(store, task_id)
         frozen = _freeze_or_require_construction_plan(
-            store, task_id, task, frozen, state
+            store, task_id, task, frozen, step, role, route_wire, state
         )
         step = next(candidate for candidate in frozen.tasks if candidate.id == step.id)
         if state in {"BLOCKED", "CLOSED", "ABORTED", "DEFERRED", "AWAITING_OWNER_DECISION"}:
@@ -3056,6 +3332,12 @@ def run_enforced_construction(
             )
         if state != "IMPLEMENTATION_RUNNING":
             _fail("CONSTRUCTION_STATE_INVALID", "construction step is not in an implementation state")
+        authority = _construction_authority(frozen, step, role, route_wire)
+        if _frozen_construction_authority(store, task_id) != authority:
+            _fail("CONSTRUCTION_AUTHORITY_DRIFT", "launch differs from the owner-frozen authority")
+        owner_decision = _load_latest_decision(store, task_id)
+        if not owner_decision or owner_decision.get("construction_authority_sha256") != artifact_sha256(authority):
+            _fail("CONSTRUCTION_AUTHORITY_DRIFT", "owner decision is not bound to frozen construction authority")
         if has_active_repair_assignment(store, task_id):
             return _transition(
                 store,
@@ -3073,13 +3355,19 @@ def run_enforced_construction(
             attempt,
             str(frozen.candidate_commit),
             store_locked=True,
+            request_sha256=str(route_wire["request_sha256"]),
+            route_fields={
+                field: route_wire[field]
+                for field in ("route", "rule_id", "routing_mode")
+            },
+            role=role,
         )
         context = ConstructionExecutionContext(
             plan=frozen,
             step=step,
             dispatch_id=launch_id,
             task_sha256=frozen.task_sha256,
-            request_sha256=request_sha256,
+            request_sha256=str(route_wire["request_sha256"]),
             role=role,
         )
         result, state_after_retry = _run_role_with_technical_retry(
@@ -3146,9 +3434,8 @@ def run_until_gate(
         budget = _budget_from_events(store, task_id)
         config = _load_workflow_config()
         if (
-            _configured_routing_mode(config) != "legacy"
+            _configured_routing_mode(config) == "enforced"
             and _resolve_role_policy(config) == "terra_os"
-            and task["task_type"] == "REMEDIATION"
         ):
             if state == "IMPLEMENTATION_RUNNING" and has_active_repair_assignment(store, task_id):
                 return _transition(
@@ -3159,10 +3446,12 @@ def run_until_gate(
                     budget,
                     event_type="REPAIR_EXECUTION_INTEGRATION_BLOCKED",
                 )
-            _fail(
-                "CONSTRUCTION_CONTEXT_REQUIRED",
-                "terra_os remediation execution requires a frozen plan, route request, step, and attempt",
+            code = (
+                "CONSTRUCTION_CONTEXT_REQUIRED"
+                if task["task_type"] == "REMEDIATION"
+                else "TERRA_OS_DECISION_REQUIRED"
             )
+            _fail(code, "terra_os execution requires a validated persisted role decision")
         while True:
             if getattr(runner, "is_live_model", False) and task["task_type"] == "ACCEPTANCE":
                 assert_acceptance_candidate(task, _execution_repo(task, "luna"))
@@ -3307,6 +3596,13 @@ def _apply_owner_decision(
             "new_state": target,
             "task_sha256": _task_sha256(store, task_id),
         }
+        if decision in {"approve_execution", "authorize_rework"}:
+            try:
+                authority = _frozen_construction_authority(store, task_id)
+            except WorkflowError:
+                pass
+            else:
+                record["construction_authority_sha256"] = artifact_sha256(authority)
         store.record_decision(task_id, record)
         event = dict(record)
         event["retry_budget"] = _budget_record(budget)

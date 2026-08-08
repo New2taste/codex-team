@@ -1,4 +1,5 @@
 import json
+import hashlib
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -23,7 +24,7 @@ def remediation_task(*, objective="implement one isolated parser behavior", path
         "base_commit": "b" * 40,
         "candidate_commit": "c" * 40,
         "authoritative_files": ["README.md"],
-        "allowed_write_paths": ["src"] if paths is None else paths,
+        "allowed_write_paths": ["tests/fixtures"] if paths is None else paths,
         "forbidden_actions": ["merge", "push"],
         "risk_flags": [],
         "acceptance_commands": ["python -m unittest"],
@@ -32,7 +33,7 @@ def remediation_task(*, objective="implement one isolated parser behavior", path
     }
 
 
-def construction_plan(*, task=None, scope="src/parser.py", envelope=None, owner_role="luna_construction"):
+def construction_plan(*, task=None, scope="tests/fixtures/paired-cases.json", envelope=None, owner_role="luna_construction"):
     selected_task = remediation_task() if task is None else task
     return {
         "schema_version": "ai-plan-1",
@@ -68,38 +69,40 @@ def construction_plan(*, task=None, scope="src/parser.py", envelope=None, owner_
 
 
 def valid_envelope(scope):
+    artifact_path = ROOT / scope
+    digest = hashlib.sha256(artifact_path.read_bytes()).hexdigest() if artifact_path.is_file() else "a" * 64
     return {
         "allowed_paths": [scope],
         "done_when": {
             "kind": "TEST",
-            "command": "python -m unittest tests.test_parser",
+            "command": "/usr/bin/grep -F case-01 tests/fixtures/paired-cases.json",
             "expected_exit": 0,
-            "assertion": "OK",
+            "assertion": "case-01",
             "artifact": scope,
         },
         "evidence": {
-            "L0": {"kind": "HASH", "artifact": scope, "sha256": "a" * 64},
+            "L0": {"kind": "HASH", "artifact": scope, "sha256": digest},
             "L1": {
                 "kind": "COMMAND",
-                "command": "python -m unittest tests.test_parser",
+                "command": "/usr/bin/grep -F case-01 tests/fixtures/paired-cases.json",
                 "expected_exit": 0,
-                "assertion": "OK",
+                "assertion": "case-01",
                 "artifact": scope,
             },
             "L2": {
                 "kind": "TEST",
-                "command": "python -m unittest tests.test_parser",
+                "command": "/usr/bin/grep -F case-01 tests/fixtures/paired-cases.json",
                 "expected_exit": 0,
-                "assertion": "OK",
+                "assertion": "case-01",
                 "artifact": scope,
             },
         },
         "negative_checks": [
             {
                 "kind": "COMMAND",
-                "command": "python -m unittest tests.test_parser --negative",
+                "command": "/usr/bin/grep -F definitely-absent tests/fixtures/paired-cases.json",
                 "expected_exit": 1,
-                "assertion": "failure reproduced",
+                "assertion": "exit=1",
                 "artifact": scope,
             }
         ],
@@ -194,6 +197,15 @@ class EnforcedConstructionExecutionTest(unittest.TestCase):
         )
         self.assertEqual("construction-601", dispatch["subtask_id"])
         self.assertEqual(workflow.validate_plan(self.plan, self.task).plan_sha256, dispatch["plan_sha256"])
+        events = [json.loads(line) for line in (
+            self.root / self.task["task_id"] / "events.jsonl"
+        ).read_text().splitlines()]
+        evidence_event = next(
+            event for event in events
+            if event["event_type"] == "CONSTRUCTION_EVIDENCE_RECORDED"
+        )
+        self.assertEqual("controller", json.loads(evidence_event["evidence"][0]["observation"])["source"])
+        self.assertEqual(0, json.loads(evidence_event["evidence"][1]["observation"])["exit_code"])
 
     def test_non_luna_frozen_step_runs_terra_xhigh_without_any_sol_role(self):
         task = remediation_task()

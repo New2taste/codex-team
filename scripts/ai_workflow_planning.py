@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import shlex
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 try:
     from .ai_workflow_artifacts import artifact_sha256, validate_plan_shape
@@ -274,10 +276,22 @@ def _construction_check(value: object, *, expected_kind: str, negative: bool = F
     command = value.get("command")
     assertion = value.get("assertion")
     expected_exit = value.get("expected_exit")
+    try:
+        argv = shlex.split(command) if isinstance(command, str) else []
+    except ValueError:
+        argv = []
+    executable = Path(argv[0]).name.casefold() if argv else ""
+    shell_tokens = {"sh", "bash", "zsh", "dash", "command", "true", "false"}
+    allowed_executables = {"python", "python3", "python3.11", "grep"}
     if (
         not isinstance(command, str)
         or not command.strip()
         or command.strip() in {"true", ":", "/usr/bin/true"}
+        or any(token in command for token in (";", "&&", "||", "`", "$(", ">", "<", "\n"))
+        or len(argv) < 2
+        or executable in shell_tokens
+        or executable not in allowed_executables
+        or (executable.startswith("python") and tuple(argv[1:3]) != ("-m", "unittest"))
         or not isinstance(assertion, str)
         or not assertion.strip()
         or isinstance(expected_exit, bool)
@@ -301,8 +315,8 @@ def _construction_envelope(value: object) -> ConstructionEnvelope:
     allowed_paths = _scope_strings(value["allowed_paths"], field="construction_envelope.allowed_paths")
     done_when = _construction_check(value["done_when"], expected_kind="TEST")
     negative_raw = value["negative_checks"]
-    if not isinstance(negative_raw, list) or not negative_raw:
-        _fail("PLAN_INVALID", "construction_envelope.negative_checks must be a non-empty array")
+    if not isinstance(negative_raw, list) or len(negative_raw) != 1:
+        _fail("PLAN_INVALID", "construction_envelope requires exactly one negative check")
     negative_checks = tuple(
         _construction_check(item, expected_kind="COMMAND", negative=True)
         for item in negative_raw
@@ -315,6 +329,8 @@ def _construction_envelope(value: object) -> ConstructionEnvelope:
         ("L1", _construction_check(evidence["L1"], expected_kind="COMMAND")),
         ("L2", _construction_check(evidence["L2"], expected_kind="TEST")),
     ]
+    if done_when != levels[2][1]:
+        _fail("PLAN_INVALID", "done_when must be the controller-executed L2 test")
     classification = value["risk_classification"]
     if not isinstance(classification, Mapping):
         _fail("PLAN_INVALID", "construction_envelope.risk_classification must be an object")
@@ -348,16 +364,64 @@ def _required_nonempty_strings(value: object, *, field: str) -> tuple[str, ...]:
 
 def _luna_scope_is_forbidden(scope: str) -> bool:
     path = normalize_scope(scope)
-    parts = path.parts
+    parts = tuple(part.casefold() for part in path.parts)
     if not parts:
         return True
     if parts[0] in {".git", ".superpowers", "logs"}:
         return True
     if len(parts) >= 2 and parts[:2] == ("data", "state"):
         return True
-    if parts[0] == "config" and path.name.startswith("ai_workflow"):
+    if parts[0] in {"scripts", "config", "data"} and len(parts) == 1:
         return True
-    return parts[0] == "scripts" and path.name.startswith("ai_workflow")
+    if parts[0] == "config" and path.name.casefold().startswith("ai_workflow"):
+        return True
+    return parts[0] == "scripts" and path.name.casefold().startswith("ai_workflow")
+
+
+def _scope_has_unsafe_filesystem_component(repository_root: object, scope: str) -> bool:
+    """Inspect every existing component through no-follow directory FDs."""
+
+    if not isinstance(repository_root, str) or not Path(repository_root).is_absolute():
+        return True
+    root = Path(repository_root)
+    try:
+        root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return True
+    current_fd = root_fd
+    try:
+        for index, component in enumerate(normalize_scope(scope).parts):
+            flags = os.O_RDONLY | os.O_NOFOLLOW
+            if index < len(normalize_scope(scope).parts) - 1:
+                flags |= os.O_DIRECTORY
+            try:
+                next_fd = os.open(component, flags, dir_fd=current_fd)
+            except FileNotFoundError:
+                return False
+            except OSError:
+                return True
+            if current_fd != root_fd:
+                os.close(current_fd)
+            current_fd = next_fd
+        return False
+    finally:
+        if current_fd != root_fd:
+            os.close(current_fd)
+        os.close(root_fd)
+
+
+def _luna_local_task_is_explicit(task: Mapping[str, object], scopes: set[str]) -> bool:
+    objective = task.get("objective")
+    if not isinstance(objective, str):
+        return False
+    # Luna is an explicit exception: only concrete local implementation verbs
+    # and local source/test/doc/fixture roots qualify.  Uncertain semantics go
+    # to Terra without attempting an ever-growing deny-word classifier.
+    action = objective.strip().casefold().split(maxsplit=1)[0]
+    if action not in {"add", "create", "fix", "implement", "rename", "update", "write"}:
+        return False
+    allowed_roots = {"src", "tests", "docs", "fixtures", "examples", "scripts"}
+    return bool(scopes) and all(normalize_scope(scope).parts[0].casefold() in allowed_roots for scope in scopes)
 
 
 def _luna_semantics_are_prohibited(task: Mapping[str, object], subtask: Mapping[str, object]) -> bool:
@@ -486,8 +550,15 @@ def validate_plan(plan: object, task: Mapping[str, object]) -> FrozenPlan:
             if tuple(write_scope) != construction_envelope.allowed_paths:
                 _fail("PLAN_INVALID", "luna construction allowed_paths must exactly match write_scope")
             bound_scopes = set(write_scope) | set(read_scope)
+            if not _luna_local_task_is_explicit(task_value, bound_scopes):
+                _fail("PLAN_INVALID", "luna construction requires an explicitly local task kind and scope")
             if any(_luna_scope_is_forbidden(scope) for scope in bound_scopes):
                 _fail("PLAN_INVALID", "luna construction cannot access metadata or control-plane paths")
+            if any(
+                _scope_has_unsafe_filesystem_component(task_value["repository_root"], scope)
+                for scope in bound_scopes
+            ):
+                _fail("PLAN_INVALID", "luna construction scope contains an unsafe filesystem component")
             checks = (
                 construction_envelope.done_when,
                 *(record for _, record in construction_envelope.evidence),
@@ -632,6 +703,10 @@ def dispatch_id(
     subtask_id: str,
     attempt: int,
     candidate_commit: str,
+    *,
+    request_sha256: str | None = None,
+    route_fields: Mapping[str, object] | None = None,
+    role: str | None = None,
 ) -> str:
     """Hash exactly the five canonical values that define one launch attempt."""
 
@@ -642,6 +717,16 @@ def dispatch_id(
         "attempt": attempt,
         "candidate_commit": _identity_string(candidate_commit, field="candidate_commit"),
     }
+    if request_sha256 is not None or route_fields is not None or role is not None:
+        if request_sha256 is None or route_fields is None or role is None:
+            _fail("DISPATCH_IDENTITY_DRIFT", "dispatch authority binding must be complete")
+        value.update(
+            {
+                "request_sha256": _identity_string(request_sha256, field="request_sha256"),
+                "route_fields": dict(route_fields),
+                "role": _identity_string(role, field="role"),
+            }
+        )
     if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
         _fail("DISPATCH_IDENTITY_DRIFT", "attempt must be a positive integer")
     payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -680,6 +765,9 @@ def record_dispatch(
     candidate_commit: str,
     *,
     store_locked: bool = False,
+    request_sha256: str | None = None,
+    route_fields: Mapping[str, object] | None = None,
+    role: str | None = None,
 ) -> str:
     """Append one immutable dispatch record and return its canonical identity."""
 
@@ -711,6 +799,9 @@ def record_dispatch(
         subtask_id,
         attempt,
         candidate_commit,
+        request_sha256=request_sha256,
+        route_fields=route_fields,
+        role=role,
     )
     method_name = "_record_dispatch_locked" if store_locked else "record_dispatch"
     method = getattr(store, method_name, None)
@@ -729,6 +820,15 @@ def record_dispatch(
             "subtask_id": selected.id,
             "attempt": attempt,
             "candidate_commit": candidate_commit,
+            **(
+                {
+                    "request_sha256": request_sha256,
+                    "route_fields": dict(route_fields),
+                    "role": role,
+                }
+                if request_sha256 is not None and route_fields is not None and role is not None
+                else {}
+            ),
         },
     )
     return identity
