@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Close the owner-authorized, Sol xhigh-frozen `TRANSACTION_EXCEPTION_ROLLBACK` defect so Plugin Agent installation never leaves a newly published Agent without matching ownership state after state publication fails or raises.
+**Goal:** Close the `TRANSACTION_EXCEPTION_ROLLBACK` defect so Plugin Agent installation never leaves a newly published Agent without matching ownership state after state publication fails or raises.
 
 **Architecture:** Treat `luna-worker.toml` and `.ai-workflow-agent-state.json` as one two-phase transaction. After Agent publication, state-hook and state-publication exits share an ownership-aware rollback path. It removes only entries whose device/inode match staged publications and restores known-legacy payloads only through no-clobber operations. Lifecycle/OSError failures return nonzero; arbitrary RuntimeError is re-raised after cleanup.
 
@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- This is owner-authorized Sol xhigh escalation, not a reset of Task 6's two-round automatic repair budget.
+- Policy amendment (2026-08-08): Task 6 has exhausted two earlier repair submissions. Per the owner’s final lightweight-workflow rule, this is the one post-budget direct fix by the original Sol medium acceptance role, followed by a different Sol medium peer review. It is not a reset of Terra’s two-round budget and must not trigger Sol high/xhigh.
 - Modify only `plugins/ai-workflow/scripts/agent_lifecycle.py` and `tests/test_ai_workflow_distribution.py`.
 - Preserve O_NOFOLLOW, ancestor checks, directory FDs, no-clobber hard links, fixed digest, tombstone recovery and no recursive delete.
 - Rollback requires exact staged `(st_dev, st_ino)` plus digest; SHA alone cannot authorize deletion.
@@ -20,7 +20,7 @@
 
 ### Task 1: Exception-Safe Agent/State Publication Transaction
 
-**Owner:** Terra `xhigh` — owner-authorized escalation implementation.
+**Owner:** original acceptance Sol `medium` — one post-budget direct fix.
 
 **Files:**
 - Modify: `plugins/ai-workflow/scripts/agent_lifecycle.py`
