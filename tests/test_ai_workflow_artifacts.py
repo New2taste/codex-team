@@ -12,6 +12,8 @@ TERRA_OS_MODEL_ROLES = (
     "luna_construction",
     "sol_medium_supervisor",
     "terra_xhigh",
+    "terra_xhigh_planner",
+    "terra_xhigh_reviewer",
     "sol_medium_reviewer",
     "sol_xhigh_planner",
 )
@@ -236,6 +238,8 @@ class ArtifactValidatorTest(unittest.TestCase):
             "sol_xhigh": "OPTION_A",
             "sol_medium_supervisor": "PLAN_READY",
             "terra_xhigh": "IMPLEMENTED_CANDIDATE",
+            "terra_xhigh_planner": "PLAN_READY",
+            "terra_xhigh_reviewer": "ACCEPTANCE_RECOMMENDED",
             "sol_medium_reviewer": "ACCEPTANCE_RECOMMENDED",
             "sol_xhigh_planner": "OPTION_A",
         }

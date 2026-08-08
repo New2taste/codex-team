@@ -11,7 +11,6 @@ import json
 import math
 import os
 import re
-import shlex
 import subprocess
 import sys
 import tempfile
@@ -102,6 +101,8 @@ READ_ONLY_ROLES = frozenset(
         "sol_medium_supervisor",
         "sol_medium_reviewer",
         "sol_xhigh_planner",
+        "terra_xhigh_planner",
+        "terra_xhigh_reviewer",
     }
 )
 TERRA_WRITE_ROLES = frozenset({"luna_construction", "terra", "terra_xhigh"})
@@ -899,18 +900,9 @@ def _safe_artifact_sha256(repository: Path, artifact: str) -> str:
 
 
 def _execute_construction_command(repository: Path, check: ConstructionCheck) -> dict[str, object]:
-    try:
-        argv = shlex.split(str(check.command))
-    except ValueError as exc:
-        raise WorkflowError("CONSTRUCTION_EVIDENCE_FAILED", "invalid evidence argv") from exc
-    executable = Path(argv[0]).name.casefold() if argv else ""
-    if (
-        len(argv) < 2
-        or executable not in {"python", "python3", "python3.11", "grep"}
-        or any(token in str(check.command) for token in (";", "&&", "||", "`", "$(", ">", "<", "\n"))
-        or (executable.startswith("python") and tuple(argv[1:3]) != ("-m", "unittest"))
-    ):
-        _fail("CONSTRUCTION_EVIDENCE_FAILED", "evidence command is not an approved argv")
+    argv = list(
+        construction_evidence_argv(check, error_code="CONSTRUCTION_EVIDENCE_FAILED")
+    )
     try:
         completed = subprocess.run(
             argv,
@@ -921,7 +913,7 @@ def _execute_construction_command(repository: Path, check: ConstructionCheck) ->
             text=True,
             timeout=120,
             check=False,
-            env={"PATH": os.environ.get("PATH", ""), "PYTHONPATH": str(repository)},
+            env={"PATH": "/usr/bin:/bin", "PYTHONPATH": str(repository)},
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise WorkflowError("CONSTRUCTION_EVIDENCE_FAILED", "evidence argv could not complete") from exc
@@ -1787,6 +1779,7 @@ try:
         decide_route as _decide_route,
         record_route_decision as _record_route_decision,
         resolve_role_policy as _resolve_role_policy,
+        terra_os_read_only_role as _terra_os_read_only_role,
     )
 except ImportError:  # direct script execution
     from ai_workflow_routing import (
@@ -1794,6 +1787,7 @@ except ImportError:  # direct script execution
         decide_route as _decide_route,
         record_route_decision as _record_route_decision,
         resolve_role_policy as _resolve_role_policy,
+        terra_os_read_only_role as _terra_os_read_only_role,
     )
 
 
@@ -1851,6 +1845,7 @@ try:
         ConstructionCheck,
         FrozenPlan,
         FrozenSubtask,
+        construction_evidence_argv,
         dispatch_id,
         normalize_scope,
         ready_batch,
@@ -1865,6 +1860,7 @@ except ImportError:  # direct script execution
         ConstructionCheck,
         FrozenPlan,
         FrozenSubtask,
+        construction_evidence_argv,
         dispatch_id,
         normalize_scope,
         ready_batch,
@@ -2339,6 +2335,8 @@ FAKE_ROLE_RESULTS = {
     "luna_construction": ("IMPLEMENTED_CANDIDATE", "PRECHECK_RUNNING"),
     "terra": ("IMPLEMENTED_CANDIDATE", "PRECHECK_RUNNING"),
     "terra_xhigh": ("IMPLEMENTED_CANDIDATE", "PRECHECK_RUNNING"),
+    "terra_xhigh_planner": ("PLAN_READY", "AWAITING_OWNER_DECISION"),
+    "terra_xhigh_reviewer": ("ACCEPTANCE_RECOMMENDED", "AWAITING_OWNER_DECISION"),
     "sol_planner": ("PLAN_READY", "AWAITING_OWNER_DECISION"),
     "sol_medium_supervisor": ("PLAN_READY", "AWAITING_OWNER_DECISION"),
     "sol_reviewer": ("ACCEPTANCE_RECOMMENDED", "AWAITING_OWNER_DECISION"),
@@ -3068,9 +3066,9 @@ def _role_state_after_result(
                     event_type="IMPLEMENTATION_REWORK_EXHAUSTED",
                 )
             target = "NEEDS_REPLAN"
-    elif role in {"sol_planner", "sol_medium_supervisor"}:
+    elif role in {"sol_planner", "sol_medium_supervisor", "terra_xhigh_planner"}:
         target = "PLAN_READY"
-    elif role in {"sol_reviewer", "sol_medium_reviewer"}:
+    elif role in {"sol_reviewer", "sol_medium_reviewer", "terra_xhigh_reviewer"}:
         target = "ESCALATION_PROPOSED" if status == "ESCALATION_PROPOSED" else "REVIEW_READY"
     elif role in {"sol_xhigh", "sol_xhigh_planner"}:
         target = "ESCALATION_PROPOSED"
@@ -3107,13 +3105,82 @@ def _run_pipeline_role(
     role: str,
     runner: Runner,
     budget: RetryBudget,
+    *,
+    state_root: Path | None = None,
 ) -> str:
     result, state_after_retry = _run_role_with_technical_retry(
-        store, task_id, task, state, role, runner, budget
+        store,
+        task_id,
+        task,
+        state,
+        role,
+        runner,
+        budget,
+        state_root=state_root,
     )
     if result is None:
         return state_after_retry
     return _role_state_after_result(store, task_id, state_after_retry, role, result, budget)
+
+
+def _load_enforced_read_only_route_role(
+    store: WorkflowStore, task_id: str, task: Mapping[str, object]
+) -> str:
+    """Recover one executable role from a frozen enforced sol-only decision."""
+
+    if task.get("task_type") not in {"PLAN", "ACCEPTANCE"}:
+        _fail(
+            "TERRA_OS_DECISION_REQUIRED",
+            "generic terra_os read-only execution requires PLAN or ACCEPTANCE",
+        )
+    try:
+        decision = load_artifact(store._require_task(task_id) / "route-decision.json")
+    except ArtifactError as exc:
+        raise WorkflowError(
+            "TERRA_OS_DECISION_REQUIRED",
+            "terra_os execution requires a persisted route decision",
+        ) from exc
+    validate_route_decision(decision)
+    if (
+        decision.get("task_id") != task_id
+        or decision.get("task_sha256") != artifact_sha256(task)
+        or decision.get("routing_mode") != "enforced"
+        or decision.get("route") != "sol_only"
+        or decision.get("rule_id")
+        not in {
+            "PLANNING_ONLY_ROUTE",
+            "HIGH_RISK_READ_ONLY_ROUTE",
+            "DECOMPOSABLE_READ_ONLY_ROUTE",
+            "DECOMPOSABLE_SOL_ONLY_ROUTE",
+        }
+    ):
+        _fail(
+            "TERRA_OS_ROUTE_MISMATCH",
+            "persisted route decision does not authorize this read-only execution",
+        )
+    route_events = [
+        event
+        for event in _load_event_records(store, task_id)
+        if event.get("event_type") == "ROUTE_DECIDED"
+    ]
+    if len(route_events) != 1 or any(
+        route_events[0].get(field) != decision[field]
+        for field in (
+            "task_sha256",
+            "request_sha256",
+            "route",
+            "routing_mode",
+            "rule_id",
+        )
+    ):
+        _fail(
+            "TERRA_OS_ROUTE_MISMATCH",
+            "persisted route decision does not match its append-only event",
+        )
+    role = _terra_os_read_only_role(task)
+    if role not in READ_ONLY_ROLES or role in TERRA_WRITE_ROLES:
+        _fail("INVALID_ROLE", "terra_os route resolved to a non-read-only role")
+    return role
 
 
 def _load_enforced_construction_artifacts(
@@ -3433,6 +3500,7 @@ def run_until_gate(
         state = _current_state(store, task_id)
         budget = _budget_from_events(store, task_id)
         config = _load_workflow_config()
+        enforced_read_only_role: str | None = None
         if (
             _configured_routing_mode(config) == "enforced"
             and _resolve_role_policy(config) == "terra_os"
@@ -3446,12 +3514,15 @@ def run_until_gate(
                     budget,
                     event_type="REPAIR_EXECUTION_INTEGRATION_BLOCKED",
                 )
-            code = (
-                "CONSTRUCTION_CONTEXT_REQUIRED"
-                if task["task_type"] == "REMEDIATION"
-                else "TERRA_OS_DECISION_REQUIRED"
-            )
-            _fail(code, "terra_os execution requires a validated persisted role decision")
+            if task["task_type"] in {"PLAN", "ACCEPTANCE"}:
+                enforced_read_only_role = _load_enforced_read_only_route_role(
+                    store, task_id, task
+                )
+            else:
+                _fail(
+                    "CONSTRUCTION_CONTEXT_REQUIRED",
+                    "terra_os remediation requires a validated construction context",
+                )
         while True:
             if getattr(runner, "is_live_model", False) and task["task_type"] == "ACCEPTANCE":
                 assert_acceptance_candidate(task, _execution_repo(task, "luna"))
@@ -3461,6 +3532,11 @@ def run_until_gate(
                 state = _transition(store, task_id, state, "TASK_VALIDATED", budget)
                 continue
             if state == "TASK_VALIDATED":
+                if enforced_read_only_role is not None:
+                    state = _transition(
+                        store, task_id, state, "PLAN_OR_REVIEW_RUNNING", budget
+                    )
+                    continue
                 if task["task_type"] in {"PLAN", "ACCEPTANCE"}:
                     state = _transition(store, task_id, state, "EVIDENCE_RUNNING", budget)
                     continue
@@ -3545,8 +3621,21 @@ def run_until_gate(
                 )
                 continue
             if state == "PLAN_OR_REVIEW_RUNNING":
-                role = _role_for_plan_or_review(store, task_id, task)
-                state = _run_pipeline_role(store, task_id, task, state, role, runner, budget)
+                role = (
+                    enforced_read_only_role
+                    if enforced_read_only_role is not None
+                    and not _authorization_is_recorded(
+                        store,
+                        task_id,
+                        "ESCALATION_AUTHORIZED",
+                        "authorize_escalation",
+                    )
+                    else _role_for_plan_or_review(store, task_id, task)
+                )
+                state = _run_pipeline_role(
+                    store, task_id, task, state, role, runner, budget,
+                    state_root=store.root,
+                )
                 continue
             _fail("INVALID_STATE", f"cannot run task from state {state}")
 

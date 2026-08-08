@@ -261,6 +261,40 @@ def _validate_write_ownership(tasks: tuple[FrozenSubtask, ...]) -> None:
             claims.append((task.id, scope))
 
 
+def construction_evidence_argv(
+    check: ConstructionCheck, *, error_code: str = "PLAN_INVALID"
+) -> tuple[str, ...]:
+    """Return the one typed evidence argv bound to its exact artifact.
+
+    Evidence collection runs in the controller process, so a plan never gets
+    to choose an executable through ``PATH`` or add unrelated file operands.
+    The frozen command string is merely the wire representation of this
+    closed fixed-string-search operation.
+    """
+
+    if not isinstance(check, ConstructionCheck):
+        _fail(error_code, "construction evidence check is invalid")
+    try:
+        artifact = normalize_scope(check.artifact).as_posix()
+        argv = shlex.split(check.command) if isinstance(check.command, str) else []
+    except ValueError:
+        argv = []
+    if (
+        check.kind not in {"COMMAND", "TEST"}
+        or isinstance(check.expected_exit, bool)
+        or check.expected_exit not in {0, 1}
+        or not isinstance(check.assertion, str)
+        or not check.assertion.strip()
+        or len(argv) != 4
+        or argv[0] != "/usr/bin/grep"
+        or argv[1] != "-F"
+        or not argv[2]
+        or argv[3] != artifact
+    ):
+        _fail(error_code, "construction evidence operation is not artifact-bound")
+    return tuple(argv)
+
+
 def _construction_check(value: object, *, expected_kind: str, negative: bool = False) -> ConstructionCheck:
     if not isinstance(value, Mapping):
         _fail("PLAN_INVALID", "construction check must be an object")
@@ -276,22 +310,9 @@ def _construction_check(value: object, *, expected_kind: str, negative: bool = F
     command = value.get("command")
     assertion = value.get("assertion")
     expected_exit = value.get("expected_exit")
-    try:
-        argv = shlex.split(command) if isinstance(command, str) else []
-    except ValueError:
-        argv = []
-    executable = Path(argv[0]).name.casefold() if argv else ""
-    shell_tokens = {"sh", "bash", "zsh", "dash", "command", "true", "false"}
-    allowed_executables = {"python", "python3", "python3.11", "grep"}
     if (
         not isinstance(command, str)
         or not command.strip()
-        or command.strip() in {"true", ":", "/usr/bin/true"}
-        or any(token in command for token in (";", "&&", "||", "`", "$(", ">", "<", "\n"))
-        or len(argv) < 2
-        or executable in shell_tokens
-        or executable not in allowed_executables
-        or (executable.startswith("python") and tuple(argv[1:3]) != ("-m", "unittest"))
         or not isinstance(assertion, str)
         or not assertion.strip()
         or isinstance(expected_exit, bool)
@@ -300,13 +321,15 @@ def _construction_check(value: object, *, expected_kind: str, negative: bool = F
         or (not negative and expected_exit != 0)
     ):
         _fail("PLAN_INVALID", "construction command check is not mechanically bound")
-    return ConstructionCheck(
+    check = ConstructionCheck(
         kind=kind,
         artifact=artifact.as_posix(),
         command=command,
         expected_exit=expected_exit,
         assertion=assertion,
     )
+    construction_evidence_argv(check)
+    return check
 
 
 def _construction_envelope(value: object) -> ConstructionEnvelope:

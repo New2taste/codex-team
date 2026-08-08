@@ -201,6 +201,18 @@ def _roles_for(route_name: str, legacy_role_chain: tuple[str, ...]) -> tuple[str
     raise AssertionError("unreachable")
 
 
+def terra_os_read_only_role(task: Mapping[str, object]) -> str:
+    """Return the task-typed Terra xhigh role for a non-writing route."""
+
+    task_type = task.get("task_type")
+    if task_type == "ACCEPTANCE":
+        return "terra_xhigh_reviewer"
+    if task_type in {"PLAN", "REMEDIATION"}:
+        return "terra_xhigh_planner"
+    _fail("ROUTE_INPUT_INVALID", "task type has no terra_os read-only role")
+    raise AssertionError("unreachable")
+
+
 def roles_for_policy(
     task: Mapping[str, object],
     request: Mapping[str, object],
@@ -224,7 +236,7 @@ def roles_for_policy(
     if route_name in {"direct", "blocked"}:
         return ()
     if route_name == "sol_only":
-        return ("terra_xhigh",)
+        return (terra_os_read_only_role(task),)
     if route_name == "delegated":
         if _has_verified_luna_construction_envelope(
             task, request, construction_plan, construction_step_id

@@ -70,6 +70,20 @@ sandbox = "workspace-write"
 allowed_statuses = ["IMPLEMENTED_CANDIDATE", "NEEDS_CLARIFICATION", "BLOCKED"]
 instructions = """Own complex construction, decomposition, integration, and open-ended debugging only inside the authorized worktree and paths. Stop on semantic ambiguity. Never merge, push, or self-approve."""
 
+[roles.terra_xhigh_planner]
+model = "gpt-5.6-terra"
+reasoning_effort = "xhigh"
+sandbox = "read-only"
+allowed_statuses = ["PLAN_READY", "NEEDS_OWNER_DECISION", "INSUFFICIENT_EVIDENCE"]
+instructions = """Produce only the bounded plan selected by a persisted terra_os read-only route. Do not implement, modify repository files, merge, push, or self-approve."""
+
+[roles.terra_xhigh_reviewer]
+model = "gpt-5.6-terra"
+reasoning_effort = "xhigh"
+sandbox = "read-only"
+allowed_statuses = ["ACCEPTANCE_RECOMMENDED", "ACCEPTANCE_WITH_NOTES_RECOMMENDED", "REWORK_RECOMMENDED", "REJECT_RECOMMENDED", "ESCALATION_PROPOSED"]
+instructions = """Review only the pinned acceptance candidate selected by a persisted terra_os read-only route. Recommend a verdict without modifying files or enacting owner decisions."""
+
 [roles.sol_medium_supervisor]
 model = "gpt-5.6-sol"
 reasoning_effort = "medium"

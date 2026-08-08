@@ -59,38 +59,39 @@ def plan_task(
 
 def luna_construction_envelope(paths):
     artifact = paths[0]
+    command = f"/usr/bin/grep -F bounded {artifact}"
     return {
         "allowed_paths": paths,
         "done_when": {
             "kind": "TEST",
-            "command": "python -m unittest tests.test_bounded",
+            "command": command,
             "expected_exit": 0,
-            "assertion": "OK",
+            "assertion": "bounded",
             "artifact": artifact,
         },
         "evidence": {
             "L0": {"kind": "HASH", "artifact": artifact, "sha256": "a" * 64},
             "L1": {
                 "kind": "COMMAND",
-                "command": "python -m unittest tests.test_bounded",
+                "command": command,
                 "expected_exit": 0,
-                "assertion": "OK",
+                "assertion": "bounded",
                 "artifact": artifact,
             },
             "L2": {
                 "kind": "TEST",
-                "command": "python -m unittest tests.test_bounded",
+                "command": command,
                 "expected_exit": 0,
-                "assertion": "OK",
+                "assertion": "bounded",
                 "artifact": artifact,
             },
         },
         "negative_checks": [
             {
                 "kind": "COMMAND",
-                "command": "python -m unittest tests.test_bounded --negative",
+                "command": f"/usr/bin/grep -F definitely-absent {artifact}",
                 "expected_exit": 1,
-                "assertion": "negative fixture fails",
+                "assertion": "exit=1",
                 "artifact": artifact,
             }
         ],

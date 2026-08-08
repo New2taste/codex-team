@@ -8,7 +8,7 @@
     },
     "role": {
       "type": "string",
-      "enum": ["luna", "luna_construction", "terra", "sol_planner", "sol_reviewer", "sol_xhigh", "sol_medium_supervisor", "terra_xhigh", "sol_medium_reviewer", "sol_xhigh_planner"]
+      "enum": ["luna", "luna_construction", "terra", "sol_planner", "sol_reviewer", "sol_xhigh", "sol_medium_supervisor", "terra_xhigh", "terra_xhigh_planner", "terra_xhigh_reviewer", "sol_medium_reviewer", "sol_xhigh_planner"]
     },
     "status": {
       "type": "string",

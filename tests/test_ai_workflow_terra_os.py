@@ -43,6 +43,8 @@ def route_request(work_class, execution_need, *, decomposable=True, risk_flags=N
 
 
 def approved_luna_construction_plan(*, owner_role="luna_construction"):
+    artifact = "scripts/bounded_fixture.py"
+    command = f"/usr/bin/grep -F bounded {artifact}"
     return {
         "schema_version": "ai-plan-1",
         "plan_id": "plan-20260808-luna-construction",
@@ -53,31 +55,31 @@ def approved_luna_construction_plan(*, owner_role="luna_construction"):
             {
                 "id": "luna-construction-step",
                 "owner_role": owner_role,
-                "read_scope": ["scripts/bounded_fixture.py"],
-                "write_scope": ["scripts/bounded_fixture.py"],
+                "read_scope": [artifact],
+                "write_scope": [artifact],
                 "do_not_touch": ["plugins"],
                 "depends_on": [],
                 "expected_result": "the bounded parser behavior is implemented",
                 "verification_commands": [
                     "python -m unittest tests.test_ai_workflow_terra_os"
                 ],
-                "first_artifact": "scripts/bounded_fixture.py",
+                "first_artifact": artifact,
                 "evidence_level": "L2",
                 "construction_envelope": {
-                    "allowed_paths": ["scripts/bounded_fixture.py"],
+                    "allowed_paths": [artifact],
                     "done_when": {
                         "kind": "TEST",
-                        "command": "python -m unittest tests.test_ai_workflow_terra_os",
+                        "command": command,
                         "expected_exit": 0,
-                        "assertion": "OK",
-                        "artifact": "scripts/bounded_fixture.py",
+                        "assertion": "bounded",
+                        "artifact": artifact,
                     },
                     "evidence": {
-                        "L0": {"kind": "HASH", "artifact": "scripts/bounded_fixture.py", "sha256": "a" * 64},
-                        "L1": {"kind": "COMMAND", "command": "python -m unittest tests.test_ai_workflow_terra_os", "expected_exit": 0, "assertion": "OK", "artifact": "scripts/bounded_fixture.py"},
-                        "L2": {"kind": "TEST", "command": "python -m unittest tests.test_ai_workflow_terra_os", "expected_exit": 0, "assertion": "OK", "artifact": "scripts/bounded_fixture.py"},
+                        "L0": {"kind": "HASH", "artifact": artifact, "sha256": "a" * 64},
+                        "L1": {"kind": "COMMAND", "command": command, "expected_exit": 0, "assertion": "bounded", "artifact": artifact},
+                        "L2": {"kind": "TEST", "command": command, "expected_exit": 0, "assertion": "bounded", "artifact": artifact},
                     },
-                    "negative_checks": [{"kind": "COMMAND", "command": "python -m unittest tests.test_ai_workflow_terra_os --negative", "expected_exit": 1, "assertion": "negative fixture fails", "artifact": "scripts/bounded_fixture.py"}],
+                    "negative_checks": [{"kind": "COMMAND", "command": f"/usr/bin/grep -F definitely-absent {artifact}", "expected_exit": 1, "assertion": "exit=1", "artifact": artifact}],
                     "risk_classification": {"kind": "LOCAL_DETERMINISTIC_IMPLEMENTATION", "security": False, "authorization": False, "protocol": False, "control_plane": False},
                 },
             }
@@ -132,6 +134,15 @@ class TerraOSConfigTest(unittest.TestCase):
                 for key in ("model", "reasoning_effort", "sandbox")
             ),
         )
+        for role in ("terra_xhigh_planner", "terra_xhigh_reviewer"):
+            with self.subTest(role=role):
+                self.assertEqual(
+                    ("gpt-5.6-terra", "xhigh", "read-only"),
+                    tuple(
+                        roles[role][key]
+                        for key in ("model", "reasoning_effort", "sandbox")
+                    ),
+                )
 
     def test_role_policy_resolution_is_closed_and_honors_explicit_override(self):
         self.assertEqual("terra_os", routing.resolve_role_policy(self.config))
@@ -221,9 +232,9 @@ class TerraOSRolePolicyTest(unittest.TestCase):
             roles,
         )
 
-    def test_sol_only_policy_uses_terra_xhigh_not_ordinary_sol_medium(self):
+    def test_sol_only_policy_uses_read_only_terra_xhigh_not_ordinary_sol_medium(self):
         self.assertEqual(
-            ("terra_xhigh",),
+            ("terra_xhigh_planner",),
             routing.roles_for_policy(
                 valid_task(), route_request("PLANNING_ONLY", "READ_ONLY"), "sol_only", "terra_os"
             ),
@@ -238,7 +249,7 @@ class TerraOSRolePolicyTest(unittest.TestCase):
                     )
 
                     self.assertEqual("sol_only", decision.route)
-                    self.assertEqual(("terra_xhigh",), decision.roles)
+                    self.assertEqual(("terra_xhigh_planner",), decision.roles)
                     self.assertEqual(
                         (
                             "DECOMPOSABLE_READ_ONLY_ROUTE"
@@ -413,6 +424,8 @@ class TerraOSExecutionGuardTest(unittest.TestCase):
         for role in (
             "luna_construction",
             "terra_xhigh",
+            "terra_xhigh_planner",
+            "terra_xhigh_reviewer",
             "sol_xhigh_planner",
         ):
             with self.subTest(role=role):
