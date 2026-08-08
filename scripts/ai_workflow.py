@@ -103,7 +103,7 @@ READ_ONLY_ROLES = frozenset(
         "sol_xhigh_planner",
     }
 )
-TERRA_WRITE_ROLES = frozenset({"terra", "terra_xhigh"})
+TERRA_WRITE_ROLES = frozenset({"luna_construction", "terra", "terra_xhigh"})
 ROLE_GUARD_FAILURES = frozenset(
     {
         "ACCEPTANCE_CANDIDATE_HEAD_MISMATCH",
@@ -881,12 +881,24 @@ def run_codex(
     paths: RunPaths,
     *,
     attempt_context: AttemptAccountingContext | None = None,
+    construction_plan: object | None = None,
+    construction_step_id: object = None,
 ) -> dict:
     """Run one pinned Codex role and accept only a validated output document."""
 
     validate_task(task)
     if not isinstance(prompt, str):
         _fail("INVALID_PROMPT", "prompt must be a string")
+    luna_construction_step: FrozenSubtask | None = None
+    if role == "luna_construction":
+        if task["task_type"] != "REMEDIATION" or task["risk_flags"]:
+            _fail(
+                "LUNA_ENVELOPE_INVALID",
+                "luna construction is limited to low-risk remediation work",
+            )
+        luna_construction_step = require_luna_construction_step(
+            construction_plan, task, construction_step_id
+        )
     accounting_context = _require_attempt_accounting_context(
         attempt_context, task["task_id"], role
     )
@@ -1006,7 +1018,14 @@ def run_codex(
                     assert_acceptance_candidate(task, repo)
                 if role in TERRA_WRITE_ROLES:
                     actual_changes = after_changes - before_changes
-                    assert_allowed_changes(actual_changes, task["allowed_write_paths"])
+                    assert_allowed_changes(
+                        actual_changes,
+                        (
+                            luna_construction_step.write_scope
+                            if luna_construction_step is not None
+                            else task["allowed_write_paths"]
+                        ),
+                    )
                 else:
                     actual_changes = after_changes - before_changes
             except BaseException as exc:
@@ -1494,7 +1513,12 @@ def _configured_routing_mode(config: Mapping[str, object]) -> str:
 
 
 def decide_route(
-    task: Mapping[str, object], request: object, mode: str | None = None
+    task: Mapping[str, object],
+    request: object,
+    mode: str | None = None,
+    *,
+    construction_plan: object | None = None,
+    construction_step_id: object = None,
 ) -> RuntimeRouteDecision:
     """Make a validated local route decision without executing a model."""
 
@@ -1507,6 +1531,8 @@ def decide_route(
         configured_mode if mode is None else mode,
         legacy_router=route,
         role_policy=_resolve_role_policy(config),
+        construction_plan=construction_plan,
+        construction_step_id=construction_step_id,
     )
 
 
@@ -1526,6 +1552,7 @@ try:
         normalize_scope,
         ready_batch,
         record_dispatch,
+        require_luna_construction_step,
         scope_owner_map,
         scopes_overlap,
         validate_plan,
@@ -1538,6 +1565,7 @@ except ImportError:  # direct script execution
         normalize_scope,
         ready_batch,
         record_dispatch,
+        require_luna_construction_step,
         scope_owner_map,
         scopes_overlap,
         validate_plan,
@@ -1955,6 +1983,7 @@ def render_report(metrics: Mapping[str, object]) -> str:
 
 FAKE_ROLE_RESULTS = {
     "luna": ("SUPPORTED", "EVIDENCE_READY"),
+    "luna_construction": ("IMPLEMENTED_CANDIDATE", "PRECHECK_RUNNING"),
     "terra": ("IMPLEMENTED_CANDIDATE", "PRECHECK_RUNNING"),
     "terra_xhigh": ("IMPLEMENTED_CANDIDATE", "PRECHECK_RUNNING"),
     "sol_planner": ("PLAN_READY", "AWAITING_OWNER_DECISION"),
@@ -2304,6 +2333,12 @@ def _run_role_with_technical_retry(
     budget: RetryBudget,
 ) -> tuple[Mapping[str, object] | None, str]:
     """Run one role, allowing only the single persisted technical retry."""
+
+    if role == "luna_construction":
+        _fail(
+            "LUNA_ENVELOPE_INVALID",
+            "generic pipeline dispatch cannot launch luna construction without its envelope",
+        )
 
     retry_kind = "none"
     while True:

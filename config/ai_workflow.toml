@@ -27,6 +27,13 @@ sandbox = "read-only"
 allowed_statuses = ["SUPPORTED", "PARTIALLY_SUPPORTED", "NOT_SUPPORTED", "BLOCKED"]
 instructions = """Handle only bounded tasks. Do not redefine scope or acceptance. Use the requested L0/L1/L2 evidence level. Never claim final acceptance."""
 
+[roles.luna_construction]
+model = "gpt-5.6-luna"
+reasoning_effort = "max"
+sandbox = "workspace-write"
+allowed_statuses = ["IMPLEMENTED_CANDIDATE", "NEEDS_CLARIFICATION", "BLOCKED"]
+instructions = """Own only a locally verified bounded construction envelope with exact allowed paths, deterministic done_when, L0/L1/L2 evidence, negative or mutation checks, and runnable commands. Do not plan, review, widen scope, handle security work, merge, push, or self-approve."""
+
 [roles.terra]
 model = "gpt-5.6-terra"
 reasoning_effort = "xhigh"
@@ -61,21 +68,21 @@ model = "gpt-5.6-terra"
 reasoning_effort = "xhigh"
 sandbox = "workspace-write"
 allowed_statuses = ["IMPLEMENTED_CANDIDATE", "NEEDS_CLARIFICATION", "BLOCKED"]
-instructions = """Own implementation only inside the authorized worktree and paths. Stop on semantic ambiguity. Never merge, push, or self-approve."""
+instructions = """Own complex construction, decomposition, integration, and open-ended debugging only inside the authorized worktree and paths. Stop on semantic ambiguity. Never merge, push, or self-approve."""
 
 [roles.sol_medium_supervisor]
 model = "gpt-5.6-sol"
 reasoning_effort = "medium"
 sandbox = "read-only"
 allowed_statuses = ["PLAN_READY", "NEEDS_OWNER_DECISION", "INSUFFICIENT_EVIDENCE"]
-instructions = """Produce one bounded task decomposition and construction plan for each approved stage, then supervise its semantic and risk constraints. Do not implement."""
+instructions = """Reserved for legacy compatibility only. Do not select this role for ordinary terra_os task planning, construction, or local acceptance."""
 
 [roles.sol_medium_reviewer]
 model = "gpt-5.6-sol"
 reasoning_effort = "medium"
 sandbox = "read-only"
 allowed_statuses = ["ACCEPTANCE_RECOMMENDED", "ACCEPTANCE_WITH_NOTES_RECOMMENDED", "REWORK_RECOMMENDED", "REJECT_RECOMMENDED", "ESCALATION_PROPOSED"]
-instructions = """Review the pinned candidate against the frozen task contract and evidence. Recommend a semantic verdict but never enact owner decisions."""
+instructions = """Reserved for the scoped fallback repair and peer-review ladder. Do not select this role for ordinary terra_os task planning, construction, or local acceptance."""
 
 [roles.sol_xhigh_planner]
 model = "gpt-5.6-sol"
@@ -83,4 +90,4 @@ reasoning_effort = "xhigh"
 sandbox = "read-only"
 requires_owner_approval = true
 allowed_statuses = ["OPTION_A", "OPTION_B", "OPTION_C", "INSUFFICIENT_EVIDENCE"]
-instructions = """Plan only an owner-authorized large project in its closed case file. Do not implement or invent an unlisted option."""
+instructions = """Plan only an owner-authorized large project in its closed case file. Do not implement, review local task acceptance, or invent an unlisted option."""

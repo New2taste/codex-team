@@ -108,6 +108,7 @@ def write_exec_rollout(sessions: Path, *, model="gpt-5.6-luna", agent_type=None)
 class RuntimeIdentityTest(unittest.TestCase):
     def test_each_pinned_terra_os_role_has_a_verifiable_runtime_identity(self):
         for role in (
+            "luna_construction",
             "sol_medium_supervisor",
             "terra_xhigh",
             "sol_medium_reviewer",

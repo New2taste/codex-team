@@ -45,6 +45,7 @@ USAGE_FIELDS = ("input_tokens", "cached_input_tokens", "output_tokens")
 _RUNTIME_ROLES = frozenset(
     {
         "luna",
+        "luna_construction",
         "terra",
         "sol_planner",
         "sol_reviewer",

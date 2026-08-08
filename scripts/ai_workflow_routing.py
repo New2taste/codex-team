@@ -206,6 +206,9 @@ def roles_for_policy(
     request: Mapping[str, object],
     route_name: str,
     policy: str,
+    *,
+    construction_plan: object | None = None,
+    construction_step_id: object = None,
 ) -> tuple[str, ...]:
     """Return the closed runtime role chain for a selected policy route.
 
@@ -221,20 +224,61 @@ def roles_for_policy(
     if route_name in {"direct", "blocked"}:
         return ()
     if route_name == "sol_only":
-        return ("sol_medium_supervisor",)
+        return ("terra_xhigh",)
     if route_name == "delegated":
-        return ("sol_medium_supervisor", "terra_xhigh", "sol_medium_reviewer")
+        if _has_verified_luna_construction_envelope(
+            task, request, construction_plan, construction_step_id
+        ):
+            return ("luna_construction",)
+        return ("terra_xhigh",)
     if route_name == OWNER_AUTHORIZED_LARGE_PROJECT_ROUTE:
         if request.get("execution_need") != "WRITE":
             _fail("ROUTE_INPUT_INVALID", "large-project authorization requires a write route")
         return (
             "sol_xhigh_planner",
-            "sol_medium_supervisor",
             "terra_xhigh",
-            "sol_medium_reviewer",
         )
     _fail("ROUTE_INPUT_INVALID", "route is not supported")
     raise AssertionError("unreachable")
+
+
+def _has_verified_luna_construction_envelope(
+    task: Mapping[str, object],
+    request: Mapping[str, object],
+    plan: object,
+    step_id: object,
+) -> bool:
+    """Accept Luna only from a locally revalidated bounded construction step.
+
+    The frozen route request has no owner or envelope fields.  Treating one as
+    an authority source would permit a caller to grow Luna's scope by changing
+    route JSON, so the only positive branch here is a fresh plan validation.
+    Every other input is a closed fallback to Terra xhigh.
+    """
+
+    if (
+        request.get("work_class") != "BOUNDED"
+        or request.get("execution_need") != "WRITE"
+        or request.get("decomposable") is not True
+        or task.get("task_type") != "REMEDIATION"
+        or task.get("risk_flags")
+        or request.get("risk_flags")
+        or not isinstance(step_id, str)
+        or not step_id.strip()
+        or plan is None
+    ):
+        return False
+    try:
+        try:
+            from .ai_workflow_planning import require_luna_construction_step
+        except (ImportError, ModuleNotFoundError):
+            from ai_workflow_planning import require_luna_construction_step
+        selected = require_luna_construction_step(plan, task, step_id)
+    except Exception:
+        return False
+    return bool(
+        selected.owner_role == "luna_construction" and selected.construction_envelope is not None
+    )
 
 
 def _rule_id_for(
@@ -262,6 +306,8 @@ def decide_route(
     *,
     legacy_router: Callable[[Mapping[str, object]], tuple[str, ...]] | None = None,
     role_policy: str = "terra_os",
+    construction_plan: object | None = None,
+    construction_step_id: object = None,
 ) -> RuntimeRouteDecision:
     """Select one closed-set route without starting a model.
 
@@ -314,7 +360,14 @@ def decide_route(
     roles = (
         _roles_for(selected, current_legacy_roles)
         if mode == "legacy"
-        else roles_for_policy(task_value, request_value, selected, policy)
+        else roles_for_policy(
+            task_value,
+            request_value,
+            selected,
+            policy,
+            construction_plan=construction_plan,
+            construction_step_id=construction_step_id,
+        )
     )
     wire = RouteDecision(
         task_id=str(task_value["task_id"]),

@@ -40,7 +40,7 @@
           },
           "owner_role": {
             "type": "string",
-            "enum": ["host", "luna", "terra", "sol_planner", "sol_reviewer", "sol_xhigh", "sol_medium_supervisor", "terra_xhigh", "sol_medium_reviewer", "sol_xhigh_planner"]
+            "enum": ["host", "luna", "luna_construction", "terra", "sol_planner", "sol_reviewer", "sol_xhigh", "sol_medium_supervisor", "terra_xhigh", "sol_medium_reviewer", "sol_xhigh_planner"]
           },
           "read_scope": {
             "type": "array",
@@ -93,6 +93,41 @@
           "evidence_level": {
             "type": "string",
             "enum": ["L0", "L1", "L2"]
+          },
+          "construction_envelope": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "allowed_paths": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": {"type": "string", "minLength": 1}
+              },
+              "done_when": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": {"type": "string", "minLength": 1}
+              },
+              "evidence": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "L0": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+                  "L1": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+                  "L2": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}}
+                },
+                "required": ["L0", "L1", "L2"]
+              },
+              "negative_checks": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": {"type": "string", "minLength": 1}
+              }
+            },
+            "required": ["allowed_paths", "done_when", "evidence", "negative_checks"]
           }
         },
         "required": [

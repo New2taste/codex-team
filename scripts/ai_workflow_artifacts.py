@@ -82,6 +82,7 @@ ROLES = frozenset(
     {
         "host",
         "luna",
+        "luna_construction",
         "terra",
         "sol_planner",
         "sol_reviewer",
@@ -135,8 +136,14 @@ PLAN_TASK_FIELDS = frozenset(
         "verification_commands",
         "first_artifact",
         "evidence_level",
+        "construction_envelope",
     }
 )
+PLAN_TASK_REQUIRED_FIELDS = PLAN_TASK_FIELDS - {"construction_envelope"}
+CONSTRUCTION_ENVELOPE_FIELDS = frozenset(
+    {"allowed_paths", "done_when", "evidence", "negative_checks"}
+)
+CONSTRUCTION_EVIDENCE_LEVELS = frozenset({"L0", "L1", "L2"})
 RUNTIME_EVIDENCE_FIELDS = frozenset(
     {
         "schema_version",
@@ -479,7 +486,7 @@ def validate_plan_shape(value: object) -> None:
             _raise("INVALID_TYPE", f"tasks[{index}] must be an object")
         task = dict(item)
         unknown = sorted(set(item) - PLAN_TASK_FIELDS)
-        missing = sorted(PLAN_TASK_FIELDS - set(item))
+        missing = sorted(PLAN_TASK_REQUIRED_FIELDS - set(item))
         if unknown:
             _raise("UNKNOWN_FIELD", f"tasks[{index}] has unsupported field {unknown[0]}")
         if missing:
@@ -491,6 +498,46 @@ def validate_plan_shape(value: object) -> None:
         _string(task["expected_result"], f"tasks[{index}].expected_result")
         _string(task["first_artifact"], f"tasks[{index}].first_artifact")
         _enum(task["evidence_level"], f"tasks[{index}].evidence_level", frozenset({"L0", "L1", "L2"}))
+        if "construction_envelope" in task:
+            envelope = task["construction_envelope"]
+            if not isinstance(envelope, Mapping):
+                _raise("INVALID_TYPE", f"tasks[{index}].construction_envelope must be an object")
+            unknown_envelope = sorted(set(envelope) - CONSTRUCTION_ENVELOPE_FIELDS)
+            missing_envelope = sorted(CONSTRUCTION_ENVELOPE_FIELDS - set(envelope))
+            if unknown_envelope:
+                _raise(
+                    "UNKNOWN_FIELD",
+                    f"tasks[{index}].construction_envelope has unsupported field {unknown_envelope[0]}",
+                )
+            if missing_envelope:
+                _raise(
+                    "MISSING_FIELD",
+                    f"tasks[{index}].construction_envelope is missing field {missing_envelope[0]}",
+                )
+            _string_array(envelope["allowed_paths"], f"tasks[{index}].construction_envelope.allowed_paths", allow_empty=False)
+            _string_array(envelope["done_when"], f"tasks[{index}].construction_envelope.done_when", allow_empty=False)
+            _string_array(envelope["negative_checks"], f"tasks[{index}].construction_envelope.negative_checks", allow_empty=False)
+            evidence = envelope["evidence"]
+            if not isinstance(evidence, Mapping):
+                _raise("INVALID_TYPE", f"tasks[{index}].construction_envelope.evidence must be an object")
+            unknown_evidence = sorted(set(evidence) - CONSTRUCTION_EVIDENCE_LEVELS)
+            missing_evidence = sorted(CONSTRUCTION_EVIDENCE_LEVELS - set(evidence))
+            if unknown_evidence:
+                _raise(
+                    "UNKNOWN_FIELD",
+                    f"tasks[{index}].construction_envelope.evidence has unsupported field {unknown_evidence[0]}",
+                )
+            if missing_evidence:
+                _raise(
+                    "MISSING_FIELD",
+                    f"tasks[{index}].construction_envelope.evidence is missing field {missing_evidence[0]}",
+                )
+            for level in ("L0", "L1", "L2"):
+                _string_array(
+                    evidence[level],
+                    f"tasks[{index}].construction_envelope.evidence.{level}",
+                    allow_empty=False,
+                )
     stages = plan["stages"]
     if not isinstance(stages, list):
         _raise("INVALID_TYPE", "stages must be an array")

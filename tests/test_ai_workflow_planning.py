@@ -38,8 +38,9 @@ def plan_task(
     owner_role="terra",
     read_scope=None,
     do_not_touch=None,
+    construction_envelope=None,
 ):
-    return {
+    task = {
         "id": identifier,
         "owner_role": owner_role,
         "read_scope": [] if read_scope is None else read_scope,
@@ -50,6 +51,22 @@ def plan_task(
         "verification_commands": ["python -m unittest"],
         "first_artifact": f"tests/{identifier}.py",
         "evidence_level": "L1",
+    }
+    if construction_envelope is not None:
+        task["construction_envelope"] = construction_envelope
+    return task
+
+
+def luna_construction_envelope(paths):
+    return {
+        "allowed_paths": paths,
+        "done_when": ["the bounded implementation test passes"],
+        "evidence": {
+            "L0": ["inspect the source path"],
+            "L1": ["run the focused unit test"],
+            "L2": ["inspect the candidate diff"],
+        },
+        "negative_checks": ["remove the expected behavior and observe the test fail"],
     }
 
 
@@ -67,6 +84,59 @@ def valid_plan(tasks=None, stages=None):
 
 
 class PlanScopeValidationTest(unittest.TestCase):
+    def test_luna_execution_context_revalidates_the_exact_envelope_step(self):
+        plan = valid_plan(
+            tasks=[
+                plan_task(
+                    "task-a",
+                    ["src/a.py"],
+                    owner_role="luna_construction",
+                    construction_envelope=luna_construction_envelope(["src/a.py"]),
+                )
+            ]
+        )
+
+        selected = workflow.require_luna_construction_step(
+            plan, remediation_task(), "task-a"
+        )
+
+        self.assertEqual("task-a", selected.id)
+        self.assertEqual(("src/a.py",), selected.write_scope)
+
+    def test_luna_construction_owner_requires_a_complete_local_envelope(self):
+        plan = valid_plan(
+            tasks=[
+                plan_task(
+                    "task-a",
+                    ["src/a.py"],
+                    owner_role="luna_construction",
+                    construction_envelope=luna_construction_envelope(["src/a.py"]),
+                )
+            ]
+        )
+
+        frozen = workflow.validate_plan(plan, remediation_task())
+
+        self.assertEqual("luna_construction", frozen.tasks[0].owner_role)
+        self.assertEqual(("src/a.py",), frozen.tasks[0].construction_envelope.allowed_paths)
+
+    def test_luna_construction_owner_rejects_missing_mutation_evidence(self):
+        envelope = luna_construction_envelope(["src/a.py"])
+        del envelope["negative_checks"]
+        plan = valid_plan(
+            tasks=[
+                plan_task(
+                    "task-a",
+                    ["src/a.py"],
+                    owner_role="luna_construction",
+                    construction_envelope=envelope,
+                )
+            ]
+        )
+
+        with self.assertRaisesRegex(workflow.WorkflowError, "PLAN_INVALID"):
+            workflow.validate_plan(plan, remediation_task())
+
     def test_each_new_terra_os_role_is_a_valid_frozen_plan_owner(self):
         for role in (
             "sol_medium_supervisor",

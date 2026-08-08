@@ -84,6 +84,24 @@ def _scope_within(scope: PurePosixPath, allowed: PurePosixPath) -> bool:
 
 
 @dataclass(frozen=True)
+class ConstructionEnvelope:
+    """A complete, path-bounded construction contract for a Luna owner."""
+
+    allowed_paths: tuple[str, ...]
+    done_when: tuple[str, ...]
+    evidence: tuple[tuple[str, tuple[str, ...]], ...]
+    negative_checks: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "allowed_paths": list(self.allowed_paths),
+            "done_when": list(self.done_when),
+            "evidence": {level: list(records) for level, records in self.evidence},
+            "negative_checks": list(self.negative_checks),
+        }
+
+
+@dataclass(frozen=True)
 class FrozenSubtask:
     """A validated subtask whose scopes and dependencies cannot be mutated."""
 
@@ -97,9 +115,10 @@ class FrozenSubtask:
     verification_commands: tuple[str, ...]
     first_artifact: str
     evidence_level: str
+    construction_envelope: ConstructionEnvelope | None
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "id": self.id,
             "owner_role": self.owner_role,
             "read_scope": list(self.read_scope),
@@ -111,6 +130,9 @@ class FrozenSubtask:
             "first_artifact": self.first_artifact,
             "evidence_level": self.evidence_level,
         }
+        if self.construction_envelope is not None:
+            result["construction_envelope"] = self.construction_envelope.to_dict()
+        return result
 
     def __getitem__(self, key: str) -> object:
         return self.to_dict()[key]
@@ -212,6 +234,40 @@ def _validate_write_ownership(tasks: tuple[FrozenSubtask, ...]) -> None:
             claims.append((task.id, scope))
 
 
+def _construction_envelope(value: object) -> ConstructionEnvelope:
+    if not isinstance(value, Mapping):
+        _fail("PLAN_INVALID", "construction_envelope must be an object")
+    allowed_paths = _scope_strings(value["allowed_paths"], field="construction_envelope.allowed_paths")
+    done_when = _required_nonempty_strings(value["done_when"], field="construction_envelope.done_when")
+    negative_checks = _required_nonempty_strings(
+        value["negative_checks"], field="construction_envelope.negative_checks"
+    )
+    evidence = value["evidence"]
+    if not isinstance(evidence, Mapping):
+        _fail("PLAN_INVALID", "construction_envelope.evidence must be an object")
+    levels: list[tuple[str, tuple[str, ...]]] = []
+    for level in ("L0", "L1", "L2"):
+        levels.append(
+            (level, _required_nonempty_strings(evidence[level], field=f"construction_envelope.evidence.{level}"))
+        )
+    return ConstructionEnvelope(
+        allowed_paths=allowed_paths,
+        done_when=done_when,
+        evidence=tuple(levels),
+        negative_checks=negative_checks,
+    )
+
+
+def _required_nonempty_strings(value: object, *, field: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or not value:
+        _fail("PLAN_INVALID", f"{field} must be a non-empty array")
+    if any(not isinstance(item, str) or not item.strip() for item in value):
+        _fail("PLAN_INVALID", f"{field} must contain non-empty strings")
+    if len(value) != len(set(value)):
+        _fail("PLAN_INVALID", f"{field} must not contain duplicates")
+    return tuple(value)
+
+
 def validate_plan(plan: object, task: Mapping[str, object]) -> FrozenPlan:
     """Validate, normalize, and freeze a bounded plan against one parent task."""
 
@@ -243,12 +299,28 @@ def validate_plan(plan: object, task: Mapping[str, object]) -> FrozenPlan:
         read_scope = _scope_strings(value["read_scope"], field="read_scope")
         write_scope = _scope_strings(value["write_scope"], field="write_scope")
         do_not_touch = _scope_strings(value["do_not_touch"], field="do_not_touch")
+        construction_envelope = (
+            _construction_envelope(value["construction_envelope"])
+            if "construction_envelope" in value
+            else None
+        )
         for raw_scope in write_scope:
             scope = normalize_scope(raw_scope)
             if not any(_scope_within(scope, allowed) for allowed in allowed_scopes):
                 _fail("PLAN_INVALID", "write_scope is outside parent allowed_write_paths")
             if any(scopes_overlap(scope, normalize_scope(blocked)) for blocked in do_not_touch):
                 _fail("PLAN_INVALID", "write_scope overlaps do_not_touch")
+        if value["owner_role"] == "luna_construction":
+            if construction_envelope is None:
+                _fail("PLAN_INVALID", "luna_construction requires construction_envelope")
+            if task_value["task_type"] != "REMEDIATION" or task_value["risk_flags"]:
+                _fail("PLAN_INVALID", "luna_construction is limited to low-risk remediation work")
+            if not write_scope or not value["verification_commands"]:
+                _fail("PLAN_INVALID", "luna_construction requires write_scope and verification_commands")
+            if tuple(write_scope) != construction_envelope.allowed_paths:
+                _fail("PLAN_INVALID", "luna construction allowed_paths must exactly match write_scope")
+        elif construction_envelope is not None:
+            _fail("PLAN_INVALID", "construction_envelope is reserved for luna_construction")
         frozen_tasks.append(
             FrozenSubtask(
                 id=identifier,
@@ -261,6 +333,7 @@ def validate_plan(plan: object, task: Mapping[str, object]) -> FrozenPlan:
                 verification_commands=tuple(value["verification_commands"]),
                 first_artifact=value["first_artifact"],
                 evidence_level=value["evidence_level"],
+                construction_envelope=construction_envelope,
             )
         )
 
@@ -287,6 +360,25 @@ def validate_plan(plan: object, task: Mapping[str, object]) -> FrozenPlan:
         base_commit=task_value["base_commit"],
         candidate_commit=task_value["candidate_commit"],
     )
+
+
+def require_luna_construction_step(
+    plan: object, task: Mapping[str, object], step_id: object
+) -> FrozenSubtask:
+    """Return exactly one freshly validated Luna construction step or fail closed."""
+
+    if not isinstance(step_id, str) or not step_id.strip():
+        _fail("LUNA_ENVELOPE_INVALID", "luna construction step_id must be a non-empty string")
+    document = plan.to_dict() if callable(getattr(plan, "to_dict", None)) else plan
+    frozen = validate_plan(document, task)
+    selected = next((item for item in frozen.tasks if item.id == step_id), None)
+    if (
+        selected is None
+        or selected.owner_role != "luna_construction"
+        or selected.construction_envelope is None
+    ):
+        _fail("LUNA_ENVELOPE_INVALID", "luna construction requires its verified envelope step")
+    return selected
 
 
 def scope_owner_map(plan: FrozenPlan) -> dict[str, str]:

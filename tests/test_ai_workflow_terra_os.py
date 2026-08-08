@@ -21,7 +21,7 @@ def valid_task(*, task_type="REMEDIATION", risk_flags=None):
         "base_commit": None,
         "candidate_commit": None,
         "authoritative_files": ["README.md"],
-        "allowed_write_paths": ["scripts/"],
+        "allowed_write_paths": ["scripts"],
         "forbidden_actions": ["merge", "push"],
         "risk_flags": [] if risk_flags is None else risk_flags,
         "acceptance_commands": ["python -m unittest"],
@@ -39,6 +39,43 @@ def route_request(work_class, execution_need, *, decomposable=True, risk_flags=N
         "decomposable": decomposable,
         "risk_flags": [] if risk_flags is None else risk_flags,
         "reason_codes": ["PLAN_IS_DELIVERABLE"],
+    }
+
+
+def approved_luna_construction_plan(*, owner_role="luna_construction"):
+    return {
+        "schema_version": "ai-plan-1",
+        "plan_id": "plan-20260808-luna-construction",
+        "task_id": "AWF-20260808-001",
+        "goal": "apply one fully bounded construction change",
+        "done_when": ["the approved construction step has completed"],
+        "tasks": [
+            {
+                "id": "luna-construction-step",
+                "owner_role": owner_role,
+                "read_scope": ["scripts/ai_workflow.py"],
+                "write_scope": ["scripts/ai_workflow.py"],
+                "do_not_touch": ["plugins"],
+                "depends_on": [],
+                "expected_result": "the bounded routing behavior is implemented",
+                "verification_commands": [
+                    "python -m unittest tests.test_ai_workflow_terra_os"
+                ],
+                "first_artifact": "scripts/ai_workflow.py",
+                "evidence_level": "L2",
+                "construction_envelope": {
+                    "allowed_paths": ["scripts/ai_workflow.py"],
+                    "done_when": ["the focused routing test passes"],
+                    "evidence": {
+                        "L0": ["inspect the changed file"],
+                        "L1": ["run the focused routing test"],
+                        "L2": ["inspect the complete diff"],
+                    },
+                    "negative_checks": ["remove the envelope and verify Luna is not routed"],
+                },
+            }
+        ],
+        "stages": [["luna-construction-step"]],
     }
 
 
@@ -68,18 +105,19 @@ class TerraOSConfigTest(unittest.TestCase):
             self.config["repair"],
         )
 
-    def test_terra_os_roles_pin_only_the_allowed_model_tiers(self):
+    def test_terra_os_roles_pin_luna_construction_and_terra_xhigh(self):
         roles = self.config["roles"]
+        self.assertEqual(
+            ("gpt-5.6-luna", "max", "workspace-write"),
+            tuple(
+                roles["luna_construction"][key]
+                for key in ("model", "reasoning_effort", "sandbox")
+            ),
+        )
         self.assertEqual(
             ("gpt-5.6-terra", "xhigh", "workspace-write"),
             tuple(roles["terra_xhigh"][key] for key in ("model", "reasoning_effort", "sandbox")),
         )
-        for name in ("sol_medium_supervisor", "sol_medium_reviewer"):
-            with self.subTest(name=name):
-                self.assertEqual(
-                    ("gpt-5.6-sol", "medium", "read-only"),
-                    tuple(roles[name][key] for key in ("model", "reasoning_effort", "sandbox")),
-                )
         self.assertEqual(
             ("gpt-5.6-sol", "xhigh", "read-only"),
             tuple(
@@ -98,17 +136,67 @@ class TerraOSConfigTest(unittest.TestCase):
 
 
 class TerraOSRolePolicyTest(unittest.TestCase):
-    def test_normal_writes_have_the_terra_os_construction_chain(self):
+    def test_normal_writes_default_to_the_terra_xhigh_construction_owner(self):
         roles = routing.roles_for_policy(
             valid_task(), route_request("BOUNDED", "WRITE"), "delegated", "terra_os"
         )
 
-        self.assertEqual(
-            ("sol_medium_supervisor", "terra_xhigh", "sol_medium_reviewer"), roles
-        )
+        self.assertEqual(("terra_xhigh",), roles)
         self.assertTrue(
-            {"luna", "terra_medium", "sol_high", "sol_xhigh"}.isdisjoint(roles)
+            {
+                "luna_construction",
+                "sol_medium_supervisor",
+                "sol_medium_reviewer",
+                "terra_medium",
+                "sol_high",
+                "sol_xhigh",
+            }.isdisjoint(roles)
         )
+
+    def test_only_a_verified_luna_construction_envelope_can_select_luna(self):
+        decision = workflow.decide_route(
+            valid_task(),
+            route_request("BOUNDED", "WRITE"),
+            "enforced",
+            construction_plan=approved_luna_construction_plan(),
+            construction_step_id="luna-construction-step",
+        )
+
+        self.assertEqual("delegated", decision.route)
+        self.assertEqual(("luna_construction",), decision.roles)
+        self.assertNotIn("construction_envelope", decision.to_dict())
+
+    def test_missing_or_invalid_luna_envelope_fails_closed_to_terra(self):
+        incomplete = approved_luna_construction_plan()
+        del incomplete["tasks"][0]["construction_envelope"]["negative_checks"]
+        out_of_scope = approved_luna_construction_plan()
+        out_of_scope["tasks"][0]["construction_envelope"]["allowed_paths"] = ["README.md"]
+
+        for plan, step_id in (
+            (None, None),
+            (incomplete, "luna-construction-step"),
+            (out_of_scope, "luna-construction-step"),
+            (approved_luna_construction_plan(owner_role="terra_xhigh"), "luna-construction-step"),
+        ):
+            with self.subTest(plan=plan is not None, step_id=step_id):
+                decision = workflow.decide_route(
+                    valid_task(),
+                    route_request("BOUNDED", "WRITE"),
+                    "enforced",
+                    construction_plan=plan,
+                    construction_step_id=step_id,
+                )
+
+                self.assertEqual(("terra_xhigh",), decision.roles)
+
+    def test_unselectable_terra_medium_and_sol_high_owner_roles_are_rejected(self):
+        for owner_role in ("terra_medium", "sol_high"):
+            with self.subTest(owner_role=owner_role):
+                plan = approved_luna_construction_plan(owner_role=owner_role)
+                del plan["tasks"][0]["construction_envelope"]
+
+                with self.assertRaisesRegex(workflow.WorkflowError, "PLAN_INVALID"):
+                    workflow.validate_plan(plan, valid_task())
 
     def test_authorized_large_project_chain_is_pure_policy_only(self):
         roles = routing.roles_for_policy(
@@ -121,16 +209,14 @@ class TerraOSRolePolicyTest(unittest.TestCase):
         self.assertEqual(
             (
                 "sol_xhigh_planner",
-                "sol_medium_supervisor",
                 "terra_xhigh",
-                "sol_medium_reviewer",
             ),
             roles,
         )
 
-    def test_sol_only_policy_uses_the_medium_supervisor(self):
+    def test_sol_only_policy_uses_terra_xhigh_not_ordinary_sol_medium(self):
         self.assertEqual(
-            ("sol_medium_supervisor",),
+            ("terra_xhigh",),
             routing.roles_for_policy(
                 valid_task(), route_request("PLANNING_ONLY", "READ_ONLY"), "sol_only", "terra_os"
             ),
@@ -145,7 +231,7 @@ class TerraOSRolePolicyTest(unittest.TestCase):
                     )
 
                     self.assertEqual("sol_only", decision.route)
-                    self.assertEqual(("sol_medium_supervisor",), decision.roles)
+                    self.assertEqual(("terra_xhigh",), decision.roles)
                     self.assertEqual(
                         (
                             "DECOMPOSABLE_READ_ONLY_ROUTE"
@@ -155,7 +241,7 @@ class TerraOSRolePolicyTest(unittest.TestCase):
                         decision.rule_id,
                     )
 
-    def test_bounded_and_multi_stage_writes_use_the_terra_os_construction_chain(self):
+    def test_bounded_and_multi_stage_writes_use_terra_without_an_envelope(self):
         for work_class in ("BOUNDED", "MULTI_STAGE"):
             with self.subTest(work_class=work_class):
                 decision = workflow.decide_route(
@@ -163,10 +249,26 @@ class TerraOSRolePolicyTest(unittest.TestCase):
                 )
 
                 self.assertEqual("delegated", decision.route)
-                self.assertEqual(
-                    ("sol_medium_supervisor", "terra_xhigh", "sol_medium_reviewer"),
-                    decision.roles,
+                self.assertEqual(("terra_xhigh",), decision.roles)
+
+    def test_security_and_open_ended_work_cannot_gain_luna_from_an_envelope(self):
+        security_task = valid_task(risk_flags=["SECURITY"])
+        security_request = route_request("BOUNDED", "WRITE", risk_flags=["SECURITY"])
+        for request, task in (
+            (security_request, security_task),
+            (route_request("MULTI_STAGE", "WRITE"), valid_task()),
+            (route_request("BOUNDED", "WRITE"), valid_task(task_type="PLAN")),
+        ):
+            with self.subTest(work_class=request["work_class"], risk_flags=task["risk_flags"]):
+                decision = workflow.decide_route(
+                    task,
+                    request,
+                    "enforced",
+                    construction_plan=approved_luna_construction_plan(),
+                    construction_step_id="luna-construction-step",
                 )
+
+                self.assertEqual(("terra_xhigh",), decision.roles)
 
     def test_non_decomposable_bounded_and_multi_stage_work_is_blocked(self):
         for work_class in ("BOUNDED", "MULTI_STAGE"):
@@ -218,7 +320,7 @@ class TerraOSRolePolicyTest(unittest.TestCase):
         )
 
         self.assertEqual(
-            ("sol_medium_supervisor", "terra_xhigh", "sol_medium_reviewer"),
+            ("terra_xhigh",),
             decision.roles,
         )
         self.assertNotIn("sol_xhigh_planner", decision.roles)
@@ -229,7 +331,7 @@ class TerraOSRolePolicyTest(unittest.TestCase):
         )
 
         self.assertEqual(
-            ("sol_medium_supervisor", "terra_xhigh", "sol_medium_reviewer"),
+            ("terra_xhigh",),
             decision.roles,
         )
         self.assertEqual(("terra", "luna", "sol_reviewer"), decision.effective_roles)
@@ -247,11 +349,63 @@ class TerraOSRolePolicyTest(unittest.TestCase):
 
 
 class TerraOSExecutionGuardTest(unittest.TestCase):
+    def test_luna_construction_cannot_bypass_the_verified_plan_step_at_launch(self):
+        paths = workflow.RunPaths(
+            repo=ROOT,
+            output_path=ROOT / ".luna-construction-should-not-run.json",
+            schema_path=ROOT / "config" / "ai_workflow_result.schema.json",
+            logs_dir=ROOT / ".luna-construction-should-not-run-logs",
+        )
+
+        with self.assertRaisesRegex(workflow.WorkflowError, "LUNA_ENVELOPE_INVALID"):
+            workflow.run_codex("luna_construction", valid_task(), "bounded", paths)
+
+    def test_luna_construction_role_closes_plan_result_runtime_and_cost_validation(self):
+        result = workflow.FakeRunner().run("luna_construction", valid_task())
+        result["changed_files"] = ["scripts/ai_workflow.py"]
+        workflow.validate_role_result("luna_construction", result, {"scripts/ai_workflow.py"})
+        workflow.validate_runtime_evidence(
+            {
+                "schema_version": "runtime-evidence-1",
+                "attempt_id": "luna-construction-attempt",
+                "requested_role": "luna_construction",
+                "execution_surface": "CODEX_EXEC_ROLE_CONTRACT",
+                "observed_agent_type": None,
+                "observed_model": "gpt-5.6-luna",
+                "observed_reasoning_effort": "max",
+                "observed_sandbox_policy": "workspace-write",
+                "observed_permission_profile": "workspace-write",
+                "observed_cwd": str(ROOT),
+                "evidence_source": "LOCAL_ROLLOUT",
+                "observed_at_utc": "2026-08-08T00:00:00Z",
+                "verification_status": "VERIFIED",
+                "failure_reasons": [],
+            }
+        )
+        workflow.validate_cost_evidence(
+            {
+                "schema_version": "cost-evidence-1",
+                "route": "delegated",
+                "role": "luna_construction",
+                "execution_surface": "CODEX_EXEC_ROLE_CONTRACT",
+                "duration_seconds": 1.0,
+                "prompt_bytes": 1,
+                "input_tokens": None,
+                "cached_input_tokens": None,
+                "output_tokens": None,
+                "retry_kind": "none",
+                "verification_seconds": 0.0,
+                "quality_outcome": "IMPLEMENTED_CANDIDATE",
+                "paired_case_id": None,
+                "evidence_class": "unavailable",
+                "rate_snapshot_id": None,
+            }
+        )
+
     def test_new_role_names_are_accepted_by_pinned_role_configuration(self):
         for role in (
-            "sol_medium_supervisor",
+            "luna_construction",
             "terra_xhigh",
-            "sol_medium_reviewer",
             "sol_xhigh_planner",
         ):
             with self.subTest(role=role):

@@ -60,15 +60,15 @@ class ClosedSetRoutingTest(unittest.TestCase):
         self.assertEqual((), decision.roles)
         self.assertEqual((), decision.effective_roles)
 
-    def test_planning_only_routes_sol_only_with_zero_workers(self):
-        """Enforced Terra OS planning uses the medium Sol supervisor only."""
+    def test_planning_only_routes_terra_xhigh_without_sol_medium(self):
+        """Enforced Terra OS planning never injects ordinary Sol-medium work."""
 
         decision = workflow.decide_route(
             valid_task(), route_request("PLANNING_ONLY", "READ_ONLY"), "enforced"
         )
 
         self.assertEqual("sol_only", decision.route)
-        self.assertEqual(("sol_medium_supervisor",), decision.roles)
+        self.assertEqual(("terra_xhigh",), decision.roles)
 
     def test_security_write_can_never_route_direct(self):
         """A risk-handling regression must fail if security writes become direct."""

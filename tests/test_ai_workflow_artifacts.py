@@ -9,6 +9,7 @@ from scripts import ai_workflow as workflow
 ROOT = Path(__file__).resolve().parents[1]
 LEGACY_MODEL_ROLES = ("luna", "terra", "sol_planner", "sol_reviewer", "sol_xhigh")
 TERRA_OS_MODEL_ROLES = (
+    "luna_construction",
     "sol_medium_supervisor",
     "terra_xhigh",
     "sol_medium_reviewer",
@@ -228,6 +229,7 @@ class ArtifactValidatorTest(unittest.TestCase):
         }
         result_statuses = {
             "luna": "SUPPORTED",
+            "luna_construction": "IMPLEMENTED_CANDIDATE",
             "terra": "IMPLEMENTED_CANDIDATE",
             "sol_planner": "PLAN_READY",
             "sol_reviewer": "ACCEPTANCE_RECOMMENDED",
