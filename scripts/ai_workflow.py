@@ -510,6 +510,36 @@ class RunPaths:
     runtime_sessions_dir: Path | None = None
 
 
+@dataclass
+class AttemptAccountingContext:
+    """Controller-issued identity and retry label for one live Codex attempt."""
+
+    attempt_id: str
+    retry_kind: str
+
+
+def _new_attempt_accounting_context(role: str, retry_kind: str) -> AttemptAccountingContext:
+    if retry_kind not in {"none", "technical"}:
+        _fail("INVALID_RETRY_KIND", "attempt retry kind is not supported")
+    return AttemptAccountingContext(
+        attempt_id=f"{role}-{time.time_ns()}-{uuid.uuid4().hex}",
+        retry_kind=retry_kind,
+    )
+
+
+def _require_attempt_accounting_context(
+    value: AttemptAccountingContext | None, role: str
+) -> AttemptAccountingContext:
+    context = value or _new_attempt_accounting_context(role, "none")
+    if (
+        not isinstance(context.attempt_id, str)
+        or not context.attempt_id.strip()
+        or context.retry_kind not in {"none", "technical"}
+    ):
+        _fail("INVALID_ATTEMPT_CONTEXT", "attempt accounting context is invalid")
+    return context
+
+
 def _verified_cost_route(state_root: Path | None, task_id: str) -> str:
     """Read one persisted route decision, failing closed when none is present."""
 
@@ -769,7 +799,14 @@ def _require_runtime_sessions_directory(value: Path | None) -> Path:
     return value
 
 
-def run_codex(role: str, task: dict, prompt: str, paths: RunPaths) -> dict:
+def run_codex(
+    role: str,
+    task: dict,
+    prompt: str,
+    paths: RunPaths,
+    *,
+    attempt_context: AttemptAccountingContext | None = None,
+) -> dict:
     """Run one pinned Codex role and accept only a validated output document."""
 
     validate_task(task)
@@ -811,7 +848,8 @@ def run_codex(role: str, task: dict, prompt: str, paths: RunPaths) -> dict:
         )
     before_run = capture_repo(repo)
     before_changes = working_tree_paths(repo)
-    attempt_id = f"{role}-{time.time_ns()}-{uuid.uuid4().hex}"
+    accounting_context = _require_attempt_accounting_context(attempt_context, role)
+    attempt_id = accounting_context.attempt_id
     attempt_output = Path(paths.output_path).parent / "attempts" / f"{attempt_id}.json"
     attempt_events = Path(paths.logs_dir) / f"{attempt_id}.jsonl"
     attempt_started_ns = time.time_ns()
@@ -835,7 +873,7 @@ def run_codex(role: str, task: dict, prompt: str, paths: RunPaths) -> dict:
             (time.time_ns() - attempt_started_ns) / 1_000_000_000,
             len(prompt.encode("utf-8")),
             runtime_usage,
-            "none",
+            accounting_context.retry_kind,
             quality_outcome,
             paths.state_root,
             attempt_id=attempt_id,
@@ -1878,8 +1916,15 @@ class Runner(Protocol):
     """The small, injectable boundary used by the gated orchestrator."""
 
     is_live_model: bool
+    owns_cost_attempt_accounting: bool
 
-    def run(self, role: str, task: dict[str, object]) -> Mapping[str, object]:
+    def run(
+        self,
+        role: str,
+        task: dict[str, object],
+        *,
+        attempt_context: AttemptAccountingContext | None = None,
+    ) -> Mapping[str, object]:
         """Return one ai-result-1-compatible role result."""
 
 
@@ -2160,6 +2205,14 @@ def _run_role_with_technical_retry(
 
     retry_kind = "none"
     while True:
+        runner_owns_attempt_accounting = bool(
+            getattr(runner, "owns_cost_attempt_accounting", False)
+        )
+        attempt_context = (
+            _new_attempt_accounting_context(role, retry_kind)
+            if runner_owns_attempt_accounting
+            else None
+        )
         try:
             guarded_repo: Path | None = None
             before_snapshot: RepoSnapshot | None = None
@@ -2192,7 +2245,10 @@ def _run_role_with_technical_retry(
             attempt_error: BaseException | None = None
             runtime_usage = None
             try:
-                result = runner.run(role, task)
+                if attempt_context is None:
+                    result = runner.run(role, task)
+                else:
+                    result = runner.run(role, task, attempt_context=attempt_context)
             except BaseException as exc:
                 attempt_error = exc
                 raise
@@ -2220,7 +2276,7 @@ def _run_role_with_technical_retry(
                         attempt_error = exc
                         raise
                 finally:
-                    if attempt_error is not None:
+                    if attempt_error is not None and attempt_context is None:
                         _controller_cost_attempt(
                             task_id,
                             task,
@@ -2247,6 +2303,24 @@ def _run_role_with_technical_retry(
                 validate_role_result(role, result, actual_changes)
                 validate_verification_package(role, task, result)
             except BaseException:
+                if attempt_context is None:
+                    _controller_cost_attempt(
+                        task_id,
+                        task,
+                        role,
+                        CODEX_EXEC_ROLE_CONTRACT
+                        if getattr(runner, "is_live_model", False)
+                        else NATIVE_SUBAGENT,
+                        metric_run["duration_seconds"],
+                        0,
+                        runtime_usage,
+                        retry_kind,
+                        "FAILED",
+                        WORKFLOW_STATE_ROOT,
+                        base_metric_run=metric_run,
+                    )
+                raise
+            if attempt_context is None:
                 _controller_cost_attempt(
                     task_id,
                     task,
@@ -2258,26 +2332,10 @@ def _run_role_with_technical_retry(
                     0,
                     runtime_usage,
                     retry_kind,
-                    "FAILED",
+                    str(result.get("status", "UNKNOWN")),
                     WORKFLOW_STATE_ROOT,
                     base_metric_run=metric_run,
                 )
-                raise
-            _controller_cost_attempt(
-                task_id,
-                task,
-                role,
-                CODEX_EXEC_ROLE_CONTRACT
-                if getattr(runner, "is_live_model", False)
-                else NATIVE_SUBAGENT,
-                metric_run["duration_seconds"],
-                0,
-                runtime_usage,
-                retry_kind,
-                str(result.get("status", "UNKNOWN")),
-                WORKFLOW_STATE_ROOT,
-                base_metric_run=metric_run,
-            )
             return result, state
         except (WorkflowError, ValueError, json.JSONDecodeError) as exc:
             error_code = exc.code if isinstance(exc, WorkflowError) else "INVALID_ROLE_RESULT"

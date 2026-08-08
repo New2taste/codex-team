@@ -355,6 +355,116 @@ class MetricsReportTest(unittest.TestCase):
         self.assertEqual("unavailable", evidence["evidence_class"])
         self.assertIsNone(evidence["input_tokens"])
 
+    def _live_codex_adapter(self, task, outcomes):
+        """Return a minimal live runner that delegates each attempt to run_codex."""
+
+        state_root = self.state_root
+        remaining_outcomes = list(outcomes)
+
+        class LiveCodexAdapter:
+            is_live_model = True
+            owns_cost_attempt_accounting = True
+
+            def run(self, role, task, *, attempt_context=None):
+                paths = workflow.RunPaths(
+                    repo=ROOT,
+                    output_path=state_root / task["task_id"] / f"{role}-result.json",
+                    schema_path=ROOT / "config" / "ai_workflow_result.schema.json",
+                    logs_dir=state_root / task["task_id"] / "logs",
+                    state_root=state_root,
+                )
+                kwargs = (
+                    {"attempt_context": attempt_context}
+                    if attempt_context is not None
+                    else {}
+                )
+                return workflow.run_codex(role, task, "live role prompt", paths, **kwargs)
+
+        adapter = LiveCodexAdapter()
+
+        def launch_codex(command, *args, **kwargs):
+            outcome = remaining_outcomes.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            if outcome == "failure":
+                return subprocess.CompletedProcess(command, 23, stdout="", stderr="failed")
+            return write_codex_result(command, workflow.FakeRunner().run("luna", task))
+
+        return adapter, launch_codex
+
+    def _run_live_codex_attempts(self, task_id, outcomes, budget):
+        task = workflow.load_task(self.state_root / task_id / "task.json")
+        adapter, launch_codex = self._live_codex_adapter(task, outcomes)
+        with (
+            mock.patch.object(workflow, "WORKFLOW_STATE_ROOT", self.state_root),
+            mock.patch.object(
+                workflow,
+                "capture_repo",
+                return_value=workflow.RepoSnapshot("pinned-head", ()),
+            ),
+            mock.patch.object(workflow, "working_tree_paths", return_value=set()),
+            mock.patch("scripts.ai_workflow.subprocess.run", side_effect=launch_codex),
+        ):
+            result, state = workflow._run_role_with_technical_retry(
+                self.store,
+                task_id,
+                task,
+                "EVIDENCE_RUNNING",
+                "luna",
+                adapter,
+                budget,
+            )
+        document = json.loads(
+            (self.state_root / task_id / "metrics.json").read_text(encoding="utf-8")
+        )
+        return result, state, document["runs"]
+
+    def test_live_codex_successful_attempt_is_recorded_once(self):
+        task_id = self._create_task("AWF-20260803-010")
+
+        result, state, runs = self._run_live_codex_attempts(
+            task_id, ["success"], workflow.RetryBudget()
+        )
+
+        self.assertEqual("SUPPORTED", result["status"])
+        self.assertEqual("EVIDENCE_RUNNING", state)
+        self.assertEqual(1, len(runs))
+        self.assertEqual("none", runs[0]["cost_evidence"]["retry_kind"])
+        self.assertTrue(runs[0]["cost_evidence"]["attempt_id"])
+
+    def test_live_codex_unrecovered_failure_is_recorded_once(self):
+        task_id = self._create_task("AWF-20260803-011")
+
+        result, state, runs = self._run_live_codex_attempts(
+            task_id, ["failure"], workflow.RetryBudget(technical_retries=1)
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual("BLOCKED", state)
+        self.assertEqual(1, len(runs))
+        evidence = runs[0]["cost_evidence"]
+        self.assertEqual("FAILED", evidence["quality_outcome"])
+        self.assertEqual("none", evidence["retry_kind"])
+
+    def test_live_codex_retry_records_inner_attempts_with_outer_retry_kinds(self):
+        task_id = self._create_task("AWF-20260803-012")
+
+        result, state, runs = self._run_live_codex_attempts(
+            task_id, ["failure", "success"], workflow.RetryBudget()
+        )
+
+        self.assertEqual("SUPPORTED", result["status"])
+        self.assertEqual("EVIDENCE_RUNNING", state)
+        self.assertEqual(2, len(runs))
+        self.assertEqual(
+            ["none", "technical"],
+            [run["cost_evidence"]["retry_kind"] for run in runs],
+        )
+        self.assertEqual(
+            2,
+            len({run["cost_evidence"]["attempt_id"] for run in runs}),
+        )
+
     def test_invalid_role_result_is_recorded_as_failed_cost_attempt(self):
         task_id = self._create_task("AWF-20260803-008")
         task = workflow.load_task(self.state_root / task_id / "task.json")
