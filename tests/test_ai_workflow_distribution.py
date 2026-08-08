@@ -1035,7 +1035,11 @@ class AgentLifecycleTest(unittest.TestCase):
             content = b"same digest payload\n"
             owned.write_bytes(content)
             owned_status = owned.stat()
-            expected_identity = (owned_status.st_dev, owned_status.st_ino)
+            expected_identity = (
+                owned_status.st_dev,
+                owned_status.st_ino,
+                hashlib.sha256(content).hexdigest(),
+            )
             replacement_inode: int | None = None
             directory = lifecycle._open_target_directory(target, create=False)
             self.assertIsNotNone(directory)
@@ -1151,6 +1155,35 @@ class AgentLifecycleTest(unittest.TestCase):
             self.assertEqual(user_bytes, destination.read_bytes())
             self.assertFalse((target / STATE_NAME).exists())
 
+    def test_known_legacy_install_preserves_same_digest_hook_replacement_inode(self):
+        lifecycle = load_lifecycle_helper()
+        with temporary_directory() as temporary:
+            root = Path(temporary)
+            target = root / "agents"
+            prepare_known_legacy(target)
+            replacement_inode: int | None = None
+
+            def race(point: str) -> None:
+                nonlocal replacement_inode
+                if point == "install.before_retire_known_legacy":
+                    replacement = root / "same-digest-legacy"
+                    replacement.write_bytes(KNOWN_LEGACY_TEMPLATE)
+                    replacement_inode = replacement.stat().st_ino
+                    os.replace(replacement, target / "luna-worker.toml")
+
+            self.assertEqual(1, lifecycle.install(target, hook=race))
+            self.assertIsNotNone(replacement_inode)
+            recoverable_inodes = [
+                entry.stat().st_ino
+                for entry in target.iterdir()
+                if entry.is_file()
+            ]
+            recoverable_inodes.extend(
+                payload.stat().st_ino
+                for payload in target.glob(".ai-workflow-tombstone-*/payload")
+            )
+            self.assertIn(replacement_inode, recoverable_inodes)
+
     def test_uninstall_preserves_a_raced_user_replacement(self):
         lifecycle = load_lifecycle_helper()
         with temporary_directory() as temporary:
@@ -1171,6 +1204,91 @@ class AgentLifecycleTest(unittest.TestCase):
             self.assertNotEqual(0, lifecycle.uninstall(target, hook=race))
             self.assertEqual(user_bytes, destination.read_bytes())
             self.assertTrue((target / STATE_NAME).exists())
+
+    def test_uninstall_preserves_same_digest_target_hook_replacement_inode(self):
+        lifecycle = load_lifecycle_helper()
+        with temporary_directory() as temporary:
+            root = Path(temporary)
+            target = root / "agents"
+            target.mkdir()
+            destination = target / "luna-worker.toml"
+            destination.write_bytes(TEMPLATE.read_bytes())
+            write_owned_state(target)
+            replacement_inode: int | None = None
+
+            def race(point: str) -> None:
+                nonlocal replacement_inode
+                if point == "uninstall.before_retire_current":
+                    replacement = root / "same-digest-current"
+                    replacement.write_bytes(TEMPLATE.read_bytes())
+                    replacement_inode = replacement.stat().st_ino
+                    os.replace(replacement, destination)
+
+            self.assertEqual(1, lifecycle.uninstall(target, hook=race))
+            self.assertIsNotNone(replacement_inode)
+            recoverable_inodes = [
+                entry.stat().st_ino
+                for entry in target.iterdir()
+                if entry.is_file()
+            ]
+            recoverable_inodes.extend(
+                payload.stat().st_ino
+                for payload in target.glob(".ai-workflow-tombstone-*/payload")
+            )
+            self.assertIn(replacement_inode, recoverable_inodes)
+
+    def test_uninstall_preserves_same_digest_state_or_backup_replacement_inode(self):
+        for raced_name in (STATE_NAME, BACKUP_NAME):
+            with self.subTest(raced_name=raced_name):
+                lifecycle = load_lifecycle_helper()
+                with temporary_directory() as temporary:
+                    root = Path(temporary)
+                    target = root / "agents"
+                    target.mkdir()
+                    (target / "luna-worker.toml").write_bytes(TEMPLATE.read_bytes())
+                    backup_bytes = b'name = "backup"\n'
+                    backup_sha = None
+                    if raced_name == BACKUP_NAME:
+                        (target / BACKUP_NAME).write_bytes(backup_bytes)
+                        backup_sha = sha256(target / BACKUP_NAME)
+                    write_owned_state(target, backup_sha)
+                    raced_bytes = (target / raced_name).read_bytes()
+                    replacement_inode: int | None = None
+                    original_retire = lifecycle._retire_and_discard
+
+                    def replace_then_retire(
+                        directory, name, expected_sha, **keywords
+                    ):
+                        nonlocal replacement_inode
+                        if name == raced_name and replacement_inode is None:
+                            replacement = root / f"replacement-{raced_name}"
+                            replacement.write_bytes(raced_bytes)
+                            replacement_inode = replacement.stat().st_ino
+                            os.replace(replacement, target / raced_name)
+                        return original_retire(
+                            directory, name, expected_sha, **keywords
+                        )
+
+                    with mock.patch.object(
+                        lifecycle,
+                        "_retire_and_discard",
+                        side_effect=replace_then_retire,
+                    ):
+                        self.assertEqual(1, lifecycle.uninstall(target))
+
+                    self.assertIsNotNone(replacement_inode)
+                    recoverable_inodes = [
+                        entry.stat().st_ino
+                        for entry in target.iterdir()
+                        if entry.is_file()
+                    ]
+                    recoverable_inodes.extend(
+                        payload.stat().st_ino
+                        for payload in target.glob(
+                            ".ai-workflow-tombstone-*/payload"
+                        )
+                    )
+                    self.assertIn(replacement_inode, recoverable_inodes)
 
     def test_owned_backup_is_restored_only_when_current_and_backup_hashes_match(self):
         lifecycle = load_lifecycle_helper()

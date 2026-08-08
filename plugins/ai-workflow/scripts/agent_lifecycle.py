@@ -436,13 +436,13 @@ def _discard_owned_publication(
 
     if identity is None:
         return True
-    device, inode, digest = identity
+    _, _, digest = identity
     try:
         return _retire_and_discard(
             directory,
             name,
             digest,
-            expected_identity=(device, inode),
+            expected_identity=identity,
         )
     except BaseException:
         return False
@@ -554,10 +554,13 @@ def install(
 
         if classification != "known_legacy" or expected_sha is None:
             return 1
+        legacy_identity = _file_identity(directory, TARGET_FILENAME)
+        if legacy_identity[2] != expected_sha:
+            return 1
         _hook(hook, "install.before_retire_known_legacy")
         tombstone_name, tombstone = _retire_to_tombstone(directory, TARGET_FILENAME)
         moved_identity = _file_identity(tombstone, "payload")
-        if moved_identity[2] != expected_sha:
+        if moved_identity != legacy_identity:
             _preserve_tombstone(directory, TARGET_FILENAME, tombstone)
             return 1
         try:
@@ -649,12 +652,12 @@ def _retire_and_discard(
     name: str,
     expected_sha: str,
     *,
-    expected_identity: tuple[int, int] | None = None,
+    expected_identity: FileIdentity | None = None,
 ) -> bool:
     tombstone_name, tombstone = _retire_to_tombstone(directory, name)
     try:
         moved_identity = _file_identity(tombstone, "payload")
-        if expected_identity is not None and moved_identity[:2] != expected_identity:
+        if expected_identity is not None and moved_identity != expected_identity:
             _preserve_tombstone(directory, name, tombstone)
             return False
         if moved_identity[2] != expected_sha:
@@ -683,11 +686,16 @@ def uninstall(
         state_content = _read_regular(directory, STATE_FILENAME)
         state_sha = _sha256(state_content)
         backup_sha = _parse_state(state_content, RELEASE_SHA256)
-        if _hash_regular(directory, TARGET_FILENAME) != RELEASE_SHA256:
+        target_identity = _file_identity(directory, TARGET_FILENAME)
+        if target_identity[2] != RELEASE_SHA256:
             return 1
+        state_identity = _file_identity(directory, STATE_FILENAME)
+        if state_identity[2] != state_sha:
+            return 1
+        backup_identity: FileIdentity | None = None
         if backup_sha is not None:
-            _require_regular(directory, BACKUP_FILENAME)
-            if _hash_regular(directory, BACKUP_FILENAME) != backup_sha:
+            backup_identity = _file_identity(directory, BACKUP_FILENAME)
+            if backup_identity[2] != backup_sha:
                 return 1
         elif _entry_stat(directory, BACKUP_FILENAME) is not None:
             return 1
@@ -695,7 +703,7 @@ def uninstall(
         _hook(hook, "uninstall.before_retire_current")
         tombstone_name, tombstone = _retire_to_tombstone(directory, TARGET_FILENAME)
         moved_identity = _file_identity(tombstone, "payload")
-        if moved_identity[2] != RELEASE_SHA256:
+        if moved_identity != target_identity:
             _preserve_tombstone(directory, TARGET_FILENAME, tombstone)
             return 1
 
@@ -704,9 +712,19 @@ def uninstall(
                 return 1
             if _hash_regular(directory, TARGET_FILENAME) != backup_sha:
                 return 1
-            if not _retire_and_discard(directory, BACKUP_FILENAME, backup_sha):
+            if not _retire_and_discard(
+                directory,
+                BACKUP_FILENAME,
+                backup_sha,
+                expected_identity=backup_identity,
+            ):
                 return 1
-        if not _retire_and_discard(directory, STATE_FILENAME, state_sha):
+        if not _retire_and_discard(
+            directory,
+            STATE_FILENAME,
+            state_sha,
+            expected_identity=state_identity,
+        ):
             _preserve_tombstone(directory, TARGET_FILENAME, tombstone)
             return 1
         discarded = _discard_verified_tombstone(
