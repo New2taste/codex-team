@@ -75,6 +75,7 @@ HUMAN_GATES = frozenset(
     }
 )
 TASK_ID_PATTERN = re.compile(r"^AWF-[0-9]{8}-[0-9]{3,}$")
+ATTEMPT_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
 ROLE_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "ai_workflow.toml"
 RESULT_REQUIRED_FIELDS = frozenset(
     {
@@ -510,34 +511,86 @@ class RunPaths:
     runtime_sessions_dir: Path | None = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class AttemptAccountingContext:
     """Controller-issued identity and retry label for one live Codex attempt."""
 
-    attempt_id: str
+    task_id: str
+    role: str
     retry_kind: str
+    attempt_id: str
 
 
-def _new_attempt_accounting_context(role: str, retry_kind: str) -> AttemptAccountingContext:
+def _new_attempt_accounting_context(
+    task_id: str, role: str, retry_kind: str
+) -> AttemptAccountingContext:
     if retry_kind not in {"none", "technical"}:
         _fail("INVALID_RETRY_KIND", "attempt retry kind is not supported")
     return AttemptAccountingContext(
-        attempt_id=f"{role}-{time.time_ns()}-{uuid.uuid4().hex}",
+        task_id=task_id,
+        role=role,
         retry_kind=retry_kind,
+        attempt_id=f"{role}-{time.time_ns()}-{uuid.uuid4().hex}",
     )
 
 
 def _require_attempt_accounting_context(
-    value: AttemptAccountingContext | None, role: str
+    value: AttemptAccountingContext | None, task_id: str, role: str
 ) -> AttemptAccountingContext:
-    context = value or _new_attempt_accounting_context(role, "none")
+    context = value or _new_attempt_accounting_context(task_id, role, "none")
     if (
-        not isinstance(context.attempt_id, str)
-        or not context.attempt_id.strip()
+        not isinstance(context, AttemptAccountingContext)
+        or not isinstance(context.task_id, str)
+        or not TASK_ID_PATTERN.fullmatch(context.task_id)
+        or not isinstance(context.role, str)
+        or not context.role.strip()
+        or not isinstance(context.attempt_id, str)
+        or not ATTEMPT_ID_PATTERN.fullmatch(context.attempt_id)
         or context.retry_kind not in {"none", "technical"}
     ):
         _fail("INVALID_ATTEMPT_CONTEXT", "attempt accounting context is invalid")
+    if context.task_id != task_id or context.role != role:
+        _fail("ATTEMPT_CONTEXT_MISMATCH", "attempt accounting context does not match this role task")
     return context
+
+
+def _claim_attempt_context(paths: RunPaths, context: AttemptAccountingContext) -> None:
+    """Atomically reserve one controller-issued attempt identity without replay cleanup."""
+
+    if paths.state_root is None:
+        task_dir = Path(paths.output_path).parent
+    else:
+        task_dir = WorkflowStore(paths.state_root)._require_task(context.task_id)
+    claims_dir = task_dir / "attempt-claims"
+    try:
+        claims_dir.mkdir(parents=True, exist_ok=True)
+        if not claims_dir.is_dir() or claims_dir.is_symlink():
+            _fail("ATTEMPT_CLAIM_DIRECTORY_INVALID", "attempt claim directory is not controlled")
+    except OSError as exc:
+        raise WorkflowError(
+            "ATTEMPT_CLAIM_DIRECTORY_INVALID", "cannot create attempt claim directory"
+        ) from exc
+    claim_path = claims_dir / f"{context.attempt_id}.json"
+    identity = {
+        "task_id": context.task_id,
+        "role": context.role,
+        "retry_kind": context.retry_kind,
+        "attempt_id": context.attempt_id,
+    }
+    try:
+        descriptor = os.open(claim_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        _fail("ATTEMPT_CONTEXT_REUSED", "attempt accounting context has already been claimed")
+    except OSError as exc:
+        raise WorkflowError("ATTEMPT_CLAIM_FAILED", "cannot claim attempt context") from exc
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(_canonical_json({"schema_version": "attempt-claim-1", "identity": identity}))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError as exc:
+        raise WorkflowError("ATTEMPT_CLAIM_FAILED", "cannot persist attempt claim") from exc
 
 
 def _verified_cost_route(state_root: Path | None, task_id: str) -> str:
@@ -812,6 +865,9 @@ def run_codex(
     validate_task(task)
     if not isinstance(prompt, str):
         _fail("INVALID_PROMPT", "prompt must be a string")
+    accounting_context = _require_attempt_accounting_context(
+        attempt_context, task["task_id"], role
+    )
     runtime_sessions_dir: Path | None = None
     if paths.runtime_evidence_required:
         runtime_sessions_dir = _require_runtime_sessions_directory(paths.runtime_sessions_dir)
@@ -827,6 +883,7 @@ def run_codex(
         assert_acceptance_candidate(task, repo)
     if role == "terra":
         _reject_dirty_input(repo, "DIRTY_TERRA_WORKTREE", "Terra requires a clean source_worktree")
+    _claim_attempt_context(paths, accounting_context)
     runtime_store: WorkflowStore | None = None
     runtime_task_dir: Path | None = None
     runtime_before_artifacts: RuntimeArtifactSnapshot | None = None
@@ -848,7 +905,6 @@ def run_codex(
         )
     before_run = capture_repo(repo)
     before_changes = working_tree_paths(repo)
-    accounting_context = _require_attempt_accounting_context(attempt_context, role)
     attempt_id = accounting_context.attempt_id
     attempt_output = Path(paths.output_path).parent / "attempts" / f"{attempt_id}.json"
     attempt_events = Path(paths.logs_dir) / f"{attempt_id}.jsonl"
@@ -2209,7 +2265,7 @@ def _run_role_with_technical_retry(
             getattr(runner, "owns_cost_attempt_accounting", False)
         )
         attempt_context = (
-            _new_attempt_accounting_context(role, retry_kind)
+            _new_attempt_accounting_context(task_id, role, retry_kind)
             if runner_owns_attempt_accounting
             else None
         )

@@ -1227,15 +1227,18 @@ class CodexRunnerTest(unittest.TestCase):
     def test_codex_non_runtime_usage_is_unavailable_without_verified_runtime_identity(
         self, record_metrics, run, _working_tree_paths, _capture_repo
     ):
+        task = self.valid_task()
         result = self.valid_result()
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
+            state_root = root / "state"
+            workflow.WorkflowStore(state_root).create_task(task)
             paths = workflow.RunPaths(
                 repo=ROOT,
                 output_path=root / "luna-result.json",
                 schema_path=ROOT / "config/ai_workflow_result.schema.json",
                 logs_dir=root / "logs",
-                state_root=root / "state",
+                state_root=state_root,
             )
 
             def write_usage_result(command, *args, **kwargs):
@@ -1251,7 +1254,7 @@ class CodexRunnerTest(unittest.TestCase):
                 )
 
             run.side_effect = write_usage_result
-            workflow.run_codex("luna", self.valid_task(), "task contract", paths)
+            workflow.run_codex("luna", task, "task contract", paths)
 
         record_metrics.assert_called_once()
         metric_run = record_metrics.call_args.args[1]
@@ -1398,6 +1401,160 @@ class CodexRunnerTest(unittest.TestCase):
         evidence = document["runs"][0]["cost_evidence"]
         self.assertEqual("FAILED", evidence["quality_outcome"])
         self.assertEqual("unavailable", evidence["evidence_class"])
+
+    @staticmethod
+    def _bound_attempt_context(task, attempt_id, *, role="luna", retry_kind="none"):
+        return workflow.AttemptAccountingContext(
+            task_id=task["task_id"],
+            role=role,
+            retry_kind=retry_kind,
+            attempt_id=attempt_id,
+        )
+
+    @mock.patch(
+        "scripts.ai_workflow.capture_repo",
+        return_value=workflow.RepoSnapshot("pinned-head", ()),
+    )
+    @mock.patch("scripts.ai_workflow.working_tree_paths", return_value=set())
+    @mock.patch("scripts.ai_workflow.subprocess.run")
+    def test_reused_failed_attempt_context_is_rejected_before_a_second_launch(
+        self, run, _working_tree_paths, _capture_repo
+    ):
+        task = self.valid_task()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_root = root / "state"
+            workflow.WorkflowStore(state_root).create_task(task)
+            paths = workflow.RunPaths(
+                repo=ROOT,
+                output_path=root / "luna-result.json",
+                schema_path=ROOT / "config/ai_workflow_result.schema.json",
+                logs_dir=root / "logs",
+                state_root=state_root,
+            )
+            context = self._bound_attempt_context(task, "luna-reused-failure")
+            run.return_value = subprocess.CompletedProcess(
+                [], 23, stdout="first failed attempt\n", stderr=""
+            )
+
+            with self.assertRaisesRegex(workflow.WorkflowError, "CODEX_EXIT_NONZERO"):
+                workflow.run_codex("luna", task, "task contract", paths, attempt_context=context)
+            log_path = paths.logs_dir / "luna-reused-failure.jsonl"
+            first_log = log_path.read_text(encoding="utf-8")
+
+            with self.assertRaisesRegex(workflow.WorkflowError, "ATTEMPT_CONTEXT_REUSED"):
+                workflow.run_codex("luna", task, "task contract", paths, attempt_context=context)
+
+            document = json.loads(
+                (state_root / task["task_id"] / "metrics.json").read_text(encoding="utf-8")
+            )
+            second_log = log_path.read_text(encoding="utf-8")
+
+        self.assertEqual(1, run.call_count)
+        self.assertEqual(1, len(document["runs"]))
+        self.assertEqual(first_log, second_log)
+
+    @mock.patch(
+        "scripts.ai_workflow.capture_repo",
+        return_value=workflow.RepoSnapshot("pinned-head", ()),
+    )
+    @mock.patch("scripts.ai_workflow.working_tree_paths", return_value=set())
+    @mock.patch("scripts.ai_workflow.subprocess.run")
+    def test_reused_successful_attempt_context_is_rejected_before_a_second_launch(
+        self, run, _working_tree_paths, _capture_repo
+    ):
+        task = self.valid_task()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_root = root / "state"
+            workflow.WorkflowStore(state_root).create_task(task)
+            paths = workflow.RunPaths(
+                repo=ROOT,
+                output_path=root / "luna-result.json",
+                schema_path=ROOT / "config/ai_workflow_result.schema.json",
+                logs_dir=root / "logs",
+                state_root=state_root,
+            )
+            context = self._bound_attempt_context(task, "luna-reused-success")
+            run.side_effect = lambda command, *args, **kwargs: write_codex_result(
+                command, self.valid_result()
+            )
+
+            workflow.run_codex("luna", task, "task contract", paths, attempt_context=context)
+            with self.assertRaisesRegex(workflow.WorkflowError, "ATTEMPT_CONTEXT_REUSED"):
+                workflow.run_codex("luna", task, "task contract", paths, attempt_context=context)
+
+            document = json.loads(
+                (state_root / task["task_id"] / "metrics.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(1, run.call_count)
+        self.assertEqual(1, len(document["runs"]))
+
+    @mock.patch("scripts.ai_workflow.subprocess.run")
+    def test_attempt_context_rejects_task_and_role_mismatches_before_launch(self, run):
+        task = self.valid_task()
+        other_task = dict(task)
+        other_task["task_id"] = "AWF-20260803-099"
+        context = self._bound_attempt_context(task, "luna-bound-context")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = workflow.RunPaths(
+                repo=ROOT,
+                output_path=root / "luna-result.json",
+                schema_path=ROOT / "config/ai_workflow_result.schema.json",
+                logs_dir=root / "logs",
+            )
+
+            with self.assertRaisesRegex(workflow.WorkflowError, "ATTEMPT_CONTEXT_MISMATCH"):
+                workflow.run_codex("sol_reviewer", task, "task contract", paths, attempt_context=context)
+            with self.assertRaisesRegex(workflow.WorkflowError, "ATTEMPT_CONTEXT_MISMATCH"):
+                workflow.run_codex("luna", other_task, "task contract", paths, attempt_context=context)
+
+        run.assert_not_called()
+
+    @mock.patch(
+        "scripts.ai_workflow.capture_repo",
+        return_value=workflow.RepoSnapshot("pinned-head", ()),
+    )
+    @mock.patch("scripts.ai_workflow.working_tree_paths", return_value=set())
+    @mock.patch("scripts.ai_workflow.subprocess.run")
+    def test_distinct_attempt_contexts_can_launch_independent_failures(
+        self, run, _working_tree_paths, _capture_repo
+    ):
+        task = self.valid_task()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_root = root / "state"
+            workflow.WorkflowStore(state_root).create_task(task)
+            paths = workflow.RunPaths(
+                repo=ROOT,
+                output_path=root / "luna-result.json",
+                schema_path=ROOT / "config/ai_workflow_result.schema.json",
+                logs_dir=root / "logs",
+                state_root=state_root,
+            )
+            run.return_value = subprocess.CompletedProcess([], 23, stdout="failed\n", stderr="")
+            for attempt_id in ("luna-first-failure", "luna-second-failure"):
+                with self.assertRaisesRegex(workflow.WorkflowError, "CODEX_EXIT_NONZERO"):
+                    workflow.run_codex(
+                        "luna",
+                        task,
+                        "task contract",
+                        paths,
+                        attempt_context=self._bound_attempt_context(task, attempt_id),
+                    )
+            document = json.loads(
+                (state_root / task["task_id"] / "metrics.json").read_text(encoding="utf-8")
+            )
+            log_names = {path.name for path in paths.logs_dir.glob("*.jsonl")}
+
+        self.assertEqual(2, run.call_count)
+        self.assertEqual(2, len(document["runs"]))
+        self.assertEqual(
+            {"luna-first-failure.jsonl", "luna-second-failure.jsonl"},
+            log_names,
+        )
 
     @mock.patch(
         "scripts.ai_workflow.capture_repo",
