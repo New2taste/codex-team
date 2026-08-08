@@ -1,0 +1,158 @@
+{
+  "schema_version": "paired-cases-1",
+  "synthetic": true,
+  "label": "synthetic fixture values for deterministic gate tests; not experiment results",
+  "strata": ["direct", "sol_only", "delegated"],
+  "cases": [
+    {
+      "paired_case_id": "case-01",
+      "route": "direct",
+      "attempts": [{"schema_version":"cost-evidence-1","route":"direct","role":"terra","execution_surface":"CODEX_EXEC_ROLE_CONTRACT","duration_seconds":1.0,"prompt_bytes":80,"input_tokens":20,"cached_input_tokens":0,"output_tokens":5,"retry_kind":"none","verification_seconds":0.0,"quality_outcome":"SUPPORTED","paired_case_id":"case-01","evidence_class":"measured","rate_snapshot_id":null}]
+    },
+    {
+      "paired_case_id": "case-02",
+      "route": "direct",
+      "attempts": [{"schema_version":"cost-evidence-1","route":"direct","role":"terra","execution_surface":"NATIVE_SUBAGENT","duration_seconds":1.0,"prompt_bytes":80,"input_tokens":20,"cached_input_tokens":0,"output_tokens":5,"retry_kind":"none","verification_seconds":0.0,"quality_outcome":"SUPPORTED","paired_case_id":"case-02","evidence_class":"measured","rate_snapshot_id":null}]
+    },
+    {
+      "paired_case_id": "case-03",
+      "route": "direct",
+      "attempts": [{"schema_version":"cost-evidence-1","route":"direct","role":"terra","execution_surface":"CODEX_EXEC_ROLE_CONTRACT","duration_seconds":1.0,"prompt_bytes":80,"input_tokens":20,"cached_input_tokens":0,"output_tokens":5,"retry_kind":"none","verification_seconds":0.0,"quality_outcome":"SUPPORTED","paired_case_id":"case-03","evidence_class":"measured","rate_snapshot_id":null}]
+    },
+    {
+      "paired_case_id": "case-04",
+      "route": "direct",
+      "attempts": [{"schema_version":"cost-evidence-1","route":"direct","role":"terra","execution_surface":"NATIVE_SUBAGENT","duration_seconds":1.0,"prompt_bytes":80,"input_tokens":20,"cached_input_tokens":0,"output_tokens":5,"retry_kind":"none","verification_seconds":0.0,"quality_outcome":"SUPPORTED","paired_case_id":"case-04","evidence_class":"measured","rate_snapshot_id":null}]
+    },
+    {
+      "paired_case_id": "case-05",
+      "route": "direct",
+      "attempts": [{"schema_version":"cost-evidence-1","route":"direct","role":"terra","execution_surface":"CODEX_EXEC_ROLE_CONTRACT","duration_seconds":1.0,"prompt_bytes":80,"input_tokens":20,"cached_input_tokens":0,"output_tokens":5,"retry_kind":"none","verification_seconds":0.0,"quality_outcome":"SUPPORTED","paired_case_id":"case-05","evidence_class":"measured","rate_snapshot_id":null}]
+    },
+    {
+      "paired_case_id": "case-06",
+      "route": "direct",
+      "attempts": [{"schema_version":"cost-evidence-1","route":"direct","role":"terra","execution_surface":"NATIVE_SUBAGENT","duration_seconds":1.0,"prompt_bytes":80,"input_tokens":20,"cached_input_tokens":0,"output_tokens":5,"retry_kind":"none","verification_seconds":0.0,"quality_outcome":"SUPPORTED","paired_case_id":"case-06","evidence_class":"measured","rate_snapshot_id":null}]
+    },
+    {
+      "paired_case_id": "case-07",
+      "route": "direct",
+      "attempts": [{"schema_version":"cost-evidence-1","route":"direct","role":"terra","execution_surface":"CODEX_EXEC_ROLE_CONTRACT","duration_seconds":1.0,"prompt_bytes":80,"input_tokens":20,"cached_input_tokens":0,"output_tokens":5,"retry_kind":"none","verification_seconds":0.0,"quality_outcome":"SUPPORTED","paired_case_id":"case-07","evidence_class":"measured","rate_snapshot_id":null}]
+    },
+    {
+      "paired_case_id": "case-08",
+      "route": "direct",
+      "attempts": [{"schema_version":"cost-evidence-1","route":"direct","role":"terra","execution_surface":"NATIVE_SUBAGENT","duration_seconds":1.0,"prompt_bytes":80,"input_tokens":20,"cached_input_tokens":0,"output_tokens":5,"retry_kind":"none","verification_seconds":0.0,"quality_outcome":"SUPPORTED","paired_case_id":"case-08","evidence_class":"measured","rate_snapshot_id":null}]
+    },
+    {
+      "paired_case_id": "case-09",
+      "route": "direct",
+      "attempts": [{"schema_version":"cost-evidence-1","route":"direct","role":"terra","execution_surface":"CODEX_EXEC_ROLE_CONTRACT","duration_seconds":1.0,"prompt_bytes":80,"input_tokens":20,"cached_input_tokens":0,"output_tokens":5,"retry_kind":"none","verification_seconds":0.0,"quality_outcome":"SUPPORTED","paired_case_id":"case-09","evidence_class":"measured","rate_snapshot_id":null}]
+    },
+    {
+      "paired_case_id": "case-10",
+      "route": "direct",
+      "attempts": [{"schema_version":"cost-evidence-1","route":"direct","role":"terra","execution_surface":"NATIVE_SUBAGENT","duration_seconds":1.0,"prompt_bytes":80,"input_tokens":20,"cached_input_tokens":0,"output_tokens":5,"retry_kind":"none","verification_seconds":0.0,"quality_outcome":"SUPPORTED","paired_case_id":"case-10","evidence_class":"measured","rate_snapshot_id":null}]
+    },
+    {
+      "paired_case_id": "case-11",
+      "route": "sol_only",
+      "attempts": [{"schema_version":"cost-evidence-1","route":"sol_only","role":"sol_planner","execution_surface":"CODEX_EXEC_ROLE_CONTRACT","duration_seconds":1.0,"prompt_bytes":90,"input_tokens":20,"cached_input_tokens":0,"output_tokens":5,"retry_kind":"none","verification_seconds":0.0,"quality_outcome":"SUPPORTED","paired_case_id":"case-11","evidence_class":"sample_validated_projection","rate_snapshot_id":"synthetic-rates-2026-08-03"}]
+    },
+    {
+      "paired_case_id": "case-12",
+      "route": "sol_only",
+      "attempts": [{"schema_version":"cost-evidence-1","route":"sol_only","role":"sol_planner","execution_surface":"NATIVE_SUBAGENT","duration_seconds":1.0,"prompt_bytes":90,"input_tokens":20,"cached_input_tokens":0,"output_tokens":5,"retry_kind":"none","verification_seconds":0.0,"quality_outcome":"SUPPORTED","paired_case_id":"case-12","evidence_class":"sample_validated_projection","rate_snapshot_id":"synthetic-rates-2026-08-03"}]
+    },
+    {
+      "paired_case_id": "case-13",
+      "route": "sol_only",
+      "attempts": [{"schema_version":"cost-evidence-1","route":"sol_only","role":"sol_planner","execution_surface":"CODEX_EXEC_ROLE_CONTRACT","duration_seconds":1.0,"prompt_bytes":90,"input_tokens":20,"cached_input_tokens":0,"output_tokens":5,"retry_kind":"none","verification_seconds":0.0,"quality_outcome":"SUPPORTED","paired_case_id":"case-13","evidence_class":"sample_validated_projection","rate_snapshot_id":"synthetic-rates-2026-08-03"}]
+    },
+    {
+      "paired_case_id": "case-14",
+      "route": "sol_only",
+      "attempts": [{"schema_version":"cost-evidence-1","route":"sol_only","role":"sol_planner","execution_surface":"NATIVE_SUBAGENT","duration_seconds":1.0,"prompt_bytes":90,"input_tokens":20,"cached_input_tokens":0,"output_tokens":5,"retry_kind":"none","verification_seconds":0.0,"quality_outcome":"SUPPORTED","paired_case_id":"case-14","evidence_class":"sample_validated_projection","rate_snapshot_id":"synthetic-rates-2026-08-03"}]
+    },
+    {
+      "paired_case_id": "case-15",
+      "route": "sol_only",
+      "attempts": [{"schema_version":"cost-evidence-1","route":"sol_only","role":"sol_planner","execution_surface":"CODEX_EXEC_ROLE_CONTRACT","duration_seconds":1.0,"prompt_bytes":90,"input_tokens":20,"cached_input_tokens":0,"output_tokens":5,"retry_kind":"none","verification_seconds":0.0,"quality_outcome":"SUPPORTED","paired_case_id":"case-15","evidence_class":"sample_validated_projection","rate_snapshot_id":"synthetic-rates-2026-08-03"}]
+    },
+    {
+      "paired_case_id": "case-16",
+      "route": "sol_only",
+      "attempts": [{"schema_version":"cost-evidence-1","route":"sol_only","role":"sol_planner","execution_surface":"NATIVE_SUBAGENT","duration_seconds":1.0,"prompt_bytes":90,"input_tokens":20,"cached_input_tokens":0,"output_tokens":5,"retry_kind":"none","verification_seconds":0.0,"quality_outcome":"SUPPORTED","paired_case_id":"case-16","evidence_class":"sample_validated_projection","rate_snapshot_id":"synthetic-rates-2026-08-03"}]
+    },
+    {
+      "paired_case_id": "case-17",
+      "route": "sol_only",
+      "attempts": [{"schema_version":"cost-evidence-1","route":"sol_only","role":"sol_planner","execution_surface":"CODEX_EXEC_ROLE_CONTRACT","duration_seconds":1.0,"prompt_bytes":90,"input_tokens":20,"cached_input_tokens":0,"output_tokens":5,"retry_kind":"none","verification_seconds":0.0,"quality_outcome":"SUPPORTED","paired_case_id":"case-17","evidence_class":"sample_validated_projection","rate_snapshot_id":"synthetic-rates-2026-08-03"}]
+    },
+    {
+      "paired_case_id": "case-18",
+      "route": "sol_only",
+      "attempts": [{"schema_version":"cost-evidence-1","route":"sol_only","role":"sol_planner","execution_surface":"NATIVE_SUBAGENT","duration_seconds":1.0,"prompt_bytes":90,"input_tokens":20,"cached_input_tokens":0,"output_tokens":5,"retry_kind":"none","verification_seconds":0.0,"quality_outcome":"SUPPORTED","paired_case_id":"case-18","evidence_class":"sample_validated_projection","rate_snapshot_id":"synthetic-rates-2026-08-03"}]
+    },
+    {
+      "paired_case_id": "case-19",
+      "route": "sol_only",
+      "attempts": [{"schema_version":"cost-evidence-1","route":"sol_only","role":"sol_planner","execution_surface":"CODEX_EXEC_ROLE_CONTRACT","duration_seconds":1.0,"prompt_bytes":90,"input_tokens":20,"cached_input_tokens":0,"output_tokens":5,"retry_kind":"none","verification_seconds":0.0,"quality_outcome":"SUPPORTED","paired_case_id":"case-19","evidence_class":"sample_validated_projection","rate_snapshot_id":"synthetic-rates-2026-08-03"}]
+    },
+    {
+      "paired_case_id": "case-20",
+      "route": "sol_only",
+      "attempts": [{"schema_version":"cost-evidence-1","route":"sol_only","role":"sol_planner","execution_surface":"NATIVE_SUBAGENT","duration_seconds":1.0,"prompt_bytes":90,"input_tokens":20,"cached_input_tokens":0,"output_tokens":5,"retry_kind":"none","verification_seconds":0.0,"quality_outcome":"SUPPORTED","paired_case_id":"case-20","evidence_class":"sample_validated_projection","rate_snapshot_id":"synthetic-rates-2026-08-03"}]
+    },
+    {
+      "paired_case_id": "case-21",
+      "route": "delegated",
+      "attempts": [{"schema_version":"cost-evidence-1","route":"delegated","role":"luna","execution_surface":"CODEX_EXEC_ROLE_CONTRACT","duration_seconds":null,"prompt_bytes":100,"input_tokens":null,"cached_input_tokens":null,"output_tokens":null,"retry_kind":"none","verification_seconds":null,"quality_outcome":"UNAVAILABLE","paired_case_id":"case-21","evidence_class":"unavailable","rate_snapshot_id":null}]
+    },
+    {
+      "paired_case_id": "case-22",
+      "route": "delegated",
+      "attempts": [{"schema_version":"cost-evidence-1","route":"delegated","role":"luna","execution_surface":"NATIVE_SUBAGENT","duration_seconds":null,"prompt_bytes":100,"input_tokens":null,"cached_input_tokens":null,"output_tokens":null,"retry_kind":"none","verification_seconds":null,"quality_outcome":"UNAVAILABLE","paired_case_id":"case-22","evidence_class":"unavailable","rate_snapshot_id":null}]
+    },
+    {
+      "paired_case_id": "case-23",
+      "route": "delegated",
+      "attempts": [{"schema_version":"cost-evidence-1","route":"delegated","role":"luna","execution_surface":"CODEX_EXEC_ROLE_CONTRACT","duration_seconds":null,"prompt_bytes":100,"input_tokens":null,"cached_input_tokens":null,"output_tokens":null,"retry_kind":"none","verification_seconds":null,"quality_outcome":"UNAVAILABLE","paired_case_id":"case-23","evidence_class":"unavailable","rate_snapshot_id":null}]
+    },
+    {
+      "paired_case_id": "case-24",
+      "route": "delegated",
+      "attempts": [{"schema_version":"cost-evidence-1","route":"delegated","role":"luna","execution_surface":"NATIVE_SUBAGENT","duration_seconds":null,"prompt_bytes":100,"input_tokens":null,"cached_input_tokens":null,"output_tokens":null,"retry_kind":"none","verification_seconds":null,"quality_outcome":"UNAVAILABLE","paired_case_id":"case-24","evidence_class":"unavailable","rate_snapshot_id":null}]
+    },
+    {
+      "paired_case_id": "case-25",
+      "route": "delegated",
+      "attempts": [{"schema_version":"cost-evidence-1","route":"delegated","role":"luna","execution_surface":"CODEX_EXEC_ROLE_CONTRACT","duration_seconds":null,"prompt_bytes":100,"input_tokens":null,"cached_input_tokens":null,"output_tokens":null,"retry_kind":"none","verification_seconds":null,"quality_outcome":"UNAVAILABLE","paired_case_id":"case-25","evidence_class":"unavailable","rate_snapshot_id":null}]
+    },
+    {
+      "paired_case_id": "case-26",
+      "route": "delegated",
+      "attempts": [{"schema_version":"cost-evidence-1","route":"delegated","role":"luna","execution_surface":"NATIVE_SUBAGENT","duration_seconds":null,"prompt_bytes":100,"input_tokens":null,"cached_input_tokens":null,"output_tokens":null,"retry_kind":"none","verification_seconds":null,"quality_outcome":"UNAVAILABLE","paired_case_id":"case-26","evidence_class":"unavailable","rate_snapshot_id":null}]
+    },
+    {
+      "paired_case_id": "case-27",
+      "route": "delegated",
+      "attempts": [{"schema_version":"cost-evidence-1","route":"delegated","role":"luna","execution_surface":"CODEX_EXEC_ROLE_CONTRACT","duration_seconds":null,"prompt_bytes":100,"input_tokens":null,"cached_input_tokens":null,"output_tokens":null,"retry_kind":"none","verification_seconds":null,"quality_outcome":"UNAVAILABLE","paired_case_id":"case-27","evidence_class":"unavailable","rate_snapshot_id":null}]
+    },
+    {
+      "paired_case_id": "case-28",
+      "route": "delegated",
+      "attempts": [{"schema_version":"cost-evidence-1","route":"delegated","role":"luna","execution_surface":"NATIVE_SUBAGENT","duration_seconds":null,"prompt_bytes":100,"input_tokens":null,"cached_input_tokens":null,"output_tokens":null,"retry_kind":"none","verification_seconds":null,"quality_outcome":"UNAVAILABLE","paired_case_id":"case-28","evidence_class":"unavailable","rate_snapshot_id":null}]
+    },
+    {
+      "paired_case_id": "case-29",
+      "route": "delegated",
+      "attempts": [{"schema_version":"cost-evidence-1","route":"delegated","role":"luna","execution_surface":"CODEX_EXEC_ROLE_CONTRACT","duration_seconds":null,"prompt_bytes":100,"input_tokens":null,"cached_input_tokens":null,"output_tokens":null,"retry_kind":"none","verification_seconds":null,"quality_outcome":"UNAVAILABLE","paired_case_id":"case-29","evidence_class":"unavailable","rate_snapshot_id":null}]
+    },
+    {
+      "paired_case_id": "case-30",
+      "route": "delegated",
+      "attempts": [{"schema_version":"cost-evidence-1","route":"delegated","role":"luna","execution_surface":"NATIVE_SUBAGENT","duration_seconds":null,"prompt_bytes":100,"input_tokens":null,"cached_input_tokens":null,"output_tokens":null,"retry_kind":"none","verification_seconds":null,"quality_outcome":"UNAVAILABLE","paired_case_id":"case-30","evidence_class":"unavailable","rate_snapshot_id":null}]
+    }
+  ]
+}

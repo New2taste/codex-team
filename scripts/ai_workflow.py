@@ -208,6 +208,23 @@ except ImportError:  # direct script execution
         write_runtime_evidence,
     )
 
+try:
+    from .ai_workflow_costs import (
+        aggregate_paired_cases,
+        evaluate_cost_claim,
+        finite_nonnegative_or_none,
+        normalize_cost_evidence,
+        render_cost_sections,
+    )
+except ImportError:  # direct script execution
+    from ai_workflow_costs import (
+        aggregate_paired_cases,
+        evaluate_cost_claim,
+        finite_nonnegative_or_none,
+        normalize_cost_evidence,
+        render_cost_sections,
+    )
+
 
 def _fail(code: str, message: str) -> None:
     raise WorkflowError(code, message)
@@ -1307,7 +1324,7 @@ def _normalize_metric_run(run: Mapping[str, object]) -> dict[str, object]:
     workflow_state = run.get("workflow_state")
     activity = run.get("activity")
     status = run.get("status")
-    return {
+    normalized = {
         "role": role,
         "timestamp_utc": _utc_timestamp(),
         "duration_seconds": _metric_duration(run.get("duration_seconds")),
@@ -1322,6 +1339,52 @@ def _normalize_metric_run(run: Mapping[str, object]) -> dict[str, object]:
         "full_suite_run": run.get("full_suite_run") is True,
         "status": status if isinstance(status, str) else None,
     }
+    # Preserve explicitly supplied cost-attempt fields as an append-only
+    # nested record.  Legacy metric runs that have no paired-case identity do
+    # not acquire synthetic token or price values.
+    cost_fields = (
+        "route",
+        "execution_surface",
+        "duration_seconds",
+        "prompt_bytes",
+        "input_tokens",
+        "cached_input_tokens",
+        "output_tokens",
+        "retry_kind",
+        "verification_seconds",
+        "quality_outcome",
+        "paired_case_id",
+        "evidence_class",
+        "rate_snapshot_id",
+        "projected_cost",
+        "projected_cost_usd",
+        "baseline_cost",
+        "baseline_cost_usd",
+        "new_cost",
+        "new_cost_usd",
+        "net_measured_cost_delta",
+        "quality_delta_points",
+    )
+    cost_record = {field: run[field] for field in cost_fields if field in run}
+    if "status" in run and "quality_outcome" not in cost_record:
+        cost_record["quality_outcome"] = run["status"]
+    if cost_record and any(
+        field in cost_record
+        for field in (
+            "paired_case_id",
+            "route",
+            "execution_surface",
+            "prompt_bytes",
+            "input_tokens",
+            "cached_input_tokens",
+            "output_tokens",
+            "evidence_class",
+            "rate_snapshot_id",
+        )
+    ):
+        cost_record.setdefault("role", role)
+        normalized["cost_evidence"] = cost_record
+    return normalized
 
 
 def _load_metrics_document(path: Path, task_id: str) -> dict[str, object]:
@@ -1416,6 +1479,7 @@ def aggregate_metrics(root: Path) -> dict:
     full_suite_runs = 0
     end_to_end_seconds = 0.0
     stop_line_events: list[dict[str, object]] = []
+    cost_records: list[Mapping[str, object]] = []
     try:
         task_dirs = sorted(
             (path for path in root.iterdir() if path.is_dir() and TASK_ID_PATTERN.fullmatch(path.name)),
@@ -1457,6 +1521,15 @@ def aggregate_metrics(root: Path) -> dict:
             if role == "terra" and task_id not in terra_first_status:
                 status = run.get("status")
                 terra_first_status[task_id] = status if isinstance(status, str) else None
+            cost_record = run.get("cost_evidence")
+            if not isinstance(cost_record, Mapping) and isinstance(run.get("paired_case_id"), str):
+                cost_record = run
+            if (
+                isinstance(cost_record, Mapping)
+                and isinstance(cost_record.get("paired_case_id"), str)
+                and cost_record["paired_case_id"].strip()
+            ):
+                cost_records.append(dict(cost_record))
         for event in _read_task_events(task_dir, task_id):
             if event.get("new_state") == "NEEDS_REPLAN" or event.get("event_type") == "SEMANTIC_REWORK":
                 semantic_reworks += 1
@@ -1470,6 +1543,7 @@ def aggregate_metrics(root: Path) -> dict:
         status == "IMPLEMENTED_CANDIDATE" for status in terra_first_status.values()
     )
     first_delivery_total = len(terra_first_status)
+    cost_summary = aggregate_paired_cases(cost_records) if cost_records else {}
     return {
         "calibration_task_count": calibration_tasks,
         "experiment_task_count": experiment_tasks,
@@ -1488,6 +1562,7 @@ def aggregate_metrics(root: Path) -> dict:
         "full_suite_runs": full_suite_runs,
         "end_to_end_seconds": end_to_end_seconds,
         "stop_line_events": stop_line_events,
+        "cost_summary": cost_summary,
     }
 
 
@@ -1542,6 +1617,18 @@ def render_report(metrics: Mapping[str, object]) -> str:
         lines.extend(f"- {_canonical_json(event)}" for event in stop_line_events)
     else:
         lines.append("- None")
+    cost_summary = metrics.get("cost_summary")
+    if cost_summary is None:
+        cost_records = metrics.get("cost_evidence")
+        if isinstance(cost_records, list):
+            cost_summary = aggregate_paired_cases(cost_records)
+    cost_sections = render_cost_sections(
+        cost_summary if isinstance(cost_summary, Mapping) else None,
+        metrics.get("cost_claim_summary")
+        if isinstance(metrics.get("cost_claim_summary"), Mapping)
+        else None,
+    )
+    lines.extend(("", cost_sections.rstrip("\n")))
     return _redact_log_text("\n".join(lines) + "\n")
 
 
