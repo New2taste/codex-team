@@ -1,0 +1,18 @@
+{
+  "name": "ai-workflow",
+  "version": "0.2.0",
+  "description": "Deterministic multi-model routing, evidence, and review workflow for Codex.",
+  "author": {
+    "name": "AI Workflow maintainers"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "AI Workflow",
+    "shortDescription": "Route bounded Codex work with evidence gates",
+    "longDescription": "Deterministic routing, runtime evidence, and review gates for bounded Codex work.",
+    "developerName": "AI Workflow maintainers",
+    "category": "Developer Tools",
+    "capabilities": ["Read", "Write"],
+    "defaultPrompt": ["Use $ai-workflow:orchestration to route and execute this task with evidence gates."]
+  }
+}
