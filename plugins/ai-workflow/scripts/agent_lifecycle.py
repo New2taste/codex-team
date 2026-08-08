@@ -31,6 +31,7 @@ BACKUP_FILENAME = ".ai-workflow-luna-worker.backup"
 RELEASE_SHA256 = "60f7240ea662cd27ea0f51f2e1efa8a2e788e16c76b04a13ab1c1df4f26ef024"
 UTC_TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 Hook = Callable[[str], None]
+FileIdentity = tuple[int, int, str]
 
 
 class LifecycleError(RuntimeError):
@@ -165,13 +166,6 @@ def _stage(directory: int, label: str, content: bytes) -> str:
     raise AssertionError("unreachable")
 
 
-def _unlink_owned(directory: int, name: str) -> None:
-    try:
-        os.unlink(name, dir_fd=directory)
-    except FileNotFoundError:
-        return
-
-
 def _publish_no_clobber(
     source_directory: int, source_name: str, destination_directory: int, destination_name: str
 ) -> bool:
@@ -191,6 +185,48 @@ def _publish_no_clobber(
         _fail("cannot publish lifecycle file")
         raise AssertionError("unreachable") from exc
     return True
+
+
+def _publish_staged_no_clobber(
+    source_directory: int,
+    source_name: str,
+    destination_directory: int,
+    destination_name: str,
+    expected_identity: FileIdentity,
+) -> bool:
+    """Publish only the staged inode and verify that exact inode was linked."""
+
+    if _file_identity(source_directory, source_name) != expected_identity:
+        return False
+    try:
+        published = _publish_no_clobber(
+            source_directory,
+            source_name,
+            destination_directory,
+            destination_name,
+        )
+    except BaseException:
+        _discard_owned_publication(
+            destination_directory, destination_name, expected_identity
+        )
+        raise
+    if not published:
+        return False
+    try:
+        destination_matches = (
+            _file_identity(destination_directory, destination_name)
+            == expected_identity
+        )
+    except BaseException:
+        _discard_owned_publication(
+            destination_directory, destination_name, expected_identity
+        )
+        raise
+    if not destination_matches:
+        _discard_owned_publication(
+            destination_directory, destination_name, expected_identity
+        )
+    return destination_matches
 
 
 def _make_tombstone_directory(directory: int) -> tuple[str, int]:
@@ -226,10 +262,10 @@ def _retire_to_tombstone(directory: int, name: str) -> tuple[str, int]:
 
 def _preserve_tombstone(
     target_directory: int, target_name: str, tombstone: int
-) -> None:
+) -> bool:
     """Attempt a no-clobber restoration; retain tombstone if anything races."""
 
-    _publish_no_clobber(tombstone, "payload", target_directory, target_name)
+    return _publish_no_clobber(tombstone, "payload", target_directory, target_name)
 
 
 def _discard_verified_tombstone(
@@ -250,6 +286,13 @@ def _discard_verified_tombstone(
 def _close_tombstone(tombstone: int) -> None:
     try:
         os.close(tombstone)
+    except OSError:
+        pass
+
+
+def _close_directory(directory: int) -> None:
+    try:
+        os.close(directory)
     except OSError:
         pass
 
@@ -368,6 +411,74 @@ def _hook(hook: Hook | None, point: str) -> None:
         hook(point)
 
 
+def _file_identity(directory: int, name: str) -> FileIdentity:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(name, flags, dir_fd=directory)
+        with os.fdopen(descriptor, "rb") as handle:
+            status = os.fstat(handle.fileno())
+            if not stat.S_ISREG(status.st_mode):
+                _fail("unsafe target entry")
+            digest = _sha256(handle.read())
+    except OSError as exc:
+        _fail("unreadable target entry")
+        raise AssertionError("unreachable") from exc
+    return status.st_dev, status.st_ino, digest
+
+
+def _discard_owned_publication(
+    directory: int, name: str, identity: FileIdentity | None
+) -> bool:
+    """Best-effort cleanup that never deletes a replacement or raises."""
+
+    if identity is None:
+        return True
+    device, inode, digest = identity
+    try:
+        return _retire_and_discard(
+            directory,
+            name,
+            digest,
+            expected_identity=(device, inode),
+        )
+    except BaseException:
+        return False
+
+
+def _rollback_install_publication(
+    directory: int,
+    agent_identity: FileIdentity | None,
+    state_identity: FileIdentity | None,
+    *,
+    legacy_tombstone_name: str | None = None,
+    legacy_tombstone: int | None = None,
+    legacy_sha: str | None = None,
+) -> None:
+    """Best-effort transaction rollback; original failures remain authoritative."""
+
+    _discard_owned_publication(directory, STATE_FILENAME, state_identity)
+    _discard_owned_publication(directory, TARGET_FILENAME, agent_identity)
+    if (
+        legacy_tombstone_name is None
+        or legacy_tombstone is None
+        or legacy_sha is None
+    ):
+        return
+    try:
+        restored = _preserve_tombstone(
+            directory, TARGET_FILENAME, legacy_tombstone
+        )
+        if restored:
+            _discard_verified_tombstone(
+                directory,
+                legacy_tombstone_name,
+                legacy_tombstone,
+                legacy_sha,
+            )
+    except BaseException:
+        pass
+
+
 def install(
     target_directory: str | os.PathLike[str], *, check: bool = False, hook: Hook | None = None
 ) -> int:
@@ -377,6 +488,10 @@ def install(
     staged_agent: str | None = None
     staged_state: str | None = None
     tombstone: int | None = None
+    published_agent: FileIdentity | None = None
+    published_state: FileIdentity | None = None
+    staged_agent_identity: FileIdentity | None = None
+    staged_state_identity: FileIdentity | None = None
     try:
         template, template_sha = _validate_template()
         directory = _open_target_directory(target_directory, create=False)
@@ -393,29 +508,45 @@ def install(
             if classification != "missing":
                 return 1
         staged_agent = _stage(directory, "agent", template)
-        if _hash_regular(directory, staged_agent) != template_sha:
+        staged_agent_identity = _file_identity(directory, staged_agent)
+        if staged_agent_identity[2] != template_sha:
             _fail("staged template digest mismatch")
         staged_state = _stage(directory, "state", _state_content(template_sha, None))
+        staged_state_identity = _file_identity(directory, staged_state)
 
         if classification == "missing":
             _hook(hook, "install.before_publish_missing")
-            if not _publish_no_clobber(directory, staged_agent, directory, TARGET_FILENAME):
+            if not _publish_staged_no_clobber(
+                directory,
+                staged_agent,
+                directory,
+                TARGET_FILENAME,
+                staged_agent_identity,
+            ):
                 return 1
-            published_status = _require_regular(directory, staged_agent)
-            published_identity = (published_status.st_dev, published_status.st_ino)
-            _unlink_owned(directory, staged_agent)
-            staged_agent = None
-            _hook(hook, "install.before_publish_missing_state")
-            if not _publish_no_clobber(directory, staged_state, directory, STATE_FILENAME):
-                _retire_and_discard(
+            published_agent = staged_agent_identity
+            try:
+                _hook(hook, "install.before_publish_missing_state")
+                if not _publish_staged_no_clobber(
                     directory,
-                    TARGET_FILENAME,
-                    template_sha,
-                    expected_identity=published_identity,
+                    staged_state,
+                    directory,
+                    STATE_FILENAME,
+                    staged_state_identity,
+                ):
+                    _rollback_install_publication(
+                        directory, published_agent, published_state
+                    )
+                    return 1
+                published_state = staged_state_identity
+                _hook(hook, "install.after_publish_missing_state")
+            except BaseException:
+                _rollback_install_publication(
+                    directory,
+                    published_agent,
+                    published_state,
                 )
-                return 1
-            _unlink_owned(directory, staged_state)
-            staged_state = None
+                raise
             return 0
 
         if classification != "known_legacy" or expected_sha is None:
@@ -426,14 +557,64 @@ def install(
         if moved_sha != expected_sha:
             _preserve_tombstone(directory, TARGET_FILENAME, tombstone)
             return 1
-        if not _publish_no_clobber(directory, staged_agent, directory, TARGET_FILENAME):
-            return 1
-        _unlink_owned(directory, staged_agent)
-        staged_agent = None
-        if not _publish_no_clobber(directory, staged_state, directory, STATE_FILENAME):
-            return 1
-        _unlink_owned(directory, staged_state)
-        staged_state = None
+        try:
+            if not _publish_staged_no_clobber(
+                directory,
+                staged_agent,
+                directory,
+                TARGET_FILENAME,
+                staged_agent_identity,
+            ):
+                _rollback_install_publication(
+                    directory,
+                    published_agent,
+                    published_state,
+                    legacy_tombstone_name=tombstone_name,
+                    legacy_tombstone=tombstone,
+                    legacy_sha=expected_sha,
+                )
+                return 1
+        except BaseException:
+            _rollback_install_publication(
+                directory,
+                published_agent,
+                published_state,
+                legacy_tombstone_name=tombstone_name,
+                legacy_tombstone=tombstone,
+                legacy_sha=expected_sha,
+            )
+            raise
+        published_agent = staged_agent_identity
+        try:
+            _hook(hook, "install.before_publish_known_legacy_state")
+            if not _publish_staged_no_clobber(
+                directory,
+                staged_state,
+                directory,
+                STATE_FILENAME,
+                staged_state_identity,
+            ):
+                _rollback_install_publication(
+                    directory,
+                    published_agent,
+                    published_state,
+                    legacy_tombstone_name=tombstone_name,
+                    legacy_tombstone=tombstone,
+                    legacy_sha=expected_sha,
+                )
+                return 1
+            published_state = staged_state_identity
+            _hook(hook, "install.after_publish_known_legacy_state")
+        except BaseException:
+            _rollback_install_publication(
+                directory,
+                published_agent,
+                published_state,
+                legacy_tombstone_name=tombstone_name,
+                legacy_tombstone=tombstone,
+                legacy_sha=expected_sha,
+            )
+            raise
         discarded = _discard_verified_tombstone(
             directory, tombstone_name, tombstone, expected_sha
         )
@@ -446,14 +627,18 @@ def install(
         return 1
     finally:
         if directory is not None:
-            if staged_agent is not None:
-                _unlink_owned(directory, staged_agent)
-            if staged_state is not None:
-                _unlink_owned(directory, staged_state)
+            if staged_agent is not None and staged_agent_identity is not None:
+                _discard_owned_publication(
+                    directory, staged_agent, staged_agent_identity
+                )
+            if staged_state is not None and staged_state_identity is not None:
+                _discard_owned_publication(
+                    directory, staged_state, staged_state_identity
+                )
         if tombstone is not None:
             _close_tombstone(tombstone)
         if directory is not None:
-            os.close(directory)
+            _close_directory(directory)
 
 
 def _retire_and_discard(

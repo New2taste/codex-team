@@ -54,6 +54,7 @@ developer_instructions = """
 - 先给结论，再列已完成内容、最小证据、验证结果、盲区和未执行事项。
 """
 '''.encode()
+LEGACY_BYTES = KNOWN_LEGACY_TEMPLATE
 
 
 def sha256(path: Path) -> str:
@@ -132,6 +133,50 @@ def write_owned_state(target: Path, backup_sha256: str | None = None) -> None:
         )
         + "\n"
     )
+
+
+def prepare_known_legacy(target: Path) -> None:
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "luna-worker.toml").write_bytes(KNOWN_LEGACY_TEMPLATE)
+
+
+def raise_on_state_hook(exception_type: type[BaseException], point: str):
+    def hook(observed: str) -> None:
+        if observed == point:
+            raise exception_type("injected")
+
+    return hook
+
+
+def raise_on_missing_state(exception_type: type[BaseException]):
+    return raise_on_state_hook(exception_type, "install.before_publish_missing_state")
+
+
+def raise_on_known_legacy_state(exception_type: type[BaseException]):
+    return raise_on_state_hook(
+        exception_type, "install.before_publish_known_legacy_state"
+    )
+
+
+def raise_after_missing_state_publish(exception_type: type[BaseException]):
+    return raise_on_state_hook(exception_type, "install.after_publish_missing_state")
+
+
+def raise_after_known_legacy_state_publish(exception_type: type[BaseException]):
+    return raise_on_state_hook(
+        exception_type, "install.after_publish_known_legacy_state"
+    )
+
+
+def raise_from_state_publish(lifecycle, exception_type: type[BaseException]):
+    original_publish = lifecycle._publish_no_clobber
+
+    def publish(*arguments):
+        if arguments[-1] == STATE_NAME:
+            raise exception_type("injected")
+        return original_publish(*arguments)
+
+    return mock.patch.object(lifecycle, "_publish_no_clobber", side_effect=publish)
 
 
 def temporary_directory():
@@ -527,6 +572,422 @@ class AgentLifecycleTest(unittest.TestCase):
                 for payload in target.glob(".ai-workflow-tombstone-*/payload")
             )
             self.assertIn(replacement_inode, recoverable_inodes)
+
+    def test_missing_state_hook_oserror_rolls_back_agent_and_state(self):
+        lifecycle = load_lifecycle_helper()
+        with temporary_directory() as temporary:
+            target = Path(temporary) / "agents"
+
+            self.assertEqual(
+                1, lifecycle.install(target, hook=raise_on_missing_state(OSError))
+            )
+
+            self.assertFalse((target / "luna-worker.toml").exists())
+            self.assertFalse((target / STATE_NAME).exists())
+
+    def test_missing_state_hook_runtimeerror_rolls_back_then_reraises(self):
+        lifecycle = load_lifecycle_helper()
+        with temporary_directory() as temporary:
+            target = Path(temporary) / "agents"
+
+            with self.assertRaisesRegex(RuntimeError, "injected"):
+                lifecycle.install(target, hook=raise_on_missing_state(RuntimeError))
+
+            self.assertFalse((target / "luna-worker.toml").exists())
+            self.assertFalse((target / STATE_NAME).exists())
+
+    def test_missing_state_publish_oserror_rolls_back(self):
+        lifecycle = load_lifecycle_helper()
+        with temporary_directory() as temporary:
+            target = Path(temporary) / "agents"
+
+            with raise_from_state_publish(lifecycle, OSError):
+                self.assertEqual(1, lifecycle.install(target))
+
+            self.assertFalse((target / "luna-worker.toml").exists())
+            self.assertFalse((target / STATE_NAME).exists())
+
+    def test_missing_post_link_state_exception_rolls_back_then_reraises(self):
+        lifecycle = load_lifecycle_helper()
+        with temporary_directory() as temporary:
+            target = Path(temporary) / "agents"
+
+            with self.assertRaisesRegex(RuntimeError, "injected"):
+                lifecycle.install(
+                    target, hook=raise_after_missing_state_publish(RuntimeError)
+                )
+
+            self.assertFalse((target / "luna-worker.toml").exists())
+            self.assertFalse((target / STATE_NAME).exists())
+
+    def test_known_legacy_state_failure_restores_legacy_without_new_state(self):
+        lifecycle = load_lifecycle_helper()
+        with temporary_directory() as temporary:
+            target = Path(temporary) / "agents"
+            prepare_known_legacy(target)
+            legacy_inode = (target / "luna-worker.toml").stat().st_ino
+
+            with raise_from_state_publish(lifecycle, OSError):
+                self.assertEqual(1, lifecycle.install(target))
+
+            self.assertEqual(LEGACY_BYTES, (target / "luna-worker.toml").read_bytes())
+            self.assertEqual(legacy_inode, (target / "luna-worker.toml").stat().st_ino)
+            self.assertFalse((target / STATE_NAME).exists())
+
+    def test_known_legacy_state_hook_runtimeerror_restores_then_reraises(self):
+        lifecycle = load_lifecycle_helper()
+        with temporary_directory() as temporary:
+            target = Path(temporary) / "agents"
+            prepare_known_legacy(target)
+            legacy_inode = (target / "luna-worker.toml").stat().st_ino
+
+            with self.assertRaisesRegex(RuntimeError, "injected"):
+                lifecycle.install(
+                    target, hook=raise_on_known_legacy_state(RuntimeError)
+                )
+
+            self.assertEqual(LEGACY_BYTES, (target / "luna-worker.toml").read_bytes())
+            self.assertEqual(legacy_inode, (target / "luna-worker.toml").stat().st_ino)
+            self.assertFalse((target / STATE_NAME).exists())
+
+    def test_known_legacy_state_publish_race_restores_legacy(self):
+        lifecycle = load_lifecycle_helper()
+        with temporary_directory() as temporary:
+            target = Path(temporary) / "agents"
+            prepare_known_legacy(target)
+            legacy_inode = (target / "luna-worker.toml").stat().st_ino
+            user_state = b'{"owner":"user"}\n'
+
+            def race(point: str) -> None:
+                if point == "install.before_publish_known_legacy_state":
+                    (target / STATE_NAME).write_bytes(user_state)
+
+            self.assertEqual(1, lifecycle.install(target, hook=race))
+            self.assertEqual(legacy_inode, (target / "luna-worker.toml").stat().st_ino)
+            self.assertEqual(user_state, (target / STATE_NAME).read_bytes())
+
+    def test_known_legacy_state_failure_preserves_user_agent_and_legacy_tombstone(self):
+        lifecycle = load_lifecycle_helper()
+        with temporary_directory() as temporary:
+            root = Path(temporary)
+            target = root / "agents"
+            prepare_known_legacy(target)
+            legacy_inode = (target / "luna-worker.toml").stat().st_ino
+            user_bytes = b'name = "user_replacement"\n'
+
+            def replace_then_raise(point: str) -> None:
+                if point == "install.before_publish_known_legacy_state":
+                    replacement = root / "user-replacement.toml"
+                    replacement.write_bytes(user_bytes)
+                    os.replace(replacement, target / "luna-worker.toml")
+                    raise OSError("injected")
+
+            self.assertEqual(1, lifecycle.install(target, hook=replace_then_raise))
+            self.assertEqual(user_bytes, (target / "luna-worker.toml").read_bytes())
+            self.assertIn(
+                legacy_inode,
+                [
+                    payload.stat().st_ino
+                    for payload in target.glob(".ai-workflow-tombstone-*/payload")
+                ],
+            )
+            self.assertFalse((target / STATE_NAME).exists())
+
+    def test_known_legacy_state_failure_preserves_same_digest_replacement_inode(self):
+        lifecycle = load_lifecycle_helper()
+        with temporary_directory() as temporary:
+            root = Path(temporary)
+            target = root / "agents"
+            prepare_known_legacy(target)
+            legacy_inode = (target / "luna-worker.toml").stat().st_ino
+            replacement_inode: int | None = None
+
+            def replace_then_raise(point: str) -> None:
+                nonlocal replacement_inode
+                if point == "install.before_publish_known_legacy_state":
+                    replacement = root / "same-digest-replacement.toml"
+                    replacement.write_bytes(TEMPLATE.read_bytes())
+                    replacement_inode = replacement.stat().st_ino
+                    os.replace(replacement, target / "luna-worker.toml")
+                    raise OSError("injected")
+
+            self.assertEqual(1, lifecycle.install(target, hook=replace_then_raise))
+            self.assertEqual(replacement_inode, (target / "luna-worker.toml").stat().st_ino)
+            self.assertIn(
+                legacy_inode,
+                [
+                    payload.stat().st_ino
+                    for payload in target.glob(".ai-workflow-tombstone-*/payload")
+                ],
+            )
+            self.assertFalse((target / STATE_NAME).exists())
+
+    def test_post_link_state_replacement_is_preserved_on_exception(self):
+        lifecycle = load_lifecycle_helper()
+        with temporary_directory() as temporary:
+            root = Path(temporary)
+            target = root / "agents"
+            replacement_inode: int | None = None
+
+            def replace_then_raise(point: str) -> None:
+                nonlocal replacement_inode
+                if point == "install.after_publish_missing_state":
+                    replacement = root / "replacement-state"
+                    replacement.write_bytes((target / STATE_NAME).read_bytes())
+                    replacement_inode = replacement.stat().st_ino
+                    os.replace(replacement, target / STATE_NAME)
+                    raise RuntimeError("injected")
+
+            with self.assertRaisesRegex(RuntimeError, "injected"):
+                lifecycle.install(target, hook=replace_then_raise)
+
+            self.assertIsNotNone(replacement_inode)
+            self.assertEqual(replacement_inode, (target / STATE_NAME).stat().st_ino)
+            self.assertFalse((target / "luna-worker.toml").exists())
+
+    def test_known_legacy_post_link_runtimeerror_restores_then_reraises(self):
+        lifecycle = load_lifecycle_helper()
+        with temporary_directory() as temporary:
+            target = Path(temporary) / "agents"
+            prepare_known_legacy(target)
+            legacy_inode = (target / "luna-worker.toml").stat().st_ino
+
+            with self.assertRaisesRegex(RuntimeError, "injected"):
+                lifecycle.install(
+                    target,
+                    hook=raise_after_known_legacy_state_publish(RuntimeError),
+                )
+
+            self.assertEqual(legacy_inode, (target / "luna-worker.toml").stat().st_ino)
+            self.assertFalse((target / STATE_NAME).exists())
+
+    def test_staged_cleanup_oserror_does_not_mask_original_runtimeerror(self):
+        lifecycle = load_lifecycle_helper()
+        original_unlink = lifecycle.os.unlink
+
+        def fail_staged_state_cleanup(name, *arguments, **keywords):
+            if str(name).startswith(".ai-workflow-state-"):
+                raise OSError("cleanup failed")
+            return original_unlink(name, *arguments, **keywords)
+
+        with temporary_directory() as temporary:
+            target = Path(temporary) / "agents"
+            with mock.patch.object(
+                lifecycle.os, "unlink", side_effect=fail_staged_state_cleanup
+            ):
+                with self.assertRaisesRegex(RuntimeError, "injected"):
+                    lifecycle.install(
+                        target, hook=raise_on_missing_state(RuntimeError)
+                    )
+
+    def test_failed_state_transactions_close_directory_descriptors(self):
+        lifecycle = load_lifecycle_helper()
+        with temporary_directory() as temporary:
+            root = Path(temporary)
+            before = open_fd_count()
+            for index in range(16):
+                missing = root / "missing" / str(index) / "agents"
+                self.assertEqual(
+                    1,
+                    lifecycle.install(
+                        missing, hook=raise_on_missing_state(OSError)
+                    ),
+                )
+                legacy = root / "legacy" / str(index) / "agents"
+                prepare_known_legacy(legacy)
+                self.assertEqual(
+                    1,
+                    lifecycle.install(
+                        legacy, hook=raise_on_known_legacy_state(OSError)
+                    ),
+                )
+            after = open_fd_count()
+            self.assertLessEqual(after, before + 2)
+
+    def test_agent_publish_rejects_and_preserves_a_replaced_staging_inode(self):
+        lifecycle = load_lifecycle_helper()
+        with temporary_directory() as temporary:
+            target = Path(temporary) / "agents"
+            replacement_inode: int | None = None
+
+            def replace_staging_agent(point: str) -> None:
+                nonlocal replacement_inode
+                if point == "install.before_publish_missing":
+                    staged_agent, = target.glob(".ai-workflow-agent-*")
+                    replacement = Path(temporary) / "replacement-agent"
+                    replacement.write_bytes(b'name = "user"\n')
+                    replacement_inode = replacement.stat().st_ino
+                    os.replace(replacement, staged_agent)
+
+            self.assertEqual(1, lifecycle.install(target, hook=replace_staging_agent))
+            self.assertIsNotNone(replacement_inode)
+            self.assertIn(
+                replacement_inode,
+                [entry.stat().st_ino for entry in target.iterdir()],
+            )
+            self.assertFalse((target / "luna-worker.toml").exists())
+            self.assertFalse((target / STATE_NAME).exists())
+
+    def test_state_publish_rejects_and_preserves_a_replaced_staging_inode(self):
+        lifecycle = load_lifecycle_helper()
+        with temporary_directory() as temporary:
+            target = Path(temporary) / "agents"
+            replacement_inode: int | None = None
+
+            def replace_staging_state(point: str) -> None:
+                nonlocal replacement_inode
+                if point == "install.before_publish_missing_state":
+                    staged_state, = target.glob(".ai-workflow-state-*")
+                    replacement = Path(temporary) / "replacement-state"
+                    replacement.write_bytes(b'{"owner":"user"}\n')
+                    replacement_inode = replacement.stat().st_ino
+                    os.replace(replacement, staged_state)
+
+            self.assertEqual(1, lifecycle.install(target, hook=replace_staging_state))
+            self.assertIsNotNone(replacement_inode)
+            self.assertIn(
+                replacement_inode,
+                [entry.stat().st_ino for entry in target.iterdir()],
+            )
+            self.assertFalse((target / "luna-worker.toml").exists())
+            self.assertFalse((target / STATE_NAME).exists())
+
+    def test_final_cleanup_preserves_a_replaced_staging_inode(self):
+        lifecycle = load_lifecycle_helper()
+        with temporary_directory() as temporary:
+            target = Path(temporary) / "agents"
+            replacement_inode: int | None = None
+
+            def replace_staging_agent(point: str) -> None:
+                nonlocal replacement_inode
+                if point == "install.after_publish_missing_state":
+                    staged_agent, = target.glob(".ai-workflow-agent-*")
+                    replacement = Path(temporary) / "replacement-agent"
+                    replacement.write_bytes(b'name = "user"\n')
+                    replacement_inode = replacement.stat().st_ino
+                    os.replace(replacement, staged_agent)
+
+            self.assertEqual(0, lifecycle.install(target, hook=replace_staging_agent))
+            self.assertIsNotNone(replacement_inode)
+            self.assertIn(
+                replacement_inode,
+                [entry.stat().st_ino for entry in target.iterdir()],
+            )
+
+    def test_directory_close_oserror_does_not_mask_transaction_outcome(self):
+        lifecycle = load_lifecycle_helper()
+        original_close = lifecycle.os.close
+        with temporary_directory() as temporary:
+            target = Path(temporary) / "agents"
+            prepare_known_legacy(target)
+            target_status = target.stat()
+
+            def close_then_fail_for_target(descriptor: int) -> None:
+                status = os.fstat(descriptor)
+                original_close(descriptor)
+                if (status.st_dev, status.st_ino) == (
+                    target_status.st_dev,
+                    target_status.st_ino,
+                ):
+                    raise OSError("close failed")
+
+            with mock.patch.object(
+                lifecycle.os, "close", side_effect=close_then_fail_for_target
+            ):
+                self.assertEqual(
+                    1,
+                    lifecycle.install(
+                        target, hook=raise_on_known_legacy_state(OSError)
+                    ),
+                )
+
+    def test_post_link_identity_error_rolls_back_linked_state(self):
+        lifecycle = load_lifecycle_helper()
+        original_identity = lifecycle._file_identity
+
+        def fail_state_destination_identity(directory: int, name: str):
+            if name == STATE_NAME:
+                raise OSError("identity failed")
+            return original_identity(directory, name)
+
+        with temporary_directory() as temporary:
+            target = Path(temporary) / "agents"
+            with mock.patch.object(
+                lifecycle,
+                "_file_identity",
+                side_effect=fail_state_destination_identity,
+            ):
+                self.assertEqual(1, lifecycle.install(target))
+
+            self.assertFalse((target / "luna-worker.toml").exists())
+            self.assertFalse((target / STATE_NAME).exists())
+
+    def test_known_legacy_agent_staging_race_restores_legacy_inode(self):
+        lifecycle = load_lifecycle_helper()
+        with temporary_directory() as temporary:
+            root = Path(temporary)
+            target = root / "agents"
+            prepare_known_legacy(target)
+            legacy_inode = (target / "luna-worker.toml").stat().st_ino
+            replacement_inode: int | None = None
+
+            def replace_staging_agent(point: str) -> None:
+                nonlocal replacement_inode
+                if point == "install.before_retire_known_legacy":
+                    staged_agent, = target.glob(".ai-workflow-agent-*")
+                    replacement = root / "replacement-agent"
+                    replacement.write_bytes(b'name = "user"\n')
+                    replacement_inode = replacement.stat().st_ino
+                    os.replace(replacement, staged_agent)
+
+            self.assertEqual(1, lifecycle.install(target, hook=replace_staging_agent))
+            self.assertEqual(legacy_inode, (target / "luna-worker.toml").stat().st_ino)
+            self.assertIsNotNone(replacement_inode)
+            self.assertIn(
+                replacement_inode,
+                [entry.stat().st_ino for entry in target.iterdir()],
+            )
+
+    def test_missing_state_failure_preserves_a_different_byte_agent_replacement(self):
+        lifecycle = load_lifecycle_helper()
+        with temporary_directory() as temporary:
+            root = Path(temporary)
+            target = root / "agents"
+            destination = target / "luna-worker.toml"
+            user_bytes = b'name = "user_replacement"\n'
+
+            def replace_then_raise(point: str) -> None:
+                if point == "install.after_publish_missing_state":
+                    replacement = root / "different-byte-replacement.toml"
+                    replacement.write_bytes(user_bytes)
+                    os.replace(replacement, destination)
+                    raise OSError("injected")
+
+            self.assertEqual(1, lifecycle.install(target, hook=replace_then_raise))
+            self.assertEqual(user_bytes, destination.read_bytes())
+            self.assertFalse((target / STATE_NAME).exists())
+
+    def test_missing_state_failure_preserves_same_digest_replacement_inode(self):
+        lifecycle = load_lifecycle_helper()
+        with temporary_directory() as temporary:
+            root = Path(temporary)
+            target = root / "agents"
+            destination = target / "luna-worker.toml"
+            replacement_inode: int | None = None
+
+            def replace_then_raise(point: str) -> None:
+                nonlocal replacement_inode
+                if point == "install.after_publish_missing_state":
+                    replacement = root / "same-digest-replacement.toml"
+                    replacement.write_bytes(TEMPLATE.read_bytes())
+                    replacement_inode = replacement.stat().st_ino
+                    os.replace(replacement, destination)
+                    raise OSError("injected")
+
+            self.assertEqual(1, lifecycle.install(target, hook=replace_then_raise))
+            self.assertIsNotNone(replacement_inode)
+            self.assertEqual(replacement_inode, destination.stat().st_ino)
+            self.assertFalse((target / STATE_NAME).exists())
 
     def test_missing_check_closes_its_directory_descriptor(self):
         lifecycle = load_lifecycle_helper()
