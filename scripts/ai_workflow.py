@@ -2633,6 +2633,15 @@ def run_until_gate(task_id: str, *, runner: Runner, allow_live_model: bool) -> s
                 )
                 continue
             if state == "IMPLEMENTATION_RUNNING":
+                if has_active_repair_assignment(store, task_id):
+                    return _transition(
+                        store,
+                        task_id,
+                        state,
+                        "BLOCKED",
+                        budget,
+                        event_type="REPAIR_EXECUTION_INTEGRATION_BLOCKED",
+                    )
                 state = _run_pipeline_role(store, task_id, task, state, "terra", runner, budget)
                 continue
             if state == "IMPLEMENTED_CANDIDATE":
@@ -2912,6 +2921,34 @@ def main(argv: list[str] | None = None) -> int:
     except WorkflowError as exc:
         print(f"{exc.code}: {exc.message}")
         return 2
+
+
+try:
+    from .ai_workflow_repairs import (
+        ActorIdentity,
+        RepairAssignment,
+        RepairFinding,
+        assign_repair,
+        has_active_repair_assignment,
+        record_repair_assignment,
+        record_repair_completion,
+        record_repair_review,
+        record_sol_repair_authorization,
+        validate_repair_result,
+    )
+except ImportError:  # direct script execution
+    from ai_workflow_repairs import (
+        ActorIdentity,
+        RepairAssignment,
+        RepairFinding,
+        assign_repair,
+        has_active_repair_assignment,
+        record_repair_assignment,
+        record_repair_completion,
+        record_repair_review,
+        record_sol_repair_authorization,
+        validate_repair_result,
+    )
 
 
 if __name__ == "__main__":
