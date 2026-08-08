@@ -821,6 +821,27 @@ def run_codex(role: str, task: dict, prompt: str, paths: RunPaths) -> dict:
     result: dict | None = None
     completed: subprocess.CompletedProcess | None = None
     attempt_error: BaseException | None = None
+    attempt_recorded = False
+
+    def _append_attempt(quality_outcome: str, runtime_usage: object) -> None:
+        nonlocal attempt_recorded
+        if paths.state_root is None or attempt_recorded:
+            return
+        _controller_cost_attempt(
+            task["task_id"],
+            task,
+            role,
+            CODEX_EXEC_ROLE_CONTRACT,
+            (time.time_ns() - attempt_started_ns) / 1_000_000_000,
+            len(prompt.encode("utf-8")),
+            runtime_usage,
+            "none",
+            quality_outcome,
+            paths.state_root,
+            attempt_id=attempt_id,
+        )
+        attempt_recorded = True
+
     try:
         command = build_codex_command(role, repo, attempt_output, paths.schema_path)
         try:
@@ -858,37 +879,26 @@ def run_codex(role: str, task: dict, prompt: str, paths: RunPaths) -> dict:
         raise
     finally:
         try:
-            after_run = capture_repo(repo)
-            after_changes = working_tree_paths(repo)
-            if before_run.head != after_run.head:
-                _fail("HEAD_DRIFT", "repository HEAD changed during the role run")
-            if role in READ_ONLY_ROLES and before_run != after_run:
-                _fail("READ_ONLY_ROLE_MODIFIED_REPO", f"read-only role {role} changed the repository")
-            if task["task_type"] == "ACCEPTANCE":
-                assert_acceptance_candidate(task, repo)
-            if role == "terra":
-                actual_changes = after_changes - before_changes
-                assert_allowed_changes(actual_changes, task["allowed_write_paths"])
-            else:
-                actual_changes = after_changes - before_changes
+            try:
+                after_run = capture_repo(repo)
+                after_changes = working_tree_paths(repo)
+                if before_run.head != after_run.head:
+                    _fail("HEAD_DRIFT", "repository HEAD changed during the role run")
+                if role in READ_ONLY_ROLES and before_run != after_run:
+                    _fail("READ_ONLY_ROLE_MODIFIED_REPO", f"read-only role {role} changed the repository")
+                if task["task_type"] == "ACCEPTANCE":
+                    assert_acceptance_candidate(task, repo)
+                if role == "terra":
+                    actual_changes = after_changes - before_changes
+                    assert_allowed_changes(actual_changes, task["allowed_write_paths"])
+                else:
+                    actual_changes = after_changes - before_changes
+            except BaseException as exc:
+                attempt_error = exc
+                raise
         finally:
-            if paths.state_root is not None and not paths.runtime_evidence_required:
-                stdout = completed.stdout if completed is not None else ""
-                _controller_cost_attempt(
-                    task["task_id"],
-                    task,
-                    role,
-                    CODEX_EXEC_ROLE_CONTRACT,
-                    (time.time_ns() - attempt_started_ns) / 1_000_000_000,
-                    len(prompt.encode("utf-8")),
-                    extract_codex_usage(parse_codex_jsonl(stdout)),
-                    "none",
-                    str(result.get("status", "FAILED"))
-                    if isinstance(result, Mapping) and attempt_error is None
-                    else "FAILED",
-                    paths.state_root,
-                    attempt_id=attempt_id,
-                )
+            if attempt_error is not None:
+                _append_attempt("FAILED", None)
     try:
         if result is None:
             _fail("INVALID_ROLE_RESULT", "role did not return a result")
@@ -956,36 +966,19 @@ def run_codex(role: str, task: dict, prompt: str, paths: RunPaths) -> dict:
         validate_role_result(role, result, actual_changes)
         validate_verification_package(role, task, result)
     except BaseException:
-        if paths.state_root is not None and paths.runtime_evidence_required:
-            _controller_cost_attempt(
-                task["task_id"],
-                task,
-                role,
-                CODEX_EXEC_ROLE_CONTRACT,
-                (time.time_ns() - attempt_started_ns) / 1_000_000_000,
-                len(prompt.encode("utf-8")),
-                None,
-                "none",
-                "FAILED",
-                paths.state_root,
-                attempt_id=attempt_id,
-            )
+        _append_attempt("FAILED", None)
         raise
-    if paths.state_root is not None and paths.runtime_evidence_required:
-        _controller_cost_attempt(
-            task["task_id"],
-            task,
-            role,
-            CODEX_EXEC_ROLE_CONTRACT,
-            (time.time_ns() - attempt_started_ns) / 1_000_000_000,
-            len(prompt.encode("utf-8")),
-            extract_codex_usage(parse_codex_jsonl(completed.stdout)),
-            "none",
-            str(result.get("status", "UNKNOWN")),
-            paths.state_root,
-            attempt_id=attempt_id,
-        )
-    atomic_write_json(paths.output_path, result)
+    runtime_usage = (
+        extract_codex_usage(parse_codex_jsonl(completed.stdout))
+        if paths.runtime_evidence_required
+        else None
+    )
+    try:
+        atomic_write_json(paths.output_path, result)
+    except BaseException:
+        _append_attempt("FAILED", None)
+        raise
+    _append_attempt(str(result.get("status", "UNKNOWN")), runtime_usage)
     return result
 
 

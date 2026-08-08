@@ -26,7 +26,7 @@ def cost_record(**overrides):
         "verification_seconds": 0.0,
         "quality_outcome": "SUPPORTED",
         "paired_case_id": "case-01",
-        "evidence_class": "unavailable",
+        "evidence_class": None,
         "rate_snapshot_id": None,
     }
     aliases = {
@@ -64,9 +64,32 @@ class CostNormalizationTest(unittest.TestCase):
                 cached_input_tokens=None,
                 output_tokens=None,
                 duration_seconds=2.5,
+                evidence_class="measured",
             )
         )
         self.assertEqual("measured", evidence.evidence_class)
+
+    def test_explicit_unavailable_with_duration_stays_unavailable(self):
+        evidence = workflow.normalize_cost_evidence(
+            cost_record(
+                input_tokens=None,
+                cached_input_tokens=None,
+                output_tokens=None,
+                duration_seconds=2.5,
+                evidence_class="unavailable",
+            )
+        )
+        self.assertEqual("unavailable", evidence.evidence_class)
+        summary = workflow.aggregate_paired_cases([cost_record(
+            input_tokens=None,
+            cached_input_tokens=None,
+            output_tokens=None,
+            duration_seconds=2.5,
+            evidence_class="unavailable",
+        )])
+        self.assertEqual(["unavailable"], summary["case-01"]["evidence_classes"])
+        self.assertEqual(0, summary["case-01"]["measured_attempt_count"])
+        self.assertEqual(1, summary["case-01"]["unavailable_attempt_count"])
 
     def test_projection_requires_rate_snapshot_and_keeps_price_separate(self):
         with self.assertRaisesRegex(workflow.WorkflowError, "COST_EVIDENCE_INVALID"):

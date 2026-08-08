@@ -1114,7 +1114,7 @@ class CodexRunnerTest(unittest.TestCase):
     @mock.patch("scripts.ai_workflow.working_tree_paths", return_value=set())
     @mock.patch("scripts.ai_workflow.subprocess.run")
     @mock.patch("scripts.ai_workflow.record_metrics")
-    def test_codex_controller_records_literal_runtime_usage_on_exec_surface(
+    def test_codex_non_runtime_usage_is_unavailable_without_verified_runtime_identity(
         self, record_metrics, run, _working_tree_paths, _capture_repo
     ):
         result = self.valid_result()
@@ -1147,11 +1147,11 @@ class CodexRunnerTest(unittest.TestCase):
         metric_run = record_metrics.call_args.args[1]
         evidence = metric_run["cost_evidence"]
         self.assertEqual("CODEX_EXEC_ROLE_CONTRACT", evidence["execution_surface"])
-        self.assertEqual(11, evidence["input_tokens"])
-        self.assertEqual(2, evidence["cached_input_tokens"])
-        self.assertEqual(3, evidence["output_tokens"])
+        self.assertIsNone(evidence["input_tokens"])
+        self.assertIsNone(evidence["cached_input_tokens"])
+        self.assertIsNone(evidence["output_tokens"])
         self.assertEqual(len("task contract".encode("utf-8")), evidence["prompt_bytes"])
-        self.assertEqual("measured", evidence["evidence_class"])
+        self.assertEqual("unavailable", evidence["evidence_class"])
         self.assertIsNone(evidence["paired_case_id"])
 
     @mock.patch(
@@ -1205,6 +1205,89 @@ class CodexRunnerTest(unittest.TestCase):
         self.assertEqual("FAILED", evidence["quality_outcome"])
         self.assertEqual("unavailable", evidence["evidence_class"])
         self.assertIsNone(evidence["input_tokens"])
+
+    @mock.patch(
+        "scripts.ai_workflow.capture_repo",
+        return_value=workflow.RepoSnapshot("pinned-head", ()),
+    )
+    @mock.patch("scripts.ai_workflow.working_tree_paths", return_value=set())
+    @mock.patch("scripts.ai_workflow.subprocess.run")
+    def test_non_runtime_invalid_result_has_exactly_one_failed_attempt(
+        self, run, _working_tree_paths, _capture_repo
+    ):
+        task = self.valid_task()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_root = root / "state"
+            workflow.WorkflowStore(state_root).create_task(task)
+            paths = workflow.RunPaths(
+                repo=ROOT,
+                output_path=root / "luna-result.json",
+                schema_path=ROOT / "config/ai_workflow_result.schema.json",
+                logs_dir=root / "logs",
+                state_root=state_root,
+            )
+
+            def write_invalid_result(command, *args, **kwargs):
+                write_codex_result(command, {"role": "luna", "status": "SUPPORTED"})
+                return subprocess.CompletedProcess(command, 0, stdout="{}\n", stderr="")
+
+            run.side_effect = write_invalid_result
+            with self.assertRaisesRegex(workflow.WorkflowError, "INVALID_ROLE_RESULT"):
+                workflow.run_codex("luna", task, "task contract", paths)
+            document = json.loads(
+                (state_root / task["task_id"] / "metrics.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertEqual(1, len(document["runs"]))
+        evidence = document["runs"][0]["cost_evidence"]
+        self.assertEqual("FAILED", evidence["quality_outcome"])
+        self.assertEqual("unavailable", evidence["evidence_class"])
+
+    @mock.patch("scripts.ai_workflow.working_tree_paths", return_value=set())
+    @mock.patch("scripts.ai_workflow.subprocess.run")
+    def test_non_runtime_repo_guard_failure_has_exactly_one_failed_attempt(
+        self, run, _working_tree_paths
+    ):
+        task = self.valid_task()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_root = root / "state"
+            workflow.WorkflowStore(state_root).create_task(task)
+            paths = workflow.RunPaths(
+                repo=ROOT,
+                output_path=root / "luna-result.json",
+                schema_path=ROOT / "config/ai_workflow_result.schema.json",
+                logs_dir=root / "logs",
+                state_root=state_root,
+            )
+
+            def write_valid_result(command, *args, **kwargs):
+                write_codex_result(command, self.valid_result())
+                return subprocess.CompletedProcess(command, 0, stdout="{}\n", stderr="")
+
+            run.side_effect = write_valid_result
+            with mock.patch(
+                "scripts.ai_workflow.capture_repo",
+                side_effect=[
+                    workflow.RepoSnapshot("before", ()),
+                    workflow.RepoSnapshot("after", ()),
+                ],
+            ):
+                with self.assertRaisesRegex(workflow.WorkflowError, "HEAD_DRIFT"):
+                    workflow.run_codex("luna", task, "task contract", paths)
+            document = json.loads(
+                (state_root / task["task_id"] / "metrics.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertEqual(1, len(document["runs"]))
+        evidence = document["runs"][0]["cost_evidence"]
+        self.assertEqual("FAILED", evidence["quality_outcome"])
+        self.assertEqual("unavailable", evidence["evidence_class"])
 
     @mock.patch(
         "scripts.ai_workflow.capture_repo",

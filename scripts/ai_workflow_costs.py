@@ -250,10 +250,6 @@ def _normalize_evidence_class(
         evidence_class = explicit
     if not isinstance(evidence_class, str) or evidence_class not in EVIDENCE_CLASSES:
         _fail("COST_EVIDENCE_INVALID", "evidence_class is not supported")
-    # A stale default of ``unavailable`` must not hide explicit runtime usage;
-    # callers that supplied usage are normalized as measured evidence.
-    if evidence_class == "unavailable" and measured:
-        evidence_class = "measured"
     if evidence_class == "measured" and not measured:
         _fail(
             "COST_EVIDENCE_INVALID",
