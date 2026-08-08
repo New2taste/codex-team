@@ -58,15 +58,49 @@ def plan_task(
 
 
 def luna_construction_envelope(paths):
+    artifact = paths[0]
     return {
         "allowed_paths": paths,
-        "done_when": ["the bounded implementation test passes"],
-        "evidence": {
-            "L0": ["inspect the source path"],
-            "L1": ["run the focused unit test"],
-            "L2": ["inspect the candidate diff"],
+        "done_when": {
+            "kind": "TEST",
+            "command": "python -m unittest tests.test_bounded",
+            "expected_exit": 0,
+            "assertion": "OK",
+            "artifact": artifact,
         },
-        "negative_checks": ["remove the expected behavior and observe the test fail"],
+        "evidence": {
+            "L0": {"kind": "HASH", "artifact": artifact, "sha256": "a" * 64},
+            "L1": {
+                "kind": "COMMAND",
+                "command": "python -m unittest tests.test_bounded",
+                "expected_exit": 0,
+                "assertion": "OK",
+                "artifact": artifact,
+            },
+            "L2": {
+                "kind": "TEST",
+                "command": "python -m unittest tests.test_bounded",
+                "expected_exit": 0,
+                "assertion": "OK",
+                "artifact": artifact,
+            },
+        },
+        "negative_checks": [
+            {
+                "kind": "COMMAND",
+                "command": "python -m unittest tests.test_bounded --negative",
+                "expected_exit": 1,
+                "assertion": "negative fixture fails",
+                "artifact": artifact,
+            }
+        ],
+        "risk_classification": {
+            "kind": "LOCAL_DETERMINISTIC_IMPLEMENTATION",
+            "security": False,
+            "authorization": False,
+            "protocol": False,
+            "control_plane": False,
+        },
     }
 
 

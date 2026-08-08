@@ -15,7 +15,7 @@ def valid_task(*, task_type="REMEDIATION", risk_flags=None):
         "schema_version": "ai-task-1",
         "task_id": "AWF-20260808-001",
         "task_type": task_type,
-        "objective": "route a bounded Terra OS workflow task",
+        "objective": "implement one bounded parser behavior",
         "repository_root": str(ROOT),
         "source_worktree": None,
         "base_commit": None,
@@ -53,25 +53,32 @@ def approved_luna_construction_plan(*, owner_role="luna_construction"):
             {
                 "id": "luna-construction-step",
                 "owner_role": owner_role,
-                "read_scope": ["scripts/ai_workflow.py"],
-                "write_scope": ["scripts/ai_workflow.py"],
+                "read_scope": ["scripts/bounded_fixture.py"],
+                "write_scope": ["scripts/bounded_fixture.py"],
                 "do_not_touch": ["plugins"],
                 "depends_on": [],
-                "expected_result": "the bounded routing behavior is implemented",
+                "expected_result": "the bounded parser behavior is implemented",
                 "verification_commands": [
                     "python -m unittest tests.test_ai_workflow_terra_os"
                 ],
-                "first_artifact": "scripts/ai_workflow.py",
+                "first_artifact": "scripts/bounded_fixture.py",
                 "evidence_level": "L2",
                 "construction_envelope": {
-                    "allowed_paths": ["scripts/ai_workflow.py"],
-                    "done_when": ["the focused routing test passes"],
-                    "evidence": {
-                        "L0": ["inspect the changed file"],
-                        "L1": ["run the focused routing test"],
-                        "L2": ["inspect the complete diff"],
+                    "allowed_paths": ["scripts/bounded_fixture.py"],
+                    "done_when": {
+                        "kind": "TEST",
+                        "command": "python -m unittest tests.test_ai_workflow_terra_os",
+                        "expected_exit": 0,
+                        "assertion": "OK",
+                        "artifact": "scripts/bounded_fixture.py",
                     },
-                    "negative_checks": ["remove the envelope and verify Luna is not routed"],
+                    "evidence": {
+                        "L0": {"kind": "HASH", "artifact": "scripts/bounded_fixture.py", "sha256": "a" * 64},
+                        "L1": {"kind": "COMMAND", "command": "python -m unittest tests.test_ai_workflow_terra_os", "expected_exit": 0, "assertion": "OK", "artifact": "scripts/bounded_fixture.py"},
+                        "L2": {"kind": "TEST", "command": "python -m unittest tests.test_ai_workflow_terra_os", "expected_exit": 0, "assertion": "OK", "artifact": "scripts/bounded_fixture.py"},
+                    },
+                    "negative_checks": [{"kind": "COMMAND", "command": "python -m unittest tests.test_ai_workflow_terra_os --negative", "expected_exit": 1, "assertion": "negative fixture fails", "artifact": "scripts/bounded_fixture.py"}],
+                    "risk_classification": {"kind": "LOCAL_DETERMINISTIC_IMPLEMENTATION", "security": False, "authorization": False, "protocol": False, "control_plane": False},
                 },
             }
         ],

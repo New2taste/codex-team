@@ -105,18 +105,24 @@
                 "items": {"type": "string", "minLength": 1}
               },
               "done_when": {
-                "type": "array",
-                "minItems": 1,
-                "uniqueItems": true,
-                "items": {"type": "string", "minLength": 1}
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "kind": {"const": "TEST"},
+                  "command": {"type": "string", "minLength": 1},
+                  "expected_exit": {"type": "integer", "const": 0},
+                  "assertion": {"type": "string", "minLength": 1},
+                  "artifact": {"type": "string", "minLength": 1}
+                },
+                "required": ["kind", "command", "expected_exit", "assertion", "artifact"]
               },
               "evidence": {
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
-                  "L0": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
-                  "L1": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
-                  "L2": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}}
+                  "L0": {"type": "object", "additionalProperties": false, "properties": {"kind": {"const": "HASH"}, "artifact": {"type": "string", "minLength": 1}, "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}, "required": ["kind", "artifact", "sha256"]},
+                  "L1": {"type": "object", "additionalProperties": false, "properties": {"kind": {"const": "COMMAND"}, "command": {"type": "string", "minLength": 1}, "expected_exit": {"type": "integer", "const": 0}, "assertion": {"type": "string", "minLength": 1}, "artifact": {"type": "string", "minLength": 1}}, "required": ["kind", "command", "expected_exit", "assertion", "artifact"]},
+                  "L2": {"type": "object", "additionalProperties": false, "properties": {"kind": {"const": "TEST"}, "command": {"type": "string", "minLength": 1}, "expected_exit": {"type": "integer", "const": 0}, "assertion": {"type": "string", "minLength": 1}, "artifact": {"type": "string", "minLength": 1}}, "required": ["kind", "command", "expected_exit", "assertion", "artifact"]}
                 },
                 "required": ["L0", "L1", "L2"]
               },
@@ -124,10 +130,22 @@
                 "type": "array",
                 "minItems": 1,
                 "uniqueItems": true,
-                "items": {"type": "string", "minLength": 1}
+                "items": {"type": "object", "additionalProperties": false, "properties": {"kind": {"const": "COMMAND"}, "command": {"type": "string", "minLength": 1}, "expected_exit": {"type": "integer", "not": {"const": 0}}, "assertion": {"type": "string", "minLength": 1}, "artifact": {"type": "string", "minLength": 1}}, "required": ["kind", "command", "expected_exit", "assertion", "artifact"]}
+              },
+              "risk_classification": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "kind": {"const": "LOCAL_DETERMINISTIC_IMPLEMENTATION"},
+                  "security": {"const": false},
+                  "authorization": {"const": false},
+                  "protocol": {"const": false},
+                  "control_plane": {"const": false}
+                },
+                "required": ["kind", "security", "authorization", "protocol", "control_plane"]
               }
             },
-            "required": ["allowed_paths", "done_when", "evidence", "negative_checks"]
+            "required": ["allowed_paths", "done_when", "evidence", "negative_checks", "risk_classification"]
           }
         },
         "required": [

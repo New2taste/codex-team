@@ -11,6 +11,7 @@ import dataclasses
 import hashlib
 import json
 import math
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -141,9 +142,18 @@ PLAN_TASK_FIELDS = frozenset(
 )
 PLAN_TASK_REQUIRED_FIELDS = PLAN_TASK_FIELDS - {"construction_envelope"}
 CONSTRUCTION_ENVELOPE_FIELDS = frozenset(
-    {"allowed_paths", "done_when", "evidence", "negative_checks"}
+    {"allowed_paths", "done_when", "evidence", "negative_checks", "risk_classification"}
 )
 CONSTRUCTION_EVIDENCE_LEVELS = frozenset({"L0", "L1", "L2"})
+CONSTRUCTION_CHECK_FIELDS = frozenset(
+    {"kind", "command", "expected_exit", "assertion", "artifact"}
+)
+CONSTRUCTION_HASH_CHECK_FIELDS = frozenset({"kind", "artifact", "sha256"})
+CONSTRUCTION_RISK_CLASSIFICATION_FIELDS = frozenset(
+    {"kind", "security", "authorization", "protocol", "control_plane"}
+)
+CONSTRUCTION_NOOP_COMMANDS = frozenset({"true", ":", "/usr/bin/true"})
+CONSTRUCTION_PLACEHOLDERS = frozenset({"done", "evidence", "none", "pass", "true"})
 RUNTIME_EVIDENCE_FIELDS = frozenset(
     {
         "schema_version",
@@ -249,6 +259,61 @@ def _finite_number(value: object, field: str, *, integer: bool = False) -> int |
     if integer and not isinstance(value, int):
         _raise("COST_EVIDENCE_INVALID", f"{field} must be an integer")
     return value
+
+
+def _construction_string(value: object, field: str) -> str:
+    result = _string(value, field)
+    if result.casefold() in CONSTRUCTION_PLACEHOLDERS:
+        _raise("PLAN_INVALID", f"{field} must not be a placeholder")
+    return result
+
+
+def _construction_command(value: object, field: str) -> str:
+    result = _construction_string(value, field)
+    if result.strip() in CONSTRUCTION_NOOP_COMMANDS or "\x00" in result or "\n" in result:
+        _raise("PLAN_INVALID", f"{field} must be a runnable non-noop command")
+    return result
+
+
+def _construction_exit(value: object, field: str, *, expected_zero: bool) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        _raise("PLAN_INVALID", f"{field} must be an integer exit status")
+    if (expected_zero and value != 0) or (not expected_zero and value == 0):
+        _raise("PLAN_INVALID", f"{field} has an invalid expected exit status")
+    return value
+
+
+def _construction_object(value: object, field: str, fields: frozenset[str]) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        _raise("INVALID_TYPE", f"{field} must be an object")
+    result = dict(value)
+    unknown = sorted(set(result) - fields)
+    missing = sorted(fields - set(result))
+    if unknown:
+        _raise("UNKNOWN_FIELD", f"{field} has unsupported field {unknown[0]}")
+    if missing:
+        _raise("MISSING_FIELD", f"{field} is missing field {missing[0]}")
+    return result
+
+
+def _construction_check(value: object, field: str, *, kind: str, expected_zero: bool) -> None:
+    check = _construction_object(value, field, CONSTRUCTION_CHECK_FIELDS)
+    if check["kind"] != kind:
+        _raise("PLAN_INVALID", f"{field}.kind must be {kind}")
+    _construction_command(check["command"], f"{field}.command")
+    _construction_exit(check["expected_exit"], f"{field}.expected_exit", expected_zero=expected_zero)
+    _construction_string(check["assertion"], f"{field}.assertion")
+    _string(check["artifact"], f"{field}.artifact")
+
+
+def _construction_hash_check(value: object, field: str) -> None:
+    check = _construction_object(value, field, CONSTRUCTION_HASH_CHECK_FIELDS)
+    if check["kind"] != "HASH":
+        _raise("PLAN_INVALID", f"{field}.kind must be HASH")
+    _string(check["artifact"], f"{field}.artifact")
+    digest = _string(check["sha256"], f"{field}.sha256")
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        _raise("PLAN_INVALID", f"{field}.sha256 must be a SHA256 digest")
 
 
 @dataclass(frozen=True)
@@ -515,8 +580,22 @@ def validate_plan_shape(value: object) -> None:
                     f"tasks[{index}].construction_envelope is missing field {missing_envelope[0]}",
                 )
             _string_array(envelope["allowed_paths"], f"tasks[{index}].construction_envelope.allowed_paths", allow_empty=False)
-            _string_array(envelope["done_when"], f"tasks[{index}].construction_envelope.done_when", allow_empty=False)
-            _string_array(envelope["negative_checks"], f"tasks[{index}].construction_envelope.negative_checks", allow_empty=False)
+            _construction_check(
+                envelope["done_when"],
+                f"tasks[{index}].construction_envelope.done_when",
+                kind="TEST",
+                expected_zero=True,
+            )
+            negative_checks = envelope["negative_checks"]
+            if not isinstance(negative_checks, list) or not negative_checks:
+                _raise("PLAN_INVALID", f"tasks[{index}].construction_envelope.negative_checks must be a non-empty array")
+            for check_index, check in enumerate(negative_checks):
+                _construction_check(
+                    check,
+                    f"tasks[{index}].construction_envelope.negative_checks[{check_index}]",
+                    kind="COMMAND",
+                    expected_zero=False,
+                )
             evidence = envelope["evidence"]
             if not isinstance(evidence, Mapping):
                 _raise("INVALID_TYPE", f"tasks[{index}].construction_envelope.evidence must be an object")
@@ -532,12 +611,31 @@ def validate_plan_shape(value: object) -> None:
                     "MISSING_FIELD",
                     f"tasks[{index}].construction_envelope.evidence is missing field {missing_evidence[0]}",
                 )
-            for level in ("L0", "L1", "L2"):
-                _string_array(
-                    evidence[level],
-                    f"tasks[{index}].construction_envelope.evidence.{level}",
-                    allow_empty=False,
-                )
+            _construction_hash_check(
+                evidence["L0"], f"tasks[{index}].construction_envelope.evidence.L0"
+            )
+            _construction_check(
+                evidence["L1"],
+                f"tasks[{index}].construction_envelope.evidence.L1",
+                kind="COMMAND",
+                expected_zero=True,
+            )
+            _construction_check(
+                evidence["L2"],
+                f"tasks[{index}].construction_envelope.evidence.L2",
+                kind="TEST",
+                expected_zero=True,
+            )
+            classification = _construction_object(
+                envelope["risk_classification"],
+                f"tasks[{index}].construction_envelope.risk_classification",
+                CONSTRUCTION_RISK_CLASSIFICATION_FIELDS,
+            )
+            if classification["kind"] != "LOCAL_DETERMINISTIC_IMPLEMENTATION":
+                _raise("PLAN_INVALID", "luna construction requires a local deterministic classification")
+            for field in ("security", "authorization", "protocol", "control_plane"):
+                if classification[field] is not False:
+                    _raise("PLAN_INVALID", f"luna construction cannot declare {field}")
     stages = plan["stages"]
     if not isinstance(stages, list):
         _raise("INVALID_TYPE", "stages must be an array")

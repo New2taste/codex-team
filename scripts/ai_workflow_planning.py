@@ -84,20 +84,45 @@ def _scope_within(scope: PurePosixPath, allowed: PurePosixPath) -> bool:
 
 
 @dataclass(frozen=True)
+class ConstructionCheck:
+    """One mechanically verifiable command or artifact requirement."""
+
+    kind: str
+    artifact: str
+    command: str | None = None
+    expected_exit: int | None = None
+    assertion: str | None = None
+    sha256: str | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        if self.kind == "HASH":
+            return {"kind": self.kind, "artifact": self.artifact, "sha256": self.sha256}
+        return {
+            "kind": self.kind,
+            "command": self.command,
+            "expected_exit": self.expected_exit,
+            "assertion": self.assertion,
+            "artifact": self.artifact,
+        }
+
+
+@dataclass(frozen=True)
 class ConstructionEnvelope:
     """A complete, path-bounded construction contract for a Luna owner."""
 
     allowed_paths: tuple[str, ...]
-    done_when: tuple[str, ...]
-    evidence: tuple[tuple[str, tuple[str, ...]], ...]
-    negative_checks: tuple[str, ...]
+    done_when: ConstructionCheck
+    evidence: tuple[tuple[str, ConstructionCheck], ...]
+    negative_checks: tuple[ConstructionCheck, ...]
+    risk_classification: tuple[tuple[str, object], ...]
 
     def to_dict(self) -> dict[str, object]:
         return {
             "allowed_paths": list(self.allowed_paths),
-            "done_when": list(self.done_when),
-            "evidence": {level: list(records) for level, records in self.evidence},
-            "negative_checks": list(self.negative_checks),
+            "done_when": self.done_when.to_dict(),
+            "evidence": {level: record.to_dict() for level, record in self.evidence},
+            "negative_checks": [record.to_dict() for record in self.negative_checks],
+            "risk_classification": dict(self.risk_classification),
         }
 
 
@@ -234,27 +259,80 @@ def _validate_write_ownership(tasks: tuple[FrozenSubtask, ...]) -> None:
             claims.append((task.id, scope))
 
 
+def _construction_check(value: object, *, expected_kind: str, negative: bool = False) -> ConstructionCheck:
+    if not isinstance(value, Mapping):
+        _fail("PLAN_INVALID", "construction check must be an object")
+    kind = value.get("kind")
+    if kind != expected_kind:
+        _fail("PLAN_INVALID", f"construction check kind must be {expected_kind}")
+    artifact = normalize_scope(value.get("artifact"))
+    if kind == "HASH":
+        digest = value.get("sha256")
+        if not isinstance(digest, str) or len(digest) != 64:
+            _fail("PLAN_INVALID", "construction hash check requires a SHA256 digest")
+        return ConstructionCheck(kind=kind, artifact=artifact.as_posix(), sha256=digest)
+    command = value.get("command")
+    assertion = value.get("assertion")
+    expected_exit = value.get("expected_exit")
+    if (
+        not isinstance(command, str)
+        or not command.strip()
+        or command.strip() in {"true", ":", "/usr/bin/true"}
+        or not isinstance(assertion, str)
+        or not assertion.strip()
+        or isinstance(expected_exit, bool)
+        or not isinstance(expected_exit, int)
+        or (negative and expected_exit == 0)
+        or (not negative and expected_exit != 0)
+    ):
+        _fail("PLAN_INVALID", "construction command check is not mechanically bound")
+    return ConstructionCheck(
+        kind=kind,
+        artifact=artifact.as_posix(),
+        command=command,
+        expected_exit=expected_exit,
+        assertion=assertion,
+    )
+
+
 def _construction_envelope(value: object) -> ConstructionEnvelope:
     if not isinstance(value, Mapping):
         _fail("PLAN_INVALID", "construction_envelope must be an object")
     allowed_paths = _scope_strings(value["allowed_paths"], field="construction_envelope.allowed_paths")
-    done_when = _required_nonempty_strings(value["done_when"], field="construction_envelope.done_when")
-    negative_checks = _required_nonempty_strings(
-        value["negative_checks"], field="construction_envelope.negative_checks"
+    done_when = _construction_check(value["done_when"], expected_kind="TEST")
+    negative_raw = value["negative_checks"]
+    if not isinstance(negative_raw, list) or not negative_raw:
+        _fail("PLAN_INVALID", "construction_envelope.negative_checks must be a non-empty array")
+    negative_checks = tuple(
+        _construction_check(item, expected_kind="COMMAND", negative=True)
+        for item in negative_raw
     )
     evidence = value["evidence"]
     if not isinstance(evidence, Mapping):
         _fail("PLAN_INVALID", "construction_envelope.evidence must be an object")
-    levels: list[tuple[str, tuple[str, ...]]] = []
-    for level in ("L0", "L1", "L2"):
-        levels.append(
-            (level, _required_nonempty_strings(evidence[level], field=f"construction_envelope.evidence.{level}"))
+    levels = [
+        ("L0", _construction_check(evidence["L0"], expected_kind="HASH")),
+        ("L1", _construction_check(evidence["L1"], expected_kind="COMMAND")),
+        ("L2", _construction_check(evidence["L2"], expected_kind="TEST")),
+    ]
+    classification = value["risk_classification"]
+    if not isinstance(classification, Mapping):
+        _fail("PLAN_INVALID", "construction_envelope.risk_classification must be an object")
+    classification_value = dict(classification)
+    if (
+        classification_value.get("kind") != "LOCAL_DETERMINISTIC_IMPLEMENTATION"
+        or any(
+            classification_value.get(field) is not False
+            for field in ("security", "authorization", "protocol", "control_plane")
         )
+    ):
+        _fail("PLAN_INVALID", "luna construction risk classification is not eligible")
     return ConstructionEnvelope(
         allowed_paths=allowed_paths,
         done_when=done_when,
         evidence=tuple(levels),
         negative_checks=negative_checks,
+        risk_classification=tuple(sorted(classification_value.items())),
     )
 
 
@@ -266,6 +344,92 @@ def _required_nonempty_strings(value: object, *, field: str) -> tuple[str, ...]:
     if len(value) != len(set(value)):
         _fail("PLAN_INVALID", f"{field} must not contain duplicates")
     return tuple(value)
+
+
+def _luna_scope_is_forbidden(scope: str) -> bool:
+    path = normalize_scope(scope)
+    parts = path.parts
+    if not parts:
+        return True
+    if parts[0] in {".git", ".superpowers", "logs"}:
+        return True
+    if len(parts) >= 2 and parts[:2] == ("data", "state"):
+        return True
+    if parts[0] == "config" and path.name.startswith("ai_workflow"):
+        return True
+    return parts[0] == "scripts" and path.name.startswith("ai_workflow")
+
+
+def _luna_semantics_are_prohibited(task: Mapping[str, object], subtask: Mapping[str, object]) -> bool:
+    """Classify protected surfaces from relationships, not only declared flags.
+
+    A Luna envelope is an opt-in exception for deterministic local construction.
+    The classification is intentionally conservative: protected *relations* such
+    as a subject receiving authority are rejected even when the producer omitted
+    the corresponding risk flag.  This complements the explicit structural
+    risk classification, bounded path checks, and parent-task risk flags.
+    """
+
+    values = (
+        task.get("objective"),
+        subtask.get("expected_result"),
+        subtask.get("first_artifact"),
+    )
+    text = " ".join(value for value in values if isinstance(value, str)).casefold()
+    direct_protected_surfaces = (
+        "security",
+        "authorization",
+        "authentication",
+        "principal",
+        "access boundar",
+        "credential",
+        "secret",
+        "token",
+        "protocol",
+        "control plane",
+        "routing",
+        "workflow",
+        "runtime",
+        "sandbox",
+        "identity",
+        "policy",
+    )
+    if any(marker in text for marker in direct_protected_surfaces):
+        return True
+    authority_subjects = (
+        "operator",
+        "user",
+        "account",
+        "tenant",
+        "client",
+        "member",
+        "group",
+        "service",
+    )
+    authority_actions = (
+        "allow",
+        "deny",
+        "restrict",
+        "permit",
+        "grant",
+        "revoke",
+        "access",
+        "capabilit",
+        "privilege",
+        "may change",
+        "can change",
+        "may operate",
+        "can operate",
+    )
+    if any(subject in text for subject in authority_subjects) and any(
+        action in text for action in authority_actions
+    ):
+        return True
+    control_targets = ("production", "deployment", "runtime", "configuration", "service behavior")
+    control_actions = ("change", "modify", "enable", "disable", "start", "stop", "route")
+    return any(target in text for target in control_targets) and any(
+        action in text for action in control_actions
+    )
 
 
 def validate_plan(plan: object, task: Mapping[str, object]) -> FrozenPlan:
@@ -315,10 +479,22 @@ def validate_plan(plan: object, task: Mapping[str, object]) -> FrozenPlan:
                 _fail("PLAN_INVALID", "luna_construction requires construction_envelope")
             if task_value["task_type"] != "REMEDIATION" or task_value["risk_flags"]:
                 _fail("PLAN_INVALID", "luna_construction is limited to low-risk remediation work")
+            if _luna_semantics_are_prohibited(task_value, value):
+                _fail("PLAN_INVALID", "luna_construction cannot own a protected semantic surface")
             if not write_scope or not value["verification_commands"]:
                 _fail("PLAN_INVALID", "luna_construction requires write_scope and verification_commands")
             if tuple(write_scope) != construction_envelope.allowed_paths:
                 _fail("PLAN_INVALID", "luna construction allowed_paths must exactly match write_scope")
+            bound_scopes = set(write_scope) | set(read_scope)
+            if any(_luna_scope_is_forbidden(scope) for scope in bound_scopes):
+                _fail("PLAN_INVALID", "luna construction cannot access metadata or control-plane paths")
+            checks = (
+                construction_envelope.done_when,
+                *(record for _, record in construction_envelope.evidence),
+                *construction_envelope.negative_checks,
+            )
+            if any(check.artifact not in bound_scopes for check in checks):
+                _fail("PLAN_INVALID", "construction evidence must bind an authorized scope")
         elif construction_envelope is not None:
             _fail("PLAN_INVALID", "construction_envelope is reserved for luna_construction")
         frozen_tasks.append(
@@ -502,6 +678,8 @@ def record_dispatch(
     subtask_id: str,
     attempt: int,
     candidate_commit: str,
+    *,
+    store_locked: bool = False,
 ) -> str:
     """Append one immutable dispatch record and return its canonical identity."""
 
@@ -534,9 +712,10 @@ def record_dispatch(
         attempt,
         candidate_commit,
     )
-    method = getattr(store, "record_dispatch", None)
+    method_name = "_record_dispatch_locked" if store_locked else "record_dispatch"
+    method = getattr(store, method_name, None)
     if not callable(method):
-        _fail("PLAN_INVALID", "dispatch store does not support append-only records")
+        _fail("PLAN_INVALID", "dispatch store does not support the required append-only launch")
     method(
         task_id,
         identity,

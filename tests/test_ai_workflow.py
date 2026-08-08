@@ -746,8 +746,17 @@ class GatedPipelineTest(unittest.TestCase):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.state_root = Path(self.temporary_directory.name) / "state"
         self.store = workflow.WorkflowStore(self.state_root)
+        legacy_config = workflow._load_workflow_config()
+        legacy_config["routing"] = {"mode": "legacy", "role_policy": "legacy"}
+        self.legacy_policy = mock.patch.object(
+            workflow,
+            "_load_workflow_config",
+            return_value=legacy_config,
+        )
+        self.legacy_policy.start()
 
     def tearDown(self):
+        self.legacy_policy.stop()
         self.temporary_directory.cleanup()
 
     def _task(self, task_type="PLAN", risk_flags=None):
@@ -1912,6 +1921,14 @@ class FinalSafetyRegressionTest(unittest.TestCase):
 
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
+        legacy_config = workflow._load_workflow_config()
+        legacy_config["routing"] = {"mode": "legacy", "role_policy": "legacy"}
+        self.legacy_policy = mock.patch.object(
+            workflow,
+            "_load_workflow_config",
+            return_value=legacy_config,
+        )
+        self.legacy_policy.start()
         self.repo = Path(self.temporary_directory.name) / "repository"
         self.repo.mkdir()
         self._git("init")
@@ -1923,6 +1940,7 @@ class FinalSafetyRegressionTest(unittest.TestCase):
         self.base_commit = self._git("rev-parse", "HEAD")
 
     def tearDown(self):
+        self.legacy_policy.stop()
         self.temporary_directory.cleanup()
 
     def _git(self, *args):
