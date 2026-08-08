@@ -49,6 +49,11 @@ class ContractFilesTest(unittest.TestCase):
         task_schema = json.loads((ROOT / "config/ai_workflow_task.schema.json").read_text())
         result_schema = json.loads((ROOT / "config/ai_workflow_result.schema.json").read_text())
         self.assertEqual(task_schema["properties"]["schema_version"]["const"], "ai-task-1")
+        self.assertEqual(
+            {"type": "string", "minLength": 1},
+            task_schema["properties"]["paired_case_id"],
+        )
+        self.assertNotIn("paired_case_id", task_schema["required"])
         self.assertEqual(result_schema["properties"]["schema_version"]["const"], "ai-result-1")
         self.assertEqual(
             set(task_schema["properties"]["verification_level"]["enum"]),
@@ -103,6 +108,25 @@ class TaskValidationTest(unittest.TestCase):
         task["surprise"] = True
         with self.assertRaisesRegex(workflow.WorkflowError, "UNKNOWN_FIELD"):
             workflow.validate_task(task)
+
+    def test_optional_paired_case_id_is_stored_and_legacy_tasks_remain_valid(self):
+        legacy = self.valid_task()
+        workflow.validate_task(legacy)
+        task = self.valid_task()
+        task["paired_case_id"] = "case-01"
+        workflow.validate_task(task)
+        with tempfile.TemporaryDirectory() as temporary:
+            stored = workflow.WorkflowStore(Path(temporary)).create_task(task)
+            self.assertEqual("case-01", json.loads(stored.read_text())["paired_case_id"])
+
+    def test_optional_paired_case_id_rejects_blank_or_non_string_values(self):
+        for value in ("", "   ", 1, None):
+            task = self.valid_task()
+            task["paired_case_id"] = value
+            with self.subTest(value=value), self.assertRaisesRegex(
+                workflow.WorkflowError, "(?:INVALID_TYPE|EMPTY_FIELD)"
+            ):
+                workflow.validate_task(task)
 
     def test_acceptance_requires_both_commits(self):
         task = self.valid_task()
@@ -163,9 +187,11 @@ class MetricsReportTest(unittest.TestCase):
     def tearDown(self):
         self.temporary_directory.cleanup()
 
-    def _create_task(self, task_id):
+    def _create_task(self, task_id, *, paired_case_id=None):
         task = TaskValidationTest().valid_task()
         task["task_id"] = task_id
+        if paired_case_id is not None:
+            task["paired_case_id"] = paired_case_id
         self.store.create_task(task)
         return task_id
 
@@ -235,34 +261,206 @@ class MetricsReportTest(unittest.TestCase):
 
     def test_unpaired_cost_attempt_is_reported_unavailable_and_not_aggregated(self):
         task_id = self._create_task("AWF-20260803-004")
+        with mock.patch.object(workflow, "WORKFLOW_STATE_ROOT", self.state_root):
+            workflow.record_metrics(
+                task_id,
+                {
+                    "role": "luna",
+                    "cost_evidence": {
+                        "schema_version": "cost-evidence-1",
+                        "route": "blocked",
+                        "role": "luna",
+                        "execution_surface": "NATIVE_SUBAGENT",
+                        "duration_seconds": 1.0,
+                        "prompt_bytes": 0,
+                        "input_tokens": None,
+                        "cached_input_tokens": None,
+                        "output_tokens": None,
+                        "retry_kind": "none",
+                        "verification_seconds": 0.0,
+                        "quality_outcome": "FAILED",
+                        "paired_case_id": None,
+                        "evidence_class": "unavailable",
+                        "rate_snapshot_id": None,
+                    },
+                },
+                _controller_owned=True,
+            )
+        metrics = workflow.aggregate_metrics(self.state_root)
+        self.assertEqual({}, metrics["cost_summary"])
+        self.assertEqual(1, metrics["cost_unavailable_attempt_count"])
+        report = workflow.render_report(metrics)
+        self.assertIn("- unavailable attempts: 1", report)
+
+    def test_record_metrics_strips_model_supplied_cost_evidence(self):
+        task_id = self._create_task("AWF-20260803-005")
         self._record(
             task_id,
             {
                 "role": "luna",
                 "cost_evidence": {
                     "schema_version": "cost-evidence-1",
-                    "route": "blocked",
+                    "route": "direct",
                     "role": "luna",
                     "execution_surface": "NATIVE_SUBAGENT",
                     "duration_seconds": 1.0,
-                    "prompt_bytes": 0,
-                    "input_tokens": None,
-                    "cached_input_tokens": None,
-                    "output_tokens": None,
+                    "prompt_bytes": 5,
+                    "input_tokens": 999,
+                    "cached_input_tokens": 0,
+                    "output_tokens": 1,
                     "retry_kind": "none",
                     "verification_seconds": 0.0,
-                    "quality_outcome": "FAILED",
-                    "paired_case_id": None,
-                    "evidence_class": "unavailable",
+                    "quality_outcome": "SUPPORTED",
+                    "paired_case_id": "case-forged",
+                    "evidence_class": "measured",
                     "rate_snapshot_id": None,
                 },
             },
         )
+        document = json.loads(
+            (self.state_root / task_id / "metrics.json").read_text(encoding="utf-8")
+        )
+        self.assertNotIn("cost_evidence", document["runs"][0])
+        self.assertEqual({}, workflow.aggregate_metrics(self.state_root)["cost_summary"])
+
+    def test_native_runner_stale_runtime_usage_is_not_cost_evidence(self):
+        task_id = self._create_task("AWF-20260803-006")
+        task = workflow.load_task(self.state_root / task_id / "task.json")
+
+        class StaleRunner:
+            is_live_model = False
+            runtime_usage = {
+                "input_tokens": 999,
+                "cached_input_tokens": 1,
+                "output_tokens": 2,
+            }
+
+            def run(self, role, task):
+                return workflow.FakeRunner().run(role, task)
+
+        with mock.patch.object(workflow, "WORKFLOW_STATE_ROOT", self.state_root):
+            workflow._run_role_with_technical_retry(
+                self.store,
+                task_id,
+                task,
+                "EVIDENCE_RUNNING",
+                "luna",
+                StaleRunner(),
+                workflow.RetryBudget(),
+            )
+        document = json.loads(
+            (self.state_root / task_id / "metrics.json").read_text(encoding="utf-8")
+        )
+        evidence = document["runs"][0]["cost_evidence"]
+        self.assertEqual("unavailable", evidence["evidence_class"])
+        self.assertIsNone(evidence["input_tokens"])
+
+    def test_invalid_role_result_is_recorded_as_failed_cost_attempt(self):
+        task_id = self._create_task("AWF-20260803-008")
+        task = workflow.load_task(self.state_root / task_id / "task.json")
+
+        class InvalidRunner:
+            is_live_model = False
+
+            def run(self, role, task):
+                return {"role": role, "status": "SUPPORTED"}
+
+        with mock.patch.object(workflow, "WORKFLOW_STATE_ROOT", self.state_root):
+            result, state = workflow._run_role_with_technical_retry(
+                self.store,
+                task_id,
+                task,
+                "EVIDENCE_RUNNING",
+                "luna",
+                InvalidRunner(),
+                workflow.RetryBudget(),
+            )
+        self.assertIsNone(result)
+        self.assertEqual("BLOCKED", state)
+        document = json.loads(
+            (self.state_root / task_id / "metrics.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(2, len(document["runs"]))
+        self.assertEqual(
+            ["FAILED", "FAILED"],
+            [run["cost_evidence"]["quality_outcome"] for run in document["runs"]],
+        )
+
+    def test_live_guard_failure_is_recorded_as_failed_cost_attempt(self):
+        task_id = self._create_task("AWF-20260803-009")
+        task = workflow.load_task(self.state_root / task_id / "task.json")
+
+        class LiveRunner:
+            is_live_model = True
+
+            def run(self, role, task):
+                return workflow.FakeRunner().run(role, task)
+
+        with (
+            mock.patch.object(workflow, "WORKFLOW_STATE_ROOT", self.state_root),
+            mock.patch.object(workflow, "_reject_dirty_input"),
+            mock.patch.object(workflow, "working_tree_paths", return_value=set()),
+            mock.patch.object(
+                workflow,
+                "capture_repo",
+                side_effect=[
+                    workflow.RepoSnapshot("before", ()),
+                    workflow.RepoSnapshot("after", ()),
+                ],
+            ),
+        ):
+            result, state = workflow._run_role_with_technical_retry(
+                self.store,
+                task_id,
+                task,
+                "EVIDENCE_RUNNING",
+                "luna",
+                LiveRunner(),
+                workflow.RetryBudget(),
+            )
+        self.assertIsNone(result)
+        self.assertEqual("BLOCKED", state)
+        document = json.loads(
+            (self.state_root / task_id / "metrics.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual("FAILED", document["runs"][0]["cost_evidence"]["quality_outcome"])
+
+    def test_aggregate_metrics_excludes_synthetic_fixture_records_but_keeps_production(self):
+        task_id = self._create_task("AWF-20260803-007", paired_case_id="case-production")
+        task = workflow.load_task(self.state_root / task_id / "task.json")
+        workflow._controller_cost_attempt(
+            task_id,
+            task,
+            "luna",
+            workflow.NATIVE_SUBAGENT,
+            1.0,
+            10,
+            None,
+            "none",
+            "SUPPORTED",
+            self.state_root,
+        )
+        fixture = json.loads(
+            (ROOT / "tests" / "fixtures" / "paired-cases.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        synthetic_attempt = dict(fixture["cases"][0]["attempts"][0])
+        synthetic_attempt["evidence_origin"] = "synthetic_fixture"
+        workflow.record_metrics(
+            task_id,
+            {"role": "terra", "cost_evidence": synthetic_attempt},
+            state_root=self.state_root,
+            _controller_owned=True,
+        )
         metrics = workflow.aggregate_metrics(self.state_root)
-        self.assertEqual({}, metrics["cost_summary"])
-        self.assertEqual(1, metrics["cost_unavailable_attempt_count"])
-        report = workflow.render_report(metrics)
-        self.assertIn("- unavailable attempts: 1", report)
+        self.assertEqual({"case-production"}, set(metrics["cost_summary"]))
+        self.assertEqual(1, metrics["synthetic_cost_attempt_count"])
+        self.assertEqual({"luna": 1}, metrics["role_calls"])
+        self.assertIn(
+            "synthetic fixture records: 1 (not publishable)",
+            workflow.render_report(metrics),
+        )
 
     def test_aggregate_metrics_separates_luna_value_and_review_cost(self):
         calibration_task = self._create_task("AWF-20260803-001")
@@ -955,6 +1153,58 @@ class CodexRunnerTest(unittest.TestCase):
         self.assertEqual(len("task contract".encode("utf-8")), evidence["prompt_bytes"])
         self.assertEqual("measured", evidence["evidence_class"])
         self.assertIsNone(evidence["paired_case_id"])
+
+    @mock.patch(
+        "scripts.ai_workflow.capture_repo",
+        return_value=workflow.RepoSnapshot("pinned-head", ()),
+    )
+    @mock.patch("scripts.ai_workflow.working_tree_paths", return_value=set())
+    @mock.patch("scripts.ai_workflow.subprocess.run")
+    def test_codex_usage_is_unavailable_when_runtime_identity_validation_fails(
+        self, run, _working_tree_paths, _capture_repo
+    ):
+        task = self.valid_task()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_root = root / "state"
+            workflow.WorkflowStore(state_root).create_task(task)
+            sessions = root / "sessions"
+            sessions.mkdir()
+            paths = workflow.RunPaths(
+                repo=ROOT,
+                output_path=root / "luna-result.json",
+                schema_path=ROOT / "config/ai_workflow_result.schema.json",
+                logs_dir=root / "logs",
+                state_root=state_root,
+                runtime_evidence_required=True,
+                runtime_sessions_dir=sessions,
+            )
+
+            def write_usage_result(command, *args, **kwargs):
+                write_codex_result(command, workflow.FakeRunner().run("luna", task))
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    stdout=(
+                        '{"type":"turn.completed","usage":'
+                        '{"input_tokens":11,"cached_input_tokens":2,"output_tokens":3}}\n'
+                    ),
+                    stderr="",
+                )
+
+            run.side_effect = write_usage_result
+            with self.assertRaisesRegex(workflow.WorkflowError, "RUNTIME_EVIDENCE"):
+                workflow.run_codex("luna", task, "task contract", paths)
+            document = json.loads(
+                (state_root / task["task_id"] / "metrics.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        evidence = document["runs"][0]["cost_evidence"]
+        self.assertEqual("FAILED", evidence["quality_outcome"])
+        self.assertEqual("unavailable", evidence["evidence_class"])
+        self.assertIsNone(evidence["input_tokens"])
 
     @mock.patch(
         "scripts.ai_workflow.capture_repo",

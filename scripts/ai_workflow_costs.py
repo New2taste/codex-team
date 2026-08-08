@@ -92,18 +92,10 @@ _PRICE_FIELDS = frozenset(
         "new_measured_cost",
     }
 )
-_PROJECTED_PRICE_FIELDS = frozenset(
-    {
-        "projected_cost",
-        "projected_cost_usd",
-        "projected_price",
-        "projected_price_usd",
-        "estimated_cost",
-        "estimated_cost_usd",
-        "estimated_price",
-        "estimated_price_usd",
-    }
-)
+# Every accepted price/cost value is projection evidence.  Keeping this as
+# the full closed set prevents a newly named price field from silently
+# entering measured evidence.
+_PROJECTED_PRICE_FIELDS = _PRICE_FIELDS
 _OPTIONAL_INPUT_FIELDS = frozenset(
     {
         "schema_version",
@@ -125,6 +117,7 @@ _OPTIONAL_INPUT_FIELDS = frozenset(
         "attempt_id",
         "task_id",
         "timestamp_utc",
+        "evidence_origin",
         "failed",
         "baseline_quality_points",
         "new_quality_points",

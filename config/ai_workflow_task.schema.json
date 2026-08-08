@@ -9,6 +9,10 @@
       "type": "string",
       "minLength": 1
     },
+    "paired_case_id": {
+      "type": "string",
+      "minLength": 1
+    },
     "task_type": {
       "type": "string",
       "enum": ["PLAN", "ACCEPTANCE", "REMEDIATION"]

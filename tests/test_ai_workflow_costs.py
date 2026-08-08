@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 from scripts import ai_workflow as workflow
+from scripts import ai_workflow_costs as costs
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -190,6 +191,34 @@ class PairingAndClaimGateTest(unittest.TestCase):
                     projected_cost_usd=0.25,
                 )
             )
+
+    def test_every_accepted_price_field_requires_projection_and_rate_snapshot(self):
+        for field in sorted(costs._PRICE_FIELDS):
+            measured = cost_record(
+                input_tokens=10,
+                duration_seconds=1.0,
+                evidence_class="measured",
+                **{field: 0.25},
+            )
+            with self.subTest(field=field), self.assertRaisesRegex(
+                workflow.WorkflowError, "COST_EVIDENCE_INVALID"
+            ):
+                workflow.normalize_cost_evidence(measured)
+
+            projection = cost_record(
+                input_tokens=None,
+                cached_input_tokens=None,
+                output_tokens=None,
+                duration_seconds=None,
+                evidence_class="sample_validated_projection",
+                rate_snapshot_id="rates-2026-08-08",
+                **{field: 0.25},
+            )
+            with self.subTest(field=f"projection:{field}"):
+                self.assertEqual(
+                    "sample_validated_projection",
+                    workflow.normalize_cost_evidence(projection).evidence_class,
+                )
 
     def test_paired_fixture_is_stable_stratified_and_has_both_surfaces(self):
         fixture = json.loads(
