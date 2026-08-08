@@ -114,18 +114,25 @@ def _require_regular(directory: int, name: str) -> os.stat_result:
     return status
 
 
-def _read_regular(directory: int, name: str) -> bytes:
-    _require_regular(directory, name)
+def _read_regular_identity(
+    directory: int, name: str
+) -> tuple[bytes, FileIdentity]:
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     try:
         descriptor = os.open(name, flags, dir_fd=directory)
         with os.fdopen(descriptor, "rb") as handle:
-            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            status = os.fstat(handle.fileno())
+            if not stat.S_ISREG(status.st_mode):
                 _fail("unsafe target entry")
-            return handle.read()
+            content = handle.read()
     except OSError as exc:
         _fail("unreadable target entry")
         raise AssertionError("unreachable") from exc
+    return content, (status.st_dev, status.st_ino, _sha256(content))
+
+
+def _read_regular(directory: int, name: str) -> bytes:
+    return _read_regular_identity(directory, name)[0]
 
 
 def _sha256(data: bytes) -> str:
@@ -377,36 +384,41 @@ def _state_content(installed_sha: str, backup_sha: str | None) -> bytes:
     return (json.dumps(value, separators=(",", ":")) + "\n").encode("utf-8")
 
 
-def _classify(directory: int | None, template_sha: str) -> tuple[str, str | None, str | None]:
+def _classify(
+    directory: int | None, template_sha: str
+) -> tuple[str, FileIdentity | None, FileIdentity | None]:
     if directory is None:
         return "missing", None, None
     state_status = _entry_stat(directory, STATE_FILENAME)
     destination_status = _entry_stat(directory, TARGET_FILENAME)
     backup_status = _entry_stat(directory, BACKUP_FILENAME)
     if state_status is not None:
-        _require_regular(directory, STATE_FILENAME)
-        _require_regular(directory, TARGET_FILENAME)
-        state_backup = _parse_state(_read_regular(directory, STATE_FILENAME), template_sha)
-        destination_sha = _hash_regular(directory, TARGET_FILENAME)
-        if destination_sha != template_sha:
+        state_content, _ = _read_regular_identity(directory, STATE_FILENAME)
+        _, destination_identity = _read_regular_identity(
+            directory, TARGET_FILENAME
+        )
+        state_backup = _parse_state(state_content, template_sha)
+        if destination_identity[2] != template_sha:
             _fail("installed Agent differs from owned state")
+        backup_identity: FileIdentity | None = None
         if state_backup is None:
             if backup_status is not None:
                 _fail("unexpected backup")
         else:
-            _require_regular(directory, BACKUP_FILENAME)
-            if _hash_regular(directory, BACKUP_FILENAME) != state_backup:
+            _, backup_identity = _read_regular_identity(
+                directory, BACKUP_FILENAME
+            )
+            if backup_identity[2] != state_backup:
                 _fail("backup differs from owned state")
-        return "current", destination_sha, state_backup
+        return "current", destination_identity, backup_identity
     if backup_status is not None:
         _fail("unexpected backup")
     if destination_status is None:
         return "missing", None, None
-    _require_regular(directory, TARGET_FILENAME)
-    destination_sha = _hash_regular(directory, TARGET_FILENAME)
-    if destination_sha == RELEASE_SHA256:
-        return "known_legacy", destination_sha, None
-    return "conflict", destination_sha, None
+    _, destination_identity = _read_regular_identity(directory, TARGET_FILENAME)
+    if destination_identity[2] == RELEASE_SHA256:
+        return "known_legacy", destination_identity, None
+    return "conflict", destination_identity, None
 
 
 def _hook(hook: Hook | None, point: str) -> None:
@@ -415,18 +427,7 @@ def _hook(hook: Hook | None, point: str) -> None:
 
 
 def _file_identity(directory: int, name: str) -> FileIdentity:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
-    try:
-        descriptor = os.open(name, flags, dir_fd=directory)
-        with os.fdopen(descriptor, "rb") as handle:
-            status = os.fstat(handle.fileno())
-            if not stat.S_ISREG(status.st_mode):
-                _fail("unsafe target entry")
-            digest = _sha256(handle.read())
-    except OSError as exc:
-        _fail("unreadable target entry")
-        raise AssertionError("unreachable") from exc
-    return status.st_dev, status.st_ino, digest
+    return _read_regular_identity(directory, name)[1]
 
 
 def _discard_owned_publication(
@@ -498,7 +499,7 @@ def install(
     try:
         template, template_sha = _validate_template()
         directory = _open_target_directory(target_directory, create=False)
-        classification, expected_sha, _ = _classify(directory, template_sha)
+        classification, expected_identity, _ = _classify(directory, template_sha)
         if check:
             return 0 if classification == "current" else 1
         if classification == "current" or classification == "conflict":
@@ -507,7 +508,9 @@ def install(
             directory = _open_target_directory(target_directory, create=True)
             if directory is None:
                 _fail("cannot create target directory")
-            classification, expected_sha, _ = _classify(directory, template_sha)
+            classification, expected_identity, _ = _classify(
+                directory, template_sha
+            )
             if classification != "missing":
                 return 1
         staged_agent = _stage(directory, "agent", template)
@@ -552,15 +555,12 @@ def install(
                 raise
             return 0
 
-        if classification != "known_legacy" or expected_sha is None:
-            return 1
-        legacy_identity = _file_identity(directory, TARGET_FILENAME)
-        if legacy_identity[2] != expected_sha:
+        if classification != "known_legacy" or expected_identity is None:
             return 1
         _hook(hook, "install.before_retire_known_legacy")
         tombstone_name, tombstone = _retire_to_tombstone(directory, TARGET_FILENAME)
         moved_identity = _file_identity(tombstone, "payload")
-        if moved_identity != legacy_identity:
+        if moved_identity != expected_identity:
             _preserve_tombstone(directory, TARGET_FILENAME, tombstone)
             return 1
         try:
@@ -577,7 +577,7 @@ def install(
                     published_state,
                     legacy_tombstone_name=tombstone_name,
                     legacy_tombstone=tombstone,
-                    legacy_identity=moved_identity,
+                    legacy_identity=expected_identity,
                 )
                 return 1
         except BaseException:
@@ -587,7 +587,7 @@ def install(
                 published_state,
                 legacy_tombstone_name=tombstone_name,
                 legacy_tombstone=tombstone,
-                legacy_identity=moved_identity,
+                legacy_identity=expected_identity,
             )
             raise
         published_agent = staged_agent_identity
@@ -606,7 +606,7 @@ def install(
                     published_state,
                     legacy_tombstone_name=tombstone_name,
                     legacy_tombstone=tombstone,
-                    legacy_identity=moved_identity,
+                    legacy_identity=expected_identity,
                 )
                 return 1
             published_state = staged_state_identity
@@ -618,7 +618,7 @@ def install(
                 published_state,
                 legacy_tombstone_name=tombstone_name,
                 legacy_tombstone=tombstone,
-                legacy_identity=moved_identity,
+                legacy_identity=expected_identity,
             )
             raise
         discarded = _discard_verified_tombstone(
@@ -683,18 +683,18 @@ def uninstall(
             return 1
         _require_regular(directory, TARGET_FILENAME)
         _require_regular(directory, STATE_FILENAME)
-        state_content = _read_regular(directory, STATE_FILENAME)
-        state_sha = _sha256(state_content)
+        state_content, state_identity = _read_regular_identity(
+            directory, STATE_FILENAME
+        )
         backup_sha = _parse_state(state_content, RELEASE_SHA256)
-        target_identity = _file_identity(directory, TARGET_FILENAME)
+        _, target_identity = _read_regular_identity(directory, TARGET_FILENAME)
         if target_identity[2] != RELEASE_SHA256:
-            return 1
-        state_identity = _file_identity(directory, STATE_FILENAME)
-        if state_identity[2] != state_sha:
             return 1
         backup_identity: FileIdentity | None = None
         if backup_sha is not None:
-            backup_identity = _file_identity(directory, BACKUP_FILENAME)
+            _, backup_identity = _read_regular_identity(
+                directory, BACKUP_FILENAME
+            )
             if backup_identity[2] != backup_sha:
                 return 1
         elif _entry_stat(directory, BACKUP_FILENAME) is not None:
@@ -722,7 +722,7 @@ def uninstall(
         if not _retire_and_discard(
             directory,
             STATE_FILENAME,
-            state_sha,
+            state_identity[2],
             expected_identity=state_identity,
         ):
             _preserve_tombstone(directory, TARGET_FILENAME, tombstone)

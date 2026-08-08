@@ -179,6 +179,26 @@ def raise_from_state_publish(lifecycle, exception_type: type[BaseException]):
     return mock.patch.object(lifecycle, "_publish_no_clobber", side_effect=publish)
 
 
+def patch_after_first_snapshot(lifecycle, name: str, replacement) -> mock._patch:
+    helper_name = (
+        "_read_regular_identity"
+        if hasattr(lifecycle, "_read_regular_identity")
+        else "_read_regular"
+    )
+    original = getattr(lifecycle, helper_name)
+    injected = False
+
+    def read(directory: int, observed_name: str):
+        nonlocal injected
+        result = original(directory, observed_name)
+        if observed_name == name and not injected:
+            injected = True
+            replacement()
+        return result
+
+    return mock.patch.object(lifecycle, helper_name, side_effect=read)
+
+
 def temporary_directory():
     """Create below the physical system temp root on macOS and Linux."""
 
@@ -1184,6 +1204,38 @@ class AgentLifecycleTest(unittest.TestCase):
             )
             self.assertIn(replacement_inode, recoverable_inodes)
 
+    def test_known_legacy_install_binds_its_classification_snapshot_inode(self):
+        lifecycle = load_lifecycle_helper()
+        with temporary_directory() as temporary:
+            root = Path(temporary)
+            target = root / "agents"
+            prepare_known_legacy(target)
+            replacement_inode: int | None = None
+
+            def replace_after_snapshot() -> None:
+                nonlocal replacement_inode
+                replacement = root / "same-digest-classification-race"
+                replacement.write_bytes(KNOWN_LEGACY_TEMPLATE)
+                replacement_inode = replacement.stat().st_ino
+                os.replace(replacement, target / "luna-worker.toml")
+
+            with patch_after_first_snapshot(
+                lifecycle, "luna-worker.toml", replace_after_snapshot
+            ):
+                self.assertEqual(1, lifecycle.install(target))
+
+            self.assertIsNotNone(replacement_inode)
+            recoverable_inodes = [
+                entry.stat().st_ino
+                for entry in target.iterdir()
+                if entry.is_file()
+            ]
+            recoverable_inodes.extend(
+                payload.stat().st_ino
+                for payload in target.glob(".ai-workflow-tombstone-*/payload")
+            )
+            self.assertIn(replacement_inode, recoverable_inodes)
+
     def test_uninstall_preserves_a_raced_user_replacement(self):
         lifecycle = load_lifecycle_helper()
         with temporary_directory() as temporary:
@@ -1273,6 +1325,49 @@ class AgentLifecycleTest(unittest.TestCase):
                         lifecycle,
                         "_retire_and_discard",
                         side_effect=replace_then_retire,
+                    ):
+                        self.assertEqual(1, lifecycle.uninstall(target))
+
+                    self.assertIsNotNone(replacement_inode)
+                    recoverable_inodes = [
+                        entry.stat().st_ino
+                        for entry in target.iterdir()
+                        if entry.is_file()
+                    ]
+                    recoverable_inodes.extend(
+                        payload.stat().st_ino
+                        for payload in target.glob(
+                            ".ai-workflow-tombstone-*/payload"
+                        )
+                    )
+                    self.assertIn(replacement_inode, recoverable_inodes)
+
+    def test_uninstall_binds_each_initial_file_snapshot_inode(self):
+        for raced_name in ("luna-worker.toml", STATE_NAME, BACKUP_NAME):
+            with self.subTest(raced_name=raced_name):
+                lifecycle = load_lifecycle_helper()
+                with temporary_directory() as temporary:
+                    root = Path(temporary)
+                    target = root / "agents"
+                    target.mkdir()
+                    (target / "luna-worker.toml").write_bytes(TEMPLATE.read_bytes())
+                    backup_sha = None
+                    if raced_name == BACKUP_NAME:
+                        (target / BACKUP_NAME).write_bytes(b'name = "backup"\n')
+                        backup_sha = sha256(target / BACKUP_NAME)
+                    write_owned_state(target, backup_sha)
+                    raced_bytes = (target / raced_name).read_bytes()
+                    replacement_inode: int | None = None
+
+                    def replace_after_snapshot() -> None:
+                        nonlocal replacement_inode
+                        replacement = root / f"snapshot-race-{raced_name}"
+                        replacement.write_bytes(raced_bytes)
+                        replacement_inode = replacement.stat().st_ino
+                        os.replace(replacement, target / raced_name)
+
+                    with patch_after_first_snapshot(
+                        lifecycle, raced_name, replace_after_snapshot
                     ):
                         self.assertEqual(1, lifecycle.uninstall(target))
 
