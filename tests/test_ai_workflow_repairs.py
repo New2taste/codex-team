@@ -402,10 +402,27 @@ class RepairProtocolTest(unittest.TestCase):
             }
         )
         workflow.atomic_write_json(self.root / self.task_id / "task.json", task)
+        owner_thread = str(uuid.uuid4())
+        owner_evidence = {
+            "schema_version": "runtime-evidence-1",
+            "attempt_id": "owner-attempt-1",
+            "requested_role": "luna",
+            "execution_surface": "CODEX_EXEC_ROLE_CONTRACT",
+            "observed_agent_type": None,
+            "observed_model": "gpt-5.6-luna",
+            "observed_reasoning_effort": "max",
+            "observed_sandbox_policy": "workspace-write",
+            "observed_permission_profile": "workspace-write",
+            "observed_cwd": str(repository),
+            "evidence_source": "LOCAL_ROLLOUT",
+            "observed_at_utc": "2026-08-09T00:00:00+00:00",
+            "verification_status": "VERIFIED",
+            "failure_reasons": [],
+        }
         owner = repairs.VerifiedActorReceipt(
             assignment_id=hashlib.sha256(f"open:{self.task_id}".encode("utf-8")).hexdigest(),
             execution_surface="CODEX_EXEC_ROLE_CONTRACT",
-            runtime_instance_id="runtime-owner",
+            runtime_instance_id=owner_thread,
             attempt_id="owner-attempt-1",
             requested_role="luna",
             observed_model="gpt-5.6-luna",
@@ -413,13 +430,27 @@ class RepairProtocolTest(unittest.TestCase):
             observed_sandbox_policy="workspace-write",
             observed_permission_profile="workspace-write",
             observed_cwd=str(repository),
-            runtime_evidence_sha256="c" * 64,
+            runtime_evidence_sha256=hashlib.sha256(
+                json.dumps(owner_evidence, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest(),
             native_agent_uuid=None,
-            codex_thread_id=str(uuid.uuid4()),
+            codex_thread_id=owner_thread,
+        )
+        workflow.write_runtime_evidence(self.store, self.task_id, owner_evidence)
+        self.store.append_event(
+            self.task_id,
+            {
+                "event_type": "RUNTIME_EVIDENCE_RECORDED",
+                "attempt_id": owner.attempt_id,
+                "requested_role": owner.requested_role,
+                "execution_surface": owner.execution_surface,
+                "thread_id": owner_thread,
+            },
         )
         repairs.open_task_acceptance(self.store, task, owner)
+        reviewer_thread = str(uuid.uuid4())
         reviewer = repairs.ActorIdentity(
-            "CODEX_EXEC_ROLE_CONTRACT:runtime-reviewer", "terra_xhigh_reviewer"
+            f"CODEX_EXEC_ROLE_CONTRACT:{reviewer_thread}", "terra_xhigh_reviewer"
         )
         assignment = repairs.issue_acceptance_assignment(
             self.store, self.task_id, "REVIEW_1", reviewer
@@ -427,8 +458,8 @@ class RepairProtocolTest(unittest.TestCase):
         receipt = repairs.VerifiedActorReceipt(
             assignment_id=assignment.assignment_id,
             execution_surface="CODEX_EXEC_ROLE_CONTRACT",
-            runtime_instance_id="runtime-reviewer",
-            attempt_id="reviewer-attempt-1",
+            runtime_instance_id=reviewer_thread,
+            attempt_id=assignment.attempt_id,
             requested_role="terra_xhigh_reviewer",
             observed_model="gpt-5.6-terra",
             observed_reasoning_effort="xhigh",
@@ -437,9 +468,7 @@ class RepairProtocolTest(unittest.TestCase):
             observed_cwd=str(repository),
             runtime_evidence_sha256="d" * 64,
             native_agent_uuid=None,
-            codex_thread_id=str(
-                uuid.uuid5(uuid.NAMESPACE_URL, "codex:reviewer:runtime-reviewer")
-            ),
+            codex_thread_id=reviewer_thread,
         )
 
         case = self
@@ -491,16 +520,16 @@ class RepairProtocolTest(unittest.TestCase):
 
         self_task_id = self.task_id
         boundary = ControllerBoundary()
-        with self.assertRaises(workflow.WorkflowError):
+        with self.assertRaisesRegex(workflow.WorkflowError, "ACCEPTANCE_RECEIPT_MISMATCH"):
             repairs.run_assignment(self.store, self.task_id, assignment, boundary)
         self.assertEqual(1, boundary.attestation_calls)
-        self.assertEqual(1, boundary.execution_calls)
+        self.assertEqual(0, boundary.execution_calls)
         events = [
             json.loads(line)
             for line in (self.root / self.task_id / "events.jsonl").read_text(encoding="utf-8").splitlines()
         ]
         failed = [event for event in events if event.get("event_type") == "ASSIGNMENT_ATTEMPT_FAILED"]
-        self.assertEqual(1, len(failed))
+        self.assertEqual(0, len(failed))
 
 
 if __name__ == "__main__":

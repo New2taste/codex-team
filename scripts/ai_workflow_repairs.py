@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shlex
+import shutil
 import subprocess
 import uuid
 from collections.abc import Iterable, Mapping
@@ -87,6 +89,8 @@ _V2_COMMON_FIELDS = frozenset(
         "candidate_commit",
     }
 )
+_MAX_EVIDENCE_TRANSCRIPT_BYTES = 64 * 1024
+_SAFE_EXECUTABLE_PATH = os.defpath
 
 
 def _workflow():
@@ -1234,15 +1238,6 @@ def _v2_append(
     return event
 
 
-def _v2_expected_receipt_attempt(actor: ActorIdentity) -> str:
-    identity = actor.identity
-    if ":" not in identity:
-        _fail("ACCEPTANCE_LEDGER_INVALID", "expected actor identity is not runtime-bound")
-    _, runtime = identity.split(":", 1)
-    label = runtime.removeprefix("runtime-")
-    return f"{label}-attempt-1"
-
-
 def _v2_validate_observed_receipt(receipt: VerifiedActorReceipt, task: Mapping[str, object]) -> None:
     expected = {
         "luna": ("gpt-5.6-luna", "max", "workspace-write", "workspace-write"),
@@ -1273,7 +1268,98 @@ def _v2_validate_observed_receipt(receipt: VerifiedActorReceipt, task: Mapping[s
         _fail("ACCEPTANCE_RECEIPT_MISMATCH", "receipt working directory is invalid")
 
 
+def _v2_verified_runtime_receipt(
+    store: WorkflowStore,
+    task_id: str,
+    receipt: VerifiedActorReceipt,
+    task: Mapping[str, object],
+    *,
+    expected_attempt_id: str | None,
+) -> None:
+    """Bind a receipt to controller-written runtime evidence, never its caller.
+
+    A v2 receipt is only a convenient projection of controller facts.  The
+    authoritative record remains the append-only verified runtime-evidence
+    ledger plus the controller event that recorded the native UUID or fresh
+    Codex thread.  Keeping both sources lets a public adapter object *offer*
+    a receipt while preventing it from inventing one.
+    """
+
+    workflow = _workflow()
+    if expected_attempt_id is not None and receipt.attempt_id != expected_attempt_id:
+        _fail("ACCEPTANCE_RECEIPT_MISMATCH", "receipt attempt does not match the issued capability")
+    identity_source = (
+        receipt.native_agent_uuid
+        if receipt.execution_surface == "NATIVE_SUBAGENT"
+        else receipt.codex_thread_id
+    )
+    if not isinstance(identity_source, str):
+        _fail("ACCEPTANCE_RECEIPT_MISMATCH", "receipt runtime identity source is missing")
+    try:
+        parsed_identity = uuid.UUID(identity_source)
+    except (TypeError, ValueError):
+        _fail("ACCEPTANCE_RECEIPT_MISMATCH", "receipt runtime identity source is not canonical")
+    if str(parsed_identity) != identity_source.lower() or receipt.runtime_instance_id != identity_source:
+        _fail("ACCEPTANCE_RECEIPT_MISMATCH", "receipt runtime instance is not the recorded identity")
+
+    evidence_path = Path(store._require_task(task_id)) / "runtime-evidence.jsonl"
+    try:
+        lines = evidence_path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        lines = []
+    except OSError:
+        _fail("ACCEPTANCE_RECEIPT_MISMATCH", "controller runtime evidence cannot be read")
+    evidence_matches: list[dict[str, object]] = []
+    for line in lines:
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            _fail("ACCEPTANCE_RECEIPT_MISMATCH", "controller runtime evidence is malformed")
+        if not isinstance(value, Mapping):
+            _fail("ACCEPTANCE_RECEIPT_MISMATCH", "controller runtime evidence is malformed")
+        try:
+            workflow.validate_runtime_evidence(value)
+        except RuntimeError:
+            _fail("ACCEPTANCE_RECEIPT_MISMATCH", "controller runtime evidence is invalid")
+        if (
+            value.get("attempt_id") == receipt.attempt_id
+            and value.get("requested_role") == receipt.requested_role
+            and value.get("execution_surface") == receipt.execution_surface
+            and value.get("observed_model") == receipt.observed_model
+            and value.get("observed_reasoning_effort") == receipt.observed_reasoning_effort
+            and value.get("observed_sandbox_policy") == receipt.observed_sandbox_policy
+            and value.get("observed_permission_profile") == receipt.observed_permission_profile
+            and value.get("observed_cwd") == receipt.observed_cwd
+            and value.get("verification_status") == "VERIFIED"
+            and _v2_sha256(value) == receipt.runtime_evidence_sha256
+        ):
+            evidence_matches.append(dict(value))
+    if len(evidence_matches) != 1:
+        _fail("ACCEPTANCE_RECEIPT_MISMATCH", "receipt is not bound to one verified runtime evidence record")
+
+    identity_field = (
+        "native_agent_uuid"
+        if receipt.execution_surface == "NATIVE_SUBAGENT"
+        else "thread_id"
+    )
+    runtime_events = [
+        event
+        for event in workflow._load_event_records(store, task_id)
+        if event.get("event_type") == "RUNTIME_EVIDENCE_RECORDED"
+        and event.get("attempt_id") == receipt.attempt_id
+        and event.get("execution_surface") == receipt.execution_surface
+        and event.get(identity_field) == identity_source
+    ]
+    if len(runtime_events) != 1:
+        _fail("ACCEPTANCE_RECEIPT_MISMATCH", "receipt runtime identity lacks one controller event")
+    recorded_hash = runtime_events[0].get("runtime_evidence_sha256")
+    if recorded_hash is not None and recorded_hash != receipt.runtime_evidence_sha256:
+        _fail("ACCEPTANCE_RECEIPT_MISMATCH", "controller runtime event hash does not match receipt")
+
+
 def _v2_validate_assignment_receipt(
+    store: WorkflowStore,
+    task_id: str,
     assignment: AcceptanceAssignment,
     receipt: VerifiedActorReceipt,
     task: Mapping[str, object],
@@ -1284,26 +1370,14 @@ def _v2_validate_assignment_receipt(
     _v2_validate_observed_receipt(receipt, task)
     if receipt.actor_identity != assignment.expected_actor:
         _fail("ACCEPTANCE_RECEIPT_MISMATCH", "receipt identity does not match the issued actor")
-    if receipt.attempt_id != _v2_expected_receipt_attempt(assignment.expected_actor):
-        _fail("ACCEPTANCE_RECEIPT_MISMATCH", "receipt attempt does not match its issued actor")
-    _, runtime = assignment.expected_actor.identity.split(":", 1)
-    label = runtime.removeprefix("runtime-")
-    expected_identity = str(
-        uuid.uuid5(
-            uuid.NAMESPACE_URL,
-            f"{'native' if receipt.execution_surface == 'NATIVE_SUBAGENT' else 'codex'}:{label}:{runtime}",
-        )
+    _v2_verified_runtime_receipt(
+        store, task_id, receipt, task, expected_attempt_id=assignment.attempt_id
     )
-    observed_identity = (
-        receipt.native_agent_uuid
-        if receipt.execution_surface == "NATIVE_SUBAGENT"
-        else receipt.codex_thread_id
-    )
-    if observed_identity != expected_identity:
-        _fail("ACCEPTANCE_RECEIPT_MISMATCH", "receipt runtime identity source is not issuance-bound")
 
 
 def _v2_validate_controller_attestation(
+    store: WorkflowStore,
+    task_id: str,
     assignment: AcceptanceAssignment,
     attestation: ControllerExecutionAttestation,
     replay: _AcceptanceReplay,
@@ -1320,7 +1394,7 @@ def _v2_validate_controller_attestation(
     ):
         _fail("ACCEPTANCE_RECEIPT_MISMATCH", "controller attestation is not bound to the active capability")
     _v2_validate_assignment_receipt(
-        assignment, attestation.actor_receipt, task, replay.owner_actor
+        store, task_id, assignment, attestation.actor_receipt, task, replay.owner_actor
     )
     if assignment.phase in _REPAIR_PHASES:
         if assignment.capability.write_authority != "assignment-scoped-write":
@@ -1343,12 +1417,53 @@ def _v2_evidence(value: object) -> AdversarialEvidence:
 def _v2_evidence_output(completed: subprocess.CompletedProcess[str]) -> str:
     """Canonical bounded command transcript for the append-only ledger."""
 
+    stdout = completed.stdout if isinstance(completed.stdout, str) else ""
+    stderr = completed.stderr if isinstance(completed.stderr, str) else ""
+    if len(stdout.encode("utf-8", errors="replace")) + len(
+        stderr.encode("utf-8", errors="replace")
+    ) > _MAX_EVIDENCE_TRANSCRIPT_BYTES:
+        _fail("ACCEPTANCE_EVIDENCE_INVALID", "controller verification transcript exceeds its cap")
     return _v2_canonical(
         {
-            "stdout": completed.stdout,
-            "stderr": completed.stderr,
+            "stdout": stdout,
+            "stderr": stderr,
         }
     )
+
+
+def _v2_safe_acceptance_argv(command: str) -> list[str]:
+    """Resolve one intentionally small, non-interpreting acceptance argv.
+
+    ``acceptance_commands`` is a frozen legacy string field, so the controller
+    parses it once and immediately reduces it to a closed argv grammar.  Shell
+    and interpreter expression forms are never accepted, and a caller's PATH
+    is never used to resolve the executable.
+    """
+
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        _fail("ACCEPTANCE_EVIDENCE_INVALID", "frozen acceptance command cannot be parsed")
+    if not argv or any(not isinstance(value, str) or not value for value in argv):
+        _fail("ACCEPTANCE_EVIDENCE_INVALID", "frozen acceptance command is empty")
+    executable = argv[0]
+    basename = Path(executable).name.casefold()
+    forbidden = {"sh", "bash", "zsh", "dash", "fish", "command", "env"}
+    if basename in forbidden or any(
+        token in command for token in (";", "&&", "||", "`", "$(", ">", "<", "\n", "\x00")
+    ):
+        _fail("ACCEPTANCE_EVIDENCE_INVALID", "frozen acceptance command is not safe argv")
+    if basename == "git" and argv[1:] in (["diff", "--check"], ["status", "--porcelain=v1"]):
+        resolved = shutil.which("git", path=_SAFE_EXECUTABLE_PATH)
+    elif basename in {"python", "python3", "python3.11"} and tuple(argv[1:3]) == ("-m", "unittest"):
+        if any(value in {"-c", "-m", "-I", "-S", "-E"} for value in argv[3:]):
+            _fail("ACCEPTANCE_EVIDENCE_INVALID", "frozen acceptance interpreter arguments are not safe")
+        resolved = shutil.which(basename, path=_SAFE_EXECUTABLE_PATH)
+    else:
+        _fail("ACCEPTANCE_EVIDENCE_INVALID", "frozen acceptance command is outside the safe argv allowlist")
+    if not isinstance(resolved, str) or not resolved:
+        _fail("ACCEPTANCE_EVIDENCE_INVALID", "controller safe executable is unavailable")
+    return [resolved, *argv[1:]]
 
 
 def execute_adversarial_evidence(
@@ -1381,12 +1496,13 @@ def execute_adversarial_evidence(
     output_hashes: list[str] = []
     exit_codes: list[int] = []
     for command in commands:
+        argv = _v2_safe_acceptance_argv(command)
         try:
-            argv = shlex.split(command)
-        except ValueError:
-            _fail("ACCEPTANCE_EVIDENCE_INVALID", "frozen acceptance command cannot be parsed")
-        if not argv:
-            _fail("ACCEPTANCE_EVIDENCE_INVALID", "frozen acceptance command is empty")
+            before_command = workflow.capture_repo(repository)
+        except RuntimeError:
+            _fail("ACCEPTANCE_EVIDENCE_INVALID", "controller cannot snapshot verification command input")
+        if before_command != snapshot or before_command.status:
+            _fail("ACCEPTANCE_EVIDENCE_INVALID", "controller verification repository changed before a command")
         try:
             completed = subprocess.run(
                 argv,
@@ -1396,9 +1512,16 @@ def execute_adversarial_evidence(
                 text=True,
                 timeout=30,
                 shell=False,
+                env={"PATH": _SAFE_EXECUTABLE_PATH, "LANG": "C", "LC_ALL": "C", "PYTHONNOUSERSITE": "1"},
             )
         except (OSError, subprocess.TimeoutExpired):
             _fail("ACCEPTANCE_EVIDENCE_INVALID", "controller verification command could not run")
+        try:
+            after_command = workflow.capture_repo(repository)
+        except RuntimeError:
+            _fail("ACCEPTANCE_EVIDENCE_INVALID", "controller cannot snapshot verification command output")
+        if after_command != before_command or after_command.status:
+            _fail("ACCEPTANCE_EVIDENCE_INVALID", "controller verification command changed the repository")
         output = _v2_evidence_output(completed)
         outputs.append(output)
         output_hashes.append(_v2_sha256(output))
@@ -1615,6 +1738,9 @@ def open_task_acceptance(
         if owner_receipt.assignment_id != hashlib.sha256(f"open:{task_id}".encode("utf-8")).hexdigest():
             _fail("ACCEPTANCE_RECEIPT_MISMATCH", "opening receipt is not task-bound")
         _v2_validate_observed_receipt(owner_receipt, stored)
+        _v2_verified_runtime_receipt(
+            store, task_id, owner_receipt, stored, expected_attempt_id=None
+        )
         if owner_receipt.requested_role not in {"luna", "terra_xhigh"}:
             _fail("ACCEPTANCE_RECEIPT_MISMATCH", "only Luna or Terra xhigh may own acceptance")
         owner_actor = owner_receipt.actor_identity
@@ -1669,7 +1795,11 @@ def replay_acceptance_ledger(store: WorkflowStore, task_id: str) -> _AcceptanceR
             owner_actor = _v2_actor(event.get("owner_actor"), "owner_actor")
             if owner_actor != owner_receipt.actor_identity:
                 _fail("ACCEPTANCE_LEDGER_INVALID", "owner actor does not match the opening receipt")
-            _v2_validate_observed_receipt(owner_receipt, _workflow().load_task(store._require_task(task_id) / "task.json"))
+            stored_task = _workflow().load_task(store._require_task(task_id) / "task.json")
+            _v2_validate_observed_receipt(owner_receipt, stored_task)
+            _v2_verified_runtime_receipt(
+                store, task_id, owner_receipt, stored_task, expected_attempt_id=None
+            )
             replay = _AcceptanceReplay(
                 task_id,
                 context.task_sha256,
@@ -1716,7 +1846,9 @@ def replay_acceptance_ledger(store: WorkflowStore, task_id: str) -> _AcceptanceR
                     _fail("ACCEPTANCE_LEDGER_INVALID", "attempt start is duplicated or mismatched")
                 receipt = _v2_receipt(event.get("actor_receipt"), "actor_receipt")
                 stored_task = _workflow().load_task(store._require_task(task_id) / "task.json")
-                _v2_validate_assignment_receipt(assignment, receipt, stored_task, replay.owner_actor)
+                _v2_validate_assignment_receipt(
+                    store, task_id, assignment, receipt, stored_task, replay.owner_actor
+                )
                 if event.get("receipt_sha256") != _v2_sha256(_v2_receipt_payload(receipt)):
                     _fail("ACCEPTANCE_LEDGER_INVALID", "attempt receipt binding drifted")
                 if "controller_attestation" in event or "controller_attestation_sha256" in event:
@@ -1726,6 +1858,8 @@ def replay_acceptance_ledger(store: WorkflowStore, task_id: str) -> _AcceptanceR
                     if event.get("controller_attestation_sha256") != attestation.attestation_sha256:
                         _fail("ACCEPTANCE_LEDGER_INVALID", "controller attestation binding drifted")
                     _v2_validate_controller_attestation(
+                        store,
+                        task_id,
                         assignment,
                         attestation,
                         replay,
@@ -1962,10 +2096,12 @@ def _v2_start_attempt(
     controller_attestation: ControllerExecutionAttestation | None = None,
 ) -> _AcceptanceReplay:
     _v2_require_issued_assignment(replay, assignment)
-    _v2_validate_assignment_receipt(assignment, receipt, stored_task, replay.owner_actor)
+    _v2_validate_assignment_receipt(
+        store, task_id, assignment, receipt, stored_task, replay.owner_actor
+    )
     if controller_attestation is not None:
         _v2_validate_controller_attestation(
-            assignment, controller_attestation, replay, stored_task
+            store, task_id, assignment, controller_attestation, replay, stored_task
         )
         if controller_attestation.actor_receipt != receipt:
             _fail("ACCEPTANCE_RECEIPT_MISMATCH", "controller attestation receipt drifted")
@@ -2066,7 +2202,27 @@ def _v2_validate_repair_output(
     return actual
 
 
-def record_adversarial_review(
+def _v2_reject_orphaned_direct_attempt(
+    store: WorkflowStore,
+    task_id: str,
+    replay: _AcceptanceReplay,
+    context: _TaskContext,
+    assignment: AcceptanceAssignment,
+) -> None:
+    """Prevent a public completion API from adopting an old STARTED attempt."""
+
+    if (
+        replay.active_assignment_id == assignment.assignment_id
+        and assignment.assignment_id in replay.started_receipts
+    ):
+        _v2_recover_orphaned_attempt(store, task_id, replay, context)
+        _fail(
+            "ASSIGNMENT_ATTEMPT_INTERRUPTED",
+            "started assignment was recovered; issue a new capability before retrying",
+        )
+
+
+def _record_adversarial_review(
     store: WorkflowStore,
     task_id: str,
     assignment: AcceptanceAssignment,
@@ -2074,6 +2230,8 @@ def record_adversarial_review(
     verdict: str,
     findings: Iterable[RepairFinding],
     evidence: AdversarialEvidence,
+    *,
+    controller_started: bool,
 ) -> None:
     """Record one independent review with exact findings and evidence binding."""
 
@@ -2087,9 +2245,17 @@ def record_adversarial_review(
             _fail("ACCEPTANCE_SEQUENCE_INVALID", "acceptance ledger is not open")
         context = _v2_context(store, task_id)
         stored_task = _workflow().load_task(store._require_task(task_id) / "task.json")
-        replay = _v2_start_attempt(
-            store, task_id, replay, context, assignment, reviewer_receipt, stored_task
-        )
+        if not controller_started:
+            _v2_reject_orphaned_direct_attempt(
+                store, task_id, replay, context, assignment
+            )
+            replay = _v2_start_attempt(
+                store, task_id, replay, context, assignment, reviewer_receipt, stored_task
+            )
+        else:
+            _v2_require_issued_assignment(replay, assignment)
+            if replay.started_receipts.get(assignment.assignment_id) != reviewer_receipt:
+                _fail("ACCEPTANCE_SEQUENCE_INVALID", "controller-started review receipt drifted")
         try:
             _v2_require_issued_assignment(replay, assignment)
             if assignment.phase not in _REVIEW_PHASES or verdict not in {"ACCEPT", "REWORK"}:
@@ -2145,13 +2311,38 @@ def record_adversarial_review(
             raise
 
 
-def complete_acceptance_assignment(
+def record_adversarial_review(
+    store: WorkflowStore,
+    task_id: str,
+    assignment: AcceptanceAssignment,
+    reviewer_receipt: VerifiedActorReceipt,
+    verdict: str,
+    findings: Iterable[RepairFinding],
+    evidence: AdversarialEvidence,
+) -> None:
+    """Record a direct review only when it starts a fresh assignment attempt."""
+
+    _record_adversarial_review(
+        store,
+        task_id,
+        assignment,
+        reviewer_receipt,
+        verdict,
+        findings,
+        evidence,
+        controller_started=False,
+    )
+
+
+def _complete_acceptance_assignment(
     store: WorkflowStore,
     task_id: str,
     assignment: AcceptanceAssignment,
     actor_receipt: VerifiedActorReceipt,
     output_candidate_commit: str,
     changed_paths: Iterable[str],
+    *,
+    controller_started: bool,
 ) -> None:
     """Accept one actual Git-bounded repair result for the active capability."""
 
@@ -2165,9 +2356,17 @@ def complete_acceptance_assignment(
             _fail("ACCEPTANCE_SEQUENCE_INVALID", "acceptance ledger is not open")
         context = _v2_context(store, task_id)
         stored_task = _workflow().load_task(store._require_task(task_id) / "task.json")
-        replay = _v2_start_attempt(
-            store, task_id, replay, context, assignment, actor_receipt, stored_task
-        )
+        if not controller_started:
+            _v2_reject_orphaned_direct_attempt(
+                store, task_id, replay, context, assignment
+            )
+            replay = _v2_start_attempt(
+                store, task_id, replay, context, assignment, actor_receipt, stored_task
+            )
+        else:
+            _v2_require_issued_assignment(replay, assignment)
+            if replay.started_receipts.get(assignment.assignment_id) != actor_receipt:
+                _fail("ACCEPTANCE_SEQUENCE_INVALID", "controller-started repair receipt drifted")
         try:
             _v2_require_issued_assignment(replay, assignment)
             if assignment.phase not in _REPAIR_PHASES:
@@ -2202,6 +2401,27 @@ def complete_acceptance_assignment(
         except RuntimeError as exc:
             _v2_fail_attempt(store, task_id, replay, context, assignment, exc)
             raise
+
+
+def complete_acceptance_assignment(
+    store: WorkflowStore,
+    task_id: str,
+    assignment: AcceptanceAssignment,
+    actor_receipt: VerifiedActorReceipt,
+    output_candidate_commit: str,
+    changed_paths: Iterable[str],
+) -> None:
+    """Complete a direct repair only when it starts a fresh assignment attempt."""
+
+    _complete_acceptance_assignment(
+        store,
+        task_id,
+        assignment,
+        actor_receipt,
+        output_candidate_commit,
+        changed_paths,
+        controller_started=False,
+    )
 
 
 def _v2_recover_orphaned_attempt(
@@ -2305,19 +2525,20 @@ def run_assignment(
         if assignment.phase in _REPAIR_PHASES:
             if output.get("output_candidate_commit") != after.head:
                 _fail("REPAIR_ADAPTER_INVALID_OUTPUT", "repair output is not the controller-observed commit")
-            complete_acceptance_assignment(
+            _complete_acceptance_assignment(
                 store,
                 task_id,
                 assignment,
                 attestation.actor_receipt,
                 output.get("output_candidate_commit"),
                 output.get("changed_paths"),
+                controller_started=True,
             )
             return
         evidence = output.get("evidence")
         if isinstance(evidence, Mapping):
             evidence = _v2_evidence(evidence)
-        record_adversarial_review(
+        _record_adversarial_review(
             store,
             task_id,
             assignment,
@@ -2325,6 +2546,7 @@ def run_assignment(
             output.get("verdict"),
             output.get("findings", ()),
             evidence,
+            controller_started=True,
         )
     except BaseException as exc:
         with store.lock(task_id):

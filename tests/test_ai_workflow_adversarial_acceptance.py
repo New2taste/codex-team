@@ -217,9 +217,7 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
             "allowed_write_paths": ["src/"],
             "forbidden_actions": ["merge", "push"],
             "risk_flags": [],
-            "acceptance_commands": [
-                "/Users/lee/.local/bin/python3.11 -c \"from pathlib import Path; assert Path('src/alpha.py').is_file(); print('acceptance-ok')\""
-            ],
+            "acceptance_commands": ["git diff --check"],
             "verification_level": "L2",
             "human_gates": ["PLAN_APPROVAL", "EXECUTION_APPROVAL"],
         }
@@ -227,6 +225,7 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
             repairs.RepairFinding("finding-001", ("src/alpha.py",)),
             repairs.RepairFinding("finding-002", ("src/beta.py",)),
         )
+        self._recorded_runtime_attempts: set[str] = set()
 
     def _git(self, *args: str) -> str:
         env = os.environ.copy()
@@ -303,6 +302,7 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
         *,
         runtime_instance_id: str | None = None,
         attempt_number: int = 1,
+        attempt_id: str | None = None,
         execution_surface: str = "CODEX_EXEC_ROLE_CONTRACT",
         native_agent_uuid: str | None = None,
         codex_thread_id: str | None = None,
@@ -311,8 +311,20 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
         assignment_id = assignment_id or hashlib.sha256(
             f"fixture:{label}:{role}".encode("utf-8")
         ).hexdigest()
-        runtime = runtime_instance_id or f"runtime-{label}"
-        attempt_id = f"{label}-attempt-{attempt_number}"
+        source_id = (
+            native_agent_uuid
+            if execution_surface == "NATIVE_SUBAGENT"
+            else codex_thread_id
+        )
+        if source_id is None:
+            source_id = str(
+                uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"{'native' if execution_surface == 'NATIVE_SUBAGENT' else 'codex'}:{label}",
+                )
+            )
+        runtime = runtime_instance_id or source_id
+        effective_attempt_id = attempt_id or f"{label}-attempt-{attempt_number}"
         if role in {"luna", "terra_xhigh"}:
             model = "gpt-5.6-luna" if role == "luna" else "gpt-5.6-terra"
             effort = "max" if role == "luna" else "xhigh"
@@ -332,17 +344,27 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
                 "read-only",
                 "read-only",
             )
+        native_id = source_id if execution_surface == "NATIVE_SUBAGENT" else None
+        codex_id = source_id if execution_surface == "CODEX_EXEC_ROLE_CONTRACT" else None
+        evidence = {
+            "schema_version": "runtime-evidence-1",
+            "attempt_id": effective_attempt_id,
+            "requested_role": role,
+            "execution_surface": execution_surface,
+            "observed_agent_type": role if execution_surface == "NATIVE_SUBAGENT" else None,
+            "observed_model": model,
+            "observed_reasoning_effort": effort,
+            "observed_sandbox_policy": sandbox,
+            "observed_permission_profile": permission,
+            "observed_cwd": str(self.repository_root),
+            "evidence_source": "NATIVE_METADATA" if execution_surface == "NATIVE_SUBAGENT" else "LOCAL_ROLLOUT",
+            "observed_at_utc": "2026-08-09T00:00:00+00:00",
+            "verification_status": "VERIFIED",
+            "failure_reasons": [],
+        }
         evidence_hash = hashlib.sha256(
-            f"{label}:{runtime}:{attempt_id}:{assignment_id}:{execution_surface}".encode(
-                "utf-8"
-            )
+            json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
-        native_id = native_agent_uuid or str(
-            uuid.uuid5(uuid.NAMESPACE_URL, f"native:{label}:{runtime}")
-        )
-        codex_id = codex_thread_id or str(
-            uuid.uuid5(uuid.NAMESPACE_URL, f"codex:{label}:{runtime}")
-        )
         if execution_surface == "NATIVE_SUBAGENT":
             codex_id = None
         else:
@@ -351,7 +373,7 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
             assignment_id=assignment_id,
             execution_surface=execution_surface,
             runtime_instance_id=runtime,
-            attempt_id=attempt_id,
+            attempt_id=effective_attempt_id,
             requested_role=role,
             observed_model=model,
             observed_reasoning_effort=effort,
@@ -371,7 +393,12 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
         runtime_instance_id: str | None = None,
         execution_surface: str = "CODEX_EXEC_ROLE_CONTRACT",
     ) -> object:
-        runtime = runtime_instance_id or f"runtime-{label}"
+        runtime = runtime_instance_id or str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"{'native' if execution_surface == 'NATIVE_SUBAGENT' else 'codex'}:{label}",
+            )
+        )
         return repairs.ActorIdentity(
             identity=f"{execution_surface}:{runtime}",
             role=role,
@@ -388,6 +415,7 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
             label,
             role,
             assignment.assignment_id,
+            attempt_id=assignment.attempt_id,
             **kwargs,
         )
 
@@ -411,9 +439,47 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
     def _create_task(self, task: dict[str, object] | None = None) -> None:
         self.store.create_task(dict(task or self.task))
 
+    def _record_runtime_evidence(self, receipt: object) -> None:
+        self.assertIsInstance(receipt, repairs.VerifiedActorReceipt)
+        if receipt.attempt_id in self._recorded_runtime_attempts:
+            return
+        evidence = {
+            "schema_version": "runtime-evidence-1",
+            "attempt_id": receipt.attempt_id,
+            "requested_role": receipt.requested_role,
+            "execution_surface": receipt.execution_surface,
+            "observed_agent_type": receipt.requested_role if receipt.execution_surface == "NATIVE_SUBAGENT" else None,
+            "observed_model": receipt.observed_model,
+            "observed_reasoning_effort": receipt.observed_reasoning_effort,
+            "observed_sandbox_policy": receipt.observed_sandbox_policy,
+            "observed_permission_profile": receipt.observed_permission_profile,
+            "observed_cwd": receipt.observed_cwd,
+            "evidence_source": "NATIVE_METADATA" if receipt.execution_surface == "NATIVE_SUBAGENT" else "LOCAL_ROLLOUT",
+            "observed_at_utc": "2026-08-09T00:00:00+00:00",
+            "verification_status": "VERIFIED",
+            "failure_reasons": [],
+        }
+        encoded = json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        self.assertEqual(hashlib.sha256(encoded.encode("utf-8")).hexdigest(), receipt.runtime_evidence_sha256)
+        workflow.write_runtime_evidence(self.store, self.TASK_ID, evidence)
+        identity_field = "native_agent_uuid" if receipt.execution_surface == "NATIVE_SUBAGENT" else "thread_id"
+        identity = receipt.native_agent_uuid if identity_field == "native_agent_uuid" else receipt.codex_thread_id
+        self.store.append_event(
+            self.TASK_ID,
+            {
+                "event_type": "RUNTIME_EVIDENCE_RECORDED",
+                "attempt_id": receipt.attempt_id,
+                "requested_role": receipt.requested_role,
+                "execution_surface": receipt.execution_surface,
+                identity_field: identity,
+            },
+        )
+        self._recorded_runtime_attempts.add(receipt.attempt_id)
+
     def _open(self, owner: object) -> object:
         api = self._v2()
         self._create_task()
+        self._record_runtime_evidence(owner)
         return api["open_task_acceptance"](self.store, self.task, owner)
 
     def _issue(self, phase: str, expected_actor: object) -> object:
@@ -444,15 +510,20 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
         assignment = self._issue(phase, expected)
         if phase == "OWNER_REPAIR":
             surface, runtime = expected.identity.split(":", 1)
-            label = runtime.removeprefix("runtime-")
             receipt_kwargs = {
                 **receipt_kwargs,
                 "runtime_instance_id": runtime,
                 "execution_surface": surface,
+                **(
+                    {"native_agent_uuid": runtime}
+                    if surface == "NATIVE_SUBAGENT"
+                    else {"codex_thread_id": runtime}
+                ),
             }
         receipt = self._receipt_for(
             assignment, label, role, **receipt_kwargs
         )
+        self._record_runtime_evidence(receipt)
         return expected, assignment, receipt
 
     def _complete(
@@ -493,7 +564,11 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
 
     def _events(self) -> list[dict[str, object]]:
         path = self.state_root / self.TASK_ID / "events.jsonl"
-        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        return [
+            event
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if (event := json.loads(line)).get("ledger_version") == "adversarial-acceptance-1"
+        ]
 
     def _assert_chain(self) -> list[dict[str, object]]:
         events = self._events()
@@ -829,6 +904,84 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
         self.assertNotEqual(review.assignment_id, replacement.assignment_id)
         self.assertEqual("review_1-attempt-2", replacement.attempt_id)
 
+    def test_direct_review_cannot_complete_an_orphaned_started_attempt(self):
+        self._open_with_owner("luna-owner", "luna")
+        _, review, reviewer_receipt = self._issue_with_receipt(
+            "REVIEW_1", "terra-review-one", "terra_xhigh_reviewer"
+        )
+        with self.store.lock(self.TASK_ID):
+            replay = repairs.replay_acceptance_ledger(self.store, self.TASK_ID)
+            self.assertIsNotNone(replay)
+            repairs._v2_start_attempt(
+                self.store,
+                self.TASK_ID,
+                replay,
+                repairs._v2_context(self.store, self.TASK_ID),
+                review,
+                reviewer_receipt,
+                workflow.load_task(self.store._require_task(self.TASK_ID) / "task.json"),
+            )
+        with self.assertRaisesRegex(workflow.WorkflowError, "ASSIGNMENT_ATTEMPT_INTERRUPTED"):
+            self._review(review, reviewer_receipt, "ACCEPT")
+        events = self._events()
+        self.assertEqual(
+            1,
+            sum(event["event_type"] == "ASSIGNMENT_ATTEMPT_FAILED" for event in events),
+        )
+        self.assertFalse(
+            any(event["event_type"] == "REVIEW_COMPLETED" for event in events),
+        )
+
+    def test_controller_evidence_rejects_shell_command_before_it_runs(self):
+        task = dict(self.task)
+        probe = self.repository_root / "shell-escape-probe"
+        task["acceptance_commands"] = [f"sh -c 'touch {probe.name}'"]
+        self._create_task(task)
+        try:
+            with self.assertRaisesRegex(workflow.WorkflowError, "ACCEPTANCE_EVIDENCE_INVALID"):
+                repairs.execute_adversarial_evidence(self.store, self.TASK_ID)
+            self.assertFalse(probe.exists(), "controller must not execute a shell escape")
+        finally:
+            probe.unlink(missing_ok=True)
+
+    def test_controller_evidence_rejects_safe_argv_that_mutates_the_repository(self):
+        tests = self.repository_root / "tests"
+        tests.mkdir()
+        (tests / "__init__.py").write_text("", encoding="utf-8")
+        (tests / "test_mutator.py").write_text(
+            "from pathlib import Path\nPath('python-mutation-probe').touch()\n",
+            encoding="utf-8",
+        )
+        self._git("add", "tests")
+        self._git("commit", "-q", "-m", "add controller mutation fixture")
+        task = dict(self.task)
+        task["candidate_commit"] = self._git("rev-parse", "HEAD")
+        task["acceptance_commands"] = ["python3 -m unittest tests.test_mutator"]
+        probe = self.repository_root / "python-mutation-probe"
+        self._create_task(task)
+        try:
+            with self.assertRaisesRegex(workflow.WorkflowError, "ACCEPTANCE_EVIDENCE_INVALID"):
+                repairs.execute_adversarial_evidence(self.store, self.TASK_ID)
+        finally:
+            probe.unlink(missing_ok=True)
+
+    def test_controller_evidence_rejects_transcript_over_the_cap(self):
+        tests = self.repository_root / "tests"
+        tests.mkdir()
+        (tests / "__init__.py").write_text("", encoding="utf-8")
+        (tests / "test_noisy.py").write_text(
+            "print('x' * 70000)\n",
+            encoding="utf-8",
+        )
+        self._git("add", "tests")
+        self._git("commit", "-q", "-m", "add controller transcript fixture")
+        task = dict(self.task)
+        task["candidate_commit"] = self._git("rev-parse", "HEAD")
+        task["acceptance_commands"] = ["python3 -m unittest tests.test_noisy"]
+        self._create_task(task)
+        with self.assertRaisesRegex(workflow.WorkflowError, "ACCEPTANCE_EVIDENCE_INVALID"):
+            repairs.execute_adversarial_evidence(self.store, self.TASK_ID)
+
     def test_terra_owner_rework_then_sol_peer_accepts(self):
         owner_actor, _ = self._open_with_owner("terra-owner", "terra_xhigh")
         _, first, reviewer_one_receipt = self._issue_with_receipt(
@@ -1041,11 +1194,16 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
 
     def _write_event_records(self, records: list[dict[str, object]]) -> None:
         path = self.state_root / self.TASK_ID / "events.jsonl"
+        controller_records = [
+            event
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if (event := json.loads(line)).get("ledger_version") != "adversarial-acceptance-1"
+        ]
         path.write_text(
             "".join(
                 json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
                 + "\n"
-                for record in records
+                for record in [*controller_records, *records]
             ),
             encoding="utf-8",
         )

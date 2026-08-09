@@ -1350,8 +1350,12 @@ def run_codex(
                 {
                     "event_type": "RUNTIME_EVIDENCE_RECORDED",
                     "attempt_id": attempt_id,
+                    "requested_role": role,
                     "thread_id": thread_id,
                     "execution_surface": CODEX_EXEC_ROLE_CONTRACT,
+                    "runtime_evidence_sha256": hashlib.sha256(
+                        _canonical_json(runtime_evidence.to_dict()).encode("utf-8")
+                    ).hexdigest(),
                     "usage": extract_codex_usage(events),
                     "result_sha256": hashlib.sha256(
                         _canonical_json(result).encode("utf-8")
