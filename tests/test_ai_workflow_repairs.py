@@ -256,6 +256,46 @@ class RepairProtocolTest(unittest.TestCase):
 
         self.assertFalse(repairs.has_active_repair_assignment(self.store, legacy_task_id))
 
+    def test_v2_absence_preserves_plan_acceptance_and_legacy_generic_routing(self):
+        tasks: list[tuple[str, str]] = []
+        for task_id, task_type in (
+            ("AWF-20260809-910", "PLAN"),
+            ("AWF-20260809-911", "ACCEPTANCE"),
+            ("AWF-20260809-912", "REMEDIATION"),
+        ):
+            task = json.loads((self.root / self.task_id / "task.json").read_text(encoding="utf-8"))
+            task.update({"task_id": task_id, "task_type": task_type, "allowed_write_paths": []})
+            if task_type in {"PLAN", "REMEDIATION"}:
+                task.update({"base_commit": None, "candidate_commit": None})
+            if task_type == "REMEDIATION":
+                task["allowed_write_paths"] = ["scripts/"]
+            else:
+                task["human_gates"] = ["FINAL_ACCEPTANCE"]
+            self.store.create_task(task)
+            tasks.append((task_id, "AWAITING_OWNER_DECISION" if task_type == "REMEDIATION" else "BLOCKED"))
+
+        legacy_config = workflow._load_workflow_config()
+        legacy_config["routing"] = {"mode": "legacy", "role_policy": "legacy"}
+        with mock.patch.object(workflow, "_load_workflow_config", return_value=legacy_config):
+            for task_id, expected_state in tasks:
+                with self.subTest(task_id=task_id):
+                    self.assertFalse(repairs.repair_ledger_claims_task(self.store, task_id))
+                    self.assertEqual(
+                        expected_state,
+                        workflow.run_until_gate(
+                            task_id,
+                            runner=workflow.FakeRunner(),
+                            allow_live_model=False,
+                            state_root=self.root,
+                        ),
+                    )
+        self.store.append_event(
+            "AWF-20260809-910",
+            {"ledger_version": "adversarial-acceptance-1", "event_type": "forged"},
+        )
+        with self.assertRaises(workflow.WorkflowError):
+            repairs.repair_ledger_claims_task(self.store, "AWF-20260809-910")
+
     def test_repair_protocol_owns_execution_until_an_acceptance_verdict_closes_it(self):
         first = self.assignment(1)
         repairs.record_repair_assignment(self.store, self.task_id, first)

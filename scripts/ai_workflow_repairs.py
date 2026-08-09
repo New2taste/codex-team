@@ -1046,7 +1046,11 @@ def _v2_event_records(store: WorkflowStore, task_id: str) -> list[dict[str, obje
         for record in records
     ):
         _fail("ACCEPTANCE_LEDGER_INVALID", "v1 repair history may not be upgraded into a v2 ledger")
-    if any("ledger_version" in record and record.get("ledger_version") != _ACCEPTANCE_LEDGER_VERSION for record in records):
+    if v2 and any(
+        "ledger_version" in record
+        and record.get("ledger_version") != _ACCEPTANCE_LEDGER_VERSION
+        for record in records
+    ):
         _fail("ACCEPTANCE_LEDGER_INVALID", "unknown acceptance ledger version")
     return v2
 
@@ -1391,10 +1395,10 @@ def open_task_acceptance(
 def replay_acceptance_ledger(store: WorkflowStore, task_id: str) -> _AcceptanceReplay | None:
     """Validate the hash chain and recognise v2 ownership before any execution."""
 
-    context = _v2_context(store, task_id)
     records = _v2_event_records(store, task_id)
     if not records:
         return None
+    context = _v2_context(store, task_id)
     replay: _AcceptanceReplay | None = None
     previous_id: str | None = None
     for index, event in enumerate(records):
