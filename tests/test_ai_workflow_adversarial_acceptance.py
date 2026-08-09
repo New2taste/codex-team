@@ -16,11 +16,148 @@ import subprocess
 import tempfile
 import unittest
 import uuid
+from collections import Counter
 from pathlib import Path
 from unittest import mock
 
 from scripts import ai_workflow as workflow
 from scripts import ai_workflow_repairs as repairs
+
+
+class AcceptanceContractMutationTest(unittest.TestCase):
+    """Prove the repaired assertions kill the three reviewed unsafe stubs."""
+
+    COMMON_EVENT_FIELDS = {
+        "ledger_version",
+        "event_type",
+        "event_index",
+        "event_id",
+        "previous_event_id",
+        "timestamp_utc",
+        "task_id",
+        "task_sha256",
+        "base_commit",
+        "candidate_commit",
+    }
+
+    def test_receipt_identity_contract_kills_assignment_attempt_only_verifier(self):
+        expected = {
+            "assignment_id": "assignment-001",
+            "attempt_id": "attempt-001",
+            "execution_surface": "CODEX_EXEC_ROLE_CONTRACT",
+            "runtime_instance_id": "runtime-review-two",
+            "native_agent_uuid": None,
+            "codex_thread_id": "thread-review-two",
+        }
+        forgeries = {
+            "execution_surface": {
+                **expected,
+                "execution_surface": "NATIVE_SUBAGENT",
+            },
+            "runtime_instance_id": {
+                **expected,
+                "runtime_instance_id": "runtime-forged",
+            },
+            "native_or_codex_identity_source": {
+                **expected,
+                "codex_thread_id": "thread-forged",
+            },
+        }
+
+        def unsafe_verifier(receipt: dict[str, object]) -> bool:
+            return (
+                receipt["assignment_id"],
+                receipt["attempt_id"],
+            ) == (
+                expected["assignment_id"],
+                expected["attempt_id"],
+            )
+
+        accepted_forgeries = [
+            dimension
+            for dimension, receipt in forgeries.items()
+            if unsafe_verifier(receipt)
+        ]
+        with self.assertRaisesRegex(AssertionError, "execution_surface"):
+            self.assertEqual([], accepted_forgeries)
+        self.assertEqual(
+            {
+                "execution_surface",
+                "runtime_instance_id",
+                "native_or_codex_identity_source",
+            },
+            set(accepted_forgeries),
+        )
+
+    def test_attempt_lifecycle_contract_kills_success_after_failed_same_attempt(self):
+        unsafe_events = [
+            ("ASSIGNMENT_ATTEMPT_STARTED", "assignment-001", "attempt-001"),
+            ("ASSIGNMENT_ATTEMPT_FAILED", "assignment-001", "attempt-001"),
+            ("REPAIR_COMPLETED", "assignment-001", "attempt-001"),
+        ]
+        safe_retry_events = [
+            ("ASSIGNMENT_ATTEMPT_STARTED", "assignment-001", "attempt-001"),
+            ("ASSIGNMENT_ATTEMPT_FAILED", "assignment-001", "attempt-001"),
+            ("ASSIGNMENT_ATTEMPT_STARTED", "assignment-002", "attempt-002"),
+            ("REPAIR_COMPLETED", "assignment-002", "attempt-002"),
+        ]
+
+        def assert_one_result_per_attempt(
+            events: list[tuple[str, str, str]],
+        ) -> None:
+            terminal_types = {
+                "ASSIGNMENT_ATTEMPT_FAILED",
+                "REPAIR_COMPLETED",
+                "REVIEW_COMPLETED",
+            }
+            starts = Counter(
+                (assignment_id, attempt_id)
+                for event_type, assignment_id, attempt_id in events
+                if event_type == "ASSIGNMENT_ATTEMPT_STARTED"
+            )
+            results = Counter(
+                (assignment_id, attempt_id)
+                for event_type, assignment_id, attempt_id in events
+                if event_type in terminal_types
+            )
+            self.assertEqual(starts, results)
+
+        with self.assertRaises(AssertionError):
+            assert_one_result_per_attempt(unsafe_events)
+        assert_one_result_per_attempt(safe_retry_events)
+
+    def test_common_field_contract_kills_invented_event_payload_whitelist(self):
+        event = {
+            "ledger_version": "adversarial-acceptance-1",
+            "event_type": "ASSIGNMENT_ATTEMPT_FAILED",
+            "event_index": 3,
+            "event_id": "event-003",
+            "previous_event_id": "event-002",
+            "timestamp_utc": "2026-08-09T00:00:00Z",
+            "task_id": "AWF-20260809-901",
+            "task_sha256": "task-sha256",
+            "base_commit": "base-commit",
+            "candidate_commit": "candidate-commit",
+            "assignment_id": "assignment-001",
+            "attempt_id": "attempt-001",
+            "failure_code": "RESULT_DIFF_MISMATCH",
+            "failure_details": {"reported": ["src/beta.py"]},
+        }
+        invented_exact_fields = self.COMMON_EVENT_FIELDS | {
+            "assignment_id",
+            "attempt_id",
+            "failure_code",
+        }
+
+        def unsafe_exact_schema(record: dict[str, object]) -> bool:
+            return set(record) == invented_exact_fields
+
+        with self.assertRaises(AssertionError):
+            self.assertTrue(unsafe_exact_schema(event))
+        self.assertTrue(self.COMMON_EVENT_FIELDS.issubset(event))
+        self.assertTrue(
+            {"assignment_id", "attempt_id", "failure_code"}.issubset(event)
+        )
 
 
 class AcceptanceLedgerV2ContractTest(unittest.TestCase):
@@ -381,7 +518,7 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
             {event["event_type"] for event in events},
             "each issued assignment must launch through the v2 attempt guard",
         )
-        self._assert_strict_event_fields(events)
+        self._assert_common_event_fields(events)
         self._assert_attempt_lifecycle(events)
         return events
 
@@ -451,8 +588,8 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
         self.assertIn("push", tuple(capability.forbidden_actions))
         self.assertRegex(capability.issuing_event_id, r"^[0-9a-f]{64}$")
 
-    def _strict_event_fields(self, event_type: str) -> set[str]:
-        common = {
+    def _assert_common_event_fields(self, events: list[dict[str, object]]) -> None:
+        common_fields = {
             "ledger_version",
             "event_type",
             "event_index",
@@ -464,92 +601,55 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
             "base_commit",
             "candidate_commit",
         }
-        event_fields = {
-            "ACCEPTANCE_OPENED": {"owner_receipt"},
-            "ASSIGNMENT_ISSUED": {
-                "assignment_id",
-                "phase",
-                "attempt_id",
-                "expected_actor",
-                "findings",
-                "allowed_paths",
-                "capability",
-            },
-            "ASSIGNMENT_ATTEMPT_STARTED": {
-                "assignment_id",
-                "phase",
-                "attempt_id",
-                "receipt",
-            },
-            "ASSIGNMENT_ATTEMPT_FAILED": {
-                "assignment_id",
-                "phase",
-                "attempt_id",
-                "failure_code",
-            },
-            "REPAIR_COMPLETED": {
-                "assignment_id",
-                "phase",
-                "attempt_id",
-                "actor_receipt",
-                "output_candidate_commit",
-                "changed_paths",
-                "actual_changed_paths",
-                "actual_diff_sha256",
-                "actual_snapshot_sha256",
-            },
-            "REVIEW_COMPLETED": {
-                "assignment_id",
-                "phase",
-                "attempt_id",
-                "reviewer_receipt",
-                "verdict",
-                "findings",
-                "evidence",
-                "evidence_sha256",
-                "terminal_state",
-                "terminal_reason",
-                "whole_project_acceptance_required",
-            },
-        }
-        self.assertIn(event_type, event_fields)
-        return common | event_fields[event_type]
-
-    def _assert_strict_event_fields(self, events: list[dict[str, object]]) -> None:
         for event in events:
-            self.assertEqual(self._strict_event_fields(event["event_type"]), set(event))
+            self.assertTrue(
+                common_fields.issubset(event),
+                f"{event.get('event_type')} lacks an approved common ledger field",
+            )
 
     def _assert_attempt_lifecycle(self, events: list[dict[str, object]]) -> None:
-        issued = {
-            event["assignment_id"]: (index, event)
+        issued = [
+            (index, event)
             for index, event in enumerate(events)
             if event["event_type"] == "ASSIGNMENT_ISSUED"
-        }
+        ]
         self.assertTrue(issued)
         terminal_types = {
             "ASSIGNMENT_ATTEMPT_FAILED",
             "REPAIR_COMPLETED",
             "REVIEW_COMPLETED",
         }
-        for assignment_id, (issued_index, issue_event) in issued.items():
+        issued_attempts = Counter(
+            (event["assignment_id"], event["attempt_id"])
+            for _, event in issued
+        )
+        terminal_attempts = Counter(
+            (event["assignment_id"], event["attempt_id"])
+            for event in events
+            if event["event_type"] in terminal_types
+        )
+        self.assertEqual(issued_attempts, terminal_attempts)
+        for issued_index, issue_event in issued:
+            assignment_id = issue_event["assignment_id"]
+            attempt_id = issue_event["attempt_id"]
             started = [
                 (index, event)
                 for index, event in enumerate(events)
                 if event.get("event_type") == "ASSIGNMENT_ATTEMPT_STARTED"
                 and event.get("assignment_id") == assignment_id
+                and event.get("attempt_id") == attempt_id
             ]
             terminal = [
                 (index, event)
                 for index, event in enumerate(events)
                 if event.get("event_type") in terminal_types
                 and event.get("assignment_id") == assignment_id
+                and event.get("attempt_id") == attempt_id
             ]
             self.assertEqual(1, len(started))
             self.assertEqual(1, len(terminal))
             self.assertLess(issued_index, started[0][0])
             self.assertLess(started[0][0], terminal[0][0])
-            self.assertEqual(issue_event["attempt_id"], started[0][1]["attempt_id"])
-            self.assertEqual(issue_event["attempt_id"], terminal[0][1]["attempt_id"])
 
     def _open_review_one(
         self,
@@ -794,7 +894,29 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
         output_candidate = self._commit_file("src/alpha.py", "OWNER_ALPHA = 1\n")
         with self.assertRaises(workflow.WorkflowError):
             self._complete(owner_repair, owner_receipt, output_candidate, ("src/beta.py",))
-        self._complete(owner_repair, owner_receipt, output_candidate, ("src/alpha.py",))
+
+        failed_events = self._events()
+        failed_attempt_results = [
+            event
+            for event in failed_events
+            if event.get("assignment_id") == owner_repair.assignment_id
+            and event.get("attempt_id") == owner_repair.attempt_id
+            and event.get("event_type")
+            in {"ASSIGNMENT_ATTEMPT_FAILED", "REPAIR_COMPLETED", "REVIEW_COMPLETED"}
+        ]
+        self.assertEqual(1, len(failed_attempt_results))
+        self.assertEqual(
+            "ASSIGNMENT_ATTEMPT_FAILED", failed_attempt_results[0]["event_type"]
+        )
+
+        _, retry_repair, retry_receipt = self._issue_with_receipt(
+            "OWNER_REPAIR",
+            "luna-owner-repair-retry",
+            "luna",
+            expected_actor=owner_actor,
+        )
+        self.assertNotEqual(owner_repair.attempt_id, retry_repair.attempt_id)
+        self._complete(retry_repair, retry_receipt, output_candidate, ("src/alpha.py",))
         events = self._assert_chain()
         completion = [event for event in events if event["event_type"] == "REPAIR_COMPLETED"][-1]
         self.assertEqual(["src/alpha.py"], completion["actual_changed_paths"])
@@ -917,7 +1039,7 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
             with self.subTest(mutation=mutation.__name__):
                 self._assert_replay_rejects_rechained_mutation(original, mutation)
 
-    def test_replay_rejects_missing_extra_reordered_broken_and_duplicate_records(self):
+    def test_replay_rejects_missing_common_reordered_broken_and_duplicate_records(self):
         _, _, _, first, reviewer_receipt = self._open_review_one()
         self._review(first, reviewer_receipt, "ACCEPT")
         original = self._events()
@@ -925,9 +1047,6 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
 
         def missing_field(records: list[dict[str, object]]) -> None:
             records[0].pop("timestamp_utc")
-
-        def extra_field(records: list[dict[str, object]]) -> None:
-            records[0]["unexpected"] = True
 
         def reordered(records: list[dict[str, object]]) -> None:
             records[1], records[2] = records[2], records[1]
@@ -941,7 +1060,7 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
             )
             records.append(json.loads(json.dumps(completion)))
 
-        for mutation in (missing_field, extra_field, reordered, broken_chain, duplicate_completion):
+        for mutation in (missing_field, reordered, broken_chain, duplicate_completion):
             with self.subTest(mutation=mutation.__name__):
                 records = json.loads(json.dumps(original))
                 mutation(records)
@@ -1096,21 +1215,15 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
             "REVIEW_2", "terra-review-two", "terra_xhigh_reviewer"
         )
         self.assertNotEqual(reviewer_one_actor, reviewer_two_actor)
-        same_runtime_other_surface = self._receipt_for(
-            second,
-            "terra-review-two-native-surface",
-            "terra_xhigh_reviewer",
-            runtime_instance_id=reviewer_two_receipt.runtime_instance_id,
+        same_runtime_other_surface = dataclasses.replace(
+            reviewer_two_receipt,
             execution_surface="NATIVE_SUBAGENT",
         )
         with self.assertRaises(workflow.WorkflowError):
             self._review(second, same_runtime_other_surface, "ACCEPT")
-        same_surface_other_runtime = self._receipt_for(
-            second,
-            "terra-review-two-other-runtime",
-            "terra_xhigh_reviewer",
+        same_surface_other_runtime = dataclasses.replace(
+            reviewer_two_receipt,
             runtime_instance_id="runtime-terra-review-two-other",
-            execution_surface=reviewer_two_receipt.execution_surface,
         )
         with self.assertRaises(workflow.WorkflowError):
             self._review(second, same_surface_other_runtime, "ACCEPT")
@@ -1123,16 +1236,41 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
         )
         with self.assertRaises(workflow.WorkflowError):
             self._review(second, retry_receipt, "ACCEPT")
-        forged_native = self._receipt_for(
-            second,
-            "terra-review-two-forged-native",
-            "terra_xhigh_reviewer",
-            runtime_instance_id=reviewer_two_receipt.runtime_instance_id,
-            execution_surface=reviewer_two_receipt.execution_surface,
+        forged_identity_source = dataclasses.replace(
+            reviewer_two_receipt,
             codex_thread_id=str(uuid.uuid4()),
         )
+        identity_fields = (
+            "execution_surface",
+            "runtime_instance_id",
+            "native_agent_uuid",
+            "codex_thread_id",
+        )
+        for changed_field, forged_receipt in (
+            ("execution_surface", same_runtime_other_surface),
+            ("runtime_instance_id", same_surface_other_runtime),
+            ("codex_thread_id", forged_identity_source),
+        ):
+            with self.subTest(identity_dimension=changed_field):
+                self.assertEqual(
+                    reviewer_two_receipt.assignment_id,
+                    forged_receipt.assignment_id,
+                )
+                self.assertEqual(
+                    reviewer_two_receipt.attempt_id,
+                    forged_receipt.attempt_id,
+                )
+                self.assertEqual(
+                    {changed_field},
+                    {
+                        field
+                        for field in identity_fields
+                        if getattr(reviewer_two_receipt, field)
+                        != getattr(forged_receipt, field)
+                    },
+                )
         with self.assertRaises(workflow.WorkflowError):
-            self._review(second, forged_native, "ACCEPT")
+            self._review(second, forged_identity_source, "ACCEPT")
         wrong_assignment = self._receipt(
             "terra-review-two-wrong-assignment",
             "terra_xhigh_reviewer",
