@@ -58,7 +58,30 @@ Every event is append-only and binds task id, owner/reviewer runtime identity, c
 
 **Adversarial acceptance minimum:** reviewer must try an empty/ambiguous envelope, an out-of-scope Luna request, a write/security task falsely labelled bounded, an implicit Terra-medium/Sol-high role, and a legacy wire mutation.
 
-## Task 2: Enforce adversarial reviews and the capped repair ladder
+## Task 2: Luna-owned v2 acceptance contract tests
+
+**Owner:** Luna max. **Local acceptance:** independent Terra xhigh adversarial reviewer.
+
+**Files:**
+
+- Create: `tests/test_ai_workflow_adversarial_acceptance.py`
+- Modify: only test helpers strictly required by that new test file
+
+**Interfaces to specify by RED tests:**
+
+- `AcceptanceAssignment`, `VerifiedActorReceipt`, `AssignmentCapability`, and `AdversarialEvidence` in `scripts.ai_workflow_repairs.py`
+- `open_task_acceptance`, `issue_acceptance_assignment`, `record_adversarial_review`, `replay_acceptance_ledger`, and `repair_ledger_claims_task`
+
+**Steps:**
+
+- [ ] Write a path-bounded, test-only contract suite from `2026-08-08-adversarial-repair-ledger-v2-design.md`; it must initially fail because v2 does not yet exist. Do not edit production code.
+- [ ] Cover the four permitted terminal paths, a Luna original owner, distinct Terra reviews, distinct Sol fallback peer, one Sol-xhigh terminal repair, immutable task/candidate/finding binding, canonical event-chain replay, and generic-runner ownership after terminal state.
+- [ ] Add only deterministic helpers local to the test file. Do not design a new schema, loosen a production contract, or accept a missing assertion merely to accommodate the legacy v1 ledger.
+- [ ] Run the new focused test to record RED and commit the test-only change with the exact failure evidence in its report.
+
+**Adversarial acceptance minimum:** reviewer must inspect that tests fail for missing v2 behavior rather than fixture mistakes, mutate one asserted transition and one ledger identity, and reject any test that accepts legacy v1 behavior as v2.
+
+## Task 3: Enforce adversarial reviews and the capped repair ladder
 
 **Owner:** Terra xhigh. **Local acceptance:** independent Terra xhigh adversarial reviewer.
 
@@ -78,7 +101,7 @@ Every event is append-only and binds task id, owner/reviewer runtime identity, c
 
 **Adversarial acceptance minimum:** reviewer must simulate self-review, reviewer reuse, wrong runtime identity, stale candidate, empty/new finding IDs, out-of-scope mutation, review #2 skip, Sol fallback self-peer, duplicate/replayed terminal assignment, and generic-runner bypass.
 
-## Task 3: Luna-owned distribution and evidence work
+## Task 4: Luna-owned distribution and evidence work
 
 **Owner:** Luna max, under a written bounded envelope. **Local acceptance:** independent Terra xhigh adversarial reviewer.
 
@@ -99,9 +122,9 @@ Every event is append-only and binds task id, owner/reviewer runtime identity, c
 
 **Adversarial acceptance minimum:** reviewer must tamper one mirrored file, look for stale prior policy language, invoke check/install validation in a temporary target, and confirm that documentation does not grant Luna review or ordinary Sol-medium roles.
 
-## Task 4: Whole-project adversarial acceptance
+## Task 5: Whole-project adversarial acceptance
 
-**Owner:** Sol medium, distinct from any Task-2 fallback fixer or Task-3 Luna owner. This is the only normal Sol-medium acceptance.
+**Owner:** Sol medium, distinct from any Task-3 fallback fixer or Task-4 Luna owner. This is the only normal Sol-medium acceptance.
 
 **Evidence:** all task reports and commits; clean status; full unittest discovery; compileall; Plugin verification; Skill validation; shell syntax; distribution parity; diff check; role/lifecycle mutation results.
 
