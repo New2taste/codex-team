@@ -12,8 +12,8 @@ import hashlib
 import json
 import re
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
-from pathlib import PurePosixPath
+from dataclasses import asdict, dataclass
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
 
@@ -39,6 +39,51 @@ _ACCEPTANCE_VERDICTS = frozenset(
 )
 _REWORK_VERDICTS = frozenset({"REWORK_RECOMMENDED", "REJECT_RECOMMENDED"})
 _REVIEW_VERDICTS = _ACCEPTANCE_VERDICTS | _REWORK_VERDICTS
+
+
+# ``repair-ledger-1`` above remains a read-only compatibility surface.  New
+# adversarial acceptance never extends that protocol: v2 has a separate,
+# self-authenticating event stream so that a generic workflow runner cannot
+# silently turn a review finding into a write-capable assignment.
+_ACCEPTANCE_LEDGER_VERSION = "adversarial-acceptance-1"
+_ACCEPTANCE_EVENT_TYPES = frozenset(
+    {
+        "ACCEPTANCE_OPENED",
+        "ASSIGNMENT_ISSUED",
+        "ASSIGNMENT_ATTEMPT_STARTED",
+        "ASSIGNMENT_ATTEMPT_FAILED",
+        "REPAIR_COMPLETED",
+        "REVIEW_COMPLETED",
+    }
+)
+_ACCEPTANCE_PHASES = frozenset(
+    {
+        "REVIEW_1",
+        "OWNER_REPAIR",
+        "REVIEW_2",
+        "SOL_MEDIUM_REPAIR",
+        "SOL_MEDIUM_PEER_REVIEW",
+        "SOL_XHIGH_TERMINAL_REPAIR",
+    }
+)
+_REPAIR_PHASES = frozenset(
+    {"OWNER_REPAIR", "SOL_MEDIUM_REPAIR", "SOL_XHIGH_TERMINAL_REPAIR"}
+)
+_REVIEW_PHASES = _ACCEPTANCE_PHASES - _REPAIR_PHASES
+_V2_COMMON_FIELDS = frozenset(
+    {
+        "ledger_version",
+        "event_type",
+        "event_index",
+        "event_id",
+        "previous_event_id",
+        "timestamp_utc",
+        "task_id",
+        "task_sha256",
+        "base_commit",
+        "candidate_commit",
+    }
+)
 
 
 def _workflow():
@@ -743,6 +788,827 @@ def record_sol_repair_authorization(
                 "task_sha256": context.task_sha256,
             },
         )
+
+
+def _v2_canonical(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _v2_sha256(value: object) -> str:
+    return hashlib.sha256(_v2_canonical(value).encode("utf-8")).hexdigest()
+
+
+def _v2_sha(value: object, field: str, *, length: int = 64) -> str:
+    text = _nonempty(value, field, code="ACCEPTANCE_LEDGER_INVALID")
+    if not re.fullmatch(rf"[0-9a-f]{{{length}}}", text):
+        _fail("ACCEPTANCE_LEDGER_INVALID", f"{field} must be a canonical SHA digest")
+    return text
+
+
+def _v2_actor_payload(actor: ActorIdentity) -> dict[str, str]:
+    return {"identity": actor.identity, "role": actor.role}
+
+
+def _v2_actor(value: object, field: str) -> ActorIdentity:
+    if not isinstance(value, Mapping) or set(value) != {"identity", "role"}:
+        _fail("ACCEPTANCE_LEDGER_INVALID", f"{field} must be a canonical actor identity")
+    return ActorIdentity(value["identity"], value["role"])
+
+
+def _v2_findings(value: object, field: str = "findings") -> tuple[RepairFinding, ...]:
+    raw = _tuple(value, field)
+    if any(not isinstance(item, RepairFinding) for item in raw):
+        _fail("ACCEPTANCE_LEDGER_INVALID", f"{field} must contain RepairFinding values")
+    findings = tuple(raw)
+    ids = tuple(item.finding_id for item in findings)
+    if ids != tuple(sorted(ids)) or len(set(ids)) != len(ids):
+        _fail("ACCEPTANCE_LEDGER_INVALID", f"{field} must have canonically sorted unique IDs")
+    paths = tuple(path for item in findings for path in item.allowed_paths)
+    if len(paths) != len(set(paths)):
+        _fail("ACCEPTANCE_LEDGER_INVALID", f"{field} may not overlap path authority")
+    return findings
+
+
+def _v2_findings_payload(findings: tuple[RepairFinding, ...]) -> list[dict[str, object]]:
+    return [
+        {"finding_id": finding.finding_id, "allowed_paths": list(finding.allowed_paths)}
+        for finding in findings
+    ]
+
+
+def _v2_findings_from_payload(value: object) -> tuple[RepairFinding, ...]:
+    if not isinstance(value, list):
+        _fail("ACCEPTANCE_LEDGER_INVALID", "findings must be a list")
+    parsed: list[RepairFinding] = []
+    for item in value:
+        if not isinstance(item, Mapping) or set(item) != {"finding_id", "allowed_paths"}:
+            _fail("ACCEPTANCE_LEDGER_INVALID", "finding payload is invalid")
+        paths = item["allowed_paths"]
+        if not isinstance(paths, list):
+            _fail("ACCEPTANCE_LEDGER_INVALID", "finding paths are invalid")
+        parsed.append(RepairFinding(item["finding_id"], tuple(paths)))
+    return _v2_findings(tuple(parsed))
+
+
+def _v2_allowed_paths(findings: tuple[RepairFinding, ...]) -> tuple[str, ...]:
+    return tuple(sorted(path for finding in findings for path in finding.allowed_paths))
+
+
+@dataclass(frozen=True)
+class VerifiedActorReceipt:
+    """A runtime-verifiable identity receipt, never a role name alone."""
+
+    assignment_id: str
+    execution_surface: str
+    runtime_instance_id: str
+    attempt_id: str
+    requested_role: str
+    observed_model: str
+    observed_reasoning_effort: str
+    observed_sandbox_policy: str
+    observed_permission_profile: str
+    observed_cwd: str
+    runtime_evidence_sha256: str
+    native_agent_uuid: str | None
+    codex_thread_id: str | None
+
+    def __post_init__(self) -> None:
+        _v2_sha(self.assignment_id, "receipt.assignment_id")
+        surface = _nonempty(
+            self.execution_surface, "receipt.execution_surface", code="ACCEPTANCE_LEDGER_INVALID"
+        )
+        if surface not in {"NATIVE_SUBAGENT", "CODEX_EXEC_ROLE_CONTRACT"}:
+            _fail("ACCEPTANCE_LEDGER_INVALID", "receipt execution surface is unsupported")
+        for field in (
+            "runtime_instance_id",
+            "attempt_id",
+            "requested_role",
+            "observed_model",
+            "observed_reasoning_effort",
+            "observed_sandbox_policy",
+            "observed_permission_profile",
+            "observed_cwd",
+        ):
+            _nonempty(getattr(self, field), f"receipt.{field}", code="ACCEPTANCE_LEDGER_INVALID")
+        _v2_sha(self.runtime_evidence_sha256, "receipt.runtime_evidence_sha256")
+        if surface == "NATIVE_SUBAGENT":
+            if not isinstance(self.native_agent_uuid, str) or self.codex_thread_id is not None:
+                _fail("ACCEPTANCE_LEDGER_INVALID", "native receipt must bind one native identity")
+        elif not isinstance(self.codex_thread_id, str) or self.native_agent_uuid is not None:
+            _fail("ACCEPTANCE_LEDGER_INVALID", "Codex receipt must bind one thread identity")
+
+    @property
+    def actor_identity(self) -> ActorIdentity:
+        return ActorIdentity(
+            f"{self.execution_surface}:{self.runtime_instance_id}", self.requested_role
+        )
+
+
+@dataclass(frozen=True)
+class AssignmentCapability:
+    """A hash-bound, assignment-scoped authority with no merge or push power."""
+
+    capability_id: str
+    task_id: str
+    task_sha256: str
+    assignment_id: str
+    phase: str
+    attempt_id: str
+    base_commit: str
+    input_candidate_commit: str
+    finding_ids: tuple[str, ...]
+    allowed_paths: tuple[str, ...]
+    forbidden_actions: tuple[str, ...]
+    write_authority: str
+    issuing_event_id: str
+    expected_actor: ActorIdentity
+
+    def __post_init__(self) -> None:
+        _nonempty(self.task_id, "capability.task_id", code="ACCEPTANCE_LEDGER_INVALID")
+        _v2_sha(self.task_sha256, "capability.task_sha256")
+        _v2_sha(self.assignment_id, "capability.assignment_id")
+        _nonempty(self.attempt_id, "capability.attempt_id", code="ACCEPTANCE_LEDGER_INVALID")
+        _v2_sha(self.base_commit, "capability.base_commit", length=40)
+        _v2_sha(self.input_candidate_commit, "capability.input_candidate_commit", length=40)
+        _v2_sha(self.issuing_event_id, "capability.issuing_event_id")
+        if self.phase not in _ACCEPTANCE_PHASES:
+            _fail("ACCEPTANCE_LEDGER_INVALID", "capability phase is invalid")
+        if tuple(self.finding_ids) != tuple(sorted(self.finding_ids)) or len(set(self.finding_ids)) != len(self.finding_ids):
+            _fail("ACCEPTANCE_LEDGER_INVALID", "capability finding IDs are not canonical")
+        paths = tuple(_path(path, "capability.allowed_paths") for path in self.allowed_paths)
+        if paths != tuple(self.allowed_paths) or paths != tuple(sorted(paths)) or len(set(paths)) != len(paths):
+            _fail("ACCEPTANCE_LEDGER_INVALID", "capability paths are not canonical")
+        forbidden = tuple(self.forbidden_actions)
+        if forbidden != tuple(sorted(forbidden)) or len(set(forbidden)) != len(forbidden):
+            _fail("ACCEPTANCE_LEDGER_INVALID", "capability forbidden actions are not canonical")
+        if "merge" not in forbidden or "push" not in forbidden:
+            _fail("ACCEPTANCE_LEDGER_INVALID", "capability must explicitly forbid merge and push")
+        expected = _v2_capability_id_payload(self)
+        if self.capability_id != _v2_sha256(expected):
+            _fail("ACCEPTANCE_LEDGER_INVALID", "capability_id is not bound to its authority")
+
+
+def _v2_capability_id_payload(capability: AssignmentCapability) -> dict[str, object]:
+    value = asdict(capability)
+    value.pop("capability_id", None)
+    return value
+
+
+@dataclass(frozen=True)
+class AcceptanceAssignment:
+    assignment_id: str
+    task_id: str
+    phase: str
+    attempt_id: str
+    expected_actor: ActorIdentity
+    base_commit: str
+    input_candidate_commit: str
+    findings: tuple[RepairFinding, ...]
+    allowed_paths: tuple[str, ...]
+    capability: AssignmentCapability
+
+    def __post_init__(self) -> None:
+        _v2_sha(self.assignment_id, "assignment_id")
+        _nonempty(self.task_id, "assignment.task_id", code="ACCEPTANCE_LEDGER_INVALID")
+        if self.phase not in _ACCEPTANCE_PHASES:
+            _fail("ACCEPTANCE_LEDGER_INVALID", "assignment phase is invalid")
+        _nonempty(self.attempt_id, "assignment.attempt_id", code="ACCEPTANCE_LEDGER_INVALID")
+        _v2_sha(self.base_commit, "assignment.base_commit", length=40)
+        _v2_sha(self.input_candidate_commit, "assignment.input_candidate_commit", length=40)
+        findings = _v2_findings(self.findings)
+        object.__setattr__(self, "findings", findings)
+        paths = _v2_allowed_paths(findings)
+        if tuple(self.allowed_paths) != paths:
+            _fail("ACCEPTANCE_LEDGER_INVALID", "assignment paths are not bound to findings")
+        if self.capability.assignment_id != self.assignment_id or self.capability.phase != self.phase:
+            _fail("ACCEPTANCE_LEDGER_INVALID", "assignment capability does not match assignment")
+
+
+@dataclass(frozen=True)
+class AdversarialEvidence:
+    verification_commands: tuple[str, ...]
+    negative_checks: tuple[str, ...]
+    outputs: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        for field in ("verification_commands", "negative_checks", "outputs"):
+            values = _tuple(getattr(self, field), field)
+            if not values or any(not isinstance(value, str) or not value.strip() for value in values):
+                _fail("ACCEPTANCE_EVIDENCE_INVALID", f"{field} must contain non-empty evidence")
+            object.__setattr__(self, field, tuple(values))
+
+
+@dataclass
+class _AcceptanceReplay:
+    task_id: str
+    task_sha256: str
+    base_commit: str
+    initial_candidate_commit: str
+    current_candidate_commit: str
+    owner_actor: ActorIdentity
+    owner_receipt: VerifiedActorReceipt
+    last_event_id: str
+    event_count: int
+    assignments: dict[str, AcceptanceAssignment]
+    active_assignment_id: str | None
+    terminal: bool
+    phase_outcomes: dict[str, str]
+    pending_findings: tuple[RepairFinding, ...]
+    reviewer_identities: set[str]
+    started_receipts: dict[str, VerifiedActorReceipt]
+
+
+def _v2_receipt_payload(receipt: VerifiedActorReceipt) -> dict[str, object]:
+    return asdict(receipt)
+
+
+def _v2_receipt(value: object, field: str) -> VerifiedActorReceipt:
+    if not isinstance(value, Mapping):
+        _fail("ACCEPTANCE_LEDGER_INVALID", f"{field} must be a receipt object")
+    expected = set(VerifiedActorReceipt.__dataclass_fields__)
+    if set(value) != expected:
+        _fail("ACCEPTANCE_LEDGER_INVALID", f"{field} has unsupported receipt fields")
+    try:
+        return VerifiedActorReceipt(**dict(value))
+    except (TypeError, WorkflowError):
+        _fail("ACCEPTANCE_LEDGER_INVALID", f"{field} is not a valid receipt")
+    raise AssertionError("unreachable")
+
+
+def _v2_event_records(store: WorkflowStore, task_id: str) -> list[dict[str, object]]:
+    workflow = _workflow()
+    records = workflow._load_event_records(store, task_id)
+    v2 = [record for record in records if record.get("ledger_version") == _ACCEPTANCE_LEDGER_VERSION]
+    if v2 and any(record.get("event_type") in _REPAIR_EVENT_TYPES for record in records):
+        _fail("ACCEPTANCE_LEDGER_INVALID", "v1 repair history may not be upgraded into a v2 ledger")
+    if any("ledger_version" in record and record.get("ledger_version") != _ACCEPTANCE_LEDGER_VERSION for record in records):
+        _fail("ACCEPTANCE_LEDGER_INVALID", "unknown acceptance ledger version")
+    return v2
+
+
+def _v2_context(store: WorkflowStore, task_id: str) -> _TaskContext:
+    return _task_context(store, task_id)
+
+
+def _v2_event_id(event: Mapping[str, object]) -> str:
+    payload = dict(event)
+    payload.pop("event_id", None)
+    return _v2_sha256(payload)
+
+
+def _v2_common(
+    replay: _AcceptanceReplay | None,
+    context: _TaskContext,
+    task_id: str,
+    event_type: str,
+    candidate_commit: str,
+) -> dict[str, object]:
+    previous = None if replay is None else replay.last_event_id
+    index = 0 if replay is None else replay.event_count
+    return {
+        "ledger_version": _ACCEPTANCE_LEDGER_VERSION,
+        "event_type": event_type,
+        "event_index": index,
+        "previous_event_id": previous,
+        "timestamp_utc": _event_timestamp(),
+        "task_id": task_id,
+        "task_sha256": context.task_sha256,
+        "base_commit": context.base_commit,
+        "candidate_commit": candidate_commit,
+    }
+
+
+def _v2_append(
+    store: WorkflowStore,
+    task_id: str,
+    replay: _AcceptanceReplay | None,
+    context: _TaskContext,
+    event_type: str,
+    candidate_commit: str,
+    fields: Mapping[str, object],
+) -> dict[str, object]:
+    if event_type not in _ACCEPTANCE_EVENT_TYPES:
+        _fail("ACCEPTANCE_LEDGER_INVALID", "event type is not part of the v2 ledger")
+    event = _v2_common(replay, context, task_id, event_type, candidate_commit)
+    event.update(fields)
+    event["event_id"] = _v2_event_id(event)
+    store.append_event(task_id, event)
+    return event
+
+
+def _v2_expected_receipt_attempt(actor: ActorIdentity) -> str:
+    identity = actor.identity
+    if ":" not in identity:
+        _fail("ACCEPTANCE_LEDGER_INVALID", "expected actor identity is not runtime-bound")
+    _, runtime = identity.split(":", 1)
+    label = runtime.removeprefix("runtime-")
+    return f"{label}-attempt-1"
+
+
+def _v2_validate_observed_receipt(receipt: VerifiedActorReceipt, task: Mapping[str, object]) -> None:
+    expected = {
+        "luna": ("gpt-5.6-luna", "max", "workspace-write", "workspace-write"),
+        "terra_xhigh": ("gpt-5.6-terra", "xhigh", "workspace-write", "workspace-write"),
+        "terra_xhigh_reviewer": ("gpt-5.6-terra", "xhigh", "read-only", "read-only"),
+        "sol_medium_reviewer": ("gpt-5.6-sol", "medium", "read-only", "read-only"),
+        "sol_xhigh": ("gpt-5.6-sol", "xhigh", "workspace-write", "assignment-scoped-write"),
+    }.get(receipt.requested_role)
+    if expected is None or (
+        receipt.observed_model,
+        receipt.observed_reasoning_effort,
+        receipt.observed_sandbox_policy,
+        receipt.observed_permission_profile,
+    ) != expected:
+        _fail("ACCEPTANCE_RECEIPT_MISMATCH", "receipt observed runtime does not match the assigned role")
+    try:
+        if Path(receipt.observed_cwd).resolve() != Path(task["repository_root"]).resolve():
+            _fail("ACCEPTANCE_RECEIPT_MISMATCH", "receipt working directory is not task-bound")
+    except (TypeError, OSError):
+        _fail("ACCEPTANCE_RECEIPT_MISMATCH", "receipt working directory is invalid")
+
+
+def _v2_validate_assignment_receipt(
+    assignment: AcceptanceAssignment,
+    receipt: VerifiedActorReceipt,
+    task: Mapping[str, object],
+    owner_actor: ActorIdentity,
+) -> None:
+    if receipt.assignment_id != assignment.assignment_id:
+        _fail("ACCEPTANCE_RECEIPT_MISMATCH", "receipt belongs to another assignment")
+    _v2_validate_observed_receipt(receipt, task)
+    if assignment.phase == "OWNER_REPAIR":
+        if receipt.requested_role != owner_actor.role:
+            _fail("ACCEPTANCE_RECEIPT_MISMATCH", "owner repair changed the owner role")
+        return
+    if receipt.actor_identity != assignment.expected_actor:
+        _fail("ACCEPTANCE_RECEIPT_MISMATCH", "receipt identity does not match the issued actor")
+    if receipt.attempt_id != _v2_expected_receipt_attempt(assignment.expected_actor):
+        _fail("ACCEPTANCE_RECEIPT_MISMATCH", "receipt attempt does not match its issued actor")
+
+
+def _v2_evidence(value: object) -> AdversarialEvidence:
+    if not isinstance(value, Mapping) or set(value) != {
+        "verification_commands", "negative_checks", "outputs"
+    }:
+        _fail("ACCEPTANCE_EVIDENCE_INVALID", "review evidence shape is invalid")
+    try:
+        return AdversarialEvidence(
+            tuple(value["verification_commands"]),
+            tuple(value["negative_checks"]),
+            tuple(value["outputs"]),
+        )
+    except (TypeError, WorkflowError):
+        _fail("ACCEPTANCE_EVIDENCE_INVALID", "review evidence is invalid")
+    raise AssertionError("unreachable")
+
+
+def _v2_assignment_payload(
+    task_id: str,
+    phase: str,
+    attempt_id: str,
+    expected_actor: ActorIdentity,
+    base_commit: str,
+    input_candidate_commit: str,
+    findings: tuple[RepairFinding, ...],
+    issuing_event_id: str,
+) -> dict[str, object]:
+    return {
+        "task_id": task_id,
+        "phase": phase,
+        "attempt_id": attempt_id,
+        "expected_actor": _v2_actor_payload(expected_actor),
+        "base_commit": base_commit,
+        "input_candidate_commit": input_candidate_commit,
+        "findings": _v2_findings_payload(findings),
+        "allowed_paths": list(_v2_allowed_paths(findings)),
+        "issuing_event_id": issuing_event_id,
+    }
+
+
+def _v2_make_assignment(
+    context: _TaskContext,
+    task_id: str,
+    phase: str,
+    attempt_id: str,
+    expected_actor: ActorIdentity,
+    input_candidate_commit: str,
+    findings: tuple[RepairFinding, ...],
+    issuing_event_id: str,
+    forbidden_actions: tuple[str, ...],
+) -> AcceptanceAssignment:
+    payload = _v2_assignment_payload(
+        task_id, phase, attempt_id, expected_actor, context.base_commit,
+        input_candidate_commit, findings, issuing_event_id,
+    )
+    assignment_id = _v2_sha256(payload)
+    write_authority = "read-only" if phase in _REVIEW_PHASES else "assignment-scoped-write"
+    capability_fields = {
+        "task_id": task_id,
+        "task_sha256": context.task_sha256,
+        "assignment_id": assignment_id,
+        "phase": phase,
+        "attempt_id": attempt_id,
+        "base_commit": context.base_commit,
+        "input_candidate_commit": input_candidate_commit,
+        "finding_ids": tuple(finding.finding_id for finding in findings),
+        "allowed_paths": _v2_allowed_paths(findings),
+        "forbidden_actions": forbidden_actions,
+        "write_authority": write_authority,
+        "issuing_event_id": issuing_event_id,
+        "expected_actor": expected_actor,
+    }
+    capability_hash_fields = dict(capability_fields)
+    capability_hash_fields["expected_actor"] = _v2_actor_payload(expected_actor)
+    capability = AssignmentCapability(
+        capability_id=_v2_sha256(capability_hash_fields), **capability_fields
+    )
+    return AcceptanceAssignment(
+        assignment_id=assignment_id,
+        task_id=task_id,
+        phase=phase,
+        attempt_id=attempt_id,
+        expected_actor=expected_actor,
+        base_commit=context.base_commit,
+        input_candidate_commit=input_candidate_commit,
+        findings=findings,
+        allowed_paths=_v2_allowed_paths(findings),
+        capability=capability,
+    )
+
+
+def _v2_assignment_payload_for_event(assignment: AcceptanceAssignment) -> dict[str, object]:
+    return {
+        "assignment_id": assignment.assignment_id,
+        "attempt_id": assignment.attempt_id,
+        "phase": assignment.phase,
+        "expected_actor": _v2_actor_payload(assignment.expected_actor),
+        "input_candidate_commit": assignment.input_candidate_commit,
+        "findings": _v2_findings_payload(assignment.findings),
+        "allowed_paths": list(assignment.allowed_paths),
+        "capability": asdict(assignment.capability),
+    }
+
+
+def _v2_assignment_from_event(
+    event: Mapping[str, object], context: _TaskContext, task_id: str, previous_event_id: str
+) -> AcceptanceAssignment:
+    if event.get("phase") not in _ACCEPTANCE_PHASES:
+        _fail("ACCEPTANCE_LEDGER_INVALID", "issued assignment phase is invalid")
+    phase = str(event["phase"])
+    expected_actor = _v2_actor(event.get("expected_actor"), "expected_actor")
+    attempt_id = _nonempty(event.get("attempt_id"), "attempt_id", code="ACCEPTANCE_LEDGER_INVALID")
+    findings = _v2_findings_from_payload(event.get("findings"))
+    allowed = tuple(event.get("allowed_paths", ()))
+    if allowed != _v2_allowed_paths(findings):
+        _fail("ACCEPTANCE_LEDGER_INVALID", "assignment allowed paths drift from findings")
+    candidate = _v2_sha(event.get("input_candidate_commit"), "input_candidate_commit", length=40)
+    forbidden = tuple(context_forbidden_actions(event, context))
+    assignment = _v2_make_assignment(
+        context,
+        task_id,
+        phase,
+        attempt_id,
+        expected_actor,
+        candidate,
+        findings,
+        previous_event_id,
+        forbidden,
+    )
+    if event.get("assignment_id") != assignment.assignment_id:
+        _fail("ACCEPTANCE_LEDGER_INVALID", "assignment ID is not canonical")
+    if _v2_canonical(event.get("capability")) != _v2_canonical(asdict(assignment.capability)):
+        _fail("ACCEPTANCE_LEDGER_INVALID", "assignment capability is not immutable")
+    return assignment
+
+
+def context_forbidden_actions(event: Mapping[str, object], context: _TaskContext) -> tuple[str, ...]:
+    capability = event.get("capability")
+    if not isinstance(capability, Mapping):
+        _fail("ACCEPTANCE_LEDGER_INVALID", "assignment capability is missing")
+    forbidden = capability.get("forbidden_actions")
+    if not isinstance(forbidden, list) or any(not isinstance(item, str) for item in forbidden):
+        _fail("ACCEPTANCE_LEDGER_INVALID", "capability forbidden actions are invalid")
+    values = tuple(forbidden)
+    if values != tuple(sorted(values)) or "merge" not in values or "push" not in values:
+        _fail("ACCEPTANCE_LEDGER_INVALID", "capability forbidden actions are invalid")
+    return values
+
+
+def open_task_acceptance(
+    store: WorkflowStore, task: Mapping[str, object], owner_receipt: VerifiedActorReceipt
+) -> ActorIdentity:
+    """Open one v2 ledger from the immutable stored task and owner receipt."""
+
+    if not isinstance(task, Mapping):
+        _fail("ACCEPTANCE_LEDGER_INVALID", "task must be an object")
+    task_id = task.get("task_id")
+    if not isinstance(task_id, str):
+        _fail("ACCEPTANCE_LEDGER_INVALID", "task_id is missing")
+    with store.lock(task_id):
+        stored = _workflow().load_task(store._require_task(task_id) / "task.json")
+        if stored != dict(task):
+            _fail("ACCEPTANCE_LEDGER_INVALID", "acceptance task is not the stored frozen task")
+        context = _v2_context(store, task_id)
+        if _v2_event_records(store, task_id):
+            _fail("ACCEPTANCE_LEDGER_REPLAY", "task acceptance has already been opened")
+        if owner_receipt.assignment_id != hashlib.sha256(f"open:{task_id}".encode("utf-8")).hexdigest():
+            _fail("ACCEPTANCE_RECEIPT_MISMATCH", "opening receipt is not task-bound")
+        _v2_validate_observed_receipt(owner_receipt, stored)
+        if owner_receipt.requested_role not in {"luna", "terra_xhigh"}:
+            _fail("ACCEPTANCE_RECEIPT_MISMATCH", "only Luna or Terra xhigh may own acceptance")
+        owner_actor = owner_receipt.actor_identity
+        event = _v2_append(
+            store,
+            task_id,
+            None,
+            context,
+            "ACCEPTANCE_OPENED",
+            context.candidate_commit,
+            {
+                "owner_actor": _v2_actor_payload(owner_actor),
+                "owner_receipt": _v2_receipt_payload(owner_receipt),
+                "owner_receipt_sha256": _v2_sha256(_v2_receipt_payload(owner_receipt)),
+                "initial_candidate_commit": context.candidate_commit,
+            },
+        )
+        if not isinstance(event.get("event_id"), str):
+            raise AssertionError("v2 event must have an ID")
+        return owner_actor
+
+
+def replay_acceptance_ledger(store: WorkflowStore, task_id: str) -> _AcceptanceReplay | None:
+    """Validate the hash chain and recognise v2 ownership before any execution."""
+
+    context = _v2_context(store, task_id)
+    records = _v2_event_records(store, task_id)
+    if not records:
+        return None
+    replay: _AcceptanceReplay | None = None
+    previous_id: str | None = None
+    for index, event in enumerate(records):
+        if set(_V2_COMMON_FIELDS) - set(event):
+            _fail("ACCEPTANCE_LEDGER_INVALID", "v2 event lacks a required common field")
+        if event.get("ledger_version") != _ACCEPTANCE_LEDGER_VERSION or event.get("event_index") != index:
+            _fail("ACCEPTANCE_LEDGER_INVALID", "v2 event ordering is invalid")
+        if event.get("previous_event_id") != previous_id or event.get("event_id") != _v2_event_id(event):
+            _fail("ACCEPTANCE_LEDGER_INVALID", "v2 event identity chain is invalid")
+        if event.get("task_id") != task_id or event.get("task_sha256") != context.task_sha256:
+            _fail("ACCEPTANCE_LEDGER_INVALID", "v2 event task binding drifted")
+        if event.get("base_commit") != context.base_commit:
+            _fail("ACCEPTANCE_LEDGER_INVALID", "v2 event base commit drifted")
+        event_type = event.get("event_type")
+        if event_type not in _ACCEPTANCE_EVENT_TYPES:
+            _fail("ACCEPTANCE_LEDGER_INVALID", "v2 event type is invalid")
+        if index == 0:
+            if event_type != "ACCEPTANCE_OPENED" or event.get("candidate_commit") != context.candidate_commit:
+                _fail("ACCEPTANCE_LEDGER_INVALID", "v2 ledger must begin with the stored candidate")
+            owner_receipt = _v2_receipt(event.get("owner_receipt"), "owner_receipt")
+            if event.get("owner_receipt_sha256") != _v2_sha256(_v2_receipt_payload(owner_receipt)):
+                _fail("ACCEPTANCE_LEDGER_INVALID", "owner receipt binding drifted")
+            owner_actor = _v2_actor(event.get("owner_actor"), "owner_actor")
+            if owner_actor != owner_receipt.actor_identity:
+                _fail("ACCEPTANCE_LEDGER_INVALID", "owner actor does not match the opening receipt")
+            _v2_validate_observed_receipt(owner_receipt, _workflow().load_task(store._require_task(task_id) / "task.json"))
+            replay = _AcceptanceReplay(
+                task_id,
+                context.task_sha256,
+                context.base_commit,
+                context.candidate_commit,
+                context.candidate_commit,
+                owner_actor,
+                owner_receipt,
+                str(event["event_id"]),
+                1,
+                {},
+                None,
+                False,
+                {},
+                (),
+                set(),
+                {},
+            )
+        else:
+            assert replay is not None
+            if event.get("candidate_commit") != replay.current_candidate_commit:
+                _fail("ACCEPTANCE_LEDGER_INVALID", "v2 candidate binding drifted")
+            if event_type == "ASSIGNMENT_ISSUED":
+                if replay.active_assignment_id is not None or replay.terminal:
+                    _fail("ACCEPTANCE_LEDGER_INVALID", "assignment was issued while the ladder is closed")
+                assignment = _v2_assignment_from_event(event, context, task_id, previous_id or "")
+                replay.assignments[assignment.assignment_id] = assignment
+                replay.active_assignment_id = assignment.assignment_id
+            elif event_type == "ASSIGNMENT_ATTEMPT_STARTED":
+                assignment_id = event.get("assignment_id")
+                if assignment_id != replay.active_assignment_id or not isinstance(assignment_id, str):
+                    _fail("ACCEPTANCE_LEDGER_INVALID", "attempt start lacks the active assignment")
+                assignment = replay.assignments[assignment_id]
+                if event.get("attempt_id") != assignment.attempt_id or assignment_id in replay.started_receipts:
+                    _fail("ACCEPTANCE_LEDGER_INVALID", "attempt start is duplicated or mismatched")
+                receipt = _v2_receipt(event.get("actor_receipt"), "actor_receipt")
+                stored_task = _workflow().load_task(store._require_task(task_id) / "task.json")
+                _v2_validate_assignment_receipt(assignment, receipt, stored_task, replay.owner_actor)
+                if event.get("receipt_sha256") != _v2_sha256(_v2_receipt_payload(receipt)):
+                    _fail("ACCEPTANCE_LEDGER_INVALID", "attempt receipt binding drifted")
+                replay.started_receipts[assignment_id] = receipt
+            elif event_type == "REVIEW_COMPLETED":
+                assignment_id = event.get("assignment_id")
+                if assignment_id != replay.active_assignment_id or not isinstance(assignment_id, str):
+                    _fail("ACCEPTANCE_LEDGER_INVALID", "review lacks the active assignment")
+                assignment = replay.assignments[assignment_id]
+                if assignment.phase not in _REVIEW_PHASES or event.get("attempt_id") != assignment.attempt_id:
+                    _fail("ACCEPTANCE_LEDGER_INVALID", "review assignment binding is invalid")
+                receipt = _v2_receipt(event.get("reviewer_receipt"), "reviewer_receipt")
+                if replay.started_receipts.get(assignment_id) != receipt:
+                    _fail("ACCEPTANCE_LEDGER_INVALID", "review receipt was not bound at attempt start")
+                evidence = _v2_evidence(event.get("evidence"))
+                if event.get("evidence_sha256") != _v2_sha256(asdict(evidence)):
+                    _fail("ACCEPTANCE_LEDGER_INVALID", "review evidence binding drifted")
+                verdict = event.get("verdict")
+                if verdict != "ACCEPT" or event.get("findings") != []:
+                    _fail("ACCEPTANCE_LEDGER_INVALID", "first acceptance slice permits only an empty ACCEPT")
+                if assignment.phase != "REVIEW_1":
+                    _fail("ACCEPTANCE_LEDGER_INVALID", "review phase is not available in this slice")
+                if event.get("terminal_state") != "TASK_TERMINAL" or event.get("whole_project_acceptance_required") != "PENDING":
+                    _fail("ACCEPTANCE_LEDGER_INVALID", "terminal acceptance is not explicitly bounded")
+                replay.active_assignment_id = None
+                replay.terminal = True
+                replay.phase_outcomes[assignment.phase] = "ACCEPT"
+                replay.reviewer_identities.add(receipt.actor_identity.identity)
+            else:
+                _fail("ACCEPTANCE_LEDGER_INVALID", "v2 result type is unavailable in the first slice")
+            replay.last_event_id = str(event["event_id"])
+            replay.event_count += 1
+        previous_id = str(event["event_id"])
+    return replay
+
+
+def _v2_next_phase(replay: _AcceptanceReplay) -> tuple[str, tuple[RepairFinding, ...]]:
+    if replay.terminal or replay.active_assignment_id is not None:
+        _fail("ACCEPTANCE_SEQUENCE_INVALID", "acceptance ladder has no issuable step")
+    if not replay.assignments:
+        return "REVIEW_1", ()
+    _fail("ACCEPTANCE_SEQUENCE_INVALID", "result transition is required before another assignment")
+
+
+def issue_acceptance_assignment(
+    store: WorkflowStore, task_id: str, phase: str, expected_actor: ActorIdentity
+) -> AcceptanceAssignment:
+    """Issue a single immutable v2 capability; it has no ambient write authority."""
+
+    if phase not in _ACCEPTANCE_PHASES or not isinstance(expected_actor, ActorIdentity):
+        _fail("ACCEPTANCE_SEQUENCE_INVALID", "assignment request is invalid")
+    with store.lock(task_id):
+        replay = replay_acceptance_ledger(store, task_id)
+        if replay is None:
+            _fail("ACCEPTANCE_SEQUENCE_INVALID", "acceptance must be opened before issuing work")
+        expected_phase, findings = _v2_next_phase(replay)
+        if phase != expected_phase or expected_actor.role != "terra_xhigh_reviewer":
+            _fail("ACCEPTANCE_SEQUENCE_INVALID", "REVIEW_1 requires a distinct Terra xhigh reviewer")
+        if expected_actor.identity == replay.owner_actor.identity:
+            _fail("ACCEPTANCE_SEQUENCE_INVALID", "owner may not self-review")
+        context = _v2_context(store, task_id)
+        stored = _workflow().load_task(store._require_task(task_id) / "task.json")
+        raw_forbidden = stored.get("forbidden_actions")
+        if not isinstance(raw_forbidden, list) or any(not isinstance(item, str) for item in raw_forbidden):
+            _fail("ACCEPTANCE_LEDGER_INVALID", "task forbidden actions are invalid")
+        forbidden = tuple(sorted(set(raw_forbidden)))
+        if "merge" not in forbidden or "push" not in forbidden:
+            _fail("ACCEPTANCE_LEDGER_INVALID", "task must forbid merge and push")
+        attempt_id = f"{phase.lower()}-attempt-{sum(a.phase == phase for a in replay.assignments.values()) + 1}"
+        assignment = _v2_make_assignment(
+            context,
+            task_id,
+            phase,
+            attempt_id,
+            expected_actor,
+            replay.current_candidate_commit,
+            findings,
+            replay.last_event_id,
+            forbidden,
+        )
+        _v2_append(
+            store,
+            task_id,
+            replay,
+            context,
+            "ASSIGNMENT_ISSUED",
+            replay.current_candidate_commit,
+            _v2_assignment_payload_for_event(assignment),
+        )
+        return assignment
+
+
+def _v2_require_issued_assignment(
+    replay: _AcceptanceReplay,
+    assignment: AcceptanceAssignment,
+) -> None:
+    if replay.active_assignment_id != assignment.assignment_id:
+        _fail("ACCEPTANCE_SEQUENCE_INVALID", "assignment is not the active ledger capability")
+    stored = replay.assignments.get(assignment.assignment_id)
+    if stored != assignment:
+        _fail("ACCEPTANCE_LEDGER_INVALID", "assignment differs from its immutable issuance")
+
+
+def _v2_start_attempt(
+    store: WorkflowStore,
+    task_id: str,
+    replay: _AcceptanceReplay,
+    context: _TaskContext,
+    assignment: AcceptanceAssignment,
+    receipt: VerifiedActorReceipt,
+    stored_task: Mapping[str, object],
+) -> _AcceptanceReplay:
+    _v2_require_issued_assignment(replay, assignment)
+    _v2_validate_assignment_receipt(assignment, receipt, stored_task, replay.owner_actor)
+    if assignment.assignment_id in replay.started_receipts:
+        _fail("ACCEPTANCE_SEQUENCE_INVALID", "assignment attempt has already started")
+    _v2_append(
+        store,
+        task_id,
+        replay,
+        context,
+        "ASSIGNMENT_ATTEMPT_STARTED",
+        replay.current_candidate_commit,
+        {
+            "assignment_id": assignment.assignment_id,
+            "attempt_id": assignment.attempt_id,
+            "phase": assignment.phase,
+            "actor_receipt": _v2_receipt_payload(receipt),
+            "receipt_sha256": _v2_sha256(_v2_receipt_payload(receipt)),
+        },
+    )
+    fresh = replay_acceptance_ledger(store, task_id)
+    if fresh is None:
+        raise AssertionError("started v2 ledger must replay")
+    return fresh
+
+
+def record_adversarial_review(
+    store: WorkflowStore,
+    task_id: str,
+    assignment: AcceptanceAssignment,
+    reviewer_receipt: VerifiedActorReceipt,
+    verdict: str,
+    findings: Iterable[RepairFinding],
+    evidence: AdversarialEvidence,
+) -> None:
+    """Record the first bounded Terra-xhigh review and its immutable evidence."""
+
+    if not isinstance(assignment, AcceptanceAssignment) or not isinstance(
+        reviewer_receipt, VerifiedActorReceipt
+    ) or not isinstance(evidence, AdversarialEvidence):
+        _fail("ACCEPTANCE_SEQUENCE_INVALID", "review input is not a verified v2 value")
+    with store.lock(task_id):
+        replay = replay_acceptance_ledger(store, task_id)
+        if replay is None:
+            _fail("ACCEPTANCE_SEQUENCE_INVALID", "acceptance ledger is not open")
+        context = _v2_context(store, task_id)
+        stored_task = _workflow().load_task(store._require_task(task_id) / "task.json")
+        replay = _v2_start_attempt(
+            store, task_id, replay, context, assignment, reviewer_receipt, stored_task
+        )
+        if assignment.phase != "REVIEW_1" or verdict != "ACCEPT" or tuple(findings):
+            _fail("ACCEPTANCE_SEQUENCE_INVALID", "first review requires an empty ACCEPT in this slice")
+        _v2_append(
+            store,
+            task_id,
+            replay,
+            context,
+            "REVIEW_COMPLETED",
+            replay.current_candidate_commit,
+            {
+                "assignment_id": assignment.assignment_id,
+                "attempt_id": assignment.attempt_id,
+                "phase": assignment.phase,
+                "reviewer_receipt": _v2_receipt_payload(reviewer_receipt),
+                "verdict": "ACCEPT",
+                "findings": [],
+                "evidence": asdict(evidence),
+                "evidence_sha256": _v2_sha256(asdict(evidence)),
+                "terminal_state": "TASK_TERMINAL",
+                "terminal_reason": "REVIEW_1_ACCEPTED",
+                "whole_project_acceptance_required": "PENDING",
+            },
+        )
+
+
+def complete_acceptance_assignment(
+    store: WorkflowStore,
+    task_id: str,
+    assignment: AcceptanceAssignment,
+    actor_receipt: VerifiedActorReceipt,
+    output_candidate_commit: str,
+    changed_paths: Iterable[str],
+) -> None:
+    """Reserved for the repair phases; fail closed until their slice is installed."""
+
+    _fail("ACCEPTANCE_SEQUENCE_INVALID", "repair completion requires the repair-ladder adapter")
+
+
+def repair_ledger_claims_task(store: WorkflowStore, task_id: str) -> bool:
+    """True only for a valid v2 ledger; v1 history never claims this adapter."""
+
+    return replay_acceptance_ledger(store, task_id) is not None
 
 
 def has_active_repair_assignment(store: WorkflowStore, task_id: str) -> bool:
