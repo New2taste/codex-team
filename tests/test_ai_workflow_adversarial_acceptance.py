@@ -126,8 +126,8 @@ class AcceptanceContractMutationTest(unittest.TestCase):
             assert_one_result_per_attempt(unsafe_events)
         assert_one_result_per_attempt(safe_retry_events)
 
-    def test_common_field_contract_kills_invented_event_payload_whitelist(self):
-        event = {
+    def test_common_event_binding_kills_field_presence_only_validator(self):
+        expected_event = {
             "ledger_version": "adversarial-acceptance-1",
             "event_type": "ASSIGNMENT_ATTEMPT_FAILED",
             "event_index": 3,
@@ -138,26 +138,40 @@ class AcceptanceContractMutationTest(unittest.TestCase):
             "task_sha256": "task-sha256",
             "base_commit": "base-commit",
             "candidate_commit": "candidate-commit",
-            "assignment_id": "assignment-001",
-            "attempt_id": "attempt-001",
-            "failure_code": "RESULT_DIFF_MISMATCH",
-            "failure_details": {"reported": ["src/beta.py"]},
         }
-        invented_exact_fields = self.COMMON_EVENT_FIELDS | {
-            "assignment_id",
-            "attempt_id",
-            "failure_code",
+        forged_cross_task_event = {
+            **expected_event,
+            "task_id": "AWF-20260809-902",
+        }
+        expected_bindings = {
+            field: expected_event[field]
+            for field in (
+                "task_id",
+                "task_sha256",
+                "base_commit",
+                "candidate_commit",
+            )
         }
 
-        def unsafe_exact_schema(record: dict[str, object]) -> bool:
-            return set(record) == invented_exact_fields
+        def unsafe_field_presence_only_validator(record: dict[str, object]) -> bool:
+            return set(record) == self.COMMON_EVENT_FIELDS
 
-        with self.assertRaises(AssertionError):
-            self.assertTrue(unsafe_exact_schema(event))
-        self.assertTrue(self.COMMON_EVENT_FIELDS.issubset(event))
         self.assertTrue(
-            {"assignment_id", "attempt_id", "failure_code"}.issubset(event)
+            unsafe_field_presence_only_validator(forged_cross_task_event),
+            "the unsafe stub demonstrates why common-field presence is insufficient",
         )
+        self.assertEqual(
+            expected_bindings,
+            {field: expected_event[field] for field in expected_bindings},
+        )
+        with self.assertRaisesRegex(AssertionError, "task_id"):
+            self.assertEqual(
+                expected_bindings,
+                {
+                    field: forged_cross_task_event[field]
+                    for field in expected_bindings
+                },
+            )
 
 
 class AcceptanceLedgerV2ContractTest(unittest.TestCase):
