@@ -1698,8 +1698,11 @@ def _v2_start_attempt(
 ) -> _AcceptanceReplay:
     _v2_require_issued_assignment(replay, assignment)
     _v2_validate_assignment_receipt(assignment, receipt, stored_task, replay.owner_actor)
-    if assignment.assignment_id in replay.started_receipts:
-        _fail("ACCEPTANCE_SEQUENCE_INVALID", "assignment attempt has already started")
+    started = replay.started_receipts.get(assignment.assignment_id)
+    if started is not None:
+        if started != receipt:
+            _fail("ACCEPTANCE_SEQUENCE_INVALID", "assignment attempt receipt changed after launch")
+        return replay
     _v2_append(
         store,
         task_id,
@@ -1907,6 +1910,75 @@ def complete_acceptance_assignment(
             )
         except RuntimeError as exc:
             _v2_fail_attempt(store, task_id, replay, context, assignment, exc)
+            raise
+
+
+def run_assignment(
+    store: WorkflowStore,
+    task_id: str,
+    assignment: AcceptanceAssignment,
+    actor_receipt: VerifiedActorReceipt,
+    adapter: object,
+) -> None:
+    """Run exactly one v2 capability through an identity-aware adapter.
+
+    This deliberately never falls back to ``runner.run``.  The adapter is
+    passed the immutable assignment (which contains the capability) and the
+    verified receipt; post-launch exceptions and malformed output consume one
+    attempt by appending the single permitted failure record.
+    """
+
+    launch = getattr(adapter, "run_assignment", None)
+    if not callable(launch):
+        _fail("REPAIR_ADAPTER_REQUIRED", "v2 assignments require adapter.run_assignment")
+    if not isinstance(assignment, AcceptanceAssignment) or not isinstance(
+        actor_receipt, VerifiedActorReceipt
+    ):
+        _fail("REPAIR_ADAPTER_REQUIRED", "v2 adapter input is not a verified assignment")
+    with store.lock(task_id):
+        replay = replay_acceptance_ledger(store, task_id)
+        if replay is None:
+            _fail("REPAIR_ADAPTER_REQUIRED", "v2 acceptance ledger is not open")
+        context = _v2_context(store, task_id)
+        stored_task = _workflow().load_task(store._require_task(task_id) / "task.json")
+        replay = _v2_start_attempt(
+            store, task_id, replay, context, assignment, actor_receipt, stored_task
+        )
+    try:
+        output = launch(assignment, actor_receipt)
+        if not isinstance(output, Mapping):
+            _fail("REPAIR_ADAPTER_INVALID_OUTPUT", "adapter output must be an object")
+        if assignment.phase in _REPAIR_PHASES:
+            complete_acceptance_assignment(
+                store,
+                task_id,
+                assignment,
+                actor_receipt,
+                output.get("output_candidate_commit"),
+                output.get("changed_paths"),
+            )
+            return
+        evidence = output.get("evidence")
+        if isinstance(evidence, Mapping):
+            evidence = _v2_evidence(evidence)
+        record_adversarial_review(
+            store,
+            task_id,
+            assignment,
+            actor_receipt,
+            output.get("verdict"),
+            output.get("findings", ()),
+            evidence,
+        )
+    except BaseException as exc:
+        with store.lock(task_id):
+            latest = replay_acceptance_ledger(store, task_id)
+            if (
+                latest is not None
+                and latest.active_assignment_id == assignment.assignment_id
+                and assignment.assignment_id in latest.started_receipts
+            ):
+                _v2_fail_attempt(store, task_id, latest, context, assignment, exc)
             raise
 
 

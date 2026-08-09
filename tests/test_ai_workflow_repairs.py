@@ -1,6 +1,8 @@
 import json
+import hashlib
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from unittest import mock
 
@@ -237,6 +239,8 @@ class RepairProtocolTest(unittest.TestCase):
         self.assertIs(workflow.assign_repair, repairs.assign_repair)
         self.assertIs(workflow.record_repair_assignment, repairs.record_repair_assignment)
         self.assertIs(workflow.validate_repair_result, repairs.validate_repair_result)
+        self.assertIs(workflow.open_task_acceptance, repairs.open_task_acceptance)
+        self.assertIs(workflow.run_assignment, repairs.run_assignment)
 
     def test_legacy_remediation_without_repair_events_never_requires_repair_commits(self):
         legacy_task_id = "AWF-20260808-003"
@@ -320,6 +324,77 @@ class RepairProtocolTest(unittest.TestCase):
         self.assertEqual([], runner.calls)
         events = (self.root / self.task_id / "events.jsonl").read_text(encoding="utf-8")
         self.assertIn('"event_type":"REPAIR_EXECUTION_INTEGRATION_BLOCKED"', events)
+
+    def test_v2_adapter_never_uses_generic_runner_and_records_one_failure(self):
+        task = json.loads((self.root / self.task_id / "task.json").read_text(encoding="utf-8"))
+        owner = repairs.VerifiedActorReceipt(
+            assignment_id=hashlib.sha256(f"open:{self.task_id}".encode("utf-8")).hexdigest(),
+            execution_surface="CODEX_EXEC_ROLE_CONTRACT",
+            runtime_instance_id="runtime-owner",
+            attempt_id="owner-attempt-1",
+            requested_role="luna",
+            observed_model="gpt-5.6-luna",
+            observed_reasoning_effort="max",
+            observed_sandbox_policy="workspace-write",
+            observed_permission_profile="workspace-write",
+            observed_cwd=str(Path(self.temporary_directory.name)),
+            runtime_evidence_sha256="c" * 64,
+            native_agent_uuid=None,
+            codex_thread_id=str(uuid.uuid4()),
+        )
+        repairs.open_task_acceptance(self.store, task, owner)
+        reviewer = repairs.ActorIdentity(
+            "CODEX_EXEC_ROLE_CONTRACT:runtime-reviewer", "terra_xhigh_reviewer"
+        )
+        assignment = repairs.issue_acceptance_assignment(
+            self.store, self.task_id, "REVIEW_1", reviewer
+        )
+        receipt = repairs.VerifiedActorReceipt(
+            assignment_id=assignment.assignment_id,
+            execution_surface="CODEX_EXEC_ROLE_CONTRACT",
+            runtime_instance_id="runtime-reviewer",
+            attempt_id="reviewer-attempt-1",
+            requested_role="terra_xhigh_reviewer",
+            observed_model="gpt-5.6-terra",
+            observed_reasoning_effort="xhigh",
+            observed_sandbox_policy="read-only",
+            observed_permission_profile="read-only",
+            observed_cwd=str(Path(self.temporary_directory.name)),
+            runtime_evidence_sha256="d" * 64,
+            native_agent_uuid=None,
+            codex_thread_id=str(
+                uuid.uuid5(uuid.NAMESPACE_URL, "codex:reviewer:runtime-reviewer")
+            ),
+        )
+
+        case = self
+
+        class InvalidOutputAdapter:
+            def __init__(self):
+                self.assignment_calls = 0
+                self.generic_calls = 0
+
+            def run_assignment(self, received_assignment, received_receipt):
+                self.assignment_calls += 1
+                case.assertIs(assignment, received_assignment)
+                case.assertIs(receipt, received_receipt)
+                return {"verdict": "ACCEPT"}
+
+            def run(self, *_args):
+                self.generic_calls += 1
+                raise AssertionError("generic runner must never receive a v2 assignment")
+
+        adapter = InvalidOutputAdapter()
+        with self.assertRaises(workflow.WorkflowError):
+            repairs.run_assignment(self.store, self.task_id, assignment, receipt, adapter)
+        self.assertEqual(1, adapter.assignment_calls)
+        self.assertEqual(0, adapter.generic_calls)
+        events = [
+            json.loads(line)
+            for line in (self.root / self.task_id / "events.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        failed = [event for event in events if event.get("event_type") == "ASSIGNMENT_ATTEMPT_FAILED"]
+        self.assertEqual(1, len(failed))
 
 
 if __name__ == "__main__":

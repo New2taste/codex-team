@@ -3349,6 +3349,11 @@ def run_enforced_construction(
         _fail("DISPATCH_IDENTITY_DRIFT", "construction attempt must be a positive integer")
     store = WorkflowStore(state_root or WORKFLOW_STATE_ROOT)
     with store.lock(task_id):
+        if repair_ledger_claims_task(store, task_id):
+            _fail(
+                "REPAIR_ADAPTER_REQUIRED",
+                "adversarial-acceptance-1 tasks require the verified assignment adapter",
+            )
         task, frozen, step, role, route_wire = _load_enforced_construction_artifacts(
             store, task_id, construction_plan, request, step_id
         )
@@ -3468,6 +3473,15 @@ def run_until_gate(
 ) -> str:
     """Advance one bounded pipeline only until its next owner-controlled gate."""
 
+    store = WorkflowStore(state_root or WORKFLOW_STATE_ROOT)
+    # A v2 acceptance ledger owns every phase of its task, including an open,
+    # failed, accepted, or terminal attempt.  The generic state machine has no
+    # receipt/capability channel, so it must not even select a role for it.
+    if repair_ledger_claims_task(store, task_id):
+        _fail(
+            "REPAIR_ADAPTER_REQUIRED",
+            "adversarial-acceptance-1 tasks require the verified assignment adapter",
+        )
     construction_values = (
         construction_plan,
         construction_request,
@@ -3493,8 +3507,12 @@ def run_until_gate(
         _fail("INVALID_RUNNER", "runner must provide run(role, task)")
     if getattr(runner, "is_live_model", False) and not allow_live_model:
         _fail("LIVE_MODEL_NOT_AUTHORIZED", "live model execution requires explicit authorization")
-    store = WorkflowStore(state_root or WORKFLOW_STATE_ROOT)
     with store.lock(task_id):
+        if repair_ledger_claims_task(store, task_id):
+            _fail(
+                "REPAIR_ADAPTER_REQUIRED",
+                "adversarial-acceptance-1 tasks require the verified assignment adapter",
+            )
         task_path = store._require_task(task_id) / "task.json"
         task = load_task(task_path)
         state = _current_state(store, task_id)
@@ -3962,27 +3980,49 @@ def main(argv: list[str] | None = None) -> int:
 try:
     from .ai_workflow_repairs import (
         ActorIdentity,
+        AcceptanceAssignment,
+        AdversarialEvidence,
+        AssignmentCapability,
         RepairAssignment,
         RepairFinding,
+        VerifiedActorReceipt,
         assign_repair,
+        complete_acceptance_assignment,
         has_active_repair_assignment,
+        issue_acceptance_assignment,
+        open_task_acceptance,
+        record_adversarial_review,
         record_repair_assignment,
         record_repair_completion,
         record_repair_review,
         record_sol_repair_authorization,
+        repair_ledger_claims_task,
+        replay_acceptance_ledger,
+        run_assignment,
         validate_repair_result,
     )
 except ImportError:  # direct script execution
     from ai_workflow_repairs import (
         ActorIdentity,
+        AcceptanceAssignment,
+        AdversarialEvidence,
+        AssignmentCapability,
         RepairAssignment,
         RepairFinding,
+        VerifiedActorReceipt,
         assign_repair,
+        complete_acceptance_assignment,
         has_active_repair_assignment,
+        issue_acceptance_assignment,
+        open_task_acceptance,
+        record_adversarial_review,
         record_repair_assignment,
         record_repair_completion,
         record_repair_review,
         record_sol_repair_authorization,
+        repair_ledger_claims_task,
+        replay_acceptance_ledger,
+        run_assignment,
         validate_repair_result,
     )
 
