@@ -1,5 +1,6 @@
 import json
 import hashlib
+import subprocess
 import tempfile
 import unittest
 import uuid
@@ -73,6 +74,7 @@ class RepairProtocolTest(unittest.TestCase):
             "REWORK_RECOMMENDED",
         )
 
+    @unittest.skip("repair-ledger-1 assignment creation is terminally disabled")
     def test_assignments_are_immutable_and_cap_terra_at_two_rounds(self):
         findings = list(self.findings)
         first = repairs.assign_repair(findings, 1, self.original_reviewer, None)
@@ -93,6 +95,11 @@ class RepairProtocolTest(unittest.TestCase):
         with self.assertRaisesRegex(workflow.WorkflowError, "REPAIR_BUDGET_EXHAUSTED"):
             self.assignment(4)
 
+    def test_v1_repair_mutation_api_is_disabled(self):
+        with self.assertRaisesRegex(workflow.WorkflowError, "REPAIR_PROTOCOL_V1_DISABLED"):
+            self.assignment(1)
+
+    @unittest.skip("repair-ledger-1 assignment creation is terminally disabled")
     def test_direct_assignment_construction_retains_no_mutable_finding_input(self):
         assigned = self.assignment(1)
         mutable_findings = list(assigned.findings)
@@ -109,6 +116,7 @@ class RepairProtocolTest(unittest.TestCase):
         self.assertIsInstance(reconstructed.findings, tuple)
         self.assertEqual(assigned.findings, reconstructed.findings)
 
+    @unittest.skip("repair-ledger-1 mutation is terminally disabled")
     def test_persisted_rounds_require_completed_rejections_and_replay_after_restart(self):
         first = self.assignment(1)
         with self.assertRaisesRegex(workflow.WorkflowError, "REPAIR_SEQUENCE_INVALID"):
@@ -155,6 +163,7 @@ class RepairProtocolTest(unittest.TestCase):
         self.assertEqual("b" * 40, events[0]["candidate_commit"])
         self.assertRegex(events[0]["task_sha256"], r"^[0-9a-f]{64}$")
 
+    @unittest.skip("repair-ledger-1 mutation is terminally disabled")
     def test_protocol_rejects_actor_scope_finding_commit_and_replay_drift(self):
         first = self.assignment(1)
         repairs.record_repair_assignment(self.store, self.task_id, first)
@@ -206,6 +215,7 @@ class RepairProtocolTest(unittest.TestCase):
         with self.assertRaisesRegex(workflow.WorkflowError, "REPAIR_COMMIT_DRIFT"):
             repairs.record_repair_assignment(self.store, self.task_id, drifted)
 
+    @unittest.skip("repair-ledger-1 mutation is terminally disabled")
     def test_repair_finding_scope_must_stay_within_the_parent_task_write_scope(self):
         with self.assertRaisesRegex(workflow.WorkflowError, "REPAIR_SCOPE_VIOLATION"):
             repairs.record_repair_assignment(
@@ -219,6 +229,7 @@ class RepairProtocolTest(unittest.TestCase):
                 ),
             )
 
+    @unittest.skip("repair-ledger-1 mutation is terminally disabled")
     def test_closed_actor_set_and_peer_separation_fail_closed(self):
         with self.assertRaisesRegex(workflow.WorkflowError, "REPAIR_ACTOR_MISMATCH"):
             repairs.assign_repair(
@@ -296,6 +307,7 @@ class RepairProtocolTest(unittest.TestCase):
         with self.assertRaises(workflow.WorkflowError):
             repairs.repair_ledger_claims_task(self.store, "AWF-20260809-910")
 
+    @unittest.skip("repair-ledger-1 mutation is terminally disabled")
     def test_repair_protocol_owns_execution_until_an_acceptance_verdict_closes_it(self):
         first = self.assignment(1)
         repairs.record_repair_assignment(self.store, self.task_id, first)
@@ -317,6 +329,7 @@ class RepairProtocolTest(unittest.TestCase):
         )
         self.assertTrue(repairs.has_active_repair_assignment(self.store, self.task_id))
 
+    @unittest.skip("repair-ledger-1 mutation is terminally disabled")
     def test_active_repair_fails_closed_without_identity_aware_execution_handoff(self):
         first = self.assignment(1)
         repairs.record_repair_assignment(self.store, self.task_id, first)
@@ -365,8 +378,30 @@ class RepairProtocolTest(unittest.TestCase):
         events = (self.root / self.task_id / "events.jsonl").read_text(encoding="utf-8")
         self.assertIn('"event_type":"REPAIR_EXECUTION_INTEGRATION_BLOCKED"', events)
 
-    def test_v2_adapter_never_uses_generic_runner_and_records_one_failure(self):
+    def test_v2_adapter_requires_controller_boundary_and_records_one_failure(self):
         task = json.loads((self.root / self.task_id / "task.json").read_text(encoding="utf-8"))
+        repository = Path(self.temporary_directory.name) / "repository"
+        repository.mkdir()
+        subprocess.run(["git", "init", "-q", str(repository)], check=True)
+        subprocess.run(["git", "-C", str(repository), "config", "user.email", "repair@example.invalid"], check=True)
+        subprocess.run(["git", "-C", str(repository), "config", "user.name", "Repair Tests"], check=True)
+        (repository / "README.md").write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repository), "add", "README.md"], check=True)
+        subprocess.run(["git", "-C", str(repository), "commit", "-q", "-m", "base"], check=True)
+        candidate = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        task.update(
+            {
+                "repository_root": str(repository),
+                "base_commit": candidate,
+                "candidate_commit": candidate,
+            }
+        )
+        workflow.atomic_write_json(self.root / self.task_id / "task.json", task)
         owner = repairs.VerifiedActorReceipt(
             assignment_id=hashlib.sha256(f"open:{self.task_id}".encode("utf-8")).hexdigest(),
             execution_surface="CODEX_EXEC_ROLE_CONTRACT",
@@ -377,7 +412,7 @@ class RepairProtocolTest(unittest.TestCase):
             observed_reasoning_effort="max",
             observed_sandbox_policy="workspace-write",
             observed_permission_profile="workspace-write",
-            observed_cwd=str(Path(self.temporary_directory.name)),
+            observed_cwd=str(repository),
             runtime_evidence_sha256="c" * 64,
             native_agent_uuid=None,
             codex_thread_id=str(uuid.uuid4()),
@@ -399,7 +434,7 @@ class RepairProtocolTest(unittest.TestCase):
             observed_reasoning_effort="xhigh",
             observed_sandbox_policy="read-only",
             observed_permission_profile="read-only",
-            observed_cwd=str(Path(self.temporary_directory.name)),
+            observed_cwd=str(repository),
             runtime_evidence_sha256="d" * 64,
             native_agent_uuid=None,
             codex_thread_id=str(
@@ -409,7 +444,7 @@ class RepairProtocolTest(unittest.TestCase):
 
         case = self
 
-        class InvalidOutputAdapter:
+        class LegacyAdapter:
             def __init__(self):
                 self.assignment_calls = 0
                 self.generic_calls = 0
@@ -424,11 +459,42 @@ class RepairProtocolTest(unittest.TestCase):
                 self.generic_calls += 1
                 raise AssertionError("generic runner must never receive a v2 assignment")
 
-        adapter = InvalidOutputAdapter()
+        legacy_adapter = LegacyAdapter()
+        with self.assertRaisesRegex(workflow.WorkflowError, "REPAIR_ADAPTER_REQUIRED"):
+            repairs.run_assignment(
+                self.store, self.task_id, assignment, receipt, legacy_adapter
+            )
+        self.assertEqual(0, legacy_adapter.assignment_calls)
+        self.assertEqual(0, legacy_adapter.generic_calls)
+
+        class ControllerBoundary(repairs.ControllerAssignmentBoundary):
+            def __init__(self):
+                self.attestation_calls = 0
+                self.execution_calls = 0
+
+            def attest_execution(self, capability):
+                self.attestation_calls += 1
+                case.assertEqual(assignment.capability, capability)
+                return repairs.ControllerExecutionAttestation(
+                    task_id=self_task_id,
+                    task_sha256=capability.task_sha256,
+                    assignment_id=assignment.assignment_id,
+                    capability_id=capability.capability_id,
+                    candidate_commit=assignment.input_candidate_commit,
+                    actor_receipt=receipt,
+                )
+
+            def execute_capability(self, capability):
+                self.execution_calls += 1
+                case.assertEqual(assignment.capability, capability)
+                return {"verdict": "ACCEPT"}
+
+        self_task_id = self.task_id
+        boundary = ControllerBoundary()
         with self.assertRaises(workflow.WorkflowError):
-            repairs.run_assignment(self.store, self.task_id, assignment, receipt, adapter)
-        self.assertEqual(1, adapter.assignment_calls)
-        self.assertEqual(0, adapter.generic_calls)
+            repairs.run_assignment(self.store, self.task_id, assignment, boundary)
+        self.assertEqual(1, boundary.attestation_calls)
+        self.assertEqual(1, boundary.execution_calls)
         events = [
             json.loads(line)
             for line in (self.root / self.task_id / "events.jsonl").read_text(encoding="utf-8").splitlines()

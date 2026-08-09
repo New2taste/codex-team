@@ -218,7 +218,7 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
             "forbidden_actions": ["merge", "push"],
             "risk_flags": [],
             "acceptance_commands": [
-                "python3.11 -m unittest tests.test_ai_workflow_adversarial_acceptance -v"
+                "/Users/lee/.local/bin/python3.11 -c \"from pathlib import Path; assert Path('src/alpha.py').is_file(); print('acceptance-ok')\""
             ],
             "verification_level": "L2",
             "human_gates": ["PLAN_APPROVAL", "EXECUTION_APPROVAL"],
@@ -285,6 +285,7 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
             "record_adversarial_review",
             "replay_acceptance_ledger",
             "repair_ledger_claims_task",
+            "execute_adversarial_evidence",
         )
         missing = [name for name in names if not hasattr(repairs, name)]
         if missing:
@@ -405,15 +406,7 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
 
     def _evidence(self, label: str = "review") -> object:
         api = self._v2()
-        return api["AdversarialEvidence"](
-            verification_commands=(
-                "python3.11 -m unittest tests.test_ai_workflow_adversarial_acceptance -v",
-            ),
-            negative_checks=(
-                f"mutation-{label}: reject an out-of-scope path and stale candidate",
-            ),
-            outputs=(f"{label}: verification and negative mutation were observed",),
-        )
+        return api["execute_adversarial_evidence"](self.store, self.TASK_ID)
 
     def _create_task(self, task: dict[str, object] | None = None) -> None:
         self.store.create_task(dict(task or self.task))
@@ -449,6 +442,14 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
     ) -> tuple[object, object, object]:
         expected = expected_actor or self._expected_actor(label, role)
         assignment = self._issue(phase, expected)
+        if phase == "OWNER_REPAIR":
+            surface, runtime = expected.identity.split(":", 1)
+            label = runtime.removeprefix("runtime-")
+            receipt_kwargs = {
+                **receipt_kwargs,
+                "runtime_instance_id": runtime,
+                "execution_surface": surface,
+            }
         receipt = self._receipt_for(
             assignment, label, role, **receipt_kwargs
         )
@@ -754,6 +755,79 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
         events = self._assert_chain()
         self._assert_terminal(events)
         self._assert_terminal_ladder_closed()
+
+    def test_owner_repair_requires_the_issued_owner_runtime_receipt(self):
+        owner_actor, _, _, first, first_receipt = self._open_review_one()
+        self._review(first, first_receipt, "REWORK", self.findings)
+        _, owner_repair, owner_receipt = self._issue_with_receipt(
+            "OWNER_REPAIR", "luna-owner-repair", "luna", expected_actor=owner_actor
+        )
+        self.assertEqual(owner_actor, owner_receipt.actor_identity)
+        forged = self._receipt_for(owner_repair, "luna-owner-repair", "luna")
+        candidate = self._commit_file("src/alpha.py", "OWNER_ALPHA = 1\n")
+        with self.assertRaises(workflow.WorkflowError):
+            self._complete(owner_repair, forged, candidate, ("src/alpha.py",))
+
+    def test_review_rejects_model_claimed_evidence_not_executed_by_controller(self):
+        self._open_with_owner("luna-owner", "luna")
+        _, review, reviewer_receipt = self._issue_with_receipt(
+            "REVIEW_1", "terra-review-one", "terra_xhigh_reviewer"
+        )
+        forged = self._v2()["AdversarialEvidence"](
+            verification_commands=("model says verification passed",),
+            negative_checks=("model says mutation was rejected",),
+            outputs=("model supplied output",),
+        )
+        with self.assertRaisesRegex(workflow.WorkflowError, "ACCEPTANCE_EVIDENCE_INVALID"):
+            self._review(review, reviewer_receipt, "ACCEPT", evidence=forged)
+        events = self._events()
+        self.assertEqual(
+            1,
+            sum(event["event_type"] == "ASSIGNMENT_ATTEMPT_FAILED" for event in events),
+        )
+
+    def test_orphaned_started_attempt_is_interrupted_once_before_retry(self):
+        self._open_with_owner("luna-owner", "luna")
+        _, review, reviewer_receipt = self._issue_with_receipt(
+            "REVIEW_1", "terra-review-one", "terra_xhigh_reviewer"
+        )
+        with self.store.lock(self.TASK_ID):
+            replay = repairs.replay_acceptance_ledger(self.store, self.TASK_ID)
+            self.assertIsNotNone(replay)
+            repairs._v2_start_attempt(
+                self.store,
+                self.TASK_ID,
+                replay,
+                repairs._v2_context(self.store, self.TASK_ID),
+                review,
+                reviewer_receipt,
+                workflow.load_task(self.store._require_task(self.TASK_ID) / "task.json"),
+            )
+
+        case = self
+
+        class MustNotLaunch(repairs.ControllerAssignmentBoundary):
+            def attest_execution(self, capability):
+                raise AssertionError("orphan recovery must not attest a second launch")
+
+            def execute_capability(self, capability):
+                case.fail("orphan recovery must not launch a second attempt")
+
+        with self.assertRaisesRegex(workflow.WorkflowError, "ASSIGNMENT_ATTEMPT_INTERRUPTED"):
+            repairs.run_assignment(self.store, self.TASK_ID, review, MustNotLaunch())
+        events = self._events()
+        failures = [
+            event
+            for event in events
+            if event["event_type"] == "ASSIGNMENT_ATTEMPT_FAILED"
+        ]
+        self.assertEqual(1, len(failures))
+        self.assertEqual("ASSIGNMENT_ATTEMPT_INTERRUPTED", failures[0]["failure_code"])
+        replacement = self._issue(
+            "REVIEW_1", self._expected_actor("terra-review-retry", "terra_xhigh_reviewer")
+        )
+        self.assertNotEqual(review.assignment_id, replacement.assignment_id)
+        self.assertEqual("review_1-attempt-2", replacement.attempt_id)
 
     def test_terra_owner_rework_then_sol_peer_accepts(self):
         owner_actor, _ = self._open_with_owner("terra-owner", "terra_xhigh")
@@ -1321,11 +1395,19 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
         legacy_task = dict(self.task)
         legacy_task["task_id"] = legacy_task_id
         self.store.create_task(legacy_task)
-        legacy_reviewer = repairs.ActorIdentity("sol-medium", "sol_medium_reviewer")
-        legacy_assignment = repairs.assign_repair(
-            self.findings, 1, legacy_reviewer, None
+        # A historical v1 record remains readable but cannot create a new
+        # assignment or claim this task from the v2 generic-runner guard.
+        self.store.append_event(
+            legacy_task_id,
+            {"event_type": "REPAIR_ASSIGNED", "repair_round": 1},
         )
-        repairs.record_repair_assignment(self.store, legacy_task_id, legacy_assignment)
+        with self.assertRaisesRegex(workflow.WorkflowError, "REPAIR_PROTOCOL_V1_DISABLED"):
+            repairs.assign_repair(
+                self.findings,
+                1,
+                repairs.ActorIdentity("sol-medium", "sol_medium_reviewer"),
+                None,
+            )
         self.assertFalse(
             self._v2()["repair_ledger_claims_task"](self.store, legacy_task_id),
             "repair-ledger-1 history must not be reported as v2 acceptance ownership",
