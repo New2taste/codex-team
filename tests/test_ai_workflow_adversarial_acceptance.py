@@ -11,8 +11,11 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import os
+import subprocess
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from unittest import mock
 
@@ -24,17 +27,30 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
     """Contract suite for the approved ``adversarial-acceptance-1`` ledger."""
 
     TASK_ID = "AWF-20260809-901"
-    BASE_COMMIT = "a" * 40
-    INITIAL_CANDIDATE = "b" * 40
-    OWNER_CANDIDATE = "c" * 40
-    SOL_CANDIDATE = "d" * 40
-    TERMINAL_CANDIDATE = "e" * 40
-
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
         temporary_root = Path(self.temporary_directory.name)
         self.repository_root = temporary_root / "repository"
         self.repository_root.mkdir()
+        self._git("init", "-q")
+        self._git("config", "user.email", "acceptance-tests@example.invalid")
+        self._git("config", "user.name", "Acceptance Contract Tests")
+        (self.repository_root / "README.md").write_text(
+            "base\n", encoding="utf-8"
+        )
+        self._git("add", "README.md")
+        self._git("commit", "-q", "-m", "base")
+        self.base_commit = self._git("rev-parse", "HEAD")
+        (self.repository_root / "src").mkdir()
+        (self.repository_root / "src" / "alpha.py").write_text(
+            "BASE_ALPHA = True\n", encoding="utf-8"
+        )
+        (self.repository_root / "src" / "beta.py").write_text(
+            "BASE_BETA = True\n", encoding="utf-8"
+        )
+        self._git("add", "src/alpha.py", "src/beta.py")
+        self._git("commit", "-q", "-m", "input candidate")
+        self.input_candidate = self._git("rev-parse", "HEAD")
         self.state_root = temporary_root / "state"
         self.store = workflow.WorkflowStore(self.state_root)
         self.task = {
@@ -44,8 +60,8 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
             "objective": "Repair the bounded candidate under adversarial acceptance",
             "repository_root": str(self.repository_root),
             "source_worktree": None,
-            "base_commit": self.BASE_COMMIT,
-            "candidate_commit": self.INITIAL_CANDIDATE,
+            "base_commit": self.base_commit,
+            "candidate_commit": self.input_candidate,
             "authoritative_files": ["README.md"],
             "allowed_write_paths": ["src/"],
             "forbidden_actions": ["merge", "push"],
@@ -60,6 +76,43 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
             repairs.RepairFinding("finding-001", ("src/alpha.py",)),
             repairs.RepairFinding("finding-002", ("src/beta.py",)),
         )
+
+    def _git(self, *args: str) -> str:
+        env = os.environ.copy()
+        env.update(
+            {
+                "GIT_AUTHOR_DATE": "2026-08-09T00:00:00Z",
+                "GIT_COMMITTER_DATE": "2026-08-09T00:00:00Z",
+                "GIT_CONFIG_NOSYSTEM": "1",
+            }
+        )
+        completed = subprocess.run(
+            ["git", *args],
+            cwd=self.repository_root,
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return completed.stdout.strip()
+
+    def _commit_file(self, relative_path: str, content: str) -> str:
+        path = self.repository_root / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        self._git("add", "-A")
+        self._git("commit", "-q", "-m", f"change {relative_path}")
+        return self._git("rev-parse", "HEAD")
+
+    def _commit_symlink(self, relative_path: str, target: str) -> str:
+        path = self.repository_root / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() or path.is_symlink():
+            path.unlink()
+        path.symlink_to(target)
+        self._git("add", "-A")
+        self._git("commit", "-q", "-m", f"symlink {relative_path}")
+        return self._git("rev-parse", "HEAD")
 
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
@@ -94,12 +147,18 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
         self,
         label: str,
         role: str,
+        assignment_id: str | None = None,
         *,
         runtime_instance_id: str | None = None,
         attempt_number: int = 1,
-        execution_surface: str = "codex-subagent",
+        execution_surface: str = "CODEX_EXEC_ROLE_CONTRACT",
+        native_agent_uuid: str | None = None,
+        codex_thread_id: str | None = None,
     ) -> object:
         api = self._v2()
+        assignment_id = assignment_id or hashlib.sha256(
+            f"fixture:{label}:{role}".encode("utf-8")
+        ).hexdigest()
         runtime = runtime_instance_id or f"runtime-{label}"
         attempt_id = f"{label}-attempt-{attempt_number}"
         if role in {"luna", "terra_xhigh"}:
@@ -122,9 +181,22 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
                 "read-only",
             )
         evidence_hash = hashlib.sha256(
-            f"{label}:{runtime}:{attempt_id}".encode("utf-8")
+            f"{label}:{runtime}:{attempt_id}:{assignment_id}:{execution_surface}".encode(
+                "utf-8"
+            )
         ).hexdigest()
+        native_id = native_agent_uuid or str(
+            uuid.uuid5(uuid.NAMESPACE_URL, f"native:{label}:{runtime}")
+        )
+        codex_id = codex_thread_id or str(
+            uuid.uuid5(uuid.NAMESPACE_URL, f"codex:{label}:{runtime}")
+        )
+        if execution_surface == "NATIVE_SUBAGENT":
+            codex_id = None
+        else:
+            native_id = None
         return api["VerifiedActorReceipt"](
+            assignment_id=assignment_id,
             execution_surface=execution_surface,
             runtime_instance_id=runtime,
             attempt_id=attempt_id,
@@ -135,7 +207,50 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
             observed_permission_profile=permission,
             observed_cwd=str(self.repository_root),
             runtime_evidence_sha256=evidence_hash,
+            native_agent_uuid=native_id,
+            codex_thread_id=codex_id,
         )
+
+    def _expected_actor(
+        self,
+        label: str,
+        role: str,
+        *,
+        runtime_instance_id: str | None = None,
+        execution_surface: str = "CODEX_EXEC_ROLE_CONTRACT",
+    ) -> object:
+        runtime = runtime_instance_id or f"runtime-{label}"
+        return repairs.ActorIdentity(
+            identity=f"{execution_surface}:{runtime}",
+            role=role,
+        )
+
+    def _receipt_for(
+        self,
+        assignment: object,
+        label: str,
+        role: str,
+        **kwargs: object,
+    ) -> object:
+        return self._receipt(
+            label,
+            role,
+            assignment.assignment_id,
+            **kwargs,
+        )
+
+    def _open_owner_receipt(self, label: str, role: str = "luna") -> object:
+        return self._receipt(
+            label,
+            role,
+            hashlib.sha256(f"open:{self.TASK_ID}".encode("utf-8")).hexdigest(),
+        )
+
+    def _open_with_owner(self, label: str, role: str = "luna") -> tuple[object, object]:
+        expected = self._expected_actor(label, role)
+        receipt = self._open_owner_receipt(label, role)
+        self._open(receipt)
+        return expected, receipt
 
     def _evidence(self, label: str = "review") -> object:
         api = self._v2()
@@ -169,7 +284,24 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
         self.assertEqual(assignment.assignment_id, assignment.capability.assignment_id)
         self.assertEqual(self.TASK_ID, assignment.capability.task_id)
         self.assertEqual(assignment.phase, assignment.capability.phase)
+        self.assertEqual(assignment.assignment_id, assignment.capability.assignment_id)
         return assignment
+
+    def _issue_with_receipt(
+        self,
+        phase: str,
+        label: str,
+        role: str,
+        *,
+        expected_actor: object | None = None,
+        **receipt_kwargs: object,
+    ) -> tuple[object, object, object]:
+        expected = expected_actor or self._expected_actor(label, role)
+        assignment = self._issue(phase, expected)
+        receipt = self._receipt_for(
+            assignment, label, role, **receipt_kwargs
+        )
+        return expected, assignment, receipt
 
     def _complete(
         self,
@@ -229,7 +361,7 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
             self.assertIn(event["event_type"], allowed_types)
             self.assertEqual(self.TASK_ID, event["task_id"])
             self.assertRegex(event["task_sha256"], r"^[0-9a-f]{64}$")
-            self.assertEqual(self.BASE_COMMIT, event["base_commit"])
+            self.assertEqual(self.task["base_commit"], event["base_commit"])
             self.assertRegex(event["candidate_commit"], r"^[0-9a-f]{40}$")
             self.assertIsInstance(event["event_index"], int)
             indices.append(event["event_index"])
@@ -249,6 +381,8 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
             {event["event_type"] for event in events},
             "each issued assignment must launch through the v2 attempt guard",
         )
+        self._assert_strict_event_fields(events)
+        self._assert_attempt_lifecycle(events)
         return events
 
     def _assert_terminal(self, events: list[dict[str, object]]) -> None:
@@ -261,22 +395,172 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
             terminal_events,
             "every successful terminal path must explicitly remain pending whole-project acceptance",
         )
+        terminal_states = [
+            event
+            for event in events
+            if event.get("terminal_state") == "TASK_TERMINAL"
+        ]
+        self.assertEqual(1, len(terminal_states))
+        self.assertTrue(terminal_states[0].get("terminal_reason"))
+        self.assertEqual("PENDING", terminal_states[0]["whole_project_acceptance_required"])
+
+    def _assert_terminal_ladder_closed(self) -> None:
+        self.assertTrue(repairs.repair_ledger_claims_task(self.store, self.TASK_ID))
+        candidates = (
+            ("REVIEW_1", "terra-review-after-terminal", "terra_xhigh_reviewer"),
+            ("OWNER_REPAIR", "owner-after-terminal", "luna"),
+            ("REVIEW_2", "terra-review-two-after-terminal", "terra_xhigh_reviewer"),
+            ("SOL_MEDIUM_REPAIR", "sol-repair-after-terminal", "sol_medium_reviewer"),
+            (
+                "SOL_MEDIUM_PEER_REVIEW",
+                "sol-peer-after-terminal",
+                "sol_medium_reviewer",
+            ),
+            ("SOL_XHIGH_TERMINAL_REPAIR", "sol-xhigh-after-terminal", "sol_xhigh"),
+        )
+        for phase, label, role in candidates:
+            with self.subTest(phase=phase):
+                with self.assertRaises(workflow.WorkflowError):
+                    self._issue(phase, self._expected_actor(label, role))
 
     def _assert_assignment_binding(
         self,
         assignment: object,
         phase: str,
         expected_actor: object,
-        candidate: str = INITIAL_CANDIDATE,
+        candidate: str | None = None,
     ) -> None:
         self.assertEqual(phase, assignment.phase)
         self.assertEqual(self.TASK_ID, assignment.task_id)
         self.assertEqual(expected_actor, assignment.expected_actor)
-        self.assertEqual(self.BASE_COMMIT, assignment.base_commit)
-        self.assertEqual(candidate, assignment.input_candidate_commit)
+        self.assertEqual(self.task["base_commit"], assignment.base_commit)
+        self.assertEqual(candidate or self.input_candidate, assignment.input_candidate_commit)
         self.assertEqual(self.TASK_ID, assignment.capability.task_id)
         self.assertEqual(assignment.attempt_id, assignment.capability.attempt_id)
         self.assertTrue(assignment.capability.capability_id)
+        capability = assignment.capability
+        self.assertRegex(capability.task_sha256, r"^[0-9a-f]{64}$")
+        self.assertEqual(self.task["base_commit"], capability.base_commit)
+        self.assertEqual(assignment.input_candidate_commit, capability.input_candidate_commit)
+        self.assertEqual(
+            tuple(finding.finding_id for finding in assignment.findings),
+            tuple(capability.finding_ids),
+        )
+        self.assertEqual(tuple(assignment.allowed_paths), tuple(capability.allowed_paths))
+        self.assertIn("merge", tuple(capability.forbidden_actions))
+        self.assertIn("push", tuple(capability.forbidden_actions))
+        self.assertRegex(capability.issuing_event_id, r"^[0-9a-f]{64}$")
+
+    def _strict_event_fields(self, event_type: str) -> set[str]:
+        common = {
+            "ledger_version",
+            "event_type",
+            "event_index",
+            "event_id",
+            "previous_event_id",
+            "timestamp_utc",
+            "task_id",
+            "task_sha256",
+            "base_commit",
+            "candidate_commit",
+        }
+        event_fields = {
+            "ACCEPTANCE_OPENED": {"owner_receipt"},
+            "ASSIGNMENT_ISSUED": {
+                "assignment_id",
+                "phase",
+                "attempt_id",
+                "expected_actor",
+                "findings",
+                "allowed_paths",
+                "capability",
+            },
+            "ASSIGNMENT_ATTEMPT_STARTED": {
+                "assignment_id",
+                "phase",
+                "attempt_id",
+                "receipt",
+            },
+            "ASSIGNMENT_ATTEMPT_FAILED": {
+                "assignment_id",
+                "phase",
+                "attempt_id",
+                "failure_code",
+            },
+            "REPAIR_COMPLETED": {
+                "assignment_id",
+                "phase",
+                "attempt_id",
+                "actor_receipt",
+                "output_candidate_commit",
+                "changed_paths",
+                "actual_changed_paths",
+                "actual_diff_sha256",
+                "actual_snapshot_sha256",
+            },
+            "REVIEW_COMPLETED": {
+                "assignment_id",
+                "phase",
+                "attempt_id",
+                "reviewer_receipt",
+                "verdict",
+                "findings",
+                "evidence",
+                "evidence_sha256",
+                "terminal_state",
+                "terminal_reason",
+                "whole_project_acceptance_required",
+            },
+        }
+        self.assertIn(event_type, event_fields)
+        return common | event_fields[event_type]
+
+    def _assert_strict_event_fields(self, events: list[dict[str, object]]) -> None:
+        for event in events:
+            self.assertEqual(self._strict_event_fields(event["event_type"]), set(event))
+
+    def _assert_attempt_lifecycle(self, events: list[dict[str, object]]) -> None:
+        issued = {
+            event["assignment_id"]: (index, event)
+            for index, event in enumerate(events)
+            if event["event_type"] == "ASSIGNMENT_ISSUED"
+        }
+        self.assertTrue(issued)
+        terminal_types = {
+            "ASSIGNMENT_ATTEMPT_FAILED",
+            "REPAIR_COMPLETED",
+            "REVIEW_COMPLETED",
+        }
+        for assignment_id, (issued_index, issue_event) in issued.items():
+            started = [
+                (index, event)
+                for index, event in enumerate(events)
+                if event.get("event_type") == "ASSIGNMENT_ATTEMPT_STARTED"
+                and event.get("assignment_id") == assignment_id
+            ]
+            terminal = [
+                (index, event)
+                for index, event in enumerate(events)
+                if event.get("event_type") in terminal_types
+                and event.get("assignment_id") == assignment_id
+            ]
+            self.assertEqual(1, len(started))
+            self.assertEqual(1, len(terminal))
+            self.assertLess(issued_index, started[0][0])
+            self.assertLess(started[0][0], terminal[0][0])
+            self.assertEqual(issue_event["attempt_id"], started[0][1]["attempt_id"])
+            self.assertEqual(issue_event["attempt_id"], terminal[0][1]["attempt_id"])
+
+    def _open_review_one(
+        self,
+        owner_label: str = "luna-owner",
+        owner_role: str = "luna",
+    ) -> tuple[object, object, object, object, object]:
+        owner_actor, owner_open_receipt = self._open_with_owner(owner_label, owner_role)
+        reviewer_actor, first, reviewer_receipt = self._issue_with_receipt(
+            "REVIEW_1", "terra-review-one", "terra_xhigh_reviewer"
+        )
+        return owner_actor, owner_open_receipt, reviewer_actor, first, reviewer_receipt
 
     # ------------------------------------------------------------------
     # Public API and successful terminal paths
@@ -291,117 +575,155 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
         ):
             self.assertTrue(callable(api[name]), name)
 
-        receipt = self._receipt("frozen", "luna")
+        receipt = self._receipt(
+            "frozen",
+            "luna",
+            hashlib.sha256(b"frozen-assignment").hexdigest(),
+        )
         with self.assertRaises(dataclasses.FrozenInstanceError):
             receipt.runtime_instance_id = "mutated"  # type: ignore[misc]
 
     def test_luna_owner_review_one_accepts_to_terminal(self):
-        owner = self._receipt("luna-owner", "luna")
-        reviewer_one = self._receipt("terra-review-one", "terra_xhigh_reviewer")
-        self._open(owner)
-        first = self._issue("REVIEW_1", reviewer_one)
-        self._assert_assignment_binding(first, "REVIEW_1", reviewer_one)
+        self._open_with_owner("luna-owner", "luna")
+        reviewer_actor, first, reviewer_receipt = self._issue_with_receipt(
+            "REVIEW_1", "terra-review-one", "terra_xhigh_reviewer"
+        )
+        self._assert_assignment_binding(first, "REVIEW_1", reviewer_actor)
         self.assertEqual((), tuple(first.findings))
 
-        self._review(first, reviewer_one, "ACCEPT")
+        evidence = self._evidence("review-one-accept")
+        self._review(first, reviewer_receipt, "ACCEPT", evidence=evidence)
         events = self._assert_chain()
         self._assert_terminal(events)
+        review_event = next(event for event in events if event["event_type"] == "REVIEW_COMPLETED")
+        self.assertEqual(review_event["evidence"]["verification_commands"], list(evidence.verification_commands))
+        self.assertEqual(review_event["evidence"]["negative_checks"], list(evidence.negative_checks))
+        self.assertRegex(review_event["evidence_sha256"], r"^[0-9a-f]{64}$")
+        evidence_payload = json.dumps(
+            dataclasses.asdict(evidence), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        self.assertEqual(
+            hashlib.sha256(evidence_payload.encode("utf-8")).hexdigest(),
+            review_event["evidence_sha256"],
+        )
         self.assertTrue(repairs.repair_ledger_claims_task(self.store, self.TASK_ID))
-        with self.assertRaises(workflow.WorkflowError):
-            self._issue("OWNER_REPAIR", owner)
+        self._assert_terminal_ladder_closed()
 
     def test_luna_owner_rework_then_distinct_terra_review_two_accepts(self):
-        owner = self._receipt("luna-owner", "luna")
-        reviewer_one = self._receipt("terra-review-one", "terra_xhigh_reviewer")
-        reviewer_two = self._receipt("terra-review-two", "terra_xhigh_reviewer")
-        self._open(owner)
-        first = self._issue("REVIEW_1", reviewer_one)
-        self._review(first, reviewer_one, "REWORK", self.findings)
+        owner_actor, _ = self._open_with_owner("luna-owner", "luna")
+        reviewer_one_actor, first, reviewer_one_receipt = self._issue_with_receipt(
+            "REVIEW_1", "terra-review-one", "terra_xhigh_reviewer"
+        )
+        self._review(first, reviewer_one_receipt, "REWORK", self.findings)
 
-        owner_repair = self._issue("OWNER_REPAIR", owner)
-        self._assert_assignment_binding(owner_repair, "OWNER_REPAIR", owner)
+        _, owner_repair, owner_receipt = self._issue_with_receipt(
+            "OWNER_REPAIR", "luna-owner-repair", "luna", expected_actor=owner_actor
+        )
+        self._assert_assignment_binding(owner_repair, "OWNER_REPAIR", owner_actor)
         self.assertEqual(self.findings, tuple(owner_repair.findings))
-        self._complete(owner_repair, owner, self.OWNER_CANDIDATE)
+        owner_candidate = self._commit_file("src/alpha.py", "OWNER_ALPHA = 1\n")
+        self._complete(owner_repair, owner_receipt, owner_candidate, ("src/alpha.py",))
 
-        second = self._issue("REVIEW_2", reviewer_two)
-        self._assert_assignment_binding(second, "REVIEW_2", reviewer_two, self.OWNER_CANDIDATE)
+        reviewer_two_actor, second, reviewer_two_receipt = self._issue_with_receipt(
+            "REVIEW_2", "terra-review-two", "terra_xhigh_reviewer"
+        )
+        self._assert_assignment_binding(second, "REVIEW_2", reviewer_two_actor, owner_candidate)
         self.assertNotEqual(
-            (reviewer_one.execution_surface, reviewer_one.runtime_instance_id),
-            (reviewer_two.execution_surface, reviewer_two.runtime_instance_id),
+            (reviewer_one_receipt.execution_surface, reviewer_one_receipt.runtime_instance_id),
+            (reviewer_two_receipt.execution_surface, reviewer_two_receipt.runtime_instance_id),
         )
         self.assertNotEqual(
-            (owner.execution_surface, owner.runtime_instance_id),
-            (reviewer_two.execution_surface, reviewer_two.runtime_instance_id),
+            (owner_receipt.execution_surface, owner_receipt.runtime_instance_id),
+            (reviewer_two_receipt.execution_surface, reviewer_two_receipt.runtime_instance_id),
         )
-        self._review(second, reviewer_two, "ACCEPT")
-        self._assert_terminal(self._assert_chain())
+        self._review(second, reviewer_two_receipt, "ACCEPT")
+        events = self._assert_chain()
+        self._assert_terminal(events)
+        self._assert_terminal_ladder_closed()
 
     def test_terra_owner_rework_then_sol_peer_accepts(self):
-        owner = self._receipt("terra-owner", "terra_xhigh")
-        reviewer_one = self._receipt("terra-review-one", "terra_xhigh_reviewer")
-        reviewer_two = self._receipt("terra-review-two", "terra_xhigh_reviewer")
-        sol_fixer = self._receipt("sol-fixer", "sol_medium_reviewer")
-        sol_peer = self._receipt("sol-peer", "sol_medium_reviewer")
-        self._open(owner)
-        first = self._issue("REVIEW_1", reviewer_one)
-        self._review(first, reviewer_one, "REWORK", self.findings)
-        owner_repair = self._issue("OWNER_REPAIR", owner)
-        self._complete(owner_repair, owner, self.OWNER_CANDIDATE)
-        second = self._issue("REVIEW_2", reviewer_two)
-        self._review(second, reviewer_two, "REWORK", self.findings)
+        owner_actor, _ = self._open_with_owner("terra-owner", "terra_xhigh")
+        _, first, reviewer_one_receipt = self._issue_with_receipt(
+            "REVIEW_1", "terra-review-one", "terra_xhigh_reviewer"
+        )
+        self._review(first, reviewer_one_receipt, "REWORK", self.findings)
+        _, owner_repair, owner_receipt = self._issue_with_receipt(
+            "OWNER_REPAIR", "terra-owner-repair", "terra_xhigh", expected_actor=owner_actor
+        )
+        owner_candidate = self._commit_file("src/alpha.py", "TERRA_OWNER_ALPHA = 1\n")
+        self._complete(owner_repair, owner_receipt, owner_candidate, ("src/alpha.py",))
+        _, second, reviewer_two_receipt = self._issue_with_receipt(
+            "REVIEW_2", "terra-review-two", "terra_xhigh_reviewer"
+        )
+        self._review(second, reviewer_two_receipt, "REWORK", self.findings)
 
-        sol_repair = self._issue("SOL_MEDIUM_REPAIR", sol_fixer)
+        sol_actor, sol_repair, sol_receipt = self._issue_with_receipt(
+            "SOL_MEDIUM_REPAIR", "sol-fixer", "sol_medium_reviewer"
+        )
         self._assert_assignment_binding(
-            sol_repair, "SOL_MEDIUM_REPAIR", sol_fixer, self.OWNER_CANDIDATE
+            sol_repair, "SOL_MEDIUM_REPAIR", sol_actor, owner_candidate
         )
         self.assertIn("assignment", sol_repair.capability.write_authority)
         self.assertEqual(self.findings, tuple(sol_repair.findings))
-        self._complete(sol_repair, sol_fixer, self.SOL_CANDIDATE, ("src/beta.py",))
-        peer_review = self._issue("SOL_MEDIUM_PEER_REVIEW", sol_peer)
+        sol_candidate = self._commit_file("src/beta.py", "SOL_MEDIUM_BETA = 1\n")
+        self._complete(sol_repair, sol_receipt, sol_candidate, ("src/beta.py",))
+        peer_actor, peer_review, peer_receipt = self._issue_with_receipt(
+            "SOL_MEDIUM_PEER_REVIEW", "sol-peer", "sol_medium_reviewer"
+        )
         self._assert_assignment_binding(
-            peer_review, "SOL_MEDIUM_PEER_REVIEW", sol_peer, self.SOL_CANDIDATE
+            peer_review, "SOL_MEDIUM_PEER_REVIEW", peer_actor, sol_candidate
         )
         self.assertNotEqual(
-            (sol_fixer.execution_surface, sol_fixer.runtime_instance_id),
-            (sol_peer.execution_surface, sol_peer.runtime_instance_id),
+            (sol_receipt.execution_surface, sol_receipt.runtime_instance_id),
+            (peer_receipt.execution_surface, peer_receipt.runtime_instance_id),
         )
-        self._review(peer_review, sol_peer, "ACCEPT")
-        self._assert_terminal(self._assert_chain())
+        self._review(peer_review, peer_receipt, "ACCEPT")
+        events = self._assert_chain()
+        self._assert_terminal(events)
+        self._assert_terminal_ladder_closed()
 
     def test_sol_peer_rework_creates_one_sol_xhigh_terminal_repair(self):
-        owner = self._receipt("luna-owner", "luna")
-        reviewer_one = self._receipt("terra-review-one", "terra_xhigh_reviewer")
-        reviewer_two = self._receipt("terra-review-two", "terra_xhigh_reviewer")
-        sol_fixer = self._receipt("sol-fixer", "sol_medium_reviewer")
-        sol_peer = self._receipt("sol-peer", "sol_medium_reviewer")
-        sol_xhigh = self._receipt("sol-xhigh", "sol_xhigh")
-        self._open(owner)
-        first = self._issue("REVIEW_1", reviewer_one)
-        self._review(first, reviewer_one, "REWORK", self.findings)
-        owner_repair = self._issue("OWNER_REPAIR", owner)
-        self._complete(owner_repair, owner, self.OWNER_CANDIDATE)
-        second = self._issue("REVIEW_2", reviewer_two)
-        self._review(second, reviewer_two, "REWORK", self.findings)
-        sol_repair = self._issue("SOL_MEDIUM_REPAIR", sol_fixer)
-        self._assert_assignment_binding(
-            sol_repair, "SOL_MEDIUM_REPAIR", sol_fixer, self.OWNER_CANDIDATE
+        owner_actor, _ = self._open_with_owner("luna-owner", "luna")
+        _, first, reviewer_one_receipt = self._issue_with_receipt(
+            "REVIEW_1", "terra-review-one", "terra_xhigh_reviewer"
         )
-        self._complete(sol_repair, sol_fixer, self.SOL_CANDIDATE)
-        peer_review = self._issue("SOL_MEDIUM_PEER_REVIEW", sol_peer)
-        self._assert_assignment_binding(
-            peer_review, "SOL_MEDIUM_PEER_REVIEW", sol_peer, self.SOL_CANDIDATE
+        self._review(first, reviewer_one_receipt, "REWORK", self.findings)
+        _, owner_repair, owner_receipt = self._issue_with_receipt(
+            "OWNER_REPAIR", "luna-owner-repair", "luna", expected_actor=owner_actor
         )
-        self._review(peer_review, sol_peer, "REWORK", self.findings)
+        owner_candidate = self._commit_file("src/alpha.py", "LUNA_OWNER_ALPHA = 1\n")
+        self._complete(owner_repair, owner_receipt, owner_candidate, ("src/alpha.py",))
+        _, second, reviewer_two_receipt = self._issue_with_receipt(
+            "REVIEW_2", "terra-review-two", "terra_xhigh_reviewer"
+        )
+        self._review(second, reviewer_two_receipt, "REWORK", self.findings)
+        _, sol_repair, sol_receipt = self._issue_with_receipt(
+            "SOL_MEDIUM_REPAIR", "sol-fixer", "sol_medium_reviewer"
+        )
+        self._assert_assignment_binding(
+            sol_repair, "SOL_MEDIUM_REPAIR", sol_repair.expected_actor, owner_candidate
+        )
+        sol_candidate = self._commit_file("src/alpha.py", "SOL_MEDIUM_ALPHA = 1\n")
+        self._complete(sol_repair, sol_receipt, sol_candidate, ("src/alpha.py",))
+        peer_actor, peer_review, peer_receipt = self._issue_with_receipt(
+            "SOL_MEDIUM_PEER_REVIEW", "sol-peer", "sol_medium_reviewer"
+        )
+        self._assert_assignment_binding(
+            peer_review, "SOL_MEDIUM_PEER_REVIEW", peer_actor, sol_candidate
+        )
+        self._review(peer_review, peer_receipt, "REWORK", self.findings)
+        with self.assertRaises(workflow.WorkflowError):
+            self._issue("SOL_MEDIUM_REPAIR", self._expected_actor("sol-fixer-again", "sol_medium_reviewer"))
 
-        terminal = self._issue("SOL_XHIGH_TERMINAL_REPAIR", sol_xhigh)
+        terminal_actor, terminal, terminal_receipt = self._issue_with_receipt(
+            "SOL_XHIGH_TERMINAL_REPAIR", "sol-xhigh", "sol_xhigh"
+        )
         self._assert_assignment_binding(
-            terminal,
-            "SOL_XHIGH_TERMINAL_REPAIR",
-            sol_xhigh,
-            self.SOL_CANDIDATE,
+            terminal, "SOL_XHIGH_TERMINAL_REPAIR", terminal_actor, sol_candidate
         )
         self.assertEqual("assignment-scoped-write", terminal.capability.write_authority)
-        self._complete(terminal, sol_xhigh, self.TERMINAL_CANDIDATE)
+        terminal_candidate = self._commit_file("src/alpha.py", "SOL_XHIGH_ALPHA = 1\n")
+        self._complete(terminal, terminal_receipt, terminal_candidate, ("src/alpha.py",))
         events = self._assert_chain()
         self._assert_terminal(events)
         self.assertEqual(
@@ -415,22 +737,18 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
                 for event in events
             )
         )
-        with self.assertRaises(workflow.WorkflowError):
-            self._issue("SOL_XHIGH_TERMINAL_REPAIR", sol_xhigh)
+        self._assert_terminal_ladder_closed()
 
     # ------------------------------------------------------------------
     # Binding, replay, ownership, and fail-closed counterexamples
     # ------------------------------------------------------------------
     def test_task_candidate_and_cross_task_bindings_reject_stale_capabilities(self):
-        owner = self._receipt("luna-owner", "luna")
-        reviewer_one = self._receipt("terra-review-one", "terra_xhigh_reviewer")
-        self._open(owner)
-        first = self._issue("REVIEW_1", reviewer_one)
+        _, _, _, first, reviewer_receipt = self._open_review_one()
 
         with self.assertRaises(workflow.WorkflowError):
-            self._review(first, reviewer_one, "ACCEPT", self.findings)
+            self._review(first, reviewer_receipt, "ACCEPT", self.findings)
         with self.assertRaises(workflow.WorkflowError):
-            self._review(first, reviewer_one, "REWORK", tuple(reversed(self.findings)))
+            self._review(first, reviewer_receipt, "REWORK", tuple(reversed(self.findings)))
 
         mutated_task = dict(self.task)
         mutated_task["candidate_commit"] = "f" * 40
@@ -438,7 +756,7 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
             self.state_root / self.TASK_ID / "task.json", mutated_task
         )
         with self.assertRaises(workflow.WorkflowError):
-            self._review(first, reviewer_one, "ACCEPT")
+            self._review(first, reviewer_receipt, "ACCEPT")
 
         # A task-specific capability cannot be replayed against another task.
         second_task = dict(self.task)
@@ -449,30 +767,260 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
                 self.store,
                 second_task["task_id"],
                 first,
-                reviewer_one,
+                reviewer_receipt,
                 "ACCEPT",
                 (),
                 self._evidence("cross-task"),
             )
 
     def test_finding_binding_and_actual_diff_scope_are_immutable(self):
-        owner = self._receipt("luna-owner", "luna")
-        reviewer_one = self._receipt("terra-review-one", "terra_xhigh_reviewer")
-        self._open(owner)
-        first = self._issue("REVIEW_1", reviewer_one)
-        self._review(first, reviewer_one, "REWORK", self.findings)
-        owner_repair = self._issue("OWNER_REPAIR", owner)
+        owner_actor, _, _, first, reviewer_receipt = self._open_review_one()
+        self._review(first, reviewer_receipt, "REWORK", self.findings)
+        _, owner_repair, owner_receipt = self._issue_with_receipt(
+            "OWNER_REPAIR", "luna-owner-repair", "luna", expected_actor=owner_actor
+        )
+        outside_candidate = self._commit_file("README.md", "scope escape\n")
         with self.assertRaises(workflow.WorkflowError):
-            self._complete(owner_repair, owner, self.OWNER_CANDIDATE, ("outside.py",))
+            self._complete(owner_repair, owner_receipt, outside_candidate, ("src/alpha.py",))
         with self.assertRaises((workflow.WorkflowError, dataclasses.FrozenInstanceError)):
             owner_repair.findings = (self.findings[0],)  # type: ignore[misc]
 
+    def test_actual_git_diff_is_authoritative_over_reported_changed_paths(self):
+        owner_actor, _, _, first, reviewer_receipt = self._open_review_one()
+        self._review(first, reviewer_receipt, "REWORK", self.findings)
+        _, owner_repair, owner_receipt = self._issue_with_receipt(
+            "OWNER_REPAIR", "luna-owner-repair", "luna", expected_actor=owner_actor
+        )
+        output_candidate = self._commit_file("src/alpha.py", "OWNER_ALPHA = 1\n")
+        with self.assertRaises(workflow.WorkflowError):
+            self._complete(owner_repair, owner_receipt, output_candidate, ("src/beta.py",))
+        self._complete(owner_repair, owner_receipt, output_candidate, ("src/alpha.py",))
+        events = self._assert_chain()
+        completion = [event for event in events if event["event_type"] == "REPAIR_COMPLETED"][-1]
+        self.assertEqual(["src/alpha.py"], completion["actual_changed_paths"])
+        self.assertNotEqual(completion["changed_paths"], ["src/beta.py"])
+
+    def test_actual_git_diff_rejects_traversal_and_prefix_scope_escape(self):
+        owner_actor, _, _, first, reviewer_receipt = self._open_review_one()
+        self._review(first, reviewer_receipt, "REWORK", self.findings)
+        _, owner_repair, owner_receipt = self._issue_with_receipt(
+            "OWNER_REPAIR", "luna-owner-repair", "luna", expected_actor=owner_actor
+        )
+        escaped_candidate = self._commit_file("src2/escape.py", "ESCAPE = 1\n")
+        with self.assertRaises(workflow.WorkflowError):
+            self._complete(owner_repair, owner_receipt, escaped_candidate, ("src2/escape.py",))
+        with self.assertRaises(workflow.WorkflowError):
+            self._complete(
+                owner_repair,
+                owner_receipt,
+                escaped_candidate,
+                ("src/../src2/escape.py",),
+            )
+
+    def test_actual_git_diff_rejects_symlink_scope_escape(self):
+        escape_target = self.repository_root.parent / "symlink-target.txt"
+        escape_target.write_text("outside\n", encoding="utf-8")
+        owner_actor, _, _, first, reviewer_receipt = self._open_review_one()
+        self._review(first, reviewer_receipt, "REWORK", self.findings)
+        _, owner_repair, owner_receipt = self._issue_with_receipt(
+            "OWNER_REPAIR", "luna-owner-repair", "luna", expected_actor=owner_actor
+        )
+        symlink_candidate = self._commit_symlink("src/link.py", "../symlink-target.txt")
+        with self.assertRaises(workflow.WorkflowError):
+            self._complete(owner_repair, owner_receipt, symlink_candidate, ("src/link.py",))
+
+    def _write_event_records(self, records: list[dict[str, object]]) -> None:
+        path = self.state_root / self.TASK_ID / "events.jsonl"
+        path.write_text(
+            "".join(
+                json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                + "\n"
+                for record in records
+            ),
+            encoding="utf-8",
+        )
+
+    def _rechain_event_records(self, records: list[dict[str, object]]) -> None:
+        previous_id: str | None = None
+        for index, record in enumerate(records):
+            record["event_index"] = index
+            record["previous_event_id"] = previous_id
+            record.pop("event_id", None)
+            encoded = json.dumps(
+                record, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            )
+            record["event_id"] = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+            previous_id = record["event_id"]
+
+    def _assert_replay_rejects_rechained_mutation(
+        self,
+        original: list[dict[str, object]],
+        mutate: object,
+    ) -> None:
+        records = json.loads(json.dumps(original))
+        mutate(records)
+        self._rechain_event_records(records)
+        self._write_event_records(records)
+        with self.assertRaises(workflow.WorkflowError):
+            self._v2()["replay_acceptance_ledger"](self.store, self.TASK_ID)
+        self._write_event_records(json.loads(json.dumps(original)))
+        self._v2()["replay_acceptance_ledger"](self.store, self.TASK_ID)
+
+    def test_replay_rejects_rechained_identity_binding_and_evidence_mutations(self):
+        _, _, _, first, reviewer_receipt = self._open_review_one()
+        self._review(first, reviewer_receipt, "ACCEPT")
+        original = self._events()
+        self._assert_chain()
+
+        def mutate_actor(records: list[dict[str, object]]) -> None:
+            event = next(item for item in records if item["event_type"] == "REVIEW_COMPLETED")
+            event["reviewer_receipt"]["execution_surface"] = "NATIVE_SUBAGENT"
+
+        def mutate_runtime(records: list[dict[str, object]]) -> None:
+            event = next(item for item in records if item["event_type"] == "REVIEW_COMPLETED")
+            event["reviewer_receipt"]["runtime_instance_id"] = "runtime-forged"
+
+        def mutate_receipt_identity(records: list[dict[str, object]]) -> None:
+            event = next(item for item in records if item["event_type"] == "REVIEW_COMPLETED")
+            event["reviewer_receipt"]["codex_thread_id"] = str(uuid.uuid4())
+
+        def mutate_assignment(records: list[dict[str, object]]) -> None:
+            event = next(item for item in records if item["event_type"] == "ASSIGNMENT_ISSUED")
+            event["assignment_id"] = "0" * 64
+
+        def mutate_capability(records: list[dict[str, object]]) -> None:
+            event = next(item for item in records if item["event_type"] == "ASSIGNMENT_ISSUED")
+            event["capability"]["allowed_paths"] = ["src/escape.py"]
+
+        def mutate_finding(records: list[dict[str, object]]) -> None:
+            event = next(item for item in records if item["event_type"] == "ASSIGNMENT_ISSUED")
+            event["findings"] = [{"finding_id": "finding-new", "allowed_paths": ["src/new.py"]}]
+
+        def mutate_candidate(records: list[dict[str, object]]) -> None:
+            event = next(item for item in records if item["event_type"] == "ASSIGNMENT_ISSUED")
+            event["candidate_commit"] = "f" * 40
+
+        def mutate_evidence(records: list[dict[str, object]]) -> None:
+            event = next(item for item in records if item["event_type"] == "REVIEW_COMPLETED")
+            event["evidence"]["outputs"] = ["forged evidence output"]
+
+        for mutation in (
+            mutate_actor,
+            mutate_runtime,
+            mutate_receipt_identity,
+            mutate_assignment,
+            mutate_capability,
+            mutate_finding,
+            mutate_candidate,
+            mutate_evidence,
+        ):
+            with self.subTest(mutation=mutation.__name__):
+                self._assert_replay_rejects_rechained_mutation(original, mutation)
+
+    def test_replay_rejects_missing_extra_reordered_broken_and_duplicate_records(self):
+        _, _, _, first, reviewer_receipt = self._open_review_one()
+        self._review(first, reviewer_receipt, "ACCEPT")
+        original = self._events()
+        self._assert_chain()
+
+        def missing_field(records: list[dict[str, object]]) -> None:
+            records[0].pop("timestamp_utc")
+
+        def extra_field(records: list[dict[str, object]]) -> None:
+            records[0]["unexpected"] = True
+
+        def reordered(records: list[dict[str, object]]) -> None:
+            records[1], records[2] = records[2], records[1]
+
+        def broken_chain(records: list[dict[str, object]]) -> None:
+            records[-1]["previous_event_id"] = "1" * 64
+
+        def duplicate_completion(records: list[dict[str, object]]) -> None:
+            completion = next(
+                item for item in records if item["event_type"] == "REVIEW_COMPLETED"
+            )
+            records.append(json.loads(json.dumps(completion)))
+
+        for mutation in (missing_field, extra_field, reordered, broken_chain, duplicate_completion):
+            with self.subTest(mutation=mutation.__name__):
+                records = json.loads(json.dumps(original))
+                mutation(records)
+                if mutation is not broken_chain:
+                    self._rechain_event_records(records)
+                self._write_event_records(records)
+                with self.assertRaises(workflow.WorkflowError):
+                    self._v2()["replay_acceptance_ledger"](self.store, self.TASK_ID)
+                self._write_event_records(json.loads(json.dumps(original)))
+                self._v2()["replay_acceptance_ledger"](self.store, self.TASK_ID)
+
+    def test_replay_rejects_duplicate_repair_completion(self):
+        owner_actor, _, _, first, reviewer_receipt = self._open_review_one()
+        self._review(first, reviewer_receipt, "REWORK", self.findings)
+        _, owner_repair, owner_receipt = self._issue_with_receipt(
+            "OWNER_REPAIR", "luna-owner-repair", "luna", expected_actor=owner_actor
+        )
+        owner_candidate = self._commit_file("src/alpha.py", "OWNER_ALPHA = 1\n")
+        self._complete(owner_repair, owner_receipt, owner_candidate, ("src/alpha.py",))
+        original = self._events()
+        duplicate = json.loads(json.dumps(original))
+        completion = next(
+            item for item in duplicate if item["event_type"] == "REPAIR_COMPLETED"
+        )
+        duplicate.append(json.loads(json.dumps(completion)))
+        self._rechain_event_records(duplicate)
+        self._write_event_records(duplicate)
+        with self.assertRaises(workflow.WorkflowError):
+            self._v2()["replay_acceptance_ledger"](self.store, self.TASK_ID)
+
+    def test_capability_and_evidence_tamper_fail_completion_review_and_replay(self):
+        owner_actor, _, _, first, reviewer_receipt = self._open_review_one()
+        issued_records = self._events()
+        tampered_issue = json.loads(json.dumps(issued_records))
+        issue_event = next(
+            item for item in tampered_issue if item["event_type"] == "ASSIGNMENT_ISSUED"
+        )
+        issue_event["capability"]["forbidden_actions"] = ["merge"]
+        self._rechain_event_records(tampered_issue)
+        self._write_event_records(tampered_issue)
+        with self.assertRaises(workflow.WorkflowError):
+            self._review(first, reviewer_receipt, "REWORK", self.findings)
+        self._write_event_records(issued_records)
+
+        self._review(first, reviewer_receipt, "REWORK", self.findings)
+        _, owner_repair, owner_receipt = self._issue_with_receipt(
+            "OWNER_REPAIR", "luna-owner-repair", "luna", expected_actor=owner_actor
+        )
+        owner_records = self._events()
+        tampered_owner = json.loads(json.dumps(owner_records))
+        owner_issue = [
+            item for item in tampered_owner if item["event_type"] == "ASSIGNMENT_ISSUED"
+        ][-1]
+        owner_issue["capability"]["input_candidate_commit"] = "f" * 40
+        self._rechain_event_records(tampered_owner)
+        self._write_event_records(tampered_owner)
+        output_candidate = self._commit_file("src/alpha.py", "OWNER_ALPHA = 1\n")
+        with self.assertRaises(workflow.WorkflowError):
+            self._complete(owner_repair, owner_receipt, output_candidate, ("src/alpha.py",))
+        self._write_event_records(owner_records)
+
+        # A semantically forged evidence payload cannot be made valid by merely
+        # recomputing the enclosing event hash.
+        valid_completion_records = self._events()
+        forged_evidence = json.loads(json.dumps(valid_completion_records))
+        review_event = next(
+            item for item in forged_evidence if item["event_type"] == "REVIEW_COMPLETED"
+        )
+        review_event["evidence"]["outputs"] = ["forged after review"]
+        self._rechain_event_records(forged_evidence)
+        self._write_event_records(forged_evidence)
+        with self.assertRaises(workflow.WorkflowError):
+            self._v2()["replay_acceptance_ledger"](self.store, self.TASK_ID)
+        with self.assertRaises(workflow.WorkflowError):
+            self._review(first, reviewer_receipt, "REWORK", self.findings)
+
     def test_canonical_replay_rejects_one_mutated_ledger_identity(self):
-        owner = self._receipt("luna-owner", "luna")
-        reviewer_one = self._receipt("terra-review-one", "terra_xhigh_reviewer")
-        self._open(owner)
-        first = self._issue("REVIEW_1", reviewer_one)
-        self._review(first, reviewer_one, "ACCEPT")
+        _, _, _, first, reviewer_receipt = self._open_review_one()
+        self._review(first, reviewer_receipt, "ACCEPT")
         self._assert_chain()
         replay = self._v2()["replay_acceptance_ledger"](self.store, self.TASK_ID)
         self.assertTrue(replay)
@@ -492,11 +1040,8 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
             self._v2()["replay_acceptance_ledger"](self.store, self.TASK_ID)
 
     def test_v2_terminal_ledger_claims_task_from_generic_runner(self):
-        owner = self._receipt("luna-owner", "luna")
-        reviewer_one = self._receipt("terra-review-one", "terra_xhigh_reviewer")
-        self._open(owner)
-        first = self._issue("REVIEW_1", reviewer_one)
-        self._review(first, reviewer_one, "ACCEPT")
+        _, _, _, first, reviewer_receipt = self._open_review_one()
+        self._review(first, reviewer_receipt, "ACCEPT")
         self._assert_terminal(self._assert_chain())
         self.assertTrue(self._v2()["repair_ledger_claims_task"](self.store, self.TASK_ID))
 
@@ -526,46 +1071,98 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
         self.assertEqual([], runner.calls)
 
     def test_identity_reuse_self_review_and_skipped_transition_fail_closed(self):
-        owner = self._receipt("luna-owner", "luna")
-        reviewer_one = self._receipt("terra-review-one", "terra_xhigh_reviewer")
-        self._open(owner)
+        owner_actor, _, reviewer_one_actor, first, reviewer_one_receipt = self._open_review_one()
         with self.assertRaises(workflow.WorkflowError):
-            self._issue("REVIEW_1", owner)
+            self._issue("REVIEW_1", owner_actor)
         with self.assertRaises(workflow.WorkflowError):
-            self._issue("REVIEW_1", self._receipt("sol-xhigh", "sol_xhigh"))
-        first = self._issue("REVIEW_1", reviewer_one)
-        self._review(first, reviewer_one, "REWORK", self.findings)
+            self._issue("REVIEW_1", self._expected_actor("sol-xhigh", "sol_xhigh"))
+        self._review(first, reviewer_one_receipt, "REWORK", self.findings)
         with self.assertRaises(workflow.WorkflowError):
-            self._issue("SOL_MEDIUM_REPAIR", self._receipt("sol-fixer", "sol_medium_reviewer"))
-        owner_repair = self._issue("OWNER_REPAIR", owner)
-        self._complete(owner_repair, owner, self.OWNER_CANDIDATE)
+            self._issue(
+                "SOL_MEDIUM_REPAIR",
+                self._expected_actor("sol-fixer", "sol_medium_reviewer"),
+            )
+        _, owner_repair, owner_receipt = self._issue_with_receipt(
+            "OWNER_REPAIR", "luna-owner-repair", "luna", expected_actor=owner_actor
+        )
+        owner_candidate = self._commit_file("src/alpha.py", "OWNER_ALPHA = 1\n")
+        self._complete(owner_repair, owner_receipt, owner_candidate, ("src/alpha.py",))
         with self.assertRaises(workflow.WorkflowError):
-            self._issue("SOL_MEDIUM_REPAIR", self._receipt("sol-fixer", "sol_medium_reviewer"))
-        reused_review = self._receipt(
-            "terra-review-one-retry",
+            self._issue(
+                "SOL_MEDIUM_REPAIR",
+                self._expected_actor("sol-fixer-again", "sol_medium_reviewer"),
+            )
+        reviewer_two_actor, second, reviewer_two_receipt = self._issue_with_receipt(
+            "REVIEW_2", "terra-review-two", "terra_xhigh_reviewer"
+        )
+        self.assertNotEqual(reviewer_one_actor, reviewer_two_actor)
+        same_runtime_other_surface = self._receipt_for(
+            second,
+            "terra-review-two-native-surface",
             "terra_xhigh_reviewer",
-            runtime_instance_id=reviewer_one.runtime_instance_id,
+            runtime_instance_id=reviewer_two_receipt.runtime_instance_id,
+            execution_surface="NATIVE_SUBAGENT",
+        )
+        with self.assertRaises(workflow.WorkflowError):
+            self._review(second, same_runtime_other_surface, "ACCEPT")
+        same_surface_other_runtime = self._receipt_for(
+            second,
+            "terra-review-two-other-runtime",
+            "terra_xhigh_reviewer",
+            runtime_instance_id="runtime-terra-review-two-other",
+            execution_surface=reviewer_two_receipt.execution_surface,
+        )
+        with self.assertRaises(workflow.WorkflowError):
+            self._review(second, same_surface_other_runtime, "ACCEPT")
+        retry_receipt = self._receipt_for(
+            second,
+            "terra-review-two-retry",
+            "terra_xhigh_reviewer",
+            runtime_instance_id=reviewer_two_receipt.runtime_instance_id,
             attempt_number=2,
         )
         with self.assertRaises(workflow.WorkflowError):
-            self._issue("REVIEW_2", reused_review)
+            self._review(second, retry_receipt, "ACCEPT")
+        forged_native = self._receipt_for(
+            second,
+            "terra-review-two-forged-native",
+            "terra_xhigh_reviewer",
+            runtime_instance_id=reviewer_two_receipt.runtime_instance_id,
+            execution_surface=reviewer_two_receipt.execution_surface,
+            codex_thread_id=str(uuid.uuid4()),
+        )
+        with self.assertRaises(workflow.WorkflowError):
+            self._review(second, forged_native, "ACCEPT")
+        wrong_assignment = self._receipt(
+            "terra-review-two-wrong-assignment",
+            "terra_xhigh_reviewer",
+            hashlib.sha256(b"different-assignment").hexdigest(),
+            runtime_instance_id=reviewer_two_receipt.runtime_instance_id,
+            execution_surface=reviewer_two_receipt.execution_surface,
+        )
+        with self.assertRaises(workflow.WorkflowError):
+            self._review(second, wrong_assignment, "ACCEPT")
+        self._review(second, reviewer_two_receipt, "ACCEPT")
 
     def test_sol_fixer_cannot_be_its_own_peer_and_v1_history_is_not_v2(self):
-        owner = self._receipt("luna-owner", "luna")
-        reviewer_one = self._receipt("terra-review-one", "terra_xhigh_reviewer")
-        reviewer_two = self._receipt("terra-review-two", "terra_xhigh_reviewer")
-        sol_fixer = self._receipt("sol-fixer", "sol_medium_reviewer")
-        self._open(owner)
-        first = self._issue("REVIEW_1", reviewer_one)
-        self._review(first, reviewer_one, "REWORK", self.findings)
-        owner_repair = self._issue("OWNER_REPAIR", owner)
-        self._complete(owner_repair, owner, self.OWNER_CANDIDATE)
-        second = self._issue("REVIEW_2", reviewer_two)
-        self._review(second, reviewer_two, "REWORK", self.findings)
-        sol_repair = self._issue("SOL_MEDIUM_REPAIR", sol_fixer)
-        self._complete(sol_repair, sol_fixer, self.SOL_CANDIDATE)
+        owner_actor, _, _, first, reviewer_one_receipt = self._open_review_one()
+        self._review(first, reviewer_one_receipt, "REWORK", self.findings)
+        _, owner_repair, owner_receipt = self._issue_with_receipt(
+            "OWNER_REPAIR", "luna-owner-repair", "luna", expected_actor=owner_actor
+        )
+        owner_candidate = self._commit_file("src/alpha.py", "OWNER_ALPHA = 1\n")
+        self._complete(owner_repair, owner_receipt, owner_candidate, ("src/alpha.py",))
+        _, second, reviewer_two_receipt = self._issue_with_receipt(
+            "REVIEW_2", "terra-review-two", "terra_xhigh_reviewer"
+        )
+        self._review(second, reviewer_two_receipt, "REWORK", self.findings)
+        sol_actor, sol_repair, sol_receipt = self._issue_with_receipt(
+            "SOL_MEDIUM_REPAIR", "sol-fixer", "sol_medium_reviewer"
+        )
+        sol_candidate = self._commit_file("src/beta.py", "SOL_BETA = 1\n")
+        self._complete(sol_repair, sol_receipt, sol_candidate, ("src/beta.py",))
         with self.assertRaises(workflow.WorkflowError):
-            self._issue("SOL_MEDIUM_PEER_REVIEW", sol_fixer)
+            self._issue("SOL_MEDIUM_PEER_REVIEW", sol_actor)
 
         # The legacy v1 event is not an adversarial-acceptance-1 ledger.
         legacy_task_id = "AWF-20260809-903"
