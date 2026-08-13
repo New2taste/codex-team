@@ -35,6 +35,13 @@ except ImportError:  # direct script execution
     )
 
 
+ROLE_POLICIES = frozenset({"legacy", "terra_os"})
+# This is an in-memory policy marker only.  It is deliberately not a route
+# artifact value: selecting it requires verified local owner-decision context,
+# which the public routing facade does not yet receive.
+OWNER_AUTHORIZED_LARGE_PROJECT_ROUTE = "owner_authorized_large_project"
+
+
 def _workflow_error(code: str, message: str) -> BaseException:
     """Create the public workflow exception without a module import cycle."""
 
@@ -164,6 +171,25 @@ def legacy_roles(task: Mapping[str, object]) -> tuple[str, ...]:
     return route(task)
 
 
+def _checked_role_policy(value: object) -> str:
+    if not isinstance(value, str) or value not in ROLE_POLICIES:
+        _fail("ROLE_POLICY_INVALID", "unknown role policy")
+    return value
+
+
+def resolve_role_policy(config: object, override: object = None) -> str:
+    """Resolve the configured policy or reject missing and unreviewed values."""
+
+    if override is not None:
+        return _checked_role_policy(override)
+    if not isinstance(config, Mapping):
+        _fail("ROLE_POLICY_INVALID", "workflow configuration must be an object")
+    routing = config.get("routing")
+    if not isinstance(routing, Mapping):
+        _fail("ROLE_POLICY_INVALID", "routing policy configuration is required")
+    return _checked_role_policy(routing.get("role_policy"))
+
+
 def _roles_for(route_name: str, legacy_role_chain: tuple[str, ...]) -> tuple[str, ...]:
     if route_name in {"direct", "blocked"}:
         return ()
@@ -175,11 +201,111 @@ def _roles_for(route_name: str, legacy_role_chain: tuple[str, ...]) -> tuple[str
     raise AssertionError("unreachable")
 
 
-def _rule_id_for(route_name: str, risky: bool) -> str:
+def terra_os_read_only_role(task: Mapping[str, object]) -> str:
+    """Return the task-typed Terra xhigh role for a non-writing route."""
+
+    task_type = task.get("task_type")
+    if task_type == "ACCEPTANCE":
+        return "terra_xhigh_reviewer"
+    if task_type in {"PLAN", "REMEDIATION"}:
+        return "terra_xhigh_planner"
+    _fail("ROUTE_INPUT_INVALID", "task type has no terra_os read-only role")
+    raise AssertionError("unreachable")
+
+
+def roles_for_policy(
+    task: Mapping[str, object],
+    request: Mapping[str, object],
+    route_name: str,
+    policy: str,
+    *,
+    construction_plan: object | None = None,
+    construction_step_id: object = None,
+) -> tuple[str, ...]:
+    """Return the closed runtime role chain for a selected policy route.
+
+    ``OWNER_AUTHORIZED_LARGE_PROJECT_ROUTE`` models only a chain *after* a
+    caller has independently verified local owner authorization.  It never
+    appears in the frozen route-decision wire schema, and ``decide_route``
+    deliberately cannot select it without that context.
+    """
+
+    policy_value = _checked_role_policy(policy)
+    if policy_value == "legacy":
+        return _roles_for(route_name, legacy_roles(task))
+    if route_name in {"direct", "blocked"}:
+        return ()
+    if route_name == "sol_only":
+        return (terra_os_read_only_role(task),)
+    if route_name == "delegated":
+        if _has_verified_luna_construction_envelope(
+            task, request, construction_plan, construction_step_id
+        ):
+            return ("luna_construction",)
+        return ("terra_xhigh",)
+    if route_name == OWNER_AUTHORIZED_LARGE_PROJECT_ROUTE:
+        if request.get("execution_need") != "WRITE":
+            _fail("ROUTE_INPUT_INVALID", "large-project authorization requires a write route")
+        return (
+            "sol_xhigh_planner",
+            "terra_xhigh",
+        )
+    _fail("ROUTE_INPUT_INVALID", "route is not supported")
+    raise AssertionError("unreachable")
+
+
+def _has_verified_luna_construction_envelope(
+    task: Mapping[str, object],
+    request: Mapping[str, object],
+    plan: object,
+    step_id: object,
+) -> bool:
+    """Accept Luna only from a locally revalidated bounded construction step.
+
+    The frozen route request has no owner or envelope fields.  Treating one as
+    an authority source would permit a caller to grow Luna's scope by changing
+    route JSON, so the only positive branch here is a fresh plan validation.
+    Every other input is a closed fallback to Terra xhigh.
+    """
+
+    if (
+        request.get("work_class") != "BOUNDED"
+        or request.get("execution_need") != "WRITE"
+        or request.get("decomposable") is not True
+        or task.get("task_type") != "REMEDIATION"
+        or task.get("risk_flags")
+        or request.get("risk_flags")
+        or not isinstance(step_id, str)
+        or not step_id.strip()
+        or plan is None
+    ):
+        return False
+    try:
+        try:
+            from .ai_workflow_planning import require_luna_construction_step
+        except (ImportError, ModuleNotFoundError):
+            from ai_workflow_planning import require_luna_construction_step
+        selected = require_luna_construction_step(plan, task, step_id)
+    except Exception:
+        return False
+    return bool(
+        selected.owner_role == "luna_construction" and selected.construction_envelope is not None
+    )
+
+
+def _rule_id_for(
+    route_name: str, risky: bool, work_class: str, execution_need: str
+) -> str:
     if route_name == "direct":
         return "SIMPLE_DIRECT_ROUTE"
     if route_name == "sol_only":
-        return "HIGH_RISK_READ_ONLY_ROUTE" if risky else "PLANNING_ONLY_ROUTE"
+        if risky:
+            return "HIGH_RISK_READ_ONLY_ROUTE"
+        if work_class == "PLANNING_ONLY":
+            return "PLANNING_ONLY_ROUTE"
+        if execution_need == "READ_ONLY":
+            return "DECOMPOSABLE_READ_ONLY_ROUTE"
+        return "DECOMPOSABLE_SOL_ONLY_ROUTE"
     if route_name == "delegated":
         return "HIGH_RISK_WRITE_DELEGATED_ROUTE" if risky else "DECOMPOSABLE_DELEGATED_ROUTE"
     return "ROUTE_BLOCKED"
@@ -191,6 +317,9 @@ def decide_route(
     mode: str,
     *,
     legacy_router: Callable[[Mapping[str, object]], tuple[str, ...]] | None = None,
+    role_policy: str = "terra_os",
+    construction_plan: object | None = None,
+    construction_step_id: object = None,
 ) -> RuntimeRouteDecision:
     """Select one closed-set route without starting a model.
 
@@ -204,6 +333,7 @@ def decide_route(
     validate_route_request(request_value, task_value)
     if not isinstance(mode, str) or mode not in ROUTING_MODES:
         _fail("ROUTE_INPUT_INVALID", "unknown routing mode")
+    policy = _checked_role_policy(role_policy)
     current_legacy_roles = (
         legacy_router(task_value) if legacy_router is not None else legacy_roles(task_value)
     )
@@ -212,23 +342,45 @@ def decide_route(
         rule_id = "LEGACY_TASK_TYPE_ROUTE"
     else:
         risky = bool(task_value["risk_flags"]) or request_value["work_class"] == "HIGH_CONSEQUENCE"
-        if risky and request_value["execution_need"] == "WRITE" and not request_value["decomposable"]:
+        bounded_or_multi_stage = request_value["work_class"] in {"BOUNDED", "MULTI_STAGE"}
+        if bounded_or_multi_stage and not request_value["decomposable"]:
+            selected = "blocked"
+        elif risky and request_value["execution_need"] == "WRITE" and not request_value["decomposable"]:
             _fail(
                 "ROUTE_UNDECIDABLE",
                 "high-consequence write lacks bounded decomposition",
             )
-        if risky:
+        elif risky:
             selected = "sol_only" if request_value["execution_need"] != "WRITE" else "delegated"
         elif request_value["work_class"] == "PLANNING_ONLY":
             selected = "sol_only"
         elif request_value["work_class"] == "SIMPLE":
             selected = "direct"
-        elif request_value["work_class"] in {"BOUNDED", "MULTI_STAGE"} and request_value["decomposable"]:
-            selected = "delegated"
+        elif bounded_or_multi_stage:
+            if request_value["execution_need"] == "WRITE":
+                selected = "delegated"
+            else:
+                selected = "sol_only"
         else:
             selected = "blocked"
-        rule_id = _rule_id_for(selected, risky)
-    roles = _roles_for(selected, current_legacy_roles)
+        rule_id = _rule_id_for(
+            selected,
+            risky,
+            str(request_value["work_class"]),
+            str(request_value["execution_need"]),
+        )
+    roles = (
+        _roles_for(selected, current_legacy_roles)
+        if mode == "legacy"
+        else roles_for_policy(
+            task_value,
+            request_value,
+            selected,
+            policy,
+            construction_plan=construction_plan,
+            construction_step_id=construction_step_id,
+        )
+    )
     wire = RouteDecision(
         task_id=str(task_value["task_id"]),
         route=selected,
@@ -285,6 +437,28 @@ def _atomic_write_json(path: Path, value: Mapping[str, object]) -> None:
                 pass
 
 
+def _write_json_once(path: Path, value: Mapping[str, object]) -> None:
+    """Create one immutable authority artifact without an exists/write race."""
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        descriptor = os.open(
+            target,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+        )
+    except FileExistsError:
+        _fail("ROUTE_ALREADY_FROZEN", "route decision is immutable after first persistence")
+    except OSError as exc:
+        raise _workflow_error("ATOMIC_WRITE_FAILED", f"cannot create {target.name}") from exc
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(_canonical_json(value))
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
 def _stored_task_sha256(task_dir: Path) -> str:
     try:
         value = json.loads((Path(task_dir) / "task.json").read_text(encoding="utf-8"))
@@ -316,7 +490,7 @@ def record_route_decision(
         if _stored_task_sha256(task_dir) != decision.task_sha256:
             _fail("ROUTE_TASK_MISMATCH", "route decision task hash does not match stored task")
         path = Path(task_dir) / "route-decision.json"
-        _atomic_write_json(path, wire)
+        _write_json_once(path, wire)
         store.append_event(
             task_id,
             {

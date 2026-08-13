@@ -1,4 +1,4 @@
 interface:
   display_name: "AI Workflow Orchestration"
-  short_description: "Route bounded work with evidence gates"
-  default_prompt: "Use $ai-workflow:orchestration to run a fail-closed preflight."
+  short_description: "Preflight bounded roles with parity and evidence gates"
+  default_prompt: "Use $ai-workflow:orchestration for a fail-closed preflight; preserve the frozen role envelope and final Sol-medium acceptance gate."

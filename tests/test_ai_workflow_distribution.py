@@ -257,6 +257,7 @@ class DistributionContractTest(unittest.TestCase):
             "ai_workflow_planning.py",
             "ai_workflow_runtime.py",
             "ai_workflow_costs.py",
+            "ai_workflow_repairs.py",
         )
         for name in configs:
             self.assertEqual((ROOT / "config" / name).read_bytes(), (PLUGIN / "config" / name).read_bytes())
@@ -264,6 +265,93 @@ class DistributionContractTest(unittest.TestCase):
             self.assertEqual((ROOT / "scripts" / name).read_bytes(), (PLUGIN / "runtime" / name).read_bytes())
         task_schema = json.loads((PLUGIN / "config" / "ai_workflow_task.schema.json").read_text())
         self.assertIn("paired_case_id", task_schema["properties"])
+
+    def test_published_role_and_lifecycle_language_has_no_legacy_allocation(self):
+        """The distributed docs expose the frozen role/lifecycle contract."""
+
+        readme = (ROOT / "README.md").read_text(encoding="utf-8").casefold()
+        skill = (PLUGIN / "skills" / "orchestration" / "SKILL.md").read_text(
+            encoding="utf-8"
+        ).casefold()
+        metadata = (PLUGIN / "skills" / "orchestration" / "agents" / "openai.yaml").read_text(
+            encoding="utf-8"
+        ).casefold()
+        published = "\n".join((readme, skill, metadata))
+
+        for phrase in (
+            "luna max",
+            "frozen envelope",
+            "mechanical",
+            "distribution",
+            "terra xhigh",
+            "complex construction",
+            "independent",
+            "adversarial review",
+            "sol medium",
+            "final",
+            "acceptance",
+            "sol xhigh",
+            "escalation",
+            "terra medium",
+            "sol high",
+            "no default role",
+        ):
+            self.assertIn(phrase, published, phrase)
+
+        self.assertNotIn("execution os remains terra-led", published)
+        self.assertNotIn("luna is only a low-cost bounded tool process", published)
+        self.assertNotIn("luna max 卡面预审", published)
+        self.assertNotIn("luna max pre-review", published)
+        self.assertRegex(
+            published,
+            r"luna[^\n]{0,220}(?:never|must not|does not)[^\n]{0,80}(?:review|accept)",
+        )
+
+        root_config = tomllib.loads((ROOT / "config" / "ai_workflow.toml").read_text())
+        plugin_config = tomllib.loads(
+            (PLUGIN / "config" / "ai_workflow.toml").read_text()
+        )
+        for config in (root_config, plugin_config):
+            role_names = set(config["roles"])
+            self.assertNotIn("terra_medium", role_names)
+            self.assertNotIn("sol_high", role_names)
+            self.assertIn("luna_construction", role_names)
+            self.assertIn("terra_xhigh_reviewer", role_names)
+            self.assertIn("sol_medium_reviewer", role_names)
+            self.assertIn("sol_xhigh_planner", role_names)
+
+    def test_plugin_verifier_rejects_a_tampered_mirrored_runtime_copy(self):
+        """A copied release must fail verification when one mirror is changed."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            release_root = Path(temporary) / "release"
+            shutil.copytree(ROOT / ".codex", release_root / ".codex")
+            shutil.copytree(ROOT / "config", release_root / "config")
+            shutil.copytree(ROOT / "scripts", release_root / "scripts")
+            shutil.copytree(ROOT / "plugins" / "ai-workflow", release_root / "plugins" / "ai-workflow")
+            verifier = release_root / "plugins" / "ai-workflow" / "scripts" / "verify.sh"
+
+            clean = subprocess.run(
+                ["sh", str(verifier)],
+                cwd=release_root,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(0, clean.returncode, clean.stderr)
+
+            mirrored = release_root / "plugins" / "ai-workflow" / "runtime" / "ai_workflow.py"
+            mirrored.write_bytes(mirrored.read_bytes() + b"\n# tampered mirror\n")
+            tampered = subprocess.run(
+                ["sh", str(verifier)],
+                cwd=release_root,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertNotEqual(0, tampered.returncode)
 
     def test_known_legacy_fixture_matches_the_registered_digest(self):
         self.assertEqual(KNOWN_LEGACY_SHA256, hashlib.sha256(KNOWN_LEGACY_TEMPLATE).hexdigest())

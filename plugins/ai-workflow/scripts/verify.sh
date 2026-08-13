@@ -1,5 +1,5 @@
 #!/bin/sh
-# Verify that the release bundle has no manually maintained contract copies.
+# Verify that the release bundle has no stale manually maintained contract copies.
 set -eu
 
 fail() {
@@ -36,7 +36,8 @@ for name in \
     ai_workflow_routing.py \
     ai_workflow_planning.py \
     ai_workflow_runtime.py \
-    ai_workflow_costs.py
+    ai_workflow_costs.py \
+    ai_workflow_repairs.py
 do
     cmp -s "$repository_root/scripts/$name" "$plugin_root/runtime/$name" || fail "runtime copy differs"
 done

@@ -92,7 +92,20 @@ RESULT_REQUIRED_FIELDS = frozenset(
         "recommended_next_state",
     }
 )
-READ_ONLY_ROLES = frozenset({"luna", "sol_planner", "sol_reviewer", "sol_xhigh"})
+READ_ONLY_ROLES = frozenset(
+    {
+        "luna",
+        "sol_planner",
+        "sol_reviewer",
+        "sol_xhigh",
+        "sol_medium_supervisor",
+        "sol_medium_reviewer",
+        "sol_xhigh_planner",
+        "terra_xhigh_planner",
+        "terra_xhigh_reviewer",
+    }
+)
+TERRA_WRITE_ROLES = frozenset({"luna_construction", "terra", "terra_xhigh"})
 ROLE_GUARD_FAILURES = frozenset(
     {
         "ACCEPTANCE_CANDIDATE_HEAD_MISMATCH",
@@ -337,7 +350,7 @@ def _resolve_commit(repo: Path, value: object, field: str) -> str:
 def _execution_repo(task: Mapping[str, object], role: str) -> Path:
     repository_root = Path(task["repository_root"]).resolve()
     source_worktree = task.get("source_worktree")
-    if role == "terra":
+    if role in TERRA_WRITE_ROLES:
         if task.get("task_type") != "REMEDIATION":
             _fail("TERRA_TASK_TYPE_INVALID", "Terra may run only for REMEDIATION tasks")
         if not isinstance(source_worktree, str) or not source_worktree.strip():
@@ -387,16 +400,27 @@ def assert_allowed_changes(changed: set[str], allowed: Sequence[str]) -> None:
         _fail("OUT_OF_SCOPE_CHANGE", f"changed path is outside the allowed scope: {outside[0]}")
 
 
-def _load_role_config(role: str) -> dict[str, object]:
-    """Return the pinned configuration for one named workflow role."""
+def _load_workflow_config() -> dict[str, object]:
+    """Load the one pinned workflow configuration document."""
 
     try:
         import tomllib
 
         with ROLE_CONFIG_PATH.open("rb") as handle:
             config = tomllib.load(handle)
-        role_config = config["roles"][role]
-    except (OSError, KeyError, TypeError, tomllib.TOMLDecodeError) as exc:
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise WorkflowError("INVALID_ROLE", "workflow configuration is unreadable") from exc
+    if not isinstance(config, dict):
+        raise WorkflowError("INVALID_ROLE", "workflow configuration must be an object")
+    return config
+
+
+def _load_role_config(role: str) -> dict[str, object]:
+    """Return the pinned configuration for one named workflow role."""
+
+    try:
+        role_config = _load_workflow_config()["roles"][role]
+    except (KeyError, TypeError) as exc:
         raise WorkflowError("INVALID_ROLE", f"unsupported or unreadable role {role}") from exc
     if not isinstance(role_config, dict):
         raise WorkflowError("INVALID_ROLE", f"unsupported role {role}")
@@ -784,12 +808,254 @@ def validate_role_result(
         _fail("CHANGED_FILES_MISMATCH", "declared changed_files differ from the real diff")
 
 
+def _construction_evidence_observation(check: ConstructionCheck) -> str:
+    """Canonical observation text for a frozen construction check."""
+
+    if not isinstance(check, ConstructionCheck):
+        _fail("INVALID_VERIFICATION_PACKAGE", "construction check is invalid")
+    if check.kind == "HASH":
+        return f"sha256={check.sha256}"
+    return (
+        f"command={check.command}; expected_exit={check.expected_exit}; "
+        f"assertion={check.assertion}"
+    )
+
+
+def _safe_scope_identity(repository: Path, scope: str) -> tuple[tuple[int, int, int], ...]:
+    """Resolve existing scope components with O_NOFOLLOW and return identities."""
+
+    root = Path(repository)
+    try:
+        root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise WorkflowError("CONSTRUCTION_SCOPE_UNSAFE", "repository root is not safely openable") from exc
+    root_stat = os.fstat(root_fd)
+    identities: list[tuple[int, int, int]] = [
+        (root_stat.st_dev, root_stat.st_ino, root_stat.st_mode)
+    ]
+    current_fd = root_fd
+    parts = normalize_scope(scope).parts
+    try:
+        for index, component in enumerate(parts):
+            flags = os.O_RDONLY | os.O_NOFOLLOW
+            if index < len(parts) - 1:
+                flags |= os.O_DIRECTORY
+            try:
+                next_fd = os.open(component, flags, dir_fd=current_fd)
+            except FileNotFoundError:
+                break
+            except OSError as exc:
+                raise WorkflowError(
+                    "CONSTRUCTION_SCOPE_UNSAFE", f"unsafe scope component: {scope}"
+                ) from exc
+            stat_result = os.fstat(next_fd)
+            identities.append((stat_result.st_dev, stat_result.st_ino, stat_result.st_mode))
+            if current_fd != root_fd:
+                os.close(current_fd)
+            current_fd = next_fd
+        return tuple(identities)
+    finally:
+        if current_fd != root_fd:
+            os.close(current_fd)
+        os.close(root_fd)
+
+
+def _safe_artifact_sha256(repository: Path, artifact: str) -> str:
+    """Hash one regular artifact through a no-follow descriptor."""
+
+    target = normalize_scope(artifact)
+    root_fd = os.open(repository, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    current_fd = root_fd
+    try:
+        for component in target.parts[:-1]:
+            next_fd = os.open(
+                component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current_fd
+            )
+            if current_fd != root_fd:
+                os.close(current_fd)
+            current_fd = next_fd
+        file_fd = os.open(target.parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=current_fd)
+        try:
+            stat_before = os.fstat(file_fd)
+            digest = hashlib.sha256()
+            while True:
+                chunk = os.read(file_fd, 65536)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            stat_after = os.fstat(file_fd)
+            if (stat_before.st_dev, stat_before.st_ino, stat_before.st_size, stat_before.st_mtime_ns) != (
+                stat_after.st_dev, stat_after.st_ino, stat_after.st_size, stat_after.st_mtime_ns
+            ):
+                _fail("CONSTRUCTION_EVIDENCE_DRIFT", "artifact changed while it was hashed")
+            return digest.hexdigest()
+        finally:
+            os.close(file_fd)
+    except OSError as exc:
+        raise WorkflowError("CONSTRUCTION_EVIDENCE_FAILED", f"cannot hash artifact {artifact}") from exc
+    finally:
+        if current_fd != root_fd:
+            os.close(current_fd)
+        os.close(root_fd)
+
+
+def _execute_construction_command(repository: Path, check: ConstructionCheck) -> dict[str, object]:
+    argv = list(
+        construction_evidence_argv(check, error_code="CONSTRUCTION_EVIDENCE_FAILED")
+    )
+    try:
+        completed = subprocess.run(
+            argv,
+            cwd=repository,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=120,
+            check=False,
+            env={"PATH": "/usr/bin:/bin", "PYTHONPATH": str(repository)},
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise WorkflowError("CONSTRUCTION_EVIDENCE_FAILED", "evidence argv could not complete") from exc
+    output = completed.stdout[-65536:]
+    observation = {
+        "source": "controller",
+        "argv": argv,
+        "exit_code": completed.returncode,
+        "output": output,
+    }
+    if completed.returncode != check.expected_exit:
+        _fail("CONSTRUCTION_EVIDENCE_FAILED", "evidence command returned an unexpected exit")
+    if check.assertion not in output and str(check.assertion) != f"exit={completed.returncode}":
+        _fail("CONSTRUCTION_EVIDENCE_FAILED", "evidence assertion was not observed")
+    return observation
+
+
+def _bind_controller_construction_evidence(
+    result: Mapping[str, object], task: Mapping[str, object], context: ConstructionExecutionContext
+) -> dict[str, object]:
+    """Replace model attestations with evidence observed by the controller."""
+
+    if context.role != "luna_construction" or context.step.construction_envelope is None:
+        return dict(result)
+    repository = Path(task.get("source_worktree") or task["repository_root"])
+    scopes = set(context.step.read_scope) | set(context.step.write_scope)
+    before = {scope: _safe_scope_identity(repository, scope) for scope in scopes}
+    envelope = context.step.construction_envelope
+    checks = dict(envelope.evidence)
+    evidence: list[dict[str, object]] = []
+    for level in ("L0", "L1", "L2"):
+        check = checks[level]
+        if level == "L0":
+            actual_hash = _safe_artifact_sha256(repository, check.artifact)
+            if actual_hash != check.sha256:
+                _fail("CONSTRUCTION_EVIDENCE_FAILED", "L0 artifact hash does not match the frozen digest")
+            observed: dict[str, object] = {
+                "source": "controller", "sha256": actual_hash,
+                "device_inode": list(_safe_scope_identity(repository, check.artifact)[-1][:2]),
+            }
+        else:
+            observed = _execute_construction_command(repository, check)
+        evidence.append(
+            {
+                "id": level,
+                "type": check.kind,
+                "locator": check.artifact,
+                "observation": _canonical_json(observed),
+            }
+        )
+    negative = envelope.negative_checks[0]
+    negative_observed = _execute_construction_command(repository, negative)
+    after = {scope: _safe_scope_identity(repository, scope) for scope in scopes}
+    if before != after:
+        _fail("CONSTRUCTION_SCOPE_DRIFT", "scope identity changed while evidence was collected")
+    bound = dict(result)
+    bound["evidence"] = evidence
+    claims = bound.get("claims")
+    if not isinstance(claims, list) or len(claims) != 1:
+        _fail("INVALID_VERIFICATION_PACKAGE", "construction result must reference controller evidence")
+    bound["counter_checks"] = [
+        {
+            "target_claim_id": claims[0].get("id"),
+            "method": str(negative.command),
+            "result": _canonical_json(negative_observed),
+        }
+    ]
+    return bound
+
+
+def _validate_luna_construction_verification(
+    result: Mapping[str, object], step: FrozenSubtask | None
+) -> None:
+    """Require a candidate result to reproduce all frozen L0/L1/L2 checks."""
+
+    if step is None or step.construction_envelope is None:
+        _fail(
+            "INVALID_VERIFICATION_PACKAGE",
+            "luna construction result has no frozen verification envelope",
+        )
+    if result["status"] != "IMPLEMENTED_CANDIDATE":
+        return
+    envelope = step.construction_envelope
+    evidence_by_level = dict(envelope.evidence)
+    expected = {
+        "L0": evidence_by_level["L0"],
+        "L1": evidence_by_level["L1"],
+        "L2": evidence_by_level["L2"],
+    }
+    evidence = result["evidence"]
+    evidence_by_id = {entry["id"]: entry for entry in evidence}
+    if set(evidence_by_id) != {"L0", "L1", "L2"}:
+        _fail("INVALID_VERIFICATION_PACKAGE", "luna construction requires exactly L0/L1/L2 evidence")
+    expected_types = {"L0": "HASH", "L1": "COMMAND", "L2": "TEST"}
+    for level, check in expected.items():
+        record = evidence_by_id[level]
+        if (
+            record["type"] != expected_types[level]
+            or record["locator"] != check.artifact
+            or not isinstance(record["observation"], str)
+        ):
+            _fail(
+                "INVALID_VERIFICATION_PACKAGE",
+                f"luna construction {level} evidence does not match the frozen contract",
+            )
+    claims = result["claims"]
+    if len(claims) != 1 or set(claims[0]["evidence_ids"]) != {"L0", "L1", "L2"}:
+        _fail("INVALID_VERIFICATION_PACKAGE", "luna construction candidate must bind one claim to L0/L1/L2")
+    counter_checks = result["counter_checks"]
+    if len(counter_checks) != 1 or counter_checks[0]["target_claim_id"] != claims[0]["id"]:
+        _fail("INVALID_VERIFICATION_PACKAGE", "luna construction requires one bound negative check")
+    negative = envelope.negative_checks
+    if not any(counter_checks[0]["method"] == check.command for check in negative):
+        _fail("INVALID_VERIFICATION_PACKAGE", "luna construction negative check is not frozen")
+    for record in evidence:
+        try:
+            observation = json.loads(record["observation"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise WorkflowError("INVALID_VERIFICATION_PACKAGE", "construction evidence is not controller JSON") from exc
+        if observation.get("source") != "controller":
+            _fail("INVALID_VERIFICATION_PACKAGE", "construction evidence is not controller-produced")
+    try:
+        negative_observation = json.loads(counter_checks[0]["result"])
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise WorkflowError("INVALID_VERIFICATION_PACKAGE", "negative evidence is not controller JSON") from exc
+    if negative_observation.get("source") != "controller":
+        _fail("INVALID_VERIFICATION_PACKAGE", "negative evidence is not controller-produced")
+
+
 def validate_verification_package(
-    role: str, task: Mapping[str, object], result: Mapping[str, object]
+    role: str,
+    task: Mapping[str, object],
+    result: Mapping[str, object],
+    *,
+    construction_step: FrozenSubtask | None = None,
 ) -> None:
     """Enforce only the mechanically decidable parts of an evidence level."""
 
     validate_task(task)
+    if role == "luna_construction":
+        _validate_luna_construction_verification(result, construction_step)
+        return
     if role != "luna" or task["verification_level"] != "L1":
         return
     claims = result["claims"]
@@ -859,12 +1125,40 @@ def run_codex(
     paths: RunPaths,
     *,
     attempt_context: AttemptAccountingContext | None = None,
+    construction_plan: object | None = None,
+    construction_step_id: object = None,
+    construction_context: ConstructionExecutionContext | None = None,
 ) -> dict:
     """Run one pinned Codex role and accept only a validated output document."""
 
     validate_task(task)
     if not isinstance(prompt, str):
         _fail("INVALID_PROMPT", "prompt must be a string")
+    luna_construction_step: FrozenSubtask | None = None
+    if role == "luna_construction":
+        if task["task_type"] != "REMEDIATION" or task["risk_flags"]:
+            _fail(
+                "LUNA_ENVELOPE_INVALID",
+                "luna construction is limited to low-risk remediation work",
+            )
+        if not isinstance(construction_context, ConstructionExecutionContext):
+            _fail(
+                "LUNA_ENVELOPE_INVALID",
+                "luna construction requires a hash-bound frozen dispatch context",
+            )
+        luna_construction_step = require_luna_construction_step(
+            construction_plan, task, construction_step_id
+        )
+        if (
+            construction_context.role != role
+            or construction_context.step != luna_construction_step
+            or construction_context.plan.plan_sha256
+            != validate_plan(construction_plan, task).plan_sha256
+        ):
+            _fail("LUNA_ENVELOPE_INVALID", "luna construction context does not bind the supplied step")
+        expected_prompt = build_construction_role_prompt(task, construction_context)
+        if prompt != expected_prompt:
+            _fail("CONSTRUCTION_PROMPT_MISMATCH", "construction prompt must be generated from the frozen contract")
     accounting_context = _require_attempt_accounting_context(
         attempt_context, task["task_id"], role
     )
@@ -874,14 +1168,14 @@ def run_codex(
     repo = Path(paths.repo).resolve()
     if repo != _execution_repo(task, role):
         _fail("ROLE_REPOSITORY_MISMATCH", "role repository does not match the task execution repository")
-    if role == "terra":
+    if role in TERRA_WRITE_ROLES:
         _assert_terra_worktree_authorized(task, repo, paths.state_root)
     if role in READ_ONLY_ROLES:
         _reject_dirty_input(repo, "DIRTY_READ_ONLY_REPOSITORY", "read-only role requires a clean repository")
     if task["task_type"] == "ACCEPTANCE":
         _reject_dirty_input(repo, "DIRTY_ACCEPTANCE_REPOSITORY", "acceptance requires a clean repository")
         assert_acceptance_candidate(task, repo)
-    if role == "terra":
+    if role in TERRA_WRITE_ROLES:
         _reject_dirty_input(repo, "DIRTY_TERRA_WORKTREE", "Terra requires a clean source_worktree")
     _claim_attempt_context(paths, accounting_context)
     runtime_store: WorkflowStore | None = None
@@ -982,9 +1276,16 @@ def run_codex(
                     _fail("READ_ONLY_ROLE_MODIFIED_REPO", f"read-only role {role} changed the repository")
                 if task["task_type"] == "ACCEPTANCE":
                     assert_acceptance_candidate(task, repo)
-                if role == "terra":
+                if role in TERRA_WRITE_ROLES:
                     actual_changes = after_changes - before_changes
-                    assert_allowed_changes(actual_changes, task["allowed_write_paths"])
+                    assert_allowed_changes(
+                        actual_changes,
+                        (
+                            luna_construction_step.write_scope
+                            if luna_construction_step is not None
+                            else task["allowed_write_paths"]
+                        ),
+                    )
                 else:
                     actual_changes = after_changes - before_changes
             except BaseException as exc:
@@ -1049,8 +1350,12 @@ def run_codex(
                 {
                     "event_type": "RUNTIME_EVIDENCE_RECORDED",
                     "attempt_id": attempt_id,
+                    "requested_role": role,
                     "thread_id": thread_id,
                     "execution_surface": CODEX_EXEC_ROLE_CONTRACT,
+                    "runtime_evidence_sha256": hashlib.sha256(
+                        _canonical_json(runtime_evidence.to_dict()).encode("utf-8")
+                    ).hexdigest(),
                     "usage": extract_codex_usage(events),
                     "result_sha256": hashlib.sha256(
                         _canonical_json(result).encode("utf-8")
@@ -1058,7 +1363,12 @@ def run_codex(
                 },
             )
         validate_role_result(role, result, actual_changes)
-        validate_verification_package(role, task, result)
+        validate_verification_package(
+            role,
+            task,
+            result,
+            construction_step=luna_construction_step,
+        )
     except BaseException:
         _append_attempt("FAILED", None)
         raise
@@ -1293,6 +1603,28 @@ def atomic_write_json(path: Path, value: object) -> None:
                 pass
 
 
+def write_json_once(path: Path, value: object, *, conflict_code: str) -> None:
+    """Create a frozen JSON artifact with O_EXCL/O_NOFOLLOW semantics."""
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        descriptor = os.open(
+            target,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+        )
+    except FileExistsError:
+        _fail(conflict_code, f"{target.name} is already frozen")
+    except OSError as exc:
+        raise WorkflowError("ATOMIC_WRITE_FAILED", f"cannot create {target.name}") from exc
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(_canonical_json(value))
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
 def append_jsonl(path: Path, record: Mapping[str, object]) -> None:
     """Append one compact, fsynced JSON object without rewrite/delete support."""
 
@@ -1372,6 +1704,14 @@ class WorkflowStore:
         dispatch identity twice.  The ledger is append-only by construction.
         """
 
+        with self.lock(task_id):
+            return self._record_dispatch_locked(task_id, dispatch_identity, payload)
+
+    def _record_dispatch_locked(
+        self, task_id: str, dispatch_identity: str, payload: Mapping[str, object]
+    ) -> Path:
+        """Append a dispatch while the caller already holds this task's lock."""
+
         if (
             not isinstance(dispatch_identity, str)
             or not re.fullmatch(r"[0-9a-f]{64}", dispatch_identity)
@@ -1382,32 +1722,31 @@ class WorkflowStore:
         record = dict(payload)
         if "dispatch_id" in record:
             _fail("INVALID_RECORD", "dispatch payload must not override dispatch_id")
-        with self.lock(task_id):
-            task_dir = self._require_task(task_id)
-            ledger = task_dir / "dispatches.jsonl"
+        task_dir = self._require_task(task_id)
+        ledger = task_dir / "dispatches.jsonl"
+        try:
+            lines = ledger.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            lines = []
+        except OSError as exc:
+            raise WorkflowError("DISPATCH_READ_ERROR", "cannot read dispatch ledger") from exc
+        for line in lines:
             try:
-                lines = ledger.read_text(encoding="utf-8").splitlines()
-            except FileNotFoundError:
-                lines = []
-            except OSError as exc:
-                raise WorkflowError("DISPATCH_READ_ERROR", "cannot read dispatch ledger") from exc
-            for line in lines:
-                try:
-                    prior = json.loads(line)
-                except json.JSONDecodeError as exc:
-                    raise WorkflowError(
-                        "DISPATCH_IDENTITY_DRIFT", "dispatch ledger contains invalid JSON"
-                    ) from exc
-                if (
-                    not isinstance(prior, dict)
-                    or not isinstance(prior.get("dispatch_id"), str)
-                    or not re.fullmatch(r"[0-9a-f]{64}", prior["dispatch_id"])
-                ):
-                    _fail("DISPATCH_IDENTITY_DRIFT", "dispatch ledger contains an invalid record")
-                if prior["dispatch_id"] == dispatch_identity:
-                    _fail("DUPLICATE_DISPATCH", "dispatch identity has already been recorded")
-            record["dispatch_id"] = dispatch_identity
-            append_jsonl(ledger, record)
+                prior = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise WorkflowError(
+                    "DISPATCH_IDENTITY_DRIFT", "dispatch ledger contains invalid JSON"
+                ) from exc
+            if (
+                not isinstance(prior, dict)
+                or not isinstance(prior.get("dispatch_id"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", prior["dispatch_id"])
+            ):
+                _fail("DISPATCH_IDENTITY_DRIFT", "dispatch ledger contains an invalid record")
+            if prior["dispatch_id"] == dispatch_identity:
+                _fail("DUPLICATE_DISPATCH", "dispatch identity has already been recorded")
+        record["dispatch_id"] = dispatch_identity
+        append_jsonl(ledger, record)
         return ledger
 
     def metrics_path(self, task_id: str) -> Path:
@@ -1443,12 +1782,16 @@ try:
         RuntimeRouteDecision,
         decide_route as _decide_route,
         record_route_decision as _record_route_decision,
+        resolve_role_policy as _resolve_role_policy,
+        terra_os_read_only_role as _terra_os_read_only_role,
     )
 except ImportError:  # direct script execution
     from ai_workflow_routing import (
         RuntimeRouteDecision,
         decide_route as _decide_route,
         record_route_decision as _record_route_decision,
+        resolve_role_policy as _resolve_role_policy,
+        terra_os_read_only_role as _terra_os_read_only_role,
     )
 
 
@@ -1459,13 +1802,38 @@ def legacy_roles(task: Mapping[str, object]) -> tuple[str, ...]:
     return route(task)
 
 
+def _configured_routing_mode(config: Mapping[str, object]) -> str:
+    routing = config.get("routing")
+    if not isinstance(routing, Mapping):
+        _fail("ROUTE_INPUT_INVALID", "routing configuration is required")
+    mode = routing.get("mode")
+    if mode not in {"legacy", "shadow", "enforced"}:
+        _fail("ROUTE_INPUT_INVALID", "unknown configured routing mode")
+    return mode
+
+
 def decide_route(
-    task: Mapping[str, object], request: object, mode: str
+    task: Mapping[str, object],
+    request: object,
+    mode: str | None = None,
+    *,
+    construction_plan: object | None = None,
+    construction_step_id: object = None,
 ) -> RuntimeRouteDecision:
     """Make a validated local route decision without executing a model."""
 
     validate_task(task)
-    return _decide_route(task, request, mode, legacy_router=route)
+    config = _load_workflow_config()
+    configured_mode = _configured_routing_mode(config)
+    return _decide_route(
+        task,
+        request,
+        configured_mode if mode is None else mode,
+        legacy_router=route,
+        role_policy=_resolve_role_policy(config),
+        construction_plan=construction_plan,
+        construction_step_id=construction_step_id,
+    )
 
 
 def record_route_decision(
@@ -1478,28 +1846,83 @@ def record_route_decision(
 
 try:
     from .ai_workflow_planning import (
+        ConstructionCheck,
         FrozenPlan,
         FrozenSubtask,
+        construction_evidence_argv,
         dispatch_id,
         normalize_scope,
         ready_batch,
         record_dispatch,
+        require_luna_construction_step,
         scope_owner_map,
         scopes_overlap,
         validate_plan,
     )
 except ImportError:  # direct script execution
     from ai_workflow_planning import (
+        ConstructionCheck,
         FrozenPlan,
         FrozenSubtask,
+        construction_evidence_argv,
         dispatch_id,
         normalize_scope,
         ready_batch,
         record_dispatch,
+        require_luna_construction_step,
         scope_owner_map,
         scopes_overlap,
         validate_plan,
     )
+
+
+@dataclass(frozen=True)
+class ConstructionExecutionContext:
+    """One hash-bound construction launch derived solely from frozen artifacts."""
+
+    plan: FrozenPlan
+    step: FrozenSubtask
+    dispatch_id: str
+    task_sha256: str
+    request_sha256: str
+    role: str
+
+    def contract(self) -> dict[str, object]:
+        """Return the complete immutable role contract, with no route-wire policy."""
+
+        return {
+            "schema_version": "construction-contract-1",
+            "dispatch_id": self.dispatch_id,
+            "plan_sha256": self.plan.plan_sha256,
+            "task_sha256": self.task_sha256,
+            "request_sha256": self.request_sha256,
+            "subtask_id": self.step.id,
+            "role": self.role,
+            "read_scope": list(self.step.read_scope),
+            "write_scope": list(self.step.write_scope),
+            "do_not_touch": list(self.step.do_not_touch),
+            "verification_commands": list(self.step.verification_commands),
+            "first_artifact": self.step.first_artifact,
+            "construction_envelope": (
+                self.step.construction_envelope.to_dict()
+                if self.step.construction_envelope is not None
+                else None
+            ),
+        }
+
+
+def build_construction_role_prompt(
+    task: Mapping[str, object], context: ConstructionExecutionContext
+) -> str:
+    """Create the only prompt allowed for a bounded construction launch."""
+
+    if not isinstance(context, ConstructionExecutionContext):
+        _fail("CONSTRUCTION_CONTEXT_INVALID", "construction execution requires a frozen context")
+    if context.role not in {"luna_construction", "terra_xhigh"}:
+        _fail("CONSTRUCTION_CONTEXT_INVALID", "construction context has an invalid owner role")
+    if context.role == "luna_construction" and context.step.construction_envelope is None:
+        _fail("LUNA_ENVELOPE_INVALID", "luna construction context lacks its envelope")
+    return build_role_prompt(context.role, task, context.contract(), ())
 
 
 def _parse_metric_number(value: object) -> int | float | None:
@@ -1913,10 +2336,17 @@ def render_report(metrics: Mapping[str, object]) -> str:
 
 FAKE_ROLE_RESULTS = {
     "luna": ("SUPPORTED", "EVIDENCE_READY"),
+    "luna_construction": ("IMPLEMENTED_CANDIDATE", "PRECHECK_RUNNING"),
     "terra": ("IMPLEMENTED_CANDIDATE", "PRECHECK_RUNNING"),
+    "terra_xhigh": ("IMPLEMENTED_CANDIDATE", "PRECHECK_RUNNING"),
+    "terra_xhigh_planner": ("PLAN_READY", "AWAITING_OWNER_DECISION"),
+    "terra_xhigh_reviewer": ("ACCEPTANCE_RECOMMENDED", "AWAITING_OWNER_DECISION"),
     "sol_planner": ("PLAN_READY", "AWAITING_OWNER_DECISION"),
+    "sol_medium_supervisor": ("PLAN_READY", "AWAITING_OWNER_DECISION"),
     "sol_reviewer": ("ACCEPTANCE_RECOMMENDED", "AWAITING_OWNER_DECISION"),
+    "sol_medium_reviewer": ("ACCEPTANCE_RECOMMENDED", "AWAITING_OWNER_DECISION"),
     "sol_xhigh": ("OPTION_A", "ESCALATION_PROPOSED"),
+    "sol_xhigh_planner": ("OPTION_A", "ESCALATION_PROPOSED"),
 }
 
 
@@ -1967,6 +2397,100 @@ class FakeRunner:
             ]
         return result
 
+    def run_construction(
+        self,
+        role: str,
+        task: dict[str, object],
+        context: ConstructionExecutionContext,
+        *,
+        attempt_context: AttemptAccountingContext | None = None,
+    ) -> dict[str, object]:
+        """Emit the one deterministic construction fixture bound to ``context``."""
+
+        if not isinstance(context, ConstructionExecutionContext) or context.role != role:
+            _fail("CONSTRUCTION_CONTEXT_INVALID", "fake construction run has no matching frozen context")
+        result = self.run(role, task)
+        result["changed_files"] = list(context.step.write_scope)
+        if role != "luna_construction":
+            return result
+        envelope = context.step.construction_envelope
+        if envelope is None:
+            _fail("LUNA_ENVELOPE_INVALID", "fake Luna construction run lacks an envelope")
+        checks = dict(envelope.evidence)
+        result["claims"] = [
+            {
+                "id": "construction-claim",
+                "kind": "FACT",
+                "text": "The frozen construction contract has deterministic evidence.",
+                "evidence_ids": ["L0", "L1", "L2"],
+            }
+        ]
+        result["evidence"] = [
+            {
+                "id": level,
+                "type": check.kind,
+                "locator": check.artifact,
+                "observation": _construction_evidence_observation(check),
+            }
+            for level, check in (("L0", checks["L0"]), ("L1", checks["L1"]), ("L2", checks["L2"]))
+        ]
+        negative = envelope.negative_checks[0]
+        result["counter_checks"] = [
+            {
+                "target_claim_id": "construction-claim",
+                "method": str(negative.command),
+                "result": _construction_evidence_observation(negative),
+            }
+        ]
+        return result
+
+
+class CodexConstructionRunner:
+    """Live construction runner whose prompt is derived only from a frozen context."""
+
+    is_live_model = True
+    owns_cost_attempt_accounting = True
+
+    def __init__(self, state_root: Path, runtime_sessions_dir: Path | None):
+        self.state_root = Path(state_root)
+        self.runtime_sessions_dir = runtime_sessions_dir
+
+    def run(self, role: str, task: dict[str, object], **_: object) -> Mapping[str, object]:
+        _fail("CONSTRUCTION_CONTEXT_REQUIRED", "live construction cannot run a generic role prompt")
+        raise AssertionError("unreachable")
+
+    def run_construction(
+        self,
+        role: str,
+        task: dict[str, object],
+        context: ConstructionExecutionContext,
+        *,
+        attempt_context: AttemptAccountingContext | None = None,
+    ) -> Mapping[str, object]:
+        if not isinstance(context, ConstructionExecutionContext) or context.role != role:
+            _fail("CONSTRUCTION_CONTEXT_INVALID", "live construction context does not match role")
+        task_dir = WorkflowStore(self.state_root)._require_task(str(task["task_id"]))
+        repository = _execution_repo(task, role)
+        paths = RunPaths(
+            repo=repository,
+            output_path=task_dir / f"{role}-result.json",
+            schema_path=Path(task["repository_root"]) / "config" / "ai_workflow_result.schema.json",
+            logs_dir=task_dir / "logs",
+            state_root=self.state_root,
+            runtime_evidence_required=True,
+            runtime_sessions_dir=self.runtime_sessions_dir,
+        )
+        return run_codex(
+            role,
+            task,
+            build_construction_role_prompt(task, context),
+            paths,
+            attempt_context=attempt_context,
+            construction_plan=context.plan.to_dict(),
+            construction_step_id=context.step.id,
+            construction_context=context,
+        )
+
 
 class Runner(Protocol):
     """The small, injectable boundary used by the gated orchestrator."""
@@ -1982,6 +2506,16 @@ class Runner(Protocol):
         attempt_context: AttemptAccountingContext | None = None,
     ) -> Mapping[str, object]:
         """Return one ai-result-1-compatible role result."""
+
+    def run_construction(
+        self,
+        role: str,
+        task: dict[str, object],
+        context: ConstructionExecutionContext,
+        *,
+        attempt_context: AttemptAccountingContext | None = None,
+    ) -> Mapping[str, object]:
+        """Run only a prompt generated from the provided frozen construction context."""
 
 
 @dataclass
@@ -2256,8 +2790,22 @@ def _run_role_with_technical_retry(
     role: str,
     runner: Runner,
     budget: RetryBudget,
+    *,
+    construction_context: ConstructionExecutionContext | None = None,
+    state_root: Path | None = None,
 ) -> tuple[Mapping[str, object] | None, str]:
     """Run one role, allowing only the single persisted technical retry."""
+
+    if role == "luna_construction" and construction_context is None:
+        _fail(
+            "LUNA_ENVELOPE_INVALID",
+            "generic pipeline dispatch cannot launch luna construction without its envelope",
+        )
+    if construction_context is not None and (
+        construction_context.role != role
+        or role not in {"luna_construction", "terra_xhigh"}
+    ):
+        _fail("CONSTRUCTION_CONTEXT_INVALID", "construction role does not match its frozen context")
 
     retry_kind = "none"
     while True:
@@ -2275,8 +2823,10 @@ def _run_role_with_technical_retry(
             before_changes: set[str] | None = None
             if getattr(runner, "is_live_model", False):
                 guarded_repo = _execution_repo(task, role)
-                if role == "terra":
-                    _assert_terra_worktree_authorized(task, guarded_repo, WORKFLOW_STATE_ROOT)
+                if role in TERRA_WRITE_ROLES:
+                    _assert_terra_worktree_authorized(
+                        task, guarded_repo, state_root or WORKFLOW_STATE_ROOT
+                    )
                     _reject_dirty_input(
                         guarded_repo,
                         "DIRTY_TERRA_WORKTREE",
@@ -2301,10 +2851,41 @@ def _run_role_with_technical_retry(
             attempt_error: BaseException | None = None
             runtime_usage = None
             try:
-                if attempt_context is None:
+                if construction_context is not None:
+                    run_construction = getattr(runner, "run_construction", None)
+                    if not callable(run_construction):
+                        _fail(
+                            "CONSTRUCTION_CONTEXT_INVALID",
+                            "construction runner must accept the frozen contract",
+                        )
+                    if attempt_context is None:
+                        result = run_construction(role, task, construction_context)
+                    else:
+                        result = run_construction(
+                            role,
+                            task,
+                            construction_context,
+                            attempt_context=attempt_context,
+                        )
+                elif attempt_context is None:
                     result = runner.run(role, task)
                 else:
                     result = runner.run(role, task, attempt_context=attempt_context)
+                if construction_context is not None:
+                    result = _bind_controller_construction_evidence(
+                        result, task, construction_context
+                    )
+                    if construction_context.role == "luna_construction":
+                        store.append_event(
+                            task_id,
+                            {
+                                "event_type": "CONSTRUCTION_EVIDENCE_RECORDED",
+                                "timestamp_utc": _utc_timestamp(),
+                                "dispatch_id": construction_context.dispatch_id,
+                                "evidence": result.get("evidence"),
+                                "counter_checks": result.get("counter_checks"),
+                            },
+                        )
             except BaseException as exc:
                 attempt_error = exc
                 raise
@@ -2324,8 +2905,15 @@ def _run_role_with_technical_retry(
                             if task["task_type"] == "ACCEPTANCE":
                                 assert_acceptance_candidate(task, guarded_repo)
                             actual_changes = after_changes - before_changes
-                            if role == "terra":
-                                assert_allowed_changes(actual_changes, task["allowed_write_paths"])
+                            if role in TERRA_WRITE_ROLES:
+                                assert_allowed_changes(
+                                    actual_changes,
+                                    (
+                                        construction_context.step.write_scope
+                                        if construction_context is not None
+                                        else task["allowed_write_paths"]
+                                    ),
+                                )
                         else:
                             actual_changes = set(result.get("changed_files", [])) if "result" in locals() and isinstance(result, Mapping) else set()
                     except BaseException as exc:
@@ -2345,7 +2933,7 @@ def _run_role_with_technical_retry(
                             runtime_usage,
                             retry_kind,
                             "FAILED",
-                            WORKFLOW_STATE_ROOT,
+                            state_root or WORKFLOW_STATE_ROOT,
                         )
             metric_run = dict(result) if isinstance(result, Mapping) else {}
             metric_run.update(
@@ -2357,7 +2945,12 @@ def _run_role_with_technical_retry(
             )
             try:
                 validate_role_result(role, result, actual_changes)
-                validate_verification_package(role, task, result)
+                validate_verification_package(
+                    role,
+                    task,
+                    result,
+                    construction_step=(construction_context.step if construction_context else None),
+                )
             except BaseException:
                 if attempt_context is None:
                     _controller_cost_attempt(
@@ -2372,7 +2965,7 @@ def _run_role_with_technical_retry(
                         runtime_usage,
                         retry_kind,
                         "FAILED",
-                        WORKFLOW_STATE_ROOT,
+                        state_root or WORKFLOW_STATE_ROOT,
                         base_metric_run=metric_run,
                     )
                 raise
@@ -2389,7 +2982,7 @@ def _run_role_with_technical_retry(
                     runtime_usage,
                     retry_kind,
                     str(result.get("status", "UNKNOWN")),
-                    WORKFLOW_STATE_ROOT,
+                    state_root or WORKFLOW_STATE_ROOT,
                     base_metric_run=metric_run,
                 )
             return result, state
@@ -2461,7 +3054,7 @@ def _role_state_after_result(
         else:
             event_type = "ROLE_RESULT"
         target = "EVIDENCE_READY" if state == "EVIDENCE_RUNNING" else "PRECHECK_READY"
-    elif role == "terra":
+    elif role in TERRA_WRITE_ROLES:
         if status == "IMPLEMENTED_CANDIDATE":
             target = "IMPLEMENTED_CANDIDATE"
         else:
@@ -2477,11 +3070,11 @@ def _role_state_after_result(
                     event_type="IMPLEMENTATION_REWORK_EXHAUSTED",
                 )
             target = "NEEDS_REPLAN"
-    elif role == "sol_planner":
+    elif role in {"sol_planner", "sol_medium_supervisor", "terra_xhigh_planner"}:
         target = "PLAN_READY"
-    elif role == "sol_reviewer":
+    elif role in {"sol_reviewer", "sol_medium_reviewer", "terra_xhigh_reviewer"}:
         target = "ESCALATION_PROPOSED" if status == "ESCALATION_PROPOSED" else "REVIEW_READY"
-    elif role == "sol_xhigh":
+    elif role in {"sol_xhigh", "sol_xhigh_planner"}:
         target = "ESCALATION_PROPOSED"
     else:
         _fail("INVALID_ROLE", f"unsupported role {role}")
@@ -2516,30 +3109,442 @@ def _run_pipeline_role(
     role: str,
     runner: Runner,
     budget: RetryBudget,
+    *,
+    state_root: Path | None = None,
 ) -> str:
     result, state_after_retry = _run_role_with_technical_retry(
-        store, task_id, task, state, role, runner, budget
+        store,
+        task_id,
+        task,
+        state,
+        role,
+        runner,
+        budget,
+        state_root=state_root,
     )
     if result is None:
         return state_after_retry
     return _role_state_after_result(store, task_id, state_after_retry, role, result, budget)
 
 
-def run_until_gate(task_id: str, *, runner: Runner, allow_live_model: bool) -> str:
+def _load_enforced_read_only_route_role(
+    store: WorkflowStore, task_id: str, task: Mapping[str, object]
+) -> str:
+    """Recover one executable role from a frozen enforced sol-only decision."""
+
+    if task.get("task_type") not in {"PLAN", "ACCEPTANCE"}:
+        _fail(
+            "TERRA_OS_DECISION_REQUIRED",
+            "generic terra_os read-only execution requires PLAN or ACCEPTANCE",
+        )
+    try:
+        decision = load_artifact(store._require_task(task_id) / "route-decision.json")
+    except ArtifactError as exc:
+        raise WorkflowError(
+            "TERRA_OS_DECISION_REQUIRED",
+            "terra_os execution requires a persisted route decision",
+        ) from exc
+    validate_route_decision(decision)
+    if (
+        decision.get("task_id") != task_id
+        or decision.get("task_sha256") != artifact_sha256(task)
+        or decision.get("routing_mode") != "enforced"
+        or decision.get("route") != "sol_only"
+        or decision.get("rule_id")
+        not in {
+            "PLANNING_ONLY_ROUTE",
+            "HIGH_RISK_READ_ONLY_ROUTE",
+            "DECOMPOSABLE_READ_ONLY_ROUTE",
+            "DECOMPOSABLE_SOL_ONLY_ROUTE",
+        }
+    ):
+        _fail(
+            "TERRA_OS_ROUTE_MISMATCH",
+            "persisted route decision does not authorize this read-only execution",
+        )
+    route_events = [
+        event
+        for event in _load_event_records(store, task_id)
+        if event.get("event_type") == "ROUTE_DECIDED"
+    ]
+    if len(route_events) != 1 or any(
+        route_events[0].get(field) != decision[field]
+        for field in (
+            "task_sha256",
+            "request_sha256",
+            "route",
+            "routing_mode",
+            "rule_id",
+        )
+    ):
+        _fail(
+            "TERRA_OS_ROUTE_MISMATCH",
+            "persisted route decision does not match its append-only event",
+        )
+    role = _terra_os_read_only_role(task)
+    if role not in READ_ONLY_ROLES or role in TERRA_WRITE_ROLES:
+        _fail("INVALID_ROLE", "terra_os route resolved to a non-read-only role")
+    return role
+
+
+def _load_enforced_construction_artifacts(
+    store: WorkflowStore,
+    task_id: str,
+    construction_plan: object,
+    request: object,
+    step_id: object,
+) -> tuple[dict[str, object], FrozenPlan, FrozenSubtask, str, dict[str, object]]:
+    """Revalidate the exact plan and persisted enforced route before launch."""
+
+    task = load_task(store._require_task(task_id) / "task.json")
+    frozen = validate_plan(construction_plan, task)
+    if frozen.task_id != task_id:
+        _fail("CONSTRUCTION_CONTEXT_INVALID", "construction plan task_id does not match the task")
+    if not isinstance(request, Mapping):
+        _fail("CONSTRUCTION_CONTEXT_INVALID", "construction route request must be an object")
+    request_value = dict(request)
+    validate_route_request(request_value, task)
+    try:
+        stored_decision = load_artifact(store._require_task(task_id) / "route-decision.json")
+    except ArtifactError as exc:
+        raise WorkflowError("CONSTRUCTION_ROUTE_MISSING", "enforced construction requires a stored route decision") from exc
+    validate_route_decision(stored_decision)
+    recomputed = decide_route(
+        task,
+        request_value,
+        "enforced",
+        construction_plan=construction_plan,
+        construction_step_id=step_id,
+    )
+    expected_wire = recomputed.to_dict()
+    for field in ("task_id", "task_sha256", "request_sha256", "route", "rule_id", "routing_mode"):
+        if stored_decision.get(field) != expected_wire[field]:
+            _fail("CONSTRUCTION_ROUTE_MISMATCH", "stored route decision does not bind this construction launch")
+    selected = next((candidate for candidate in frozen.tasks if candidate.id == step_id), None)
+    if selected is None:
+        _fail("CONSTRUCTION_CONTEXT_INVALID", "construction step is not present in the frozen plan")
+    if selected.owner_role not in {"luna_construction", "terra_xhigh"}:
+        _fail("CONSTRUCTION_OWNER_INVALID", "enforced construction owner is not executable")
+    expected_role = selected.owner_role
+    if recomputed.effective_roles != (expected_role,):
+        _fail("CONSTRUCTION_ROUTE_MISMATCH", "frozen route owner is not eligible for this step")
+    return task, frozen, selected, expected_role, expected_wire
+
+
+def _construction_scope_sha256(step: FrozenSubtask) -> str:
+    return artifact_sha256(
+        {
+            "read_scope": list(step.read_scope),
+            "write_scope": list(step.write_scope),
+            "do_not_touch": list(step.do_not_touch),
+        }
+    )
+
+
+def _construction_authority(
+    frozen: FrozenPlan,
+    step: FrozenSubtask,
+    role: str,
+    route_wire: Mapping[str, object],
+) -> dict[str, object]:
+    return {
+        "task_sha256": frozen.task_sha256,
+        "plan_sha256": frozen.plan_sha256,
+        "request_sha256": route_wire["request_sha256"],
+        "route": route_wire["route"],
+        "rule_id": route_wire["rule_id"],
+        "routing_mode": route_wire["routing_mode"],
+        "step_id": step.id,
+        "role": role,
+        "candidate_commit": frozen.candidate_commit,
+        "scope_sha256": _construction_scope_sha256(step),
+    }
+
+
+def _frozen_construction_authority(store: WorkflowStore, task_id: str) -> dict[str, object]:
+    records = [
+        record for record in _load_event_records(store, task_id)
+        if record.get("event_type") == "CONSTRUCTION_PLAN_FROZEN"
+    ]
+    if len(records) != 1:
+        _fail("CONSTRUCTION_AUTHORITY_DRIFT", "construction authority must have exactly one freeze event")
+    record = dict(records[0])
+    record.pop("event_type", None)
+    record.pop("timestamp_utc", None)
+    expected = {
+        "task_sha256", "plan_sha256", "request_sha256", "route", "rule_id",
+        "routing_mode", "step_id", "role", "candidate_commit", "scope_sha256",
+    }
+    if set(record) != expected:
+        _fail("CONSTRUCTION_AUTHORITY_DRIFT", "construction freeze event has invalid fields")
+    return record
+
+
+def _freeze_or_require_construction_plan(
+    store: WorkflowStore,
+    task_id: str,
+    task: Mapping[str, object],
+    frozen: FrozenPlan,
+    step: FrozenSubtask,
+    role: str,
+    route_wire: Mapping[str, object],
+    state: str,
+) -> FrozenPlan:
+    """Persist the plan before the owner gate and reject post-gate substitution."""
+
+    plan_path = store._require_task(task_id) / "construction-plan.json"
+    if plan_path.exists():
+        try:
+            recorded = load_artifact(plan_path)
+        except ArtifactError as exc:
+            raise WorkflowError(
+                "CONSTRUCTION_PLAN_MISMATCH", "frozen construction plan cannot be read"
+            ) from exc
+        recorded_frozen = validate_plan(recorded, task)
+        if recorded_frozen.plan_sha256 != frozen.plan_sha256:
+            _fail(
+                "CONSTRUCTION_PLAN_MISMATCH",
+                "supplied construction plan differs from the owner-gated frozen plan",
+            )
+        authority = _construction_authority(recorded_frozen, step, role, route_wire)
+        if _frozen_construction_authority(store, task_id) != authority:
+            _fail("CONSTRUCTION_AUTHORITY_DRIFT", "construction state differs from first freeze")
+        return recorded_frozen
+    if state not in {"DRAFT", "TASK_VALIDATED"}:
+        _fail(
+            "CONSTRUCTION_PLAN_MISSING",
+            "construction plan must be frozen before owner execution approval",
+        )
+    write_json_once(
+        plan_path, frozen.to_dict(), conflict_code="CONSTRUCTION_PLAN_MISMATCH"
+    )
+    authority = _construction_authority(frozen, step, role, route_wire)
+    store.append_event(
+        task_id,
+        {
+            "event_type": "CONSTRUCTION_PLAN_FROZEN",
+            "timestamp_utc": _utc_timestamp(),
+            **authority,
+        },
+    )
+    return frozen
+
+
+def run_enforced_construction(
+    task_id: str,
+    *,
+    construction_plan: object,
+    request: object,
+    step_id: object,
+    attempt: int,
+    runner: Runner,
+    allow_live_model: bool,
+    state_root: Path | None = None,
+) -> str:
+    """Run exactly one approved construction step; never infer it from route wire data."""
+
+    if not isinstance(allow_live_model, bool):
+        _fail("INVALID_LIVE_MODEL_FLAG", "allow_live_model must be a boolean")
+    if not hasattr(runner, "run_construction"):
+        _fail("CONSTRUCTION_CONTEXT_INVALID", "runner must provide run_construction for a frozen step")
+    if getattr(runner, "is_live_model", False) and not allow_live_model:
+        _fail("LIVE_MODEL_NOT_AUTHORIZED", "live model execution requires explicit authorization")
+    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+        _fail("DISPATCH_IDENTITY_DRIFT", "construction attempt must be a positive integer")
+    store = WorkflowStore(state_root or WORKFLOW_STATE_ROOT)
+    with store.lock(task_id):
+        if repair_ledger_claims_task(store, task_id):
+            _fail(
+                "REPAIR_ADAPTER_REQUIRED",
+                "adversarial-acceptance-1 tasks require the verified assignment adapter",
+            )
+        task, frozen, step, role, route_wire = _load_enforced_construction_artifacts(
+            store, task_id, construction_plan, request, step_id
+        )
+        state = _current_state(store, task_id)
+        budget = _budget_from_events(store, task_id)
+        frozen = _freeze_or_require_construction_plan(
+            store, task_id, task, frozen, step, role, route_wire, state
+        )
+        step = next(candidate for candidate in frozen.tasks if candidate.id == step.id)
+        if state in {"BLOCKED", "CLOSED", "ABORTED", "DEFERRED", "AWAITING_OWNER_DECISION"}:
+            return state
+        if state == "DRAFT":
+            state = _transition(store, task_id, state, "TASK_VALIDATED", budget)
+        if state == "TASK_VALIDATED":
+            return _transition(
+                store,
+                task_id,
+                state,
+                "AWAITING_OWNER_DECISION",
+                budget,
+                event_type="CONSTRUCTION_OWNER_GATE_REACHED",
+            )
+        if state == "APPROVED_FOR_EXECUTION":
+            if not _authorization_is_recorded(store, task_id, state, "approve_execution"):
+                return state
+            if getattr(runner, "is_live_model", False):
+                create_worktree(task, owner_authorized=True, store=store)
+            state = _transition(
+                store,
+                task_id,
+                state,
+                "WORKTREE_READY",
+                budget,
+                owner_authorized=True,
+            )
+        if state == "WORKTREE_READY":
+            state = _transition(store, task_id, state, "IMPLEMENTATION_RUNNING", budget)
+        if state == "REWORK_AUTHORIZED":
+            if not _authorization_is_recorded(store, task_id, state, "authorize_rework"):
+                return state
+            state = _transition(
+                store,
+                task_id,
+                state,
+                "IMPLEMENTATION_RUNNING",
+                budget,
+                owner_authorized=True,
+            )
+        if state != "IMPLEMENTATION_RUNNING":
+            _fail("CONSTRUCTION_STATE_INVALID", "construction step is not in an implementation state")
+        authority = _construction_authority(frozen, step, role, route_wire)
+        if _frozen_construction_authority(store, task_id) != authority:
+            _fail("CONSTRUCTION_AUTHORITY_DRIFT", "launch differs from the owner-frozen authority")
+        owner_decision = _load_latest_decision(store, task_id)
+        if not owner_decision or owner_decision.get("construction_authority_sha256") != artifact_sha256(authority):
+            _fail("CONSTRUCTION_AUTHORITY_DRIFT", "owner decision is not bound to frozen construction authority")
+        if has_active_repair_assignment(store, task_id):
+            return _transition(
+                store,
+                task_id,
+                state,
+                "BLOCKED",
+                budget,
+                event_type="REPAIR_EXECUTION_INTEGRATION_BLOCKED",
+            )
+        launch_id = record_dispatch(
+            store,
+            task_id,
+            frozen,
+            step.id,
+            attempt,
+            str(frozen.candidate_commit),
+            store_locked=True,
+            request_sha256=str(route_wire["request_sha256"]),
+            route_fields={
+                field: route_wire[field]
+                for field in ("route", "rule_id", "routing_mode")
+            },
+            role=role,
+        )
+        context = ConstructionExecutionContext(
+            plan=frozen,
+            step=step,
+            dispatch_id=launch_id,
+            task_sha256=frozen.task_sha256,
+            request_sha256=str(route_wire["request_sha256"]),
+            role=role,
+        )
+        result, state_after_retry = _run_role_with_technical_retry(
+            store,
+            task_id,
+            task,
+            state,
+            role,
+            runner,
+            budget,
+            construction_context=context,
+            state_root=store.root,
+        )
+        if result is None:
+            return state_after_retry
+        return _role_state_after_result(
+            store, task_id, state_after_retry, role, result, budget
+        )
+
+
+def run_until_gate(
+    task_id: str,
+    *,
+    runner: Runner,
+    allow_live_model: bool,
+    construction_plan: object | None = None,
+    construction_request: object | None = None,
+    construction_step_id: object = None,
+    construction_attempt: int | None = None,
+    state_root: Path | None = None,
+) -> str:
     """Advance one bounded pipeline only until its next owner-controlled gate."""
 
+    store = WorkflowStore(state_root or WORKFLOW_STATE_ROOT)
+    # A v2 acceptance ledger owns every phase of its task, including an open,
+    # failed, accepted, or terminal attempt.  The generic state machine has no
+    # receipt/capability channel, so it must not even select a role for it.
+    if repair_ledger_claims_task(store, task_id):
+        _fail(
+            "REPAIR_ADAPTER_REQUIRED",
+            "adversarial-acceptance-1 tasks require the verified assignment adapter",
+        )
+    construction_values = (
+        construction_plan,
+        construction_request,
+        construction_step_id,
+        construction_attempt,
+    )
+    if any(value is not None for value in construction_values):
+        if any(value is None for value in construction_values):
+            _fail("CONSTRUCTION_CONTEXT_INVALID", "construction plan, request, step, and attempt are required together")
+        return run_enforced_construction(
+            task_id,
+            construction_plan=construction_plan,
+            request=construction_request,
+            step_id=construction_step_id,
+            attempt=construction_attempt,
+            runner=runner,
+            allow_live_model=allow_live_model,
+            state_root=state_root,
+        )
     if not isinstance(allow_live_model, bool):
         _fail("INVALID_LIVE_MODEL_FLAG", "allow_live_model must be a boolean")
     if not hasattr(runner, "run"):
         _fail("INVALID_RUNNER", "runner must provide run(role, task)")
     if getattr(runner, "is_live_model", False) and not allow_live_model:
         _fail("LIVE_MODEL_NOT_AUTHORIZED", "live model execution requires explicit authorization")
-    store = WorkflowStore(WORKFLOW_STATE_ROOT)
     with store.lock(task_id):
+        if repair_ledger_claims_task(store, task_id):
+            _fail(
+                "REPAIR_ADAPTER_REQUIRED",
+                "adversarial-acceptance-1 tasks require the verified assignment adapter",
+            )
         task_path = store._require_task(task_id) / "task.json"
         task = load_task(task_path)
         state = _current_state(store, task_id)
         budget = _budget_from_events(store, task_id)
+        config = _load_workflow_config()
+        enforced_read_only_role: str | None = None
+        if (
+            _configured_routing_mode(config) == "enforced"
+            and _resolve_role_policy(config) == "terra_os"
+        ):
+            if state == "IMPLEMENTATION_RUNNING" and has_active_repair_assignment(store, task_id):
+                return _transition(
+                    store,
+                    task_id,
+                    state,
+                    "BLOCKED",
+                    budget,
+                    event_type="REPAIR_EXECUTION_INTEGRATION_BLOCKED",
+                )
+            if task["task_type"] in {"PLAN", "ACCEPTANCE"}:
+                enforced_read_only_role = _load_enforced_read_only_route_role(
+                    store, task_id, task
+                )
+            else:
+                _fail(
+                    "CONSTRUCTION_CONTEXT_REQUIRED",
+                    "terra_os remediation requires a validated construction context",
+                )
         while True:
             if getattr(runner, "is_live_model", False) and task["task_type"] == "ACCEPTANCE":
                 assert_acceptance_candidate(task, _execution_repo(task, "luna"))
@@ -2549,6 +3554,11 @@ def run_until_gate(task_id: str, *, runner: Runner, allow_live_model: bool) -> s
                 state = _transition(store, task_id, state, "TASK_VALIDATED", budget)
                 continue
             if state == "TASK_VALIDATED":
+                if enforced_read_only_role is not None:
+                    state = _transition(
+                        store, task_id, state, "PLAN_OR_REVIEW_RUNNING", budget
+                    )
+                    continue
                 if task["task_type"] in {"PLAN", "ACCEPTANCE"}:
                     state = _transition(store, task_id, state, "EVIDENCE_RUNNING", budget)
                     continue
@@ -2587,6 +3597,15 @@ def run_until_gate(task_id: str, *, runner: Runner, allow_live_model: bool) -> s
                 )
                 continue
             if state == "IMPLEMENTATION_RUNNING":
+                if has_active_repair_assignment(store, task_id):
+                    return _transition(
+                        store,
+                        task_id,
+                        state,
+                        "BLOCKED",
+                        budget,
+                        event_type="REPAIR_EXECUTION_INTEGRATION_BLOCKED",
+                    )
                 state = _run_pipeline_role(store, task_id, task, state, "terra", runner, budget)
                 continue
             if state == "IMPLEMENTED_CANDIDATE":
@@ -2624,8 +3643,21 @@ def run_until_gate(task_id: str, *, runner: Runner, allow_live_model: bool) -> s
                 )
                 continue
             if state == "PLAN_OR_REVIEW_RUNNING":
-                role = _role_for_plan_or_review(store, task_id, task)
-                state = _run_pipeline_role(store, task_id, task, state, role, runner, budget)
+                role = (
+                    enforced_read_only_role
+                    if enforced_read_only_role is not None
+                    and not _authorization_is_recorded(
+                        store,
+                        task_id,
+                        "ESCALATION_AUTHORIZED",
+                        "authorize_escalation",
+                    )
+                    else _role_for_plan_or_review(store, task_id, task)
+                )
+                state = _run_pipeline_role(
+                    store, task_id, task, state, role, runner, budget,
+                    state_root=store.root,
+                )
                 continue
             _fail("INVALID_STATE", f"cannot run task from state {state}")
 
@@ -2675,6 +3707,13 @@ def _apply_owner_decision(
             "new_state": target,
             "task_sha256": _task_sha256(store, task_id),
         }
+        if decision in {"approve_execution", "authorize_rework"}:
+            try:
+                authority = _frozen_construction_authority(store, task_id)
+            except WorkflowError:
+                pass
+            else:
+                record["construction_authority_sha256"] = artifact_sha256(authority)
         store.record_decision(task_id, record)
         event = dict(record)
         event["retry_budget"] = _budget_record(budget)
@@ -2702,6 +3741,18 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--allow-live-model", action="store_true")
     run.add_argument("--role", default="luna", choices=tuple(FAKE_ROLE_RESULTS))
     run.add_argument(
+        "--construction-plan",
+        type=Path,
+        help="required with the construction request, step, and attempt for enforced construction",
+    )
+    run.add_argument(
+        "--construction-request",
+        type=Path,
+        help="hash-bound ai-route-request-1 used for the stored enforced decision",
+    )
+    run.add_argument("--construction-step", help="one frozen plan subtask id")
+    run.add_argument("--attempt", type=int, help="positive deterministic construction attempt")
+    run.add_argument(
         "--runtime-sessions-dir",
         type=Path,
         metavar="ABSOLUTE_DIR",
@@ -2724,7 +3775,9 @@ def build_parser() -> argparse.ArgumentParser:
     route_command.add_argument("--task", type=Path, required=True)
     route_command.add_argument("--request", type=Path, required=True)
     route_command.add_argument(
-        "--mode", choices=("legacy", "shadow", "enforced"), default="legacy"
+        "--mode",
+        choices=("legacy", "shadow", "enforced"),
+        default=_configured_routing_mode(_load_workflow_config()),
     )
     route_command.add_argument("--root", type=Path, default=Path("data/state/ai-workflow"))
 
@@ -2840,6 +3893,57 @@ def _run_command(args: argparse.Namespace) -> int:
         print("DECISION_RECORDED")
         return 0
     if args.command == "run":
+        construction_values = (
+            args.construction_plan,
+            args.construction_request,
+            args.construction_step,
+            args.attempt,
+        )
+        if any(value is not None for value in construction_values):
+            if any(value is None for value in construction_values):
+                _fail(
+                    "CONSTRUCTION_CONTEXT_INVALID",
+                    "--construction-plan, --construction-request, --construction-step, and --attempt are required together",
+                )
+            if args.runner == "fake":
+                construction_runner: Runner = FakeRunner()
+            elif args.runner == "live":
+                if not args.allow_live_model:
+                    _fail(
+                        "LIVE_MODEL_NOT_AUTHORIZED",
+                        "--allow-live-model is required for the live runner",
+                    )
+                construction_runner = CodexConstructionRunner(
+                    args.root, args.runtime_sessions_dir
+                )
+            else:
+                _fail(
+                    "NOT_IMPLEMENTED_IN_CURRENT_STAGE",
+                    "enforced construction requires --runner fake or --runner live",
+                )
+            try:
+                construction_plan = load_artifact(args.construction_plan)
+                construction_request = load_artifact(args.construction_request)
+            except ArtifactError as exc:
+                raise WorkflowError(exc.code, exc.message) from exc
+            task = load_task(_task_path_from_args(args))
+            stored_task = load_task(
+                WorkflowStore(args.root)._require_task(task["task_id"]) / "task.json"
+            )
+            if stored_task != task:
+                _fail("TASK_STORE_MISMATCH", "construction task input does not match the stored task")
+            state = run_enforced_construction(
+                task["task_id"],
+                construction_plan=construction_plan,
+                request=construction_request,
+                step_id=args.construction_step,
+                attempt=args.attempt,
+                runner=construction_runner,
+                allow_live_model=args.allow_live_model,
+                state_root=args.root,
+            )
+            print(state)
+            return 0
         if args.runner == "live":
             if not args.allow_live_model:
                 _fail("LIVE_MODEL_NOT_AUTHORIZED", "--allow-live-model is required for the live runner")
@@ -2851,7 +3955,18 @@ def _run_command(args: argparse.Namespace) -> int:
         if args.runner != "fake":
             raise WorkflowError("NOT_IMPLEMENTED_IN_CURRENT_STAGE", "only --runner fake is available")
         task = load_task(_task_path_from_args(args))
-        print(_canonical_json(FakeRunner().run(args.role, task)))
+        stored_task = load_task(
+            WorkflowStore(args.root)._require_task(task["task_id"]) / "task.json"
+        )
+        if stored_task != task:
+            _fail("TASK_STORE_MISMATCH", "run task input does not match the stored task")
+        state = run_until_gate(
+            task["task_id"],
+            runner=FakeRunner(),
+            allow_live_model=False,
+            state_root=args.root,
+        )
+        print(state)
         return 0
     raise WorkflowError("UNKNOWN_COMMAND", f"unsupported command {args.command}")
 
@@ -2864,6 +3979,62 @@ def main(argv: list[str] | None = None) -> int:
     except WorkflowError as exc:
         print(f"{exc.code}: {exc.message}")
         return 2
+
+
+try:
+    from .ai_workflow_repairs import (
+        ActorIdentity,
+        AcceptanceAssignment,
+        AdversarialEvidence,
+        AssignmentCapability,
+        ControllerAssignmentBoundary,
+        ControllerExecutionAttestation,
+        RepairAssignment,
+        RepairFinding,
+        VerifiedActorReceipt,
+        assign_repair,
+        complete_acceptance_assignment,
+        execute_adversarial_evidence,
+        has_active_repair_assignment,
+        issue_acceptance_assignment,
+        open_task_acceptance,
+        record_adversarial_review,
+        record_repair_assignment,
+        record_repair_completion,
+        record_repair_review,
+        record_sol_repair_authorization,
+        repair_ledger_claims_task,
+        replay_acceptance_ledger,
+        run_assignment,
+        validate_repair_result,
+    )
+except ImportError:  # direct script execution
+    from ai_workflow_repairs import (
+        ActorIdentity,
+        AcceptanceAssignment,
+        AdversarialEvidence,
+        AssignmentCapability,
+        ControllerAssignmentBoundary,
+        ControllerExecutionAttestation,
+        RepairAssignment,
+        RepairFinding,
+        VerifiedActorReceipt,
+        assign_repair,
+        complete_acceptance_assignment,
+        execute_adversarial_evidence,
+        has_active_repair_assignment,
+        issue_acceptance_assignment,
+        open_task_acceptance,
+        record_adversarial_review,
+        record_repair_assignment,
+        record_repair_completion,
+        record_repair_review,
+        record_sol_repair_authorization,
+        repair_ledger_claims_task,
+        replay_acceptance_ledger,
+        run_assignment,
+        validate_repair_result,
+    )
 
 
 if __name__ == "__main__":

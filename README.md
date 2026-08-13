@@ -13,10 +13,12 @@
 
 | 角色 | 模型与推理档 | 主要职责 |
 |---|---|---|
-| Luna | `gpt-5.6-luna` / `max` | 取证、机械核对、冻结规格下的窄域工作 |
-| Terra | `gpt-5.6-terra` / `xhigh` | 主力工程施工、调试和集成 |
-| Sol medium | `gpt-5.6-sol` / `medium` | 方案定型、语义裁决和高风险验收 |
-| Sol xhigh | `gpt-5.6-sol` / `xhigh` | 重大争议、不可逆风险和重复语义失败的终审 |
+| Luna Max | `gpt-5.6-luna` / `max` | 精确冻结 envelope 内的中初级/机械 coding、取证和分发 |
+| Terra xhigh | `gpt-5.6-terra` / `xhigh` | 复杂施工、调试、集成；每项任务的独立对抗审查 |
+| Sol medium | `gpt-5.6-sol` / `medium` | 最终整体验收；仅第二次 Terra 失败后的 scoped fallback |
+| Sol xhigh | `gpt-5.6-sol` / `xhigh` | owner-authorized 规划与终局升级 |
+
+`Terra medium` 与 `Sol high` 没有默认角色（no default role），不得被隐式替换或注入流程。
 
 任务量比例只可用于容量预估，不得成为路由的软硬约束。
 
@@ -69,7 +71,7 @@
 → 任务信封校验
 → Luna Max 只读事实盘点（L1）
 → 证据定位机械校验
-→ Sol medium Planner 成案
+→ Terra xhigh Planner（只读）成案
 → 方案一致性机械检查
 → AWAITING_OWNER_DECISION
 ```
@@ -79,9 +81,10 @@
 ```text
 固定 base/candidate commit
 → 工作树与禁改面检查
-→ Luna Max 卡面预审（L2）
+→ Luna Max 有界 L2 证据抽取（若信封明确授权）
 → 目标测试和必要变异
-→ Sol medium Reviewer 语义验收
+→ 独立 Terra xhigh adversarial Reviewer
+→ Sol medium 最终整体验收
 → AWAITING_OWNER_DECISION
 ```
 
@@ -89,16 +92,16 @@
 
 ```text
 已接受的阻断项
-→ Sol medium 生成最小整改契约
+→ Terra xhigh 复杂施工与第一次整改
 → 人工批准范围
 → 创建独立 branch/worktree
-→ Terra xhigh 施工
-→ Luna Max 仅针对原阻断项反证（L2）
-→ Sol medium 复验
+→ 独立 Terra xhigh 对抗审查
+→ 第二次 Terra 失败后才可进入 scoped Sol medium fallback + distinct peer
+→ Sol xhigh 仅在 owner 授权时终局升级
 → AWAITING_OWNER_DECISION
 ```
 
-对宪法、PIT、幸存者偏差、公开 schema、append-only、安全、数据污染及跨卡契约类整改，Sol medium 必须先冻结规格。
+对宪法、PIT、幸存者偏差、公开 schema、append-only、安全、数据污染及跨卡契约类整改，复杂语义由 Terra xhigh 停止并回交；Sol xhigh 只处理 owner-authorized 的规划或终局升级，Sol medium 仍只做最终整体验收或规则允许的 scoped fallback。
 
 ## 6. Luna 最小证据与反证包
 
@@ -127,17 +130,21 @@ BLOCKED
 
 ### 7.1 Luna Max
 
-- 默认只读；
-- 只处理点名目标和文件；
+- 只在 exact frozen envelope 中获得写权限；
+- 只处理点名目标和文件，范围限于中初级/机械 coding、确定性验证和分发同步；
 - 不重新定义验收标准；
 - 不把相邻发现并入施工；
+- 不承担 planning、review、semantic arbitration 或 final acceptance；
 - 只有任务信封显式列出可写路径时才能修改；
 - 交付 L0/L1/L2 对应的最小证据包。
 
+Luna must never review, approve, or perform final acceptance. 任何需要开放式判断、复杂施工或高风险语义的任务都必须转 Terra xhigh 或 owner-authorized Sol xhigh。
+
 ### 7.2 Terra xhigh
 
-- 只在独立 worktree 写入；
-- 是整改任务的唯一施工所有者；
+- 只在独立 worktree 写入，负责 complex construction、调试和集成；
+- 是复杂施工和整改任务的唯一施工所有者；
+- 每个 task 都必须由独立、不同上下文的 Terra xhigh adversarial reviewer 审查；
 - 不合并、不推送、不自验；
 - 遇到两种合理规格解释时返回 `NEEDS_CLARIFICATION`；
 - 完成目标测试及至少一个负向检验；
@@ -145,15 +152,23 @@ BLOCKED
 
 ### 7.3 Sol medium
 
-Planner 和 Reviewer 是互斥模式。
+Sol medium 只做最终整体验收（final whole-project acceptance），针对固定 base/candidate commit、任务契约、证据包、独立 Terra xhigh adversarial review 和自动门禁结果作语义审查。它不得承担普通 planning 或 construction。
 
-Planner 输出事实基线、目标、边界、冻结不变量、实施段、验收标准和未决裁定。Reviewer 只对固定 base/candidate commit、任务契约、Luna 证据包及自动门禁结果作语义审查。
-
-Sol 只能推荐通过、附注通过、返工、拒绝或升级；不得自动改变人工决策状态。
+只有第二次 Terra xhigh 施工失败后，规则才允许一次 scoped Sol-medium fallback；fallback 必须由 distinct Sol-medium peer 复核。Sol medium 只能提出建议，不得自动改变人工决策状态。
 
 ### 7.4 Sol xhigh
 
-只接收包含唯一争议命题、闭集选项、各方证据及不可逆后果的最小案卷。永不自动启动。
+Sol xhigh 只接收 owner-authorized 的最小案卷，用于规划（planning）或终局升级（terminal escalation）；不得自动启动、施工、替代 Terra review 或跳过 Sol-medium final acceptance。
+
+### 7.5 Task 4 冻结分配（Frozen role/lifecycle contract）
+
+这份分配是分发和生命周期的唯一公开契约：
+
+- Luna Max 仅在 exact frozen envelope 内做 bounded mechanical coding、确定性 verification 和 root→Plugin distribution；信封必须列出精确路径、命令、负向检查和交付物。
+- Terra xhigh 负责复杂施工；每个 task 都要有独立 Terra xhigh adversarial review，施工者不得自审。
+- Sol medium 只负责 final whole-project acceptance，或在第二次 Terra xhigh 失败后执行一次有界 scoped fallback 及 distinct peer review。
+- Sol xhigh 负责 owner-authorized planning 和 terminal escalation；不得自动调用。
+- Terra medium、Sol high 没有默认角色（no default role）。任何调用都必须先获得新的 owner-authorized、闭集信封；不得作为普通流程的隐式角色。
 
 ## 8. 任务信封
 
