@@ -24,8 +24,12 @@ TEMPLATE = PLUGIN / "agents" / "luna-max.toml"
 INSTALL = PLUGIN / "scripts" / "install-agents.sh"
 UNINSTALL = PLUGIN / "scripts" / "uninstall-agents.sh"
 LIFECYCLE_HELPER = PLUGIN / "scripts" / "agent_lifecycle.py"
-STATE_NAME = ".ai-workflow-luna-worker.state"
-BACKUP_NAME = ".ai-workflow-luna-worker.backup"
+TARGET_NAME = "luna-max.toml"
+STATE_NAME = ".ai-workflow-luna-max.state"
+BACKUP_NAME = ".ai-workflow-luna-max.backup"
+LEGACY_TARGET_NAME = "luna-worker.toml"
+LEGACY_STATE_NAME = ".ai-workflow-luna-worker.state"
+LEGACY_BACKUP_NAME = ".ai-workflow-luna-worker.backup"
 KNOWN_LEGACY_SHA256 = "60f7240ea662cd27ea0f51f2e1efa8a2e788e16c76b04a13ab1c1df4f26ef024"
 CANONICAL_TEMPLATE_SHA256 = "6237649deb278392111355490a9c71c00be66388c6fb25435694d00eb6f18bbb"
 KNOWN_LEGACY_TEMPLATE = '''name = "luna_worker"
@@ -125,8 +129,8 @@ def write_owned_state(target: Path, backup_sha256: str | None = None) -> None:
         json.dumps(
             {
                 "plugin_version": "0.2.0",
-                "target_filename": "luna-worker.toml",
-                "installed_sha256": KNOWN_LEGACY_SHA256,
+                "target_filename": TARGET_NAME,
+                "installed_sha256": CANONICAL_TEMPLATE_SHA256,
                 "installed_at_utc": "2026-08-08T06:38:00Z",
                 "backup_sha256": backup_sha256,
             },
@@ -138,7 +142,32 @@ def write_owned_state(target: Path, backup_sha256: str | None = None) -> None:
 
 def prepare_known_legacy(target: Path) -> None:
     target.mkdir(parents=True, exist_ok=True)
-    (target / "luna-worker.toml").write_bytes(KNOWN_LEGACY_TEMPLATE)
+    (target / LEGACY_TARGET_NAME).write_bytes(KNOWN_LEGACY_TEMPLATE)
+
+
+def write_verified_legacy_state(target: Path, backup_sha256: str | None = None) -> None:
+    (target / LEGACY_STATE_NAME).write_text(
+        json.dumps(
+            {
+                "plugin_version": "0.2.0",
+                "target_filename": LEGACY_TARGET_NAME,
+                "installed_sha256": KNOWN_LEGACY_SHA256,
+                "installed_at_utc": "2026-08-08T06:38:00Z",
+                "backup_sha256": backup_sha256,
+            },
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+
+
+def write_verified_legacy_install(target: Path, backup: bytes | None = None) -> None:
+    prepare_known_legacy(target)
+    backup_sha256 = None
+    if backup is not None:
+        (target / LEGACY_BACKUP_NAME).write_bytes(backup)
+        backup_sha256 = hashlib.sha256(backup).hexdigest()
+    write_verified_legacy_state(target, backup_sha256)
 
 
 def raise_on_state_hook(exception_type: type[BaseException], point: str):
@@ -155,7 +184,7 @@ def raise_on_missing_state(exception_type: type[BaseException]):
 
 def raise_on_known_legacy_state(exception_type: type[BaseException]):
     return raise_on_state_hook(
-        exception_type, "install.before_publish_known_legacy_state"
+        exception_type, "install.before_publish_legacy_state"
     )
 
 
@@ -165,7 +194,7 @@ def raise_after_missing_state_publish(exception_type: type[BaseException]):
 
 def raise_after_known_legacy_state_publish(exception_type: type[BaseException]):
     return raise_on_state_hook(
-        exception_type, "install.after_publish_known_legacy_state"
+        exception_type, "install.after_publish_legacy_state"
     )
 
 
@@ -233,8 +262,8 @@ class DistributionContractTest(unittest.TestCase):
             root_template.read_bytes(),
             TEMPLATE.read_bytes(),
         )
-        self.assertFalse((ROOT / ".codex" / "agents" / "luna-worker.toml").exists())
-        self.assertFalse((PLUGIN / "agents" / "luna-worker.toml").exists())
+        self.assertFalse((ROOT / ".codex" / "agents" / LEGACY_TARGET_NAME).exists())
+        self.assertFalse((PLUGIN / "agents" / LEGACY_TARGET_NAME).exists())
 
     def test_luna_template_matches_the_project_contract(self):
         self.assertTrue(TEMPLATE.is_file())
@@ -476,6 +505,31 @@ class DistributionContractTest(unittest.TestCase):
         self.assertTrue(TEMPLATE.is_file())
         self.assertEqual(CANONICAL_TEMPLATE_SHA256, sha256(TEMPLATE))
 
+    def test_plugin_verifier_rejects_a_legacy_agent_template_in_a_copied_release(self):
+        """A release must not ship the old template alongside the canonical one."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            release_root = Path(temporary) / "release"
+            shutil.copytree(ROOT / ".codex", release_root / ".codex")
+            shutil.copytree(ROOT / "config", release_root / "config")
+            shutil.copytree(ROOT / "scripts", release_root / "scripts")
+            shutil.copytree(
+                ROOT / "plugins" / "ai-workflow",
+                release_root / "plugins" / "ai-workflow",
+            )
+            legacy = release_root / "plugins" / "ai-workflow" / "agents" / LEGACY_TARGET_NAME
+            legacy.write_bytes(KNOWN_LEGACY_TEMPLATE)
+
+            result = subprocess.run(
+                ["sh", str(release_root / "plugins" / "ai-workflow" / "scripts" / "verify.sh")],
+                cwd=release_root,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertNotEqual(0, result.returncode, result.stderr)
+
 
 class AgentLifecycleTest(unittest.TestCase):
     def run_wrapper(
@@ -519,6 +573,159 @@ class AgentLifecycleTest(unittest.TestCase):
     def uninstall(self, target: Path) -> subprocess.CompletedProcess[str]:
         return self.run_script(UNINSTALL, target)
 
+    def test_verified_luna_worker_install_migrates_to_luna_max_atomically(self):
+        with temporary_directory() as temporary:
+            target = Path(temporary) / "agents"
+            write_verified_legacy_install(target)
+
+            installed = self.install(target)
+
+            self.assertEqual(0, installed.returncode, installed.stderr)
+            self.assertFalse((target / LEGACY_TARGET_NAME).exists())
+            self.assertFalse((target / LEGACY_STATE_NAME).exists())
+            self.assertFalse((target / LEGACY_BACKUP_NAME).exists())
+            self.assertEqual(TEMPLATE.read_bytes(), (target / TARGET_NAME).read_bytes())
+            state = json.loads((target / STATE_NAME).read_text())
+            self.assertEqual(TARGET_NAME, state["target_filename"])
+            self.assertEqual(CANONICAL_TEMPLATE_SHA256, state["installed_sha256"])
+
+    def test_verified_unmanaged_luna_worker_install_migrates_to_luna_max(self):
+        with temporary_directory() as temporary:
+            target = Path(temporary) / "agents"
+            prepare_known_legacy(target)
+
+            installed = self.install(target)
+
+            self.assertEqual(0, installed.returncode, installed.stderr)
+            self.assertFalse((target / LEGACY_TARGET_NAME).exists())
+            self.assertEqual(TEMPLATE.read_bytes(), (target / TARGET_NAME).read_bytes())
+            self.assertTrue((target / STATE_NAME).is_file())
+
+    def test_verified_legacy_backup_migrates_and_uninstall_restores_it(self):
+        with temporary_directory() as temporary:
+            target = Path(temporary) / "agents"
+            backup = b'name = "user_backup"\n'
+            write_verified_legacy_install(target, backup)
+
+            self.assertEqual(0, self.install(target).returncode)
+            self.assertEqual(backup, (target / BACKUP_NAME).read_bytes())
+            self.assertEqual(0, self.uninstall(target).returncode)
+            self.assertEqual(backup, (target / TARGET_NAME).read_bytes())
+            self.assertFalse((target / STATE_NAME).exists())
+            self.assertFalse((target / BACKUP_NAME).exists())
+
+    def test_legacy_and_canonical_entries_fail_closed(self):
+        with temporary_directory() as temporary:
+            target = Path(temporary) / "agents"
+            write_verified_legacy_install(target)
+            canonical = target / TARGET_NAME
+            canonical.write_bytes(b'name = "user_owned"\n')
+            before = filesystem_snapshot(target)
+
+            result = self.install(target)
+
+            self.assertNotEqual(0, result.returncode)
+            self.assertEqual(before, filesystem_snapshot(target))
+
+    def test_uninstall_rejects_a_complete_canonical_install_with_legacy_entries(self):
+        with temporary_directory() as temporary:
+            target = Path(temporary) / "agents"
+            self.assertEqual(0, self.install(target).returncode)
+            (target / LEGACY_TARGET_NAME).write_bytes(KNOWN_LEGACY_TEMPLATE)
+            before = filesystem_snapshot(target)
+
+            result = self.uninstall(target)
+
+            self.assertNotEqual(0, result.returncode)
+            self.assertEqual(before, filesystem_snapshot(target))
+
+    def test_unverified_or_symlinked_legacy_input_is_preserved(self):
+        with temporary_directory() as temporary:
+            root = Path(temporary)
+            for name in ("unverified", "symlink"):
+                with self.subTest(name=name):
+                    target = root / name / "agents"
+                    target.mkdir(parents=True)
+                    if name == "symlink":
+                        (root / "protected.toml").write_bytes(b"protected\n")
+                        (target / LEGACY_TARGET_NAME).symlink_to(root / "protected.toml")
+                    else:
+                        (target / LEGACY_TARGET_NAME).write_bytes(b"user owned\n")
+                    before = filesystem_snapshot(root)
+                    self.assertNotEqual(0, self.install(target).returncode)
+                    self.assertEqual(before, filesystem_snapshot(root))
+
+    def test_invalid_legacy_state_or_backup_is_preserved(self):
+        with temporary_directory() as temporary:
+            root = Path(temporary)
+            for name in ("state", "backup"):
+                with self.subTest(name=name):
+                    target = root / name / "agents"
+                    write_verified_legacy_install(target, b'name = "legacy_backup"\n')
+                    if name == "state":
+                        (target / LEGACY_STATE_NAME).write_bytes(b'{"owner":"user"}\n')
+                    else:
+                        (target / LEGACY_BACKUP_NAME).write_bytes(b"tampered backup\n")
+                    before = filesystem_snapshot(target)
+
+                    result = self.install(target)
+
+                    self.assertNotEqual(0, result.returncode)
+                    self.assertEqual(before, filesystem_snapshot(target))
+                    self.assertFalse((target / TARGET_NAME).exists())
+                    self.assertFalse((target / STATE_NAME).exists())
+
+    def test_legacy_check_is_read_only_and_not_current(self):
+        with temporary_directory() as temporary:
+            target = Path(temporary) / "agents"
+            write_verified_legacy_install(target)
+            before = filesystem_snapshot(target)
+
+            checked = self.install(target, check=True)
+
+            self.assertNotEqual(0, checked.returncode)
+            self.assertEqual(before, filesystem_snapshot(target))
+
+    def test_legacy_migration_state_failure_restores_every_original_inode(self):
+        lifecycle = load_lifecycle_helper()
+        with temporary_directory() as temporary:
+            target = Path(temporary) / "agents"
+            write_verified_legacy_install(target, b'name = "legacy_backup"\n')
+            before = filesystem_snapshot(target)
+
+            result = lifecycle.install(
+                target,
+                hook=raise_on_state_hook(OSError, "install.before_publish_legacy_state"),
+            )
+
+            self.assertEqual(1, result)
+            self.assertEqual(before, filesystem_snapshot(target))
+            self.assertFalse((target / TARGET_NAME).exists())
+
+    def test_legacy_migration_rejects_a_same_digest_replacement_inode(self):
+        lifecycle = load_lifecycle_helper()
+        with temporary_directory() as temporary:
+            root = Path(temporary)
+            target = root / "agents"
+            prepare_known_legacy(target)
+            replacement_inode: int | None = None
+
+            def replace_after_snapshot() -> None:
+                nonlocal replacement_inode
+                replacement = root / "same-digest-legacy-replacement"
+                replacement.write_bytes(KNOWN_LEGACY_TEMPLATE)
+                replacement_inode = replacement.stat().st_ino
+                os.replace(replacement, target / LEGACY_TARGET_NAME)
+
+            with patch_after_first_snapshot(
+                lifecycle, LEGACY_TARGET_NAME, replace_after_snapshot
+            ):
+                self.assertEqual(1, lifecycle.install(target))
+
+            self.assertIsNotNone(replacement_inode)
+            self.assertEqual(replacement_inode, (target / LEGACY_TARGET_NAME).stat().st_ino)
+            self.assertFalse((target / TARGET_NAME).exists())
+
     def test_missing_install_and_check_are_isolated_and_idempotent(self):
         with temporary_directory() as temporary:
             root = Path(temporary)
@@ -530,7 +737,7 @@ class AgentLifecycleTest(unittest.TestCase):
 
             installed = self.install(target)
             self.assertEqual(0, installed.returncode, installed.stderr)
-            destination = target / "luna-worker.toml"
+            destination = target / TARGET_NAME
             self.assertEqual(TEMPLATE.read_bytes(), destination.read_bytes())
             self.assertTrue((target / STATE_NAME).is_file())
             state = json.loads((target / STATE_NAME).read_text())
@@ -552,7 +759,7 @@ class AgentLifecycleTest(unittest.TestCase):
         with temporary_directory() as temporary:
             target = Path(temporary) / "agents"
             target.mkdir()
-            destination = target / "luna-worker.toml"
+            destination = target / LEGACY_TARGET_NAME
             destination.write_bytes(KNOWN_LEGACY_TEMPLATE)
             unrelated = target / "unrelated.toml"
             unrelated.write_text('name = "unrelated"\n')
@@ -560,7 +767,8 @@ class AgentLifecycleTest(unittest.TestCase):
 
             installed = self.install(target)
             self.assertEqual(0, installed.returncode, installed.stderr)
-            self.assertEqual(TEMPLATE.read_bytes(), destination.read_bytes())
+            self.assertFalse(destination.exists())
+            self.assertEqual(TEMPLATE.read_bytes(), (target / TARGET_NAME).read_bytes())
             self.assertEqual(sha256(unrelated), before_hashes["unrelated.toml"])
             self.assertTrue((target / STATE_NAME).is_file())
 
@@ -568,7 +776,7 @@ class AgentLifecycleTest(unittest.TestCase):
         with temporary_directory() as temporary:
             target = Path(temporary) / "agents"
             target.mkdir()
-            destination = target / "luna-worker.toml"
+            destination = target / TARGET_NAME
             conflicting_bytes = b'name = "user_owned"\n'
             destination.write_bytes(conflicting_bytes)
             before_hashes = tree_hashes(target)
@@ -588,7 +796,7 @@ class AgentLifecycleTest(unittest.TestCase):
             target.mkdir()
             protected = root / "protected.toml"
             protected.write_text('name = "protected"\n')
-            (target / "luna-worker.toml").symlink_to(protected)
+            (target / TARGET_NAME).symlink_to(protected)
             before = tree_hashes(root)
             self.assertNotEqual(0, self.install(target).returncode)
             self.assertEqual(before, tree_hashes(root))
@@ -603,7 +811,7 @@ class AgentLifecycleTest(unittest.TestCase):
         with temporary_directory() as temporary:
             target = Path(temporary) / "agents"
             target.mkdir()
-            destination = target / "luna-worker.toml"
+            destination = target / TARGET_NAME
             destination.write_text('name = "unreadable"\n')
             destination.chmod(0)
             try:
@@ -625,24 +833,24 @@ class AgentLifecycleTest(unittest.TestCase):
 
             legacy = root / "legacy" / "agents"
             legacy.mkdir(parents=True)
-            (legacy / "luna-worker.toml").write_bytes(KNOWN_LEGACY_TEMPLATE)
+            (legacy / LEGACY_TARGET_NAME).write_bytes(KNOWN_LEGACY_TEMPLATE)
             cases["known_legacy"] = legacy
 
             conflict = root / "conflict" / "agents"
             conflict.mkdir(parents=True)
-            (conflict / "luna-worker.toml").write_bytes(b'user = "owned"\n')
+            (conflict / TARGET_NAME).write_bytes(b'user = "owned"\n')
             cases["conflict"] = conflict
 
             unsafe = root / "unsafe" / "agents"
             unsafe.mkdir(parents=True)
             protected = root / "unsafe" / "protected.toml"
             protected.write_bytes(b"protected\n")
-            (unsafe / "luna-worker.toml").symlink_to(protected)
+            (unsafe / TARGET_NAME).symlink_to(protected)
             cases["unsafe"] = unsafe
 
             unreadable = root / "unreadable" / "agents"
             unreadable.mkdir(parents=True)
-            unreadable_file = unreadable / "luna-worker.toml"
+            unreadable_file = unreadable / TARGET_NAME
             unreadable_file.write_bytes(b"unreadable\n")
             unreadable_file.chmod(0)
             cases["unreadable"] = unreadable
@@ -693,7 +901,7 @@ class AgentLifecycleTest(unittest.TestCase):
         with temporary_directory() as temporary:
             root = Path(temporary)
             target = root / "agents"
-            destination = target / "luna-worker.toml"
+            destination = target / TARGET_NAME
             user_bytes = b'name = "created_after_preflight"\n'
 
             def race(point: str) -> None:
@@ -720,7 +928,7 @@ class AgentLifecycleTest(unittest.TestCase):
                     home = root / name / "home"
                     default_target = home / ".codex" / "agents"
                     default_target.mkdir(parents=True)
-                    (default_target / "luna-worker.toml").write_bytes(TEMPLATE.read_bytes())
+                    (default_target / TARGET_NAME).write_bytes(TEMPLATE.read_bytes())
                     write_owned_state(default_target)
                     before = filesystem_snapshot(home)
 
@@ -740,7 +948,7 @@ class AgentLifecycleTest(unittest.TestCase):
                     (target / STATE_NAME).write_bytes(raced_state)
 
             self.assertNotEqual(0, lifecycle.install(target, hook=race))
-            self.assertFalse((target / "luna-worker.toml").exists())
+            self.assertFalse((target / TARGET_NAME).exists())
             self.assertEqual(raced_state, (target / STATE_NAME).read_bytes())
 
     def test_missing_install_preserves_raced_agent_bytes_when_state_publish_races(self):
@@ -748,7 +956,7 @@ class AgentLifecycleTest(unittest.TestCase):
         with temporary_directory() as temporary:
             root = Path(temporary)
             target = root / "agents"
-            destination = target / "luna-worker.toml"
+            destination = target / TARGET_NAME
             raced_state = b'{"owner":"user"}\n'
             user_bytes = b'name = "modified_during_state_race"\n'
 
@@ -775,7 +983,7 @@ class AgentLifecycleTest(unittest.TestCase):
         with temporary_directory() as temporary:
             root = Path(temporary)
             target = root / "agents"
-            destination = target / "luna-worker.toml"
+            destination = target / TARGET_NAME
             replacement_inode: int | None = None
 
             def race(point: str) -> None:
@@ -807,7 +1015,7 @@ class AgentLifecycleTest(unittest.TestCase):
                 1, lifecycle.install(target, hook=raise_on_missing_state(OSError))
             )
 
-            self.assertFalse((target / "luna-worker.toml").exists())
+            self.assertFalse((target / TARGET_NAME).exists())
             self.assertFalse((target / STATE_NAME).exists())
 
     def test_missing_state_hook_runtimeerror_rolls_back_then_reraises(self):
@@ -818,7 +1026,7 @@ class AgentLifecycleTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "injected"):
                 lifecycle.install(target, hook=raise_on_missing_state(RuntimeError))
 
-            self.assertFalse((target / "luna-worker.toml").exists())
+            self.assertFalse((target / TARGET_NAME).exists())
             self.assertFalse((target / STATE_NAME).exists())
 
     def test_missing_state_publish_oserror_rolls_back(self):
@@ -829,7 +1037,7 @@ class AgentLifecycleTest(unittest.TestCase):
             with raise_from_state_publish(lifecycle, OSError):
                 self.assertEqual(1, lifecycle.install(target))
 
-            self.assertFalse((target / "luna-worker.toml").exists())
+            self.assertFalse((target / TARGET_NAME).exists())
             self.assertFalse((target / STATE_NAME).exists())
 
     def test_missing_post_link_state_exception_rolls_back_then_reraises(self):
@@ -842,7 +1050,7 @@ class AgentLifecycleTest(unittest.TestCase):
                     target, hook=raise_after_missing_state_publish(RuntimeError)
                 )
 
-            self.assertFalse((target / "luna-worker.toml").exists())
+            self.assertFalse((target / TARGET_NAME).exists())
             self.assertFalse((target / STATE_NAME).exists())
 
     def test_known_legacy_state_failure_restores_legacy_without_new_state(self):
@@ -850,13 +1058,13 @@ class AgentLifecycleTest(unittest.TestCase):
         with temporary_directory() as temporary:
             target = Path(temporary) / "agents"
             prepare_known_legacy(target)
-            legacy_inode = (target / "luna-worker.toml").stat().st_ino
+            legacy_inode = (target / LEGACY_TARGET_NAME).stat().st_ino
 
             with raise_from_state_publish(lifecycle, OSError):
                 self.assertEqual(1, lifecycle.install(target))
 
-            self.assertEqual(LEGACY_BYTES, (target / "luna-worker.toml").read_bytes())
-            self.assertEqual(legacy_inode, (target / "luna-worker.toml").stat().st_ino)
+            self.assertEqual(LEGACY_BYTES, (target / LEGACY_TARGET_NAME).read_bytes())
+            self.assertEqual(legacy_inode, (target / LEGACY_TARGET_NAME).stat().st_ino)
             self.assertFalse((target / STATE_NAME).exists())
 
     def test_known_legacy_state_hook_runtimeerror_restores_then_reraises(self):
@@ -864,15 +1072,15 @@ class AgentLifecycleTest(unittest.TestCase):
         with temporary_directory() as temporary:
             target = Path(temporary) / "agents"
             prepare_known_legacy(target)
-            legacy_inode = (target / "luna-worker.toml").stat().st_ino
+            legacy_inode = (target / LEGACY_TARGET_NAME).stat().st_ino
 
             with self.assertRaisesRegex(RuntimeError, "injected"):
                 lifecycle.install(
                     target, hook=raise_on_known_legacy_state(RuntimeError)
                 )
 
-            self.assertEqual(LEGACY_BYTES, (target / "luna-worker.toml").read_bytes())
-            self.assertEqual(legacy_inode, (target / "luna-worker.toml").stat().st_ino)
+            self.assertEqual(LEGACY_BYTES, (target / LEGACY_TARGET_NAME).read_bytes())
+            self.assertEqual(legacy_inode, (target / LEGACY_TARGET_NAME).stat().st_ino)
             self.assertFalse((target / STATE_NAME).exists())
 
     def test_known_legacy_state_publish_race_restores_legacy(self):
@@ -880,15 +1088,15 @@ class AgentLifecycleTest(unittest.TestCase):
         with temporary_directory() as temporary:
             target = Path(temporary) / "agents"
             prepare_known_legacy(target)
-            legacy_inode = (target / "luna-worker.toml").stat().st_ino
+            legacy_inode = (target / LEGACY_TARGET_NAME).stat().st_ino
             user_state = b'{"owner":"user"}\n'
 
             def race(point: str) -> None:
-                if point == "install.before_publish_known_legacy_state":
+                if point == "install.before_publish_legacy_state":
                     (target / STATE_NAME).write_bytes(user_state)
 
             self.assertEqual(1, lifecycle.install(target, hook=race))
-            self.assertEqual(legacy_inode, (target / "luna-worker.toml").stat().st_ino)
+            self.assertEqual(legacy_inode, (target / LEGACY_TARGET_NAME).stat().st_ino)
             self.assertEqual(user_state, (target / STATE_NAME).read_bytes())
 
     def test_known_legacy_state_failure_preserves_user_agent_and_legacy_tombstone(self):
@@ -897,18 +1105,18 @@ class AgentLifecycleTest(unittest.TestCase):
             root = Path(temporary)
             target = root / "agents"
             prepare_known_legacy(target)
-            legacy_inode = (target / "luna-worker.toml").stat().st_ino
+            legacy_inode = (target / LEGACY_TARGET_NAME).stat().st_ino
             user_bytes = b'name = "user_replacement"\n'
 
             def replace_then_raise(point: str) -> None:
-                if point == "install.before_publish_known_legacy_state":
+                if point == "install.before_publish_legacy_state":
                     replacement = root / "user-replacement.toml"
                     replacement.write_bytes(user_bytes)
-                    os.replace(replacement, target / "luna-worker.toml")
+                    os.replace(replacement, target / LEGACY_TARGET_NAME)
                     raise OSError("injected")
 
             self.assertEqual(1, lifecycle.install(target, hook=replace_then_raise))
-            self.assertEqual(user_bytes, (target / "luna-worker.toml").read_bytes())
+            self.assertEqual(user_bytes, (target / LEGACY_TARGET_NAME).read_bytes())
             self.assertIn(
                 legacy_inode,
                 [
@@ -924,20 +1132,20 @@ class AgentLifecycleTest(unittest.TestCase):
             root = Path(temporary)
             target = root / "agents"
             prepare_known_legacy(target)
-            legacy_inode = (target / "luna-worker.toml").stat().st_ino
+            legacy_inode = (target / LEGACY_TARGET_NAME).stat().st_ino
             replacement_inode: int | None = None
 
             def replace_then_raise(point: str) -> None:
                 nonlocal replacement_inode
-                if point == "install.before_publish_known_legacy_state":
+                if point == "install.before_publish_legacy_state":
                     replacement = root / "same-digest-replacement.toml"
                     replacement.write_bytes(TEMPLATE.read_bytes())
                     replacement_inode = replacement.stat().st_ino
-                    os.replace(replacement, target / "luna-worker.toml")
+                    os.replace(replacement, target / LEGACY_TARGET_NAME)
                     raise OSError("injected")
 
             self.assertEqual(1, lifecycle.install(target, hook=replace_then_raise))
-            self.assertEqual(replacement_inode, (target / "luna-worker.toml").stat().st_ino)
+            self.assertEqual(replacement_inode, (target / LEGACY_TARGET_NAME).stat().st_ino)
             self.assertIn(
                 legacy_inode,
                 [
@@ -968,14 +1176,14 @@ class AgentLifecycleTest(unittest.TestCase):
 
             self.assertIsNotNone(replacement_inode)
             self.assertEqual(replacement_inode, (target / STATE_NAME).stat().st_ino)
-            self.assertFalse((target / "luna-worker.toml").exists())
+            self.assertFalse((target / TARGET_NAME).exists())
 
     def test_known_legacy_post_link_runtimeerror_restores_then_reraises(self):
         lifecycle = load_lifecycle_helper()
         with temporary_directory() as temporary:
             target = Path(temporary) / "agents"
             prepare_known_legacy(target)
-            legacy_inode = (target / "luna-worker.toml").stat().st_ino
+            legacy_inode = (target / LEGACY_TARGET_NAME).stat().st_ino
 
             with self.assertRaisesRegex(RuntimeError, "injected"):
                 lifecycle.install(
@@ -983,7 +1191,7 @@ class AgentLifecycleTest(unittest.TestCase):
                     hook=raise_after_known_legacy_state_publish(RuntimeError),
                 )
 
-            self.assertEqual(legacy_inode, (target / "luna-worker.toml").stat().st_ino)
+            self.assertEqual(legacy_inode, (target / LEGACY_TARGET_NAME).stat().st_ino)
             self.assertFalse((target / STATE_NAME).exists())
 
     def test_staged_cleanup_oserror_does_not_mask_original_runtimeerror(self):
@@ -1050,7 +1258,7 @@ class AgentLifecycleTest(unittest.TestCase):
                 replacement_inode,
                 [entry.stat().st_ino for entry in target.iterdir()],
             )
-            self.assertFalse((target / "luna-worker.toml").exists())
+            self.assertFalse((target / TARGET_NAME).exists())
             self.assertFalse((target / STATE_NAME).exists())
 
     def test_state_publish_rejects_and_preserves_a_replaced_staging_inode(self):
@@ -1074,7 +1282,7 @@ class AgentLifecycleTest(unittest.TestCase):
                 replacement_inode,
                 [entry.stat().st_ino for entry in target.iterdir()],
             )
-            self.assertFalse((target / "luna-worker.toml").exists())
+            self.assertFalse((target / TARGET_NAME).exists())
             self.assertFalse((target / STATE_NAME).exists())
 
     def test_final_cleanup_preserves_a_replaced_staging_inode(self):
@@ -1144,7 +1352,7 @@ class AgentLifecycleTest(unittest.TestCase):
             ):
                 self.assertEqual(1, lifecycle.install(target))
 
-            self.assertFalse((target / "luna-worker.toml").exists())
+            self.assertFalse((target / TARGET_NAME).exists())
             self.assertFalse((target / STATE_NAME).exists())
 
     def test_known_legacy_agent_staging_race_restores_legacy_inode(self):
@@ -1153,12 +1361,12 @@ class AgentLifecycleTest(unittest.TestCase):
             root = Path(temporary)
             target = root / "agents"
             prepare_known_legacy(target)
-            legacy_inode = (target / "luna-worker.toml").stat().st_ino
+            legacy_inode = (target / LEGACY_TARGET_NAME).stat().st_ino
             replacement_inode: int | None = None
 
             def replace_staging_agent(point: str) -> None:
                 nonlocal replacement_inode
-                if point == "install.before_retire_known_legacy":
+                if point == "install.before_retire_legacy":
                     staged_agent, = target.glob(".ai-workflow-agent-*")
                     replacement = root / "replacement-agent"
                     replacement.write_bytes(b'name = "user"\n')
@@ -1166,7 +1374,7 @@ class AgentLifecycleTest(unittest.TestCase):
                     os.replace(replacement, staged_agent)
 
             self.assertEqual(1, lifecycle.install(target, hook=replace_staging_agent))
-            self.assertEqual(legacy_inode, (target / "luna-worker.toml").stat().st_ino)
+            self.assertEqual(legacy_inode, (target / LEGACY_TARGET_NAME).stat().st_ino)
             self.assertIsNotNone(replacement_inode)
             self.assertIn(
                 replacement_inode,
@@ -1178,7 +1386,7 @@ class AgentLifecycleTest(unittest.TestCase):
         with temporary_directory() as temporary:
             root = Path(temporary)
             target = root / "agents"
-            destination = target / "luna-worker.toml"
+            destination = target / TARGET_NAME
             user_bytes = b'name = "user_replacement"\n'
 
             def replace_then_raise(point: str) -> None:
@@ -1197,7 +1405,7 @@ class AgentLifecycleTest(unittest.TestCase):
         with temporary_directory() as temporary:
             root = Path(temporary)
             target = root / "agents"
-            destination = target / "luna-worker.toml"
+            destination = target / TARGET_NAME
             replacement_inode: int | None = None
 
             def replace_then_raise(point: str) -> None:
@@ -1317,7 +1525,7 @@ class AgentLifecycleTest(unittest.TestCase):
                 for index in range(16):
                     target = root / str(index) / "agents"
                     target.mkdir(parents=True)
-                    (target / "luna-worker.toml").write_bytes(KNOWN_LEGACY_TEMPLATE)
+                    (target / LEGACY_TARGET_NAME).write_bytes(KNOWN_LEGACY_TEMPLATE)
                     self.assertNotEqual(0, lifecycle.install(target))
                 after = open_fd_count()
         finally:
@@ -1329,7 +1537,7 @@ class AgentLifecycleTest(unittest.TestCase):
         original_discard = lifecycle._discard_verified_tombstone
 
         def fail_only_final_agent_discard(*arguments):
-            if arguments[-1][2] == KNOWN_LEGACY_SHA256:
+            if arguments[-1][2] == CANONICAL_TEMPLATE_SHA256:
                 return False
             return original_discard(*arguments)
 
@@ -1341,7 +1549,7 @@ class AgentLifecycleTest(unittest.TestCase):
                 for index in range(16):
                     target = root / str(index) / "agents"
                     target.mkdir(parents=True)
-                    (target / "luna-worker.toml").write_bytes(TEMPLATE.read_bytes())
+                    (target / TARGET_NAME).write_bytes(TEMPLATE.read_bytes())
                     write_owned_state(target)
                     self.assertNotEqual(0, lifecycle.uninstall(target))
                 after = open_fd_count()
@@ -1366,12 +1574,12 @@ class AgentLifecycleTest(unittest.TestCase):
             root = Path(temporary)
             target = root / "agents"
             target.mkdir()
-            destination = target / "luna-worker.toml"
+            destination = target / LEGACY_TARGET_NAME
             destination.write_bytes(KNOWN_LEGACY_TEMPLATE)
             user_bytes = b'name = "replaced_after_preflight"\n'
 
             def race(point: str) -> None:
-                if point == "install.before_retire_known_legacy":
+                if point == "install.before_retire_legacy":
                     replacement = root / "user-replacement.toml"
                     replacement.write_bytes(user_bytes)
                     os.replace(replacement, destination)
@@ -1390,11 +1598,11 @@ class AgentLifecycleTest(unittest.TestCase):
 
             def race(point: str) -> None:
                 nonlocal replacement_inode
-                if point == "install.before_retire_known_legacy":
+                if point == "install.before_retire_legacy":
                     replacement = root / "same-digest-legacy"
                     replacement.write_bytes(KNOWN_LEGACY_TEMPLATE)
                     replacement_inode = replacement.stat().st_ino
-                    os.replace(replacement, target / "luna-worker.toml")
+                    os.replace(replacement, target / LEGACY_TARGET_NAME)
 
             self.assertEqual(1, lifecycle.install(target, hook=race))
             self.assertIsNotNone(replacement_inode)
@@ -1422,10 +1630,10 @@ class AgentLifecycleTest(unittest.TestCase):
                 replacement = root / "same-digest-classification-race"
                 replacement.write_bytes(KNOWN_LEGACY_TEMPLATE)
                 replacement_inode = replacement.stat().st_ino
-                os.replace(replacement, target / "luna-worker.toml")
+                os.replace(replacement, target / LEGACY_TARGET_NAME)
 
             with patch_after_first_snapshot(
-                lifecycle, "luna-worker.toml", replace_after_snapshot
+                lifecycle, LEGACY_TARGET_NAME, replace_after_snapshot
             ):
                 self.assertEqual(1, lifecycle.install(target))
 
@@ -1447,7 +1655,7 @@ class AgentLifecycleTest(unittest.TestCase):
             root = Path(temporary)
             target = root / "agents"
             target.mkdir()
-            destination = target / "luna-worker.toml"
+            destination = target / TARGET_NAME
             destination.write_bytes(TEMPLATE.read_bytes())
             write_owned_state(target)
             user_bytes = b'name = "raced_uninstall_user"\n'
@@ -1468,7 +1676,7 @@ class AgentLifecycleTest(unittest.TestCase):
             root = Path(temporary)
             target = root / "agents"
             target.mkdir()
-            destination = target / "luna-worker.toml"
+            destination = target / TARGET_NAME
             destination.write_bytes(TEMPLATE.read_bytes())
             write_owned_state(target)
             replacement_inode: int | None = None
@@ -1502,7 +1710,7 @@ class AgentLifecycleTest(unittest.TestCase):
                     root = Path(temporary)
                     target = root / "agents"
                     target.mkdir()
-                    (target / "luna-worker.toml").write_bytes(TEMPLATE.read_bytes())
+                    (target / TARGET_NAME).write_bytes(TEMPLATE.read_bytes())
                     backup_bytes = b'name = "backup"\n'
                     backup_sha = None
                     if raced_name == BACKUP_NAME:
@@ -1548,14 +1756,14 @@ class AgentLifecycleTest(unittest.TestCase):
                     self.assertIn(replacement_inode, recoverable_inodes)
 
     def test_uninstall_binds_each_initial_file_snapshot_inode(self):
-        for raced_name in ("luna-worker.toml", STATE_NAME, BACKUP_NAME):
+        for raced_name in (TARGET_NAME, STATE_NAME, BACKUP_NAME):
             with self.subTest(raced_name=raced_name):
                 lifecycle = load_lifecycle_helper()
                 with temporary_directory() as temporary:
                     root = Path(temporary)
                     target = root / "agents"
                     target.mkdir()
-                    (target / "luna-worker.toml").write_bytes(TEMPLATE.read_bytes())
+                    (target / TARGET_NAME).write_bytes(TEMPLATE.read_bytes())
                     backup_sha = None
                     if raced_name == BACKUP_NAME:
                         (target / BACKUP_NAME).write_bytes(b'name = "backup"\n')
@@ -1595,7 +1803,7 @@ class AgentLifecycleTest(unittest.TestCase):
         with temporary_directory() as temporary:
             target = Path(temporary) / "agents"
             target.mkdir()
-            destination = target / "luna-worker.toml"
+            destination = target / TARGET_NAME
             backup = target / BACKUP_NAME
             backup_bytes = b'name = "known_legacy_backup"\n'
             destination.write_bytes(TEMPLATE.read_bytes())
@@ -1614,7 +1822,7 @@ class AgentLifecycleTest(unittest.TestCase):
                 with self.subTest(name=name):
                     target = root / name / "agents"
                     target.mkdir(parents=True)
-                    destination = target / "luna-worker.toml"
+                    destination = target / TARGET_NAME
                     backup = target / BACKUP_NAME
                     destination.write_bytes(TEMPLATE.read_bytes())
                     backup.write_bytes(b'name = "known_legacy_backup"\n')
@@ -1633,7 +1841,7 @@ class AgentLifecycleTest(unittest.TestCase):
             root = Path(temporary)
             target = root / "agents"
             target.mkdir()
-            destination = target / "luna-worker.toml"
+            destination = target / TARGET_NAME
             backup = target / BACKUP_NAME
             destination.write_bytes(TEMPLATE.read_bytes())
             backup.write_bytes(b'name = "known_legacy_backup"\n')
@@ -1658,10 +1866,10 @@ class AgentLifecycleTest(unittest.TestCase):
             unrelated = target / "keep.toml"
             unrelated.write_text('name = "keep"\n')
             self.assertEqual(0, self.install(target).returncode)
-            destination = target / "luna-worker.toml"
+            destination = target / TARGET_NAME
             state = json.loads((target / STATE_NAME).read_text())
             self.assertEqual({"plugin_version", "target_filename", "installed_sha256", "installed_at_utc", "backup_sha256"}, set(state))
-            self.assertEqual("luna-worker.toml", state["target_filename"])
+            self.assertEqual(TARGET_NAME, state["target_filename"])
             self.assertEqual(sha256(destination), state["installed_sha256"])
             self.assertEqual(0, self.uninstall(target).returncode)
             self.assertFalse(destination.exists())

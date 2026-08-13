@@ -25,10 +25,14 @@ from typing import Callable
 
 
 PLUGIN_VERSION = "0.2.0"
-TARGET_FILENAME = "luna-worker.toml"
-STATE_FILENAME = ".ai-workflow-luna-worker.state"
-BACKUP_FILENAME = ".ai-workflow-luna-worker.backup"
-RELEASE_SHA256 = "60f7240ea662cd27ea0f51f2e1efa8a2e788e16c76b04a13ab1c1df4f26ef024"
+TARGET_FILENAME = "luna-max.toml"
+STATE_FILENAME = ".ai-workflow-luna-max.state"
+BACKUP_FILENAME = ".ai-workflow-luna-max.backup"
+RELEASE_SHA256 = "6237649deb278392111355490a9c71c00be66388c6fb25435694d00eb6f18bbb"
+LEGACY_TARGET_FILENAME = "luna-worker.toml"
+LEGACY_STATE_FILENAME = ".ai-workflow-luna-worker.state"
+LEGACY_BACKUP_FILENAME = ".ai-workflow-luna-worker.backup"
+LEGACY_RELEASE_SHA256 = "60f7240ea662cd27ea0f51f2e1efa8a2e788e16c76b04a13ab1c1df4f26ef024"
 UTC_TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 Hook = Callable[[str], None]
 FileIdentity = tuple[int, int, str]
@@ -327,7 +331,7 @@ def _validate_template() -> tuple[bytes, str]:
         _fail("invalid release template")
         raise AssertionError("unreachable") from exc
     if (
-        value.get("name") != "luna_worker"
+        value.get("name") != "luna_max"
         or value.get("model") != "gpt-5.6-luna"
         or value.get("model_reasoning_effort") != "max"
         or not isinstance(value.get("developer_instructions"), str)
@@ -337,7 +341,9 @@ def _validate_template() -> tuple[bytes, str]:
     return content, digest
 
 
-def _parse_state(content: bytes, expected_sha: str) -> str | None:
+def _parse_state(
+    content: bytes, expected_sha: str, expected_filename: str
+) -> str | None:
     try:
         value = json.loads(content.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -356,7 +362,7 @@ def _parse_state(content: bytes, expected_sha: str) -> str | None:
         not isinstance(value, dict)
         or set(value) != required
         or value.get("plugin_version") != PLUGIN_VERSION
-        or value.get("target_filename") != TARGET_FILENAME
+        or value.get("target_filename") != expected_filename
         or value.get("installed_sha256") != expected_sha
         or not isinstance(timestamp, str)
         or UTC_TIMESTAMP.fullmatch(timestamp) is None
@@ -384,41 +390,91 @@ def _state_content(installed_sha: str, backup_sha: str | None) -> bytes:
     return (json.dumps(value, separators=(",", ":")) + "\n").encode("utf-8")
 
 
+def _snapshot_owned_install(
+    directory: int,
+    *,
+    target_name: str,
+    state_name: str,
+    backup_name: str,
+    expected_sha: str,
+) -> tuple[dict[str, tuple[bytes, FileIdentity]], str | None]:
+    """Read one complete owned install through no-follow descriptors."""
+
+    state_content, state_identity = _read_regular_identity(directory, state_name)
+    target_content, target_identity = _read_regular_identity(directory, target_name)
+    backup_sha = _parse_state(state_content, expected_sha, target_name)
+    if target_identity[2] != expected_sha:
+        _fail("installed Agent differs from owned state")
+    entries = {
+        target_name: (target_content, target_identity),
+        state_name: (state_content, state_identity),
+    }
+    backup_status = _entry_stat(directory, backup_name)
+    if backup_sha is None:
+        if backup_status is not None:
+            _fail("unexpected backup")
+    else:
+        backup_content, backup_identity = _read_regular_identity(directory, backup_name)
+        if backup_identity[2] != backup_sha:
+            _fail("backup differs from owned state")
+        entries[backup_name] = (backup_content, backup_identity)
+    return entries, backup_sha
+
+
 def _classify(
     directory: int | None, template_sha: str
-) -> tuple[str, FileIdentity | None, FileIdentity | None]:
+) -> tuple[str, dict[str, tuple[bytes, FileIdentity]], str | None]:
+    """Classify canonical or verified legacy entries without following paths.
+
+    Seeing even one name from each family is ambiguous: nothing is published
+    until the user resolves it.  This intentionally rejects a partial state
+    before it can be mistaken for an installation owned by this release.
+    """
+
     if directory is None:
-        return "missing", None, None
-    state_status = _entry_stat(directory, STATE_FILENAME)
-    destination_status = _entry_stat(directory, TARGET_FILENAME)
-    backup_status = _entry_stat(directory, BACKUP_FILENAME)
-    if state_status is not None:
-        state_content, _ = _read_regular_identity(directory, STATE_FILENAME)
-        _, destination_identity = _read_regular_identity(
-            directory, TARGET_FILENAME
+        return "missing", {}, None
+    canonical_names = (TARGET_FILENAME, STATE_FILENAME, BACKUP_FILENAME)
+    legacy_names = (
+        LEGACY_TARGET_FILENAME,
+        LEGACY_STATE_FILENAME,
+        LEGACY_BACKUP_FILENAME,
+    )
+    canonical_present = any(_entry_stat(directory, name) is not None for name in canonical_names)
+    legacy_present = any(_entry_stat(directory, name) is not None for name in legacy_names)
+    if canonical_present and legacy_present:
+        _fail("ambiguous legacy and canonical installation")
+    if canonical_present:
+        if _entry_stat(directory, STATE_FILENAME) is None:
+            _fail("incomplete canonical installation")
+        entries, backup_sha = _snapshot_owned_install(
+            directory,
+            target_name=TARGET_FILENAME,
+            state_name=STATE_FILENAME,
+            backup_name=BACKUP_FILENAME,
+            expected_sha=template_sha,
         )
-        state_backup = _parse_state(state_content, template_sha)
-        if destination_identity[2] != template_sha:
-            _fail("installed Agent differs from owned state")
-        backup_identity: FileIdentity | None = None
-        if state_backup is None:
-            if backup_status is not None:
-                _fail("unexpected backup")
-        else:
-            _, backup_identity = _read_regular_identity(
-                directory, BACKUP_FILENAME
-            )
-            if backup_identity[2] != state_backup:
-                _fail("backup differs from owned state")
-        return "current", destination_identity, backup_identity
-    if backup_status is not None:
-        _fail("unexpected backup")
-    if destination_status is None:
-        return "missing", None, None
-    _, destination_identity = _read_regular_identity(directory, TARGET_FILENAME)
-    if destination_identity[2] == RELEASE_SHA256:
-        return "known_legacy", destination_identity, None
-    return "conflict", destination_identity, None
+        return "current", entries, backup_sha
+    if not legacy_present:
+        return "missing", {}, None
+    if _entry_stat(directory, LEGACY_TARGET_FILENAME) is None:
+        _fail("incomplete legacy installation")
+    legacy_content, legacy_identity = _read_regular_identity(
+        directory, LEGACY_TARGET_FILENAME
+    )
+    if legacy_identity[2] != LEGACY_RELEASE_SHA256:
+        _fail("unverified legacy installation")
+    if _entry_stat(directory, LEGACY_STATE_FILENAME) is None:
+        if _entry_stat(directory, LEGACY_BACKUP_FILENAME) is not None:
+            _fail("unexpected legacy backup")
+        return "legacy", {LEGACY_TARGET_FILENAME: (legacy_content, legacy_identity)}, None
+    entries, backup_sha = _snapshot_owned_install(
+        directory,
+        target_name=LEGACY_TARGET_FILENAME,
+        state_name=LEGACY_STATE_FILENAME,
+        backup_name=LEGACY_BACKUP_FILENAME,
+        expected_sha=LEGACY_RELEASE_SHA256,
+    )
+    return "legacy", entries, backup_sha
 
 
 def _hook(hook: Hook | None, point: str) -> None:
@@ -449,38 +505,51 @@ def _discard_owned_publication(
         return False
 
 
+Tombstones = dict[str, tuple[str, int, FileIdentity]]
+
+
+def _restore_tombstones(directory: int, tombstones: Tombstones) -> None:
+    """Restore retired entries only to their original names and inodes."""
+
+    for name, (tombstone_name, tombstone, identity) in tombstones.items():
+        try:
+            restored = _preserve_tombstone(directory, name, tombstone)
+            if restored:
+                _discard_verified_tombstone(
+                    directory, tombstone_name, tombstone, identity
+                )
+        except BaseException:
+            pass
+
+
+def _close_tombstones(tombstones: Tombstones) -> None:
+    for _, tombstone, _ in tombstones.values():
+        _close_tombstone(tombstone)
+
+
+def _discard_tombstones(directory: int, tombstones: Tombstones) -> bool:
+    """Delete old content only after all canonical entries are complete."""
+
+    discarded = True
+    for _, (tombstone_name, tombstone, identity) in tombstones.items():
+        if not _discard_verified_tombstone(
+            directory, tombstone_name, tombstone, identity
+        ):
+            discarded = False
+    return discarded
+
+
 def _rollback_install_publication(
     directory: int,
-    agent_identity: FileIdentity | None,
-    state_identity: FileIdentity | None,
-    *,
-    legacy_tombstone_name: str | None = None,
-    legacy_tombstone: int | None = None,
-    legacy_identity: FileIdentity | None = None,
+    publications: dict[str, FileIdentity],
+    tombstones: Tombstones | None = None,
 ) -> None:
-    """Best-effort transaction rollback; original failures remain authoritative."""
+    """Undo only files linked by this transaction, then restore old members."""
 
-    _discard_owned_publication(directory, STATE_FILENAME, state_identity)
-    _discard_owned_publication(directory, TARGET_FILENAME, agent_identity)
-    if (
-        legacy_tombstone_name is None
-        or legacy_tombstone is None
-        or legacy_identity is None
-    ):
-        return
-    try:
-        restored = _preserve_tombstone(
-            directory, TARGET_FILENAME, legacy_tombstone
-        )
-        if restored:
-            _discard_verified_tombstone(
-                directory,
-                legacy_tombstone_name,
-                legacy_tombstone,
-                legacy_identity,
-            )
-    except BaseException:
-        pass
+    for name in (STATE_FILENAME, BACKUP_FILENAME, TARGET_FILENAME):
+        _discard_owned_publication(directory, name, publications.get(name))
+    if tombstones:
+        _restore_tombstones(directory, tombstones)
 
 
 def install(
@@ -491,24 +560,27 @@ def install(
     directory: int | None = None
     staged_agent: str | None = None
     staged_state: str | None = None
-    tombstone: int | None = None
-    published_agent: FileIdentity | None = None
-    published_state: FileIdentity | None = None
+    staged_backup: str | None = None
+    tombstones: Tombstones = {}
+    publications: dict[str, FileIdentity] = {}
     staged_agent_identity: FileIdentity | None = None
     staged_state_identity: FileIdentity | None = None
+    staged_backup_identity: FileIdentity | None = None
     try:
         template, template_sha = _validate_template()
         directory = _open_target_directory(target_directory, create=False)
-        classification, expected_identity, _ = _classify(directory, template_sha)
+        classification, legacy_entries, legacy_backup_sha = _classify(
+            directory, template_sha
+        )
         if check:
             return 0 if classification == "current" else 1
-        if classification == "current" or classification == "conflict":
-            return 0 if classification == "current" else 1
+        if classification == "current":
+            return 0
         if directory is None:
             directory = _open_target_directory(target_directory, create=True)
             if directory is None:
                 _fail("cannot create target directory")
-            classification, expected_identity, _ = _classify(
+            classification, legacy_entries, legacy_backup_sha = _classify(
                 directory, template_sha
             )
             if classification != "missing":
@@ -517,8 +589,16 @@ def install(
         staged_agent_identity = _file_identity(directory, staged_agent)
         if staged_agent_identity[2] != template_sha:
             _fail("staged template digest mismatch")
-        staged_state = _stage(directory, "state", _state_content(template_sha, None))
+        staged_state = _stage(
+            directory, "state", _state_content(template_sha, legacy_backup_sha)
+        )
         staged_state_identity = _file_identity(directory, staged_state)
+        if legacy_backup_sha is not None:
+            legacy_backup_content, _ = legacy_entries[LEGACY_BACKUP_FILENAME]
+            staged_backup = _stage(directory, "backup", legacy_backup_content)
+            staged_backup_identity = _file_identity(directory, staged_backup)
+            if staged_backup_identity[2] != legacy_backup_sha:
+                _fail("staged backup digest mismatch")
 
         if classification == "missing":
             _hook(hook, "install.before_publish_missing")
@@ -530,7 +610,7 @@ def install(
                 staged_agent_identity,
             ):
                 return 1
-            published_agent = staged_agent_identity
+            publications[TARGET_FILENAME] = staged_agent_identity
             try:
                 _hook(hook, "install.before_publish_missing_state")
                 if not _publish_staged_no_clobber(
@@ -540,30 +620,34 @@ def install(
                     STATE_FILENAME,
                     staged_state_identity,
                 ):
-                    _rollback_install_publication(
-                        directory, published_agent, published_state
-                    )
+                    _rollback_install_publication(directory, publications)
                     return 1
-                published_state = staged_state_identity
+                publications[STATE_FILENAME] = staged_state_identity
                 _hook(hook, "install.after_publish_missing_state")
             except BaseException:
-                _rollback_install_publication(
-                    directory,
-                    published_agent,
-                    published_state,
-                )
+                _rollback_install_publication(directory, publications)
                 raise
             return 0
 
-        if classification != "known_legacy" or expected_identity is None:
+        if classification != "legacy":
             return 1
-        _hook(hook, "install.before_retire_known_legacy")
-        tombstone_name, tombstone = _retire_to_tombstone(directory, TARGET_FILENAME)
-        moved_identity = _file_identity(tombstone, "payload")
-        if moved_identity != expected_identity:
-            _preserve_tombstone(directory, TARGET_FILENAME, tombstone)
-            return 1
+        _hook(hook, "install.before_retire_legacy")
         try:
+            for name in (
+                LEGACY_TARGET_FILENAME,
+                LEGACY_STATE_FILENAME,
+                LEGACY_BACKUP_FILENAME,
+            ):
+                entry = legacy_entries.get(name)
+                if entry is None:
+                    continue
+                _, expected_identity = entry
+                tombstone_name, tombstone = _retire_to_tombstone(directory, name)
+                moved_identity = _file_identity(tombstone, "payload")
+                tombstones[name] = (tombstone_name, tombstone, expected_identity)
+                if moved_identity != expected_identity:
+                    _restore_tombstones(directory, tombstones)
+                    return 1
             if not _publish_staged_no_clobber(
                 directory,
                 staged_agent,
@@ -571,28 +655,21 @@ def install(
                 TARGET_FILENAME,
                 staged_agent_identity,
             ):
-                _rollback_install_publication(
-                    directory,
-                    published_agent,
-                    published_state,
-                    legacy_tombstone_name=tombstone_name,
-                    legacy_tombstone=tombstone,
-                    legacy_identity=expected_identity,
-                )
+                _rollback_install_publication(directory, publications, tombstones)
                 return 1
-        except BaseException:
-            _rollback_install_publication(
-                directory,
-                published_agent,
-                published_state,
-                legacy_tombstone_name=tombstone_name,
-                legacy_tombstone=tombstone,
-                legacy_identity=expected_identity,
-            )
-            raise
-        published_agent = staged_agent_identity
-        try:
-            _hook(hook, "install.before_publish_known_legacy_state")
+            publications[TARGET_FILENAME] = staged_agent_identity
+            if staged_backup is not None and staged_backup_identity is not None:
+                if not _publish_staged_no_clobber(
+                    directory,
+                    staged_backup,
+                    directory,
+                    BACKUP_FILENAME,
+                    staged_backup_identity,
+                ):
+                    _rollback_install_publication(directory, publications, tombstones)
+                    return 1
+                publications[BACKUP_FILENAME] = staged_backup_identity
+            _hook(hook, "install.before_publish_legacy_state")
             if not _publish_staged_no_clobber(
                 directory,
                 staged_state,
@@ -600,36 +677,19 @@ def install(
                 STATE_FILENAME,
                 staged_state_identity,
             ):
-                _rollback_install_publication(
-                    directory,
-                    published_agent,
-                    published_state,
-                    legacy_tombstone_name=tombstone_name,
-                    legacy_tombstone=tombstone,
-                    legacy_identity=expected_identity,
-                )
+                _rollback_install_publication(directory, publications, tombstones)
                 return 1
-            published_state = staged_state_identity
-            _hook(hook, "install.after_publish_known_legacy_state")
+            publications[STATE_FILENAME] = staged_state_identity
+            _hook(hook, "install.after_publish_legacy_state")
         except BaseException:
-            _rollback_install_publication(
-                directory,
-                published_agent,
-                published_state,
-                legacy_tombstone_name=tombstone_name,
-                legacy_tombstone=tombstone,
-                legacy_identity=expected_identity,
-            )
+            _rollback_install_publication(directory, publications, tombstones)
             raise
-        discarded = _discard_verified_tombstone(
-            directory, tombstone_name, tombstone, moved_identity
-        )
-        _close_tombstone(tombstone)
-        tombstone = None
-        if not discarded:
+        if not _discard_tombstones(directory, tombstones):
             return 1
         return 0
     except (LifecycleError, OSError):
+        if directory is not None and tombstones:
+            _rollback_install_publication(directory, publications, tombstones)
         return 1
     finally:
         if directory is not None:
@@ -641,8 +701,11 @@ def install(
                 _discard_owned_publication(
                     directory, staged_state, staged_state_identity
                 )
-        if tombstone is not None:
-            _close_tombstone(tombstone)
+            if staged_backup is not None and staged_backup_identity is not None:
+                _discard_owned_publication(
+                    directory, staged_backup, staged_backup_identity
+                )
+        _close_tombstones(tombstones)
         if directory is not None:
             _close_directory(directory)
 
@@ -681,12 +744,23 @@ def uninstall(
         directory = _open_target_directory(target_directory, create=False)
         if directory is None:
             return 1
+        if any(
+            _entry_stat(directory, name) is not None
+            for name in (
+                LEGACY_TARGET_FILENAME,
+                LEGACY_STATE_FILENAME,
+                LEGACY_BACKUP_FILENAME,
+            )
+        ):
+            return 1
         _require_regular(directory, TARGET_FILENAME)
         _require_regular(directory, STATE_FILENAME)
         state_content, state_identity = _read_regular_identity(
             directory, STATE_FILENAME
         )
-        backup_sha = _parse_state(state_content, RELEASE_SHA256)
+        backup_sha = _parse_state(
+            state_content, RELEASE_SHA256, TARGET_FILENAME
+        )
         _, target_identity = _read_regular_identity(directory, TARGET_FILENAME)
         if target_identity[2] != RELEASE_SHA256:
             return 1
