@@ -359,12 +359,17 @@ class DistributionContractTest(unittest.TestCase):
 
         readme = (ROOT / "README.md").read_text(encoding="utf-8").casefold()
         match = re.search(
-            r"### 7\.4 sol xhigh\n(?P<body>.*?)(?=\n### 7\.5)",
+            r"^### 7\.4 sol xhigh[ \t]*$\n(?P<body>.*?)(?=^### |\Z)",
             readme,
-            flags=re.DOTALL,
+            flags=re.DOTALL | re.MULTILINE,
         )
         self.assertIsNotNone(match, "README section 7.4 must remain published")
-        sol_xhigh_contract = match.group("body")
+        sol_xhigh_contract = match.group("body").strip()
+        clauses = tuple(
+            clause.strip()
+            for clause in re.split(r"[\n。；：]+", sol_xhigh_contract)
+            if clause.strip()
+        )
 
         self.assertIn(
             "不得自动启动或承担普通、常驻 construction",
@@ -384,6 +389,45 @@ class DistributionContractTest(unittest.TestCase):
             sol_xhigh_contract,
         )
         self.assertNotIn("不得自动启动、施工", sol_xhigh_contract)
+
+        positive_construction_authorization = re.compile(
+            r"(?:构成施工例外|(?:也)?可(?:以)?(?:承担|执行|负责)?|"
+            r"允许|授权|获准|有权|负责|承担|"
+            r"\b(?:may|can|allowed to|authorized to|responsible for)\b)"
+        )
+        construction_authorizations = tuple(
+            clause
+            for clause in clauses
+            if re.search(r"(?:construction|施工)", clause)
+            and positive_construction_authorization.search(clause)
+            and not re.search(r"(?:不得|禁止|不允许|不可|不能|无权)", clause)
+        )
+        self.assertEqual(
+            1,
+            len(construction_authorizations),
+            "section 7.4 must not grant a second construction exception",
+        )
+        sole_construction_exception = construction_authorizations[0]
+        self.assertTrue(
+            sole_construction_exception.startswith("只有"),
+            "the terminal repair must remain the only construction exception",
+        )
+        self.assertIn("上述 terminal repair", sole_construction_exception)
+        self.assertIn("构成施工例外", sole_construction_exception)
+
+        ordinary_construction_clauses = tuple(
+            clause
+            for clause in clauses
+            if re.search(r"(?:普通|常驻)", clause)
+            and re.search(r"(?:construction|施工)", clause)
+        )
+        for clause in ordinary_construction_clauses:
+            with self.subTest(ordinary_construction_clause=clause):
+                self.assertRegex(
+                    clause,
+                    r"(?:不得|禁止|不允许|不可|不能|无权)",
+                    "ordinary Sol-xhigh construction must remain prohibited",
+                )
 
     def test_plugin_verifier_rejects_a_tampered_mirrored_runtime_copy(self):
         """A copied release must fail verification when one mirror is changed."""
