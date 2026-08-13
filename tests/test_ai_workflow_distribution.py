@@ -419,6 +419,14 @@ class DistributionContractTest(unittest.TestCase):
             self.assertIn("sol_medium_reviewer", role_names)
             self.assertIn("sol_xhigh_planner", role_names)
 
+    def test_orchestration_metadata_has_no_legacy_agent_identifier(self):
+        """Skill metadata must never publish the legacy custom-Agent name."""
+
+        metadata = (PLUGIN / "skills" / "orchestration" / "agents" / "openai.yaml").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("luna_worker", metadata.casefold())
+
     def test_sol_xhigh_terminal_repair_is_narrow_exception_to_construction_ban(self):
         """Section 7.4 forbids ordinary construction without erasing the terminal repair."""
 
