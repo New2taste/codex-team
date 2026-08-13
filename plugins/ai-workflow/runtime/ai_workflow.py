@@ -11,6 +11,7 @@ import json
 import math
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -20,7 +21,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Protocol, Sequence
+from typing import Literal, Protocol, Sequence
 
 
 if __name__ == "__main__":
@@ -239,6 +240,28 @@ except ImportError:  # direct script execution
         finite_nonnegative_or_none,
         normalize_cost_evidence,
         render_cost_sections,
+    )
+
+
+try:
+    from .ai_workflow_team_call import (
+        L0_FIXED_ARGV,
+        TeamCallError,
+        TeamCallReceipt,
+        TeamCallRegistry,
+        TeamCallRoute,
+        classify_team_call,
+        parse_team_call,
+    )
+except ImportError:  # direct script execution
+    from ai_workflow_team_call import (
+        L0_FIXED_ARGV,
+        TeamCallError,
+        TeamCallReceipt,
+        TeamCallRegistry,
+        TeamCallRoute,
+        classify_team_call,
+        parse_team_call,
     )
 
 
@@ -2445,6 +2468,587 @@ class FakeRunner:
         return result
 
 
+class TeamCallController(Protocol):
+    """The bounded process/model boundary for a parsed Team Call."""
+
+    def run_l0(self, argv: tuple[str, ...], cwd: Path) -> object:
+        """Run one fixed L0 command in the already-validated repository."""
+
+    def run_l1(self, task: Mapping[str, object], *, role: Literal["luna"]) -> Mapping[str, object]:
+        """Run exactly the pinned Luna contract for one read-only L1 task."""
+
+
+class TeamCallFakeController:
+    """A deterministic Team Call controller that never starts a model."""
+
+    is_live_model = False
+
+    def run_l0(self, argv: tuple[str, ...], cwd: Path) -> subprocess.CompletedProcess[str]:
+        if argv not in set(L0_FIXED_ARGV.values()):
+            _fail("TEAM_CALL_L0_INVALID", "L0 argv is not allowlisted")
+        return subprocess.CompletedProcess(argv, 0, stdout="fake fixed L0 result\n", stderr="")
+
+    def run_l1(self, task: Mapping[str, object], *, role: Literal["luna"]) -> Mapping[str, object]:
+        if role != "luna":
+            _fail("TEAM_CALL_ROLE_INVALID", "Team Call L1 is limited to luna")
+        if not isinstance(task, _PinnedTeamCallTask):
+            _fail("TEAM_CALL_EVIDENCE_UNPINNED", "Team Call L1 requires pinned evidence")
+        evidence_digest = hashlib.sha256(task.pinned_evidence_bytes).hexdigest()
+        result = FakeRunner().run(role, dict(task))
+        result["evidence"][0]["observation"] = f"Pinned evidence SHA-256: {evidence_digest}."
+        return result
+
+
+class TeamCallProductionController:
+    """Production Team Call boundary for fixed L0 and explicitly authorized Luna L1."""
+
+    is_live_model = True
+
+    def __init__(
+        self,
+        state_root: Path,
+        *,
+        allow_live_model: bool = False,
+        runtime_sessions_dir: Path | None = None,
+    ):
+        self.state_root = Path(state_root)
+        self.allow_live_model = allow_live_model
+        self.runtime_sessions_dir = runtime_sessions_dir
+
+    def run_l0(self, argv: tuple[str, ...], cwd: Path) -> subprocess.CompletedProcess[str]:
+        if argv not in set(L0_FIXED_ARGV.values()):
+            _fail("TEAM_CALL_L0_INVALID", "L0 argv is not allowlisted")
+        return subprocess.run(
+            argv,
+            check=False,
+            capture_output=True,
+            text=True,
+            shell=False,
+            cwd=Path(cwd),
+        )
+
+    def run_l1(self, task: Mapping[str, object], *, role: Literal["luna"]) -> Mapping[str, object]:
+        if role != "luna":
+            _fail("TEAM_CALL_ROLE_INVALID", "Team Call L1 is limited to luna")
+        if not self.allow_live_model:
+            _fail("LIVE_MODEL_NOT_AUTHORIZED", "--allow-live-model is required for the live runner")
+        task_document = dict(task)
+        validate_task(task_document)
+        task_dir = WorkflowStore(self.state_root)._require_task(str(task_document["task_id"]))
+        stored_task = load_task(task_dir / "task.json")
+        if stored_task != task_document:
+            _fail("TASK_STORE_MISMATCH", "Team Call task input does not match the stored task")
+        repository = Path(task_document["repository_root"])
+        paths = RunPaths(
+            repo=repository,
+            output_path=task_dir / "luna-result.json",
+            schema_path=repository / "config" / "ai_workflow_result.schema.json",
+            logs_dir=task_dir / "logs",
+            state_root=self.state_root,
+            runtime_evidence_required=True,
+            runtime_sessions_dir=self.runtime_sessions_dir,
+        )
+        contract = {
+            "acceptance_commands": task_document["acceptance_commands"],
+            "verification_level": task_document["verification_level"],
+        }
+        return run_codex(
+            "luna",
+            task_document,
+            build_role_prompt("luna", task_document, contract, _authoritative_evidence_paths(task_document)),
+            paths,
+        )
+
+
+def _team_call_error_as_workflow(error: TeamCallError) -> WorkflowError:
+    """Preserve the pure Team Call code and message at the controller boundary."""
+
+    return WorkflowError(error.code, error.message)
+
+
+def _resolve_team_call_repository(repository_root: Path) -> Path:
+    """Resolve one direct-call repository root and require its Git worktree."""
+
+    try:
+        repository = Path(repository_root).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise WorkflowError("REPOSITORY_NOT_FOUND", "repository_root does not exist") from exc
+    if not repository.is_dir():
+        _fail("REPOSITORY_NOT_FOUND", "repository_root does not exist")
+    try:
+        inside_work_tree = git(repository, "rev-parse", "--is-inside-work-tree")
+        top_level = Path(git(repository, "rev-parse", "--show-toplevel")).resolve(strict=True)
+    except WorkflowError as exc:
+        if exc.code == "GIT_COMMAND_FAILED":
+            raise WorkflowError(
+                "REPOSITORY_NOT_GIT_WORKTREE", "repository_root must be a Git worktree"
+            ) from exc
+        raise
+    except (OSError, RuntimeError) as exc:
+        raise WorkflowError(
+            "REPOSITORY_NOT_GIT_WORKTREE", "repository_root must be a Git worktree"
+        ) from exc
+    if inside_work_tree != "true" or top_level != repository:
+        _fail("REPOSITORY_NOT_GIT_WORKTREE", "repository_root must be a Git worktree")
+    return repository
+
+
+@dataclass(frozen=True)
+class _TeamCallFileIdentity:
+    device: int
+    inode: int
+    mode: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+
+
+@dataclass(frozen=True)
+class _TeamCallEvidencePin:
+    evidence_path: str
+    components: tuple[tuple[str, _TeamCallFileIdentity], ...]
+    evidence_bytes: bytes
+
+
+class _PinnedTeamCallTask(Mapping[str, object]):
+    """The stored task identity plus evidence bytes pinned during no-follow traversal."""
+
+    __slots__ = ("_task", "pinned_evidence_bytes")
+
+    def __init__(self, task: dict[str, object], pinned_evidence_bytes: bytes):
+        self._task = task
+        self.pinned_evidence_bytes = pinned_evidence_bytes
+
+    def __getitem__(self, key: str) -> object:
+        return self._task[key]
+
+    def __iter__(self):
+        return iter(self._task)
+
+    def __len__(self) -> int:
+        return len(self._task)
+
+    def __setitem__(self, key: str, value: object) -> None:
+        self._task[key] = value
+
+
+def _team_call_file_identity(value: os.stat_result) -> _TeamCallFileIdentity:
+    return _TeamCallFileIdentity(
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _team_call_l1_evidence(repository: Path, evidence_path: str) -> _TeamCallEvidencePin:
+    """Pin every evidence component with component-wise no-follow identities."""
+
+    components = Path(evidence_path).parts
+    if not components or any(part in {"", ".", ".."} for part in components):
+        _fail("TEAM_CALL_EVIDENCE_UNSAFE", "Team Call evidence path is invalid")
+    root_fd: int | None = None
+    current_fd: int | None = None
+    identities: list[tuple[str, _TeamCallFileIdentity]] = []
+    evidence_bytes = b""
+    try:
+        root_fd = os.open(repository, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        current_fd = root_fd
+        identities.append((".", _team_call_file_identity(os.fstat(current_fd))))
+        for index, component in enumerate(components):
+            before = os.lstat(component, dir_fd=current_fd)
+            if stat.S_ISLNK(before.st_mode):
+                _fail("TEAM_CALL_EVIDENCE_UNSAFE", "Team Call evidence must not contain a symlink")
+            final_component = index == len(components) - 1
+            if final_component:
+                if not stat.S_ISREG(before.st_mode):
+                    _fail("TEAM_CALL_EVIDENCE_UNSAFE", "Team Call evidence must be a regular file")
+                flags = os.O_RDONLY | os.O_NOFOLLOW
+            else:
+                if not stat.S_ISDIR(before.st_mode):
+                    _fail("TEAM_CALL_EVIDENCE_UNSAFE", "Team Call evidence parent must be a directory")
+                flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            next_fd = os.open(component, flags, dir_fd=current_fd)
+            after = os.fstat(next_fd)
+            if _team_call_file_identity(before) != _team_call_file_identity(after):
+                os.close(next_fd)
+                _fail("TEAM_CALL_EVIDENCE_UNSAFE", "Team Call evidence changed while being validated")
+            if final_component:
+                chunks: list[bytes] = []
+                while True:
+                    chunk = os.read(next_fd, 1024 * 1024)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                if _team_call_file_identity(os.fstat(next_fd)) != _team_call_file_identity(after):
+                    os.close(next_fd)
+                    _fail("TEAM_CALL_EVIDENCE_UNSAFE", "Team Call evidence changed while being read")
+                evidence_bytes = b"".join(chunks)
+            identities.append((component, _team_call_file_identity(after)))
+            if current_fd != root_fd:
+                os.close(current_fd)
+            current_fd = next_fd
+        return _TeamCallEvidencePin(evidence_path, tuple(identities), evidence_bytes)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise WorkflowError(
+            "TEAM_CALL_EVIDENCE_UNSAFE",
+            "Team Call evidence must be a regular file beneath repository_root",
+        ) from exc
+    finally:
+        if current_fd is not None and current_fd != root_fd:
+            os.close(current_fd)
+        if root_fd is not None:
+            os.close(root_fd)
+
+
+def _revalidate_team_call_l1_evidence(
+    repository: Path, evidence_pin: _TeamCallEvidencePin
+) -> _TeamCallEvidencePin:
+    """Require the same no-follow component identities immediately before L1 launch."""
+
+    current = _team_call_l1_evidence(repository, evidence_pin.evidence_path)
+    if (
+        current.components != evidence_pin.components
+        or current.evidence_bytes != evidence_pin.evidence_bytes
+    ):
+        _fail("TEAM_CALL_EVIDENCE_UNSAFE", "Team Call evidence changed before controller invocation")
+    return current
+
+
+def _team_call_regular_digest(file_descriptor: int) -> str:
+    digest = hashlib.sha256()
+    while True:
+        block = os.read(file_descriptor, 1024 * 1024)
+        if not block:
+            return digest.hexdigest()
+        digest.update(block)
+
+
+def _team_call_filesystem_snapshot(
+    repository: Path, *, exclude_git_directory: bool = True
+) -> tuple[tuple[object, ...], ...]:
+    """Snapshot a tree with no-follow metadata and regular-file content."""
+
+    root_fd: int | None = None
+    entries: list[tuple[object, ...]] = []
+
+    def walk(directory_fd: int, relative: str) -> None:
+        directory_identity = _team_call_file_identity(os.fstat(directory_fd))
+        entries.append((relative, directory_identity, None))
+        for name in sorted(os.listdir(directory_fd)):
+            item_relative = name if relative == "." else f"{relative}/{name}"
+            before = os.lstat(name, dir_fd=directory_fd)
+            if (
+                exclude_git_directory
+                and relative == "."
+                and name == ".git"
+                and stat.S_ISDIR(before.st_mode)
+            ):
+                continue
+            identity = _team_call_file_identity(before)
+            if stat.S_ISDIR(before.st_mode):
+                child_fd = os.open(
+                    name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory_fd
+                )
+                try:
+                    if _team_call_file_identity(os.fstat(child_fd)) != identity:
+                        _fail("READ_ONLY_FILESYSTEM_SNAPSHOT_INVALID", "filesystem changed during snapshot")
+                    walk(child_fd, item_relative)
+                finally:
+                    os.close(child_fd)
+                continue
+            if stat.S_ISREG(before.st_mode):
+                child_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+                try:
+                    if _team_call_file_identity(os.fstat(child_fd)) != identity:
+                        _fail("READ_ONLY_FILESYSTEM_SNAPSHOT_INVALID", "filesystem changed during snapshot")
+                    digest = _team_call_regular_digest(child_fd)
+                    if _team_call_file_identity(os.fstat(child_fd)) != identity:
+                        _fail("READ_ONLY_FILESYSTEM_SNAPSHOT_INVALID", "filesystem changed during snapshot")
+                finally:
+                    os.close(child_fd)
+                entries.append((item_relative, identity, digest))
+                continue
+            entries.append((item_relative, identity, None))
+
+    try:
+        root_fd = os.open(repository, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        walk(root_fd, ".")
+        return tuple(entries)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise WorkflowError(
+            "READ_ONLY_FILESYSTEM_SNAPSHOT_INVALID", "cannot safely snapshot repository files"
+        ) from exc
+    finally:
+        if root_fd is not None:
+            os.close(root_fd)
+
+
+def _team_call_git_control_snapshot(repository: Path) -> tuple[tuple[str, object], ...]:
+    """Snapshot the per-worktree and common Git control directories."""
+
+    control_paths: set[Path] = set()
+    for argument in ("--absolute-git-dir", "--git-common-dir"):
+        raw_path = Path(git(repository, "rev-parse", argument))
+        control_path = raw_path if raw_path.is_absolute() else repository / raw_path
+        try:
+            control_paths.add(control_path.resolve(strict=True))
+        except (OSError, RuntimeError) as exc:
+            raise WorkflowError(
+                "READ_ONLY_FILESYSTEM_SNAPSHOT_INVALID",
+                "cannot resolve Git control directory",
+            ) from exc
+    return tuple(
+        (str(path), _team_call_filesystem_snapshot(path, exclude_git_directory=False))
+        for path in sorted(control_paths, key=str)
+    )
+
+
+def _next_team_call_task_id(store: WorkflowStore) -> str:
+    """Allocate the next daily task ID while the Team Call registry lock is held."""
+
+    day = datetime.now(timezone.utc).strftime("%Y%m%d")
+    prefix = f"AWF-{day}-"
+    suffixes: list[int] = []
+    try:
+        task_directories = tuple(store.root.glob(f"{prefix}*")) if store.root.is_dir() else ()
+    except OSError as exc:
+        raise WorkflowError("TASK_ID_ALLOCATION_FAILED", "cannot scan Team Call task directories") from exc
+    for task_directory in task_directories:
+        if not task_directory.is_dir():
+            continue
+        suffix = task_directory.name.removeprefix(prefix)
+        if suffix.isdigit() and len(suffix) >= 3:
+            suffixes.append(int(suffix))
+    return f"{prefix}{(max(suffixes, default=0) + 1):03d}"
+
+
+def _team_call_l1_task(
+    *, task_id: str, repository: Path, objective: str, evidence_path: str
+) -> dict[str, object]:
+    """Build the complete, read-only Luna task envelope for one file evidence request."""
+
+    task = {
+        "schema_version": "ai-task-1",
+        "task_id": task_id,
+        "task_type": "PLAN",
+        "objective": f"Team Call read-only evidence review: {objective}",
+        "repository_root": str(repository),
+        "source_worktree": None,
+        "base_commit": None,
+        "candidate_commit": None,
+        "authoritative_files": [evidence_path],
+        "allowed_write_paths": [],
+        "forbidden_actions": ["merge", "push", "change_constitution"],
+        "risk_flags": [],
+        "acceptance_commands": [],
+        "verification_level": "L1",
+        "human_gates": ["PLAN_APPROVAL"],
+    }
+    validate_task(task)
+    return task
+
+
+def _team_call_result_digest(
+    state_root: Path, receipt: TeamCallReceipt, metadata: Mapping[str, object]
+) -> str:
+    """Persist receipt-addressed output metadata and return its canonical digest."""
+
+    result = {
+        "schema_version": "team-call-result-1",
+        "call_id": receipt.call_id,
+        **dict(metadata),
+    }
+    canonical = _canonical_json(result)
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    write_json_once(
+        Path(state_root) / "team-call-results" / f"{receipt.call_id}.json",
+        result,
+        conflict_code="TEAM_CALL_RESULT_EXISTS",
+    )
+    return digest
+
+
+def _team_call_l0_metadata(
+    completed: object, argv: tuple[str, ...], repository: Path
+) -> dict[str, object]:
+    """Accept only a completed fixed L0 process and retain its bounded output."""
+
+    returncode = getattr(completed, "returncode", None)
+    if not isinstance(returncode, int) or isinstance(returncode, bool):
+        _fail("TEAM_CALL_L0_INVALID_OUTPUT", "fixed L0 command returned no integer exit status")
+    if returncode != 0:
+        _fail("TEAM_CALL_L0_FAILED", "fixed L0 command failed")
+
+    def output(name: str) -> str | None:
+        value = getattr(completed, name, None)
+        if value is None or isinstance(value, str):
+            return value
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+        _fail("TEAM_CALL_L0_INVALID_OUTPUT", f"fixed L0 {name} is invalid")
+        raise AssertionError("unreachable")
+
+    return {
+        "kind": "L0",
+        "argv": list(argv),
+        "cwd": str(repository),
+        "returncode": returncode,
+        "stdout": output("stdout"),
+        "stderr": output("stderr"),
+    }
+
+
+def _validate_team_call_l1_task(
+    task: Mapping[str, object], expected: Mapping[str, object]
+) -> None:
+    """Keep injected controllers from widening an immutable read-only handoff."""
+
+    if task.get("allowed_write_paths") != []:
+        _fail("TEAM_CALL_WRITE_SCOPE_INVALID", "Team Call L1 allowed_write_paths must stay empty")
+    actual_identity = {key: value for key, value in task.items() if key != "allowed_write_paths"}
+    expected_identity = {key: value for key, value in expected.items() if key != "allowed_write_paths"}
+    if _canonical_json(actual_identity) != _canonical_json(expected_identity):
+        _fail("TEAM_CALL_TASK_MUTATED", "Team Call L1 task changed after it was persisted")
+
+
+def _require_trusted_team_call_controller(controller: object) -> TeamCallController:
+    """Admit only the two closed controller implementations at the direct boundary."""
+
+    if type(controller) not in {TeamCallFakeController, TeamCallProductionController}:
+        _fail(
+            "TEAM_CALL_CONTROLLER_UNTRUSTED",
+            "Team Call controller must hold the trusted controller capability",
+        )
+    if not callable(getattr(controller, "run_l0", None)) or not callable(getattr(controller, "run_l1", None)):
+        _fail("TEAM_CALL_CONTROLLER_UNTRUSTED", "Team Call controller is incomplete")
+    return controller  # type: ignore[return-value]
+
+
+def run_team_call(
+    message: str,
+    *,
+    repository_root: Path,
+    state_root: Path,
+    controller: TeamCallController,
+) -> TeamCallReceipt:
+    """Run one parsed Team Call exactly once through the append-only registry."""
+
+    trusted_controller = _require_trusted_team_call_controller(controller)
+
+    try:
+        call = parse_team_call(message)
+        if call is None:
+            _fail("TEAM_CALL_INVALID", "message must start with a team call directive")
+        intent = classify_team_call(call)
+    except TeamCallError as exc:
+        raise _team_call_error_as_workflow(exc) from exc
+
+    if intent.disposition == "DIRECT_L1" and isinstance(
+        trusted_controller, TeamCallProductionController
+    ):
+        _fail(
+            "LIVE_TEAM_CALL_L1_NOT_AUTHORIZED",
+            "direct live L1 requires an explicit planned task",
+        )
+
+    repository: Path | None = None
+    if intent.disposition in {"DIRECT_L0", "DIRECT_L1"}:
+        repository = _resolve_team_call_repository(repository_root)
+    registry = TeamCallRegistry(Path(state_root))
+
+    def execute(receipt: TeamCallReceipt) -> TeamCallRoute:
+        if intent.disposition == "PLAN_REQUIRED":
+            return TeamCallRoute(task_id=None, result_sha256=None)
+        if intent.disposition == "DIRECT_L0":
+            if repository is None or intent.l0_action is None:
+                _fail("TEAM_CALL_L0_INVALID", "parsed L0 action is incomplete")
+            argv = L0_FIXED_ARGV.get(intent.l0_action)
+            if argv is None:
+                _fail("TEAM_CALL_L0_INVALID", "parsed L0 action is not allowlisted")
+            completed = trusted_controller.run_l0(argv, repository)
+            digest = _team_call_result_digest(
+                Path(state_root), receipt, _team_call_l0_metadata(completed, argv, repository)
+            )
+            return TeamCallRoute(task_id=None, result_sha256=digest)
+        if intent.disposition == "DIRECT_L1":
+            if repository is None or intent.evidence_path is None:
+                _fail("TEAM_CALL_EVIDENCE_UNSAFE", "parsed L1 evidence is incomplete")
+            evidence_pin = _team_call_l1_evidence(repository, intent.evidence_path)
+            _reject_dirty_input(
+                repository,
+                "DIRTY_READ_ONLY_REPOSITORY",
+                "Team Call L1 requires a clean repository",
+            )
+            store = WorkflowStore(Path(state_root))
+            task = _team_call_l1_task(
+                task_id=_next_team_call_task_id(store),
+                repository=repository,
+                objective=call.objective,
+                evidence_path=intent.evidence_path,
+            )
+            stored_path = store.create_task(task)
+            if load_task(stored_path) != task:
+                _fail("TASK_STORE_MISMATCH", "Team Call task was not persisted exactly")
+            expected_task = dict(task)
+            repository_before = capture_repo(repository)
+            repository_files_before = _team_call_filesystem_snapshot(repository)
+            git_control_before = _team_call_git_control_snapshot(repository)
+            invocation_pin = _revalidate_team_call_l1_evidence(repository, evidence_pin)
+            pinned_task = _PinnedTeamCallTask(task, invocation_pin.evidence_bytes)
+            result = trusted_controller.run_l1(pinned_task, role="luna")
+            _validate_team_call_l1_task(task, expected_task)
+            repository_files_after = _team_call_filesystem_snapshot(repository)
+            git_control_after = _team_call_git_control_snapshot(repository)
+            if repository_files_after != repository_files_before:
+                repository_after = capture_repo(repository)
+                if repository_after != repository_before:
+                    _fail(
+                        "TEAM_CALL_REPOSITORY_CHANGED",
+                        "Team Call L1 changed repository HEAD or status",
+                    )
+                _fail(
+                    "READ_ONLY_FILESYSTEM_CHANGED",
+                    "Team Call L1 changed repository filesystem state",
+                )
+            if git_control_after != git_control_before:
+                _fail(
+                    "READ_ONLY_FILESYSTEM_CHANGED",
+                    "Team Call L1 changed repository filesystem state",
+                )
+            repository_after = capture_repo(repository)
+            if repository_after != repository_before:
+                _fail(
+                    "TEAM_CALL_REPOSITORY_CHANGED",
+                    "Team Call L1 changed repository HEAD or status",
+                )
+            if isinstance(result, Mapping) and isinstance(result.get("changed_files"), list) and result["changed_files"]:
+                _fail("READ_ONLY_ROLE_MODIFIED_REPO", "read-only role luna claimed repository changes")
+            actual_changes = working_tree_paths(repository)
+            validate_role_result("luna", result, actual_changes)
+            validate_verification_package("luna", task, result)
+            digest = _team_call_result_digest(
+                Path(state_root),
+                receipt,
+                {
+                    "kind": "L1",
+                    "task_id": task["task_id"],
+                    "role": "luna",
+                    "result": dict(result),
+                },
+            )
+            return TeamCallRoute(task_id=str(task["task_id"]), result_sha256=digest)
+        _fail("TEAM_CALL_INVALID", "parsed Team Call disposition is unsupported")
+        raise AssertionError("unreachable")
+
+    try:
+        return registry.execute_once(call, intent, execute)
+    except TeamCallError as exc:
+        raise _team_call_error_as_workflow(exc) from exc
+
+
 class CodexConstructionRunner:
     """Live construction runner whose prompt is derived only from a frozen context."""
 
@@ -3734,6 +4338,19 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("task_path", nargs="?", type=Path)
     validate.add_argument("--task", dest="task_option", type=Path)
 
+    team_call = sub.add_parser("team-call")
+    team_call.add_argument("message")
+    team_call.add_argument("--root", type=Path, default=Path("data/state/ai-workflow"))
+    team_call.add_argument("--repository-root", type=Path, required=True)
+    team_call.add_argument("--runner", choices=("fake", "live"), default="fake")
+    team_call.add_argument("--allow-live-model", action="store_true")
+    team_call.add_argument(
+        "--runtime-sessions-dir",
+        type=Path,
+        metavar="ABSOLUTE_DIR",
+        help="required for explicitly authorized live Team Call execution",
+    )
+
     run = sub.add_parser("run")
     run.add_argument("task_path", nargs="?", type=Path)
     run.add_argument("--task", dest="task_option", type=Path)
@@ -3847,6 +4464,46 @@ def _run_live_luna(task: dict[str, object], args: argparse.Namespace) -> dict:
 def _run_command(args: argparse.Namespace) -> int:
     if args.command in {"resume", "abort"}:
         raise WorkflowError("NOT_IMPLEMENTED_IN_CURRENT_STAGE", f"{args.command} is not implemented")
+    if args.command == "team-call":
+        if args.runner == "live":
+            if not args.allow_live_model:
+                _fail("LIVE_MODEL_NOT_AUTHORIZED", "--allow-live-model is required for the live runner")
+            try:
+                call = parse_team_call(args.message)
+                if call is None:
+                    _fail("TEAM_CALL_INVALID", "message must start with a team call directive")
+                intent = classify_team_call(call)
+            except TeamCallError as exc:
+                raise _team_call_error_as_workflow(exc) from exc
+            if intent.disposition == "DIRECT_L1":
+                _fail(
+                    "LIVE_TEAM_CALL_L1_NOT_AUTHORIZED",
+                    "direct live L1 requires an explicit planned task",
+                )
+            controller: TeamCallController = TeamCallProductionController(
+                args.root,
+                allow_live_model=True,
+                runtime_sessions_dir=args.runtime_sessions_dir,
+            )
+        else:
+            controller = TeamCallFakeController()
+        receipt = run_team_call(
+            args.message,
+            repository_root=args.repository_root,
+            state_root=args.root,
+            controller=controller,
+        )
+        print(_canonical_json({
+            "call_id": receipt.call_id,
+            "raw_request_sha256": receipt.raw_request_sha256,
+            "intake_sha256": receipt.intake_sha256,
+            "disposition": receipt.disposition,
+            "risk_reasons": list(receipt.risk_reasons),
+            "task_id": receipt.task_id,
+            "created_at_utc": receipt.created_at_utc,
+            "result_sha256": receipt.result_sha256,
+        }))
+        return 0
     if args.command == "report":
         output_path = Path(args.output)
         report = render_report(aggregate_metrics(args.root))

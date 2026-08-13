@@ -39,7 +39,8 @@ for name in \
     ai_workflow_planning.py \
     ai_workflow_runtime.py \
     ai_workflow_costs.py \
-    ai_workflow_repairs.py
+    ai_workflow_repairs.py \
+    ai_workflow_team_call.py
 do
     cmp -s "$repository_root/scripts/$name" "$plugin_root/runtime/$name" || fail "runtime copy differs"
 done

@@ -294,6 +294,7 @@ class DistributionContractTest(unittest.TestCase):
             "ai_workflow_runtime.py",
             "ai_workflow_costs.py",
             "ai_workflow_repairs.py",
+            "ai_workflow_team_call.py",
         )
         for name in configs:
             self.assertEqual((ROOT / "config" / name).read_bytes(), (PLUGIN / "config" / name).read_bytes())
@@ -301,6 +302,85 @@ class DistributionContractTest(unittest.TestCase):
             self.assertEqual((ROOT / "scripts" / name).read_bytes(), (PLUGIN / "runtime" / name).read_bytes())
         task_schema = json.loads((PLUGIN / "config" / "ai_workflow_task.schema.json").read_text())
         self.assertIn("paired_case_id", task_schema["properties"])
+
+    def test_team_call_runtime_copy_and_published_contract_are_exact(self):
+        """A release must publish the bounded Team Call contract unchanged."""
+
+        self.assertEqual(
+            (ROOT / "scripts" / "ai_workflow_team_call.py").read_bytes(),
+            (PLUGIN / "runtime" / "ai_workflow_team_call.py").read_bytes(),
+        )
+        published = "\n".join(
+            (
+                (ROOT / "README.md").read_text(encoding="utf-8").casefold(),
+                (PLUGIN / "skills" / "orchestration" / "SKILL.md")
+                .read_text(encoding="utf-8")
+                .casefold(),
+            )
+        )
+        for grammar in (
+            "team call <objective>",
+            "team call: <objective>",
+            "team call：<objective>",
+        ):
+            self.assertIn(grammar, published, grammar)
+        for disposition in ("direct_l0", "direct_l1", "plan_required", "blocked"):
+            self.assertIn(disposition, published, disposition)
+        for required_boundary in (
+            "single active worker",
+            "l0 controller/no model",
+            "l1 luna read-only",
+            "plan fallback",
+            "l0/l1/l2",
+            "human owner gates",
+            "不自动合并",
+            "不自动推送",
+        ):
+            self.assertIn(required_boundary, published, required_boundary)
+        self.assertIn(
+            "luna must never review, approve, or perform final acceptance",
+            published,
+        )
+        self.assertIn("不承诺并行 agents", published)
+
+    def test_plugin_verifier_rejects_tampered_team_call_runtime_copy(self):
+        """Changing only the copied Team Call module invalidates a release."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            release_root = Path(temporary) / "release"
+            shutil.copytree(ROOT / ".codex", release_root / ".codex")
+            shutil.copytree(ROOT / "config", release_root / "config")
+            shutil.copytree(ROOT / "scripts", release_root / "scripts")
+            shutil.copytree(PLUGIN, release_root / "plugins" / "ai-workflow")
+            verifier = release_root / "plugins" / "ai-workflow" / "scripts" / "verify.sh"
+            clean = subprocess.run(
+                ["sh", str(verifier)],
+                cwd=release_root,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(0, clean.returncode, clean.stderr)
+            tampered = (
+                release_root
+                / "plugins"
+                / "ai-workflow"
+                / "runtime"
+                / "ai_workflow_team_call.py"
+            )
+            tampered.write_text(
+                tampered.read_text(encoding="utf-8") + "\n# tampered\n",
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                ["sh", str(verifier)],
+                cwd=release_root,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("runtime copy differs", result.stderr)
 
     def test_published_role_and_lifecycle_language_has_no_legacy_allocation(self):
         """The distributed docs expose the frozen role/lifecycle contract."""

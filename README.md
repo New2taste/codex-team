@@ -68,6 +68,32 @@
 
 编排器不使用模型解释路由规则。它只读取任务类型、风险标记和闭集状态，然后执行预先登记的流程。
 
+### Team Call 自然语言入口（受限直达）
+
+Team Call 只接受位于消息开头、大小写不敏感的下列 grammar；`<objective>`
+会压缩空白，但不会把任意自然语言解释为 shell 命令：
+
+```text
+team call <objective>
+team call: <objective>
+team call：<objective>
+```
+
+该入口默认 **single active worker**：全局收据锁尚有未终态请求时，下一次
+调用会被阻断；它不承诺并行 agents，也不创建并行写入 worktree。路由只会得到
+以下 disposition：
+
+| Disposition | 受限行为 | 角色与边界 |
+|---|---|---|
+| `DIRECT_L0` | 仅精确 allowlist 中的只读目标可直达。 | **L0 controller/no model**：控制器执行固定 argv，不调用模型。 |
+| `DIRECT_L1` | 仅 `核对文件 <repo-relative-path>` 可直达，并且路径必须安全、仓库相对。 | **L1 Luna read-only**：Luna 只读抽取固定证据，仍交付既有 L0/L1/L2 最小证据，不获得写权限。 |
+| `PLAN_REQUIRED` | 任何其他安全目标都停止直达路径。 | **plan fallback**：回到既有、需要 human owner gates 的规划和任务信封流程；不自动启动 Sol xhigh。 |
+| `BLOCKED` | 输入无效、已有 active receipt、缺失授权或执行失败。 | 保留阻断收据，不产生模型、任务、合并或推送承诺。 |
+
+Team Call 不授予 Luna review、approval 或 final acceptance 权限，也不改变现有
+L0/L1/owner-gate 语言与角色边界；它不自动合并、不自动推送，且不替代人工批准或
+最终整体验收。
+
 ## 5. 三条主流程
 
 ### 5.1 方案规划

@@ -47,6 +47,34 @@ Agent; the workflow role remains `luna`.
 - **Terra medium** and **Sol high** have no default role. They must not be
   silently introduced as substitutes.
 
+## Team Call natural-language contract
+
+Accept only a leading, case-insensitive directive in one of these approved
+forms. `<objective>` whitespace is normalized; it is never interpreted as a
+shell command:
+
+```text
+team call <objective>
+team call: <objective>
+team call：<objective>
+```
+
+The default is **single active worker**. A non-terminal receipt blocks another
+call, so this contract does not promise parallel agents or parallel worktree
+writes.
+
+| Disposition | Allowed route | Boundary |
+|---|---|---|
+| `DIRECT_L0` | Exact fixed L0 allowlist only. | **L0 controller/no model**: the controller runs the registered argv and starts no model. |
+| `DIRECT_L1` | Exact `核对文件 <repo-relative-path>` evidence request only. | **L1 Luna read-only**: Luna may extract the pinned evidence only; the existing L0/L1/L2 evidence contract still applies. |
+| `PLAN_REQUIRED` | Any other safe objective. | **plan fallback** to the existing frozen-envelope workflow with human owner gates; do not automatically invoke Sol xhigh. |
+| `BLOCKED` | Invalid input, an active receipt, missing authority, or failed execution. | Write a blocking receipt; do not promise a model run, task, merge, or push. |
+
+Team Call neither grants Luna review, approval, or final-acceptance authority
+nor weakens the existing L0/L1/owner-gate contract. It does not auto-merge or
+auto-push, and it never replaces human approval or final whole-project
+acceptance.
+
 ## Luna distribution envelope
 
 For a Luna-owned distribution task, the writable envelope is limited to the
@@ -64,6 +92,7 @@ scripts/ai_workflow_planning.py  -> plugins/ai-workflow/runtime/ai_workflow_plan
 scripts/ai_workflow_repairs.py   -> plugins/ai-workflow/runtime/ai_workflow_repairs.py
 scripts/ai_workflow_routing.py   -> plugins/ai-workflow/runtime/ai_workflow_routing.py
 scripts/ai_workflow_runtime.py   -> plugins/ai-workflow/runtime/ai_workflow_runtime.py
+scripts/ai_workflow_team_call.py -> plugins/ai-workflow/runtime/ai_workflow_team_call.py
 ```
 
 ### Schema and configuration copies
