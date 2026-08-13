@@ -13,12 +13,14 @@ automatic_push = false
 mode = "enforced"
 role_policy = "terra_os"
 
-[repair]
-terra_max_rounds = 2
-round_1_fixer = "terra"
-round_2_fixer = "terra"
-post_terra_fixer = "original_sol_medium_reviewer"
-post_terra_reviewer = "distinct_sol_medium_peer"
+[final_acceptance_rework]
+fixer_role = "sol_medium_reviewer"
+fixer_permission_profile = "assignment-scoped-write"
+fixer_distinct_from_acceptor = true
+recheck_role = "sol_medium_reviewer"
+recheck_distinct_from_fixer = true
+terminal_escalation_role = "sol_xhigh"
+terminal_review_required = false
 
 [roles.luna]
 model = "gpt-5.6-luna"

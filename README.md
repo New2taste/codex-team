@@ -14,8 +14,8 @@
 | 角色 | 模型与推理档 | 主要职责 |
 |---|---|---|
 | Luna Max | `gpt-5.6-luna` / `max` | 精确冻结 envelope 内的中初级/机械 coding、取证和分发 |
-| Terra xhigh | `gpt-5.6-terra` / `xhigh` | 复杂施工、调试、集成；每项任务的独立对抗审查 |
-| Sol medium | `gpt-5.6-sol` / `medium` | 最终整体验收；仅第二次 Terra 失败后的 scoped fallback |
+| Terra xhigh | `gpt-5.6-terra` / `xhigh` | 复杂施工、调试和集成；施工者完成冻结信封内的自检 |
+| Sol medium | `gpt-5.6-sol` / `medium` | 一次集中最终验收；失败时优先做有界 Sol-medium 返工与复验 |
 | Sol xhigh | `gpt-5.6-sol` / `xhigh` | owner-authorized 规划与终局升级 |
 
 `Terra medium` 与 `Sol high` 没有默认角色（no default role），不得被隐式替换或注入流程。
@@ -120,31 +120,31 @@ Max；控制器只交付与已存 task 摘要、`luna` 角色、执行面和证�
 ### 5.2 工程验收
 
 ```text
-固定 base/candidate commit
+各工程小节：冻结信封内施工、自检、目标测试、负向检查、范围核对与运行时证据门
+→ section_self_check_only（intermediate engineering sections 不派发独立对抗审查）
+→ 全部小节完成并固定 base/candidate commit
 → 工作树与禁改面检查
 → Luna Max 有界 L2 证据抽取（若信封明确授权）
-→ 目标测试和必要变异
-→ 独立 Terra xhigh adversarial Reviewer
-→ Sol medium 最终整体验收
+→ Sol-medium final acceptance（集中、只读、对抗式）
 → AWAITING_OWNER_DECISION
 ```
 
 ### 5.3 验收后整改
 
 ```text
-已接受的阻断项
-→ 原 owner（Luna Max 或 Terra xhigh，在原 envelope 内）提交初次修复
-→ 人工批准范围
-→ 创建独立 branch/worktree
-→ 初次提交由独立 Terra xhigh adversarial review
-→ 若 REWORK，原 owner 在原 envelope 内第一次返工
-→ 第二次提交由另一独立 Terra xhigh review
-→ 仍失败才可进入 scoped Sol-medium repair + different Sol-medium peer
-→ peer 再失败才由 Sol xhigh 终局升级（无 task-level review）
+Sol-medium final acceptance 的冻结 REWORK findings
+→ 人工批准范围与一次性 assignment-scoped write 授权
+→ different Sol-medium fixer 在原 candidate、允许路径和验证命令内修复
+→ different Sol-medium recheck（与验收者、fixer 均不同身份；只读）
+→ 若仍为 REWORK，才可 owner-authorized Sol-xhigh terminal repair
+→ terminal repair 无 task-level review
 → AWAITING_OWNER_DECISION
 ```
 
-对宪法、PIT、幸存者偏差、公开 schema、append-only、安全、数据污染及跨卡契约类整改，复杂语义由 Terra xhigh 停止并回交；Sol xhigh 只处理 owner-authorized 的规划或终局升级，Sol medium 仍只做最终整体验收或规则允许的 scoped fallback。
+中间工程小节取消独立对抗审查，不等于跳过验证：施工 owner 仍须完成信封内的
+测试、负向检查、范围核对和运行时证据门。对宪法、PIT、幸存者偏差、公开 schema、
+append-only、安全、数据污染及跨卡契约类整改，复杂语义由 Terra xhigh 停止并回交；
+Sol xhigh 只处理 owner-authorized 的规划或终局升级。
 
 ## 6. Luna 最小证据与反证包
 
@@ -156,7 +156,8 @@ Max；控制器只交付与已存 task 摘要、`luna` 角色、执行面和证�
 | L1 | 事实盘点、文档对照、证据抽取 | 最多 5 条关键主张，每条最小证据，最关键结论 1 次交叉检查，列盲区 |
 | L2 | 有界证据抽取、原阻断项负向验证 | 目标测试，1 个有效负向样例或变异，diff 范围核对，盲区 |
 
-L3 不是 Luna 的更高自检档。复杂或高风险语义任务默认转 Terra xhigh；只有 owner-authorized Sol xhigh 规划，或第二次 Terra xhigh 失败后的冻结梯级（scoped Sol-medium fallback + distinct peer）才可改变角色路径。
+L3 不是 Luna 的更高自检档。复杂或高风险语义任务默认转 Terra xhigh；只有
+owner-authorized Sol xhigh 规划，或最终 Sol-medium 验收的冻结返工梯级，才可改变角色路径。
 
 Luna 只能返回：
 
@@ -187,7 +188,7 @@ Luna must never review, approve, or perform final acceptance. 任何需要开放
 
 - 只在独立 worktree 写入，负责 complex construction、调试和集成；
 - 是复杂施工和整改任务的唯一施工所有者；
-- 每个 task 都必须由独立、不同上下文的 Terra xhigh adversarial reviewer 审查；
+- 每个工程小节只执行冻结信封内的自检；不得把自检称为独立验收；
 - 不合并、不推送、不自验；
 - 遇到两种合理规格解释时返回 `NEEDS_CLARIFICATION`；
 - 完成目标测试及至少一个负向检验；
@@ -195,13 +196,19 @@ Luna must never review, approve, or perform final acceptance. 任何需要开放
 
 ### 7.3 Sol medium
 
-Sol medium 只做最终整体验收（final whole-project acceptance），针对固定 base/candidate commit、任务契约、证据包、独立 Terra xhigh adversarial review 和自动门禁结果作语义审查。它不得承担普通 planning 或 construction。
+Sol medium 的 final acceptance 始终只读，针对固定 base/candidate commit、任务契约、
+证据包和自动门禁结果作集中对抗式语义审查。它不得承担普通 planning 或常驻
+construction。
 
-只有第二次 Terra xhigh 施工失败后，规则才允许一次 scoped Sol-medium fallback；fallback 必须由 distinct Sol-medium peer 复核。Sol medium 只能提出建议，不得自动改变人工决策状态。
+若 final acceptance 为 `REWORK`，控制器只能在人工批准后向 different Sol-medium
+fixer 发出一次 assignment-scoped write 授权；其范围限于冻结 findings、candidate、
+允许路径和验证命令。原验收者不得自修。随后 different Sol-medium recheck 必须与
+验收者和 fixer 均为不同 runtime identity，且保持只读；仍为 `REWORK` 才可升级。
+Sol medium 不能自动改变人工决策状态。
 
 ### 7.4 Sol xhigh
 
-Sol xhigh 只接收 owner-authorized 的最小案卷，用于规划（planning），或在 distinct Sol-medium peer 对 scoped fallback 给出 REWORK 后执行 terminal repair；不得自动启动或承担普通、常驻 construction，不得替代 Terra review 或跳过 Sol-medium final acceptance。
+Sol xhigh 只接收 owner-authorized 的最小案卷，用于规划（planning），或在 different Sol-medium recheck 对最终验收返工给出 `REWORK` 后执行 terminal repair；不得自动启动或承担普通、常驻 construction，不得跳过 Sol-medium final acceptance。
 
 只有上述 terminal repair 构成施工例外：它必须是 owner-authorized、assignment-scoped、一次性的 terminal repair。该 terminal repair 无 task-level review；不得据此泛化为普通 Sol-xhigh construction。
 
@@ -210,8 +217,9 @@ Sol xhigh 只接收 owner-authorized 的最小案卷，用于规划（planning�
 这份分配是分发和生命周期的唯一公开契约：
 
 - Luna Max 仅在 exact frozen envelope 内做 bounded mechanical coding、确定性 verification 和 root→Plugin distribution；信封必须列出精确路径、命令、负向检查和交付物。
-- Terra xhigh 负责复杂施工；每个 task 都要有独立 Terra xhigh adversarial review，施工者不得自审。
-- Sol medium 只负责 final whole-project acceptance，或在第二次 Terra xhigh 失败后执行一次有界 scoped fallback 及 distinct peer review。
+- Terra xhigh 负责复杂施工；每个工程小节完成冻结信封内自检后直接推进下一小节。
+- Sol medium 负责 final whole-project acceptance；若为 `REWORK`，另一名 Sol-medium
+  先做一次有界修复，再由第三名 Sol-medium 复验。
 - Sol xhigh 负责 owner-authorized planning 和 terminal escalation；不得自动调用。
 - Terra medium、Sol high 没有默认角色（no default role）。任何调用都必须先获得新的 owner-authorized、闭集信封；不得作为普通流程的隐式角色。
 
@@ -262,23 +270,26 @@ Sol xhigh 只可在 owner-authorized 规划或终局升级案卷中被建议：
 - 污染、PIT 或安全错误可能造成不可逆后果；
 - 重大设计存在多个不可兼容方案。
 
-Sol medium 不负责冻结规格或闭集裁定；只有第二次 Terra xhigh 失败后的冻结梯级才允许一次 scoped Sol-medium fallback + distinct peer。
+Sol medium 不负责普通规划或开放式闭集裁定；它只在集中最终验收为 `REWORK` 后，按
+冻结 findings 接收一次有界 fixer 授权，并由另一名 Sol-medium 复验。
 
 编排器只能进入 `ESCALATION_PROPOSED`，项目所有者批准后才能调用 Sol xhigh。
 
 ## 10. 重试与升级
 
-每项整改最多：
+每个全局工程闭环最多：
 
 ```text
-1 次技术重试（每个 attempt）
-初次提交由独立 Terra xhigh adversarial review；若 REWORK，由原 owner（可为 Luna Max 或 Terra xhigh，必须在原 envelope 内）做第一次返工
-第二次提交由另一独立 Terra xhigh review
-若仍失败，才可一次 scoped Sol-medium repair + different Sol-medium peer
-peer 再失败：一次 Sol-xhigh terminal repair；无 task-level review
+每个 attempt 1 次技术重试
+工程小节完成信封内自检后直接推进；无中间独立对抗审查
+1 次只读 Sol-medium final acceptance
+若 REWORK：1 次 different Sol-medium fixer 的 assignment-scoped repair
+随后：1 次 different Sol-medium recheck
+recheck 再为 REWORK：1 次 owner-authorized Sol-xhigh terminal repair；无 task-level review
 ```
 
-达到上限后强制 `BLOCKED`。
+任何身份、candidate、finding 集、允许路径、验证命令或 receipt 绑定不成立，或达到
+上述终局上限，均强制 `BLOCKED`。
 
 v2 ledger 的终局事件仍是 `TASK_TERMINAL`，并明确
 `whole_project_acceptance_required=PENDING`；Task 5 才执行独立的最终整体验收，本 Task 不新增终局 review phase。

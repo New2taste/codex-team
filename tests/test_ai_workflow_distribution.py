@@ -451,21 +451,20 @@ class DistributionContractTest(unittest.TestCase):
             "1 次同角色实现返工",
             "两轮 terra xhigh owner-repair/review",
             "第一次独立 terra review 后修复，第二次独立 terra review 再验证",
+            "every task needs an independent terra xhigh adversarial review",
+            "第二次 terra xhigh 失败后的冻结梯级",
         ):
             self.assertNotIn(stale_phrase, published, stale_phrase)
 
         for lifecycle_phrase in (
             "复杂或高风险语义任务默认转 terra xhigh",
             "owner-authorized sol xhigh 规划",
-            "初次提交由独立 terra xhigh adversarial review",
-            "若 rework",
-            "luna max 或 terra xhigh",
-            "原 owner 在原 envelope 内第一次返工",
-            "第二次提交由另一独立 terra xhigh review",
-            "仍失败才可",
-            "第二次 terra xhigh 失败后的冻结梯级",
-            "scoped sol-medium repair + different sol-medium peer",
-            "sol-xhigh terminal repair",
+            "section_self_check_only",
+            "intermediate engineering sections",
+            "sol-medium final acceptance",
+            "different sol-medium fixer",
+            "different sol-medium recheck",
+            "owner-authorized sol-xhigh terminal repair",
             "无 task-level review",
         ):
             self.assertIn(lifecycle_phrase, published, lifecycle_phrase)
@@ -476,6 +475,19 @@ class DistributionContractTest(unittest.TestCase):
         )
         for config in (root_policy, plugin_policy):
             self.assertEqual(2, config["policy"]["max_implementation_reworks"])
+            self.assertEqual(
+                {
+                    "fixer_role": "sol_medium_reviewer",
+                    "fixer_permission_profile": "assignment-scoped-write",
+                    "fixer_distinct_from_acceptor": True,
+                    "recheck_role": "sol_medium_reviewer",
+                    "recheck_distinct_from_fixer": True,
+                    "terminal_escalation_role": "sol_xhigh",
+                    "terminal_review_required": False,
+                },
+                config["final_acceptance_rework"],
+            )
+            self.assertNotIn("repair", config)
 
         self.assertNotIn("execution os remains terra-led", published)
         self.assertNotIn("luna is only a low-cost bounded tool process", published)
@@ -498,6 +510,26 @@ class DistributionContractTest(unittest.TestCase):
             self.assertIn("terra_xhigh_reviewer", role_names)
             self.assertIn("sol_medium_reviewer", role_names)
             self.assertIn("sol_xhigh_planner", role_names)
+
+    def test_published_default_defers_adversarial_review_until_final_acceptance(self):
+        """The default has section self-checks and one bounded Sol rework ladder."""
+
+        readme = (ROOT / "README.md").read_text(encoding="utf-8").casefold()
+        skill = (PLUGIN / "skills" / "orchestration" / "SKILL.md").read_text(
+            encoding="utf-8"
+        ).casefold()
+        published = "\n".join((readme, skill))
+        for phrase in (
+            "intermediate engineering sections",
+            "section_self_check_only",
+            "sol-medium final acceptance",
+            "different sol-medium fixer",
+            "different sol-medium recheck",
+            "owner-authorized sol-xhigh terminal repair",
+        ):
+            self.assertIn(phrase, published, phrase)
+        self.assertNotIn("every task needs an independent terra xhigh adversarial review", published)
+        self.assertNotIn("第二次 terra xhigh 失败后的冻结梯级", published)
 
     def test_orchestration_metadata_has_no_legacy_agent_identifier(self):
         """Skill metadata must never publish the legacy custom-Agent name."""
@@ -529,7 +561,7 @@ class DistributionContractTest(unittest.TestCase):
             sol_xhigh_contract,
         )
         self.assertIn(
-            "distinct sol-medium peer 对 scoped fallback 给出 rework 后",
+            "different sol-medium recheck",
             sol_xhigh_contract,
         )
         self.assertIn(
