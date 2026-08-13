@@ -932,6 +932,63 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
         )
         return owner_actor, owner_open_receipt, reviewer_actor, first, reviewer_receipt
 
+    def _issue_sol_medium_repair(self, fixer_thread: str) -> object:
+        owner_actor, _ = self._open_with_owner("terra-owner", "terra_xhigh")
+        _, first, reviewer_one_receipt = self._issue_with_receipt(
+            "REVIEW_1", "terra-review-one", "terra_xhigh_reviewer"
+        )
+        self._review(first, reviewer_one_receipt, "REWORK", self.findings)
+        _, owner_repair, owner_receipt = self._issue_with_receipt(
+            "OWNER_REPAIR",
+            "terra-owner-repair",
+            "terra_xhigh",
+            expected_actor=owner_actor,
+        )
+        owner_candidate = self._commit_file(
+            "src/alpha.py", "TERRA_OWNER_ALPHA = 1\n"
+        )
+        self._complete(
+            owner_repair, owner_receipt, owner_candidate, ("src/alpha.py",)
+        )
+        _, second, reviewer_two_receipt = self._issue_with_receipt(
+            "REVIEW_2", "terra-review-two", "terra_xhigh_reviewer"
+        )
+        self._review(second, reviewer_two_receipt, "REWORK", self.findings)
+        return self._issue(
+            "SOL_MEDIUM_REPAIR",
+            self._expected_actor(
+                "sol-fixed-repair",
+                "sol_medium_reviewer",
+                runtime_instance_id=fixer_thread,
+            ),
+        )
+
+    def _write_controller_runtime(
+        self,
+        sessions: Path,
+        thread_id: str,
+        *,
+        model: str,
+        reasoning_effort: str,
+        sandbox_policy: str,
+        permission_profile: str,
+    ) -> None:
+        sessions.mkdir()
+        (sessions / f"rollout-{thread_id}").write_text(
+            json.dumps(
+                {
+                    "thread_id": thread_id,
+                    "agent_type": None,
+                    "model": model,
+                    "reasoning_effort": reasoning_effort,
+                    "sandbox_policy": sandbox_policy,
+                    "permission_profile": permission_profile,
+                    "cwd": str(self.repository_root),
+                }
+            ),
+            encoding="utf-8",
+        )
+
     # ------------------------------------------------------------------
     # Public API and successful terminal paths
     # ------------------------------------------------------------------
@@ -1438,74 +1495,198 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
         self.assertEqual(["src/alpha.py"], completion["actual_changed_paths"])
 
     def test_controller_fixed_executor_binds_sol_medium_repair_write_contract(self):
-        owner_actor, _ = self._open_with_owner("terra-owner", "terra_xhigh")
-        _, first, reviewer_one_receipt = self._issue_with_receipt(
-            "REVIEW_1", "terra-review-one", "terra_xhigh_reviewer"
-        )
-        self._review(first, reviewer_one_receipt, "REWORK", self.findings)
-        _, owner_repair, owner_receipt = self._issue_with_receipt(
-            "OWNER_REPAIR", "terra-owner-repair", "terra_xhigh", expected_actor=owner_actor
-        )
-        owner_candidate = self._commit_file("src/alpha.py", "TERRA_OWNER_ALPHA = 1\n")
-        self._complete(owner_repair, owner_receipt, owner_candidate, ("src/alpha.py",))
-        _, second, reviewer_two_receipt = self._issue_with_receipt(
-            "REVIEW_2", "terra-review-two", "terra_xhigh_reviewer"
-        )
-        self._review(second, reviewer_two_receipt, "REWORK", self.findings)
         fixer_thread = str(uuid.uuid4())
-        fixer = self._issue(
-            "SOL_MEDIUM_REPAIR",
-            self._expected_actor(
-                "sol-fixed-repair",
-                "sol_medium_reviewer",
-                runtime_instance_id=fixer_thread,
-            ),
-        )
+        fixer = self._issue_sol_medium_repair(fixer_thread)
         sessions = self.repository_root.parent / "sol-medium-sessions"
-        sessions.mkdir()
-        (sessions / f"rollout-{fixer_thread}").write_text(
-            json.dumps(
-                {
-                    "thread_id": fixer_thread,
-                    "agent_type": None,
-                    "model": "gpt-5.6-sol",
-                    "reasoning_effort": "medium",
-                    "sandbox_policy": "workspace-write",
-                    "permission_profile": "assignment-scoped-write",
-                    "cwd": str(self.repository_root),
+        self._write_controller_runtime(
+            sessions,
+            fixer_thread,
+            model="gpt-5.6-sol",
+            reasoning_effort="medium",
+            sandbox_policy="workspace-write",
+            permission_profile="assignment-scoped-write",
+        )
+        peer_thread = str(uuid.uuid4())
+        peer_sessions = self.repository_root.parent / "sol-medium-peer-sessions"
+        self._write_controller_runtime(
+            peer_sessions,
+            peer_thread,
+            model="gpt-5.6-sol",
+            reasoning_effort="medium",
+            sandbox_policy="read-only",
+            permission_profile="read-only",
+        )
+        real_run = subprocess.run
+
+        def controller_process(command, *args, **kwargs):
+            if Path(command[0]).name != "codex":
+                return real_run(command, *args, **kwargs)
+            thread_id = command[-2]
+            output_path = Path(command[command.index("-o") + 1])
+            if thread_id == fixer_thread:
+                (self.repository_root / "src" / "beta.py").write_text(
+                    "SOL_MEDIUM_BETA = 1\n", encoding="utf-8"
+                )
+                real_run(
+                    ["git", "add", "src/beta.py"],
+                    cwd=self.repository_root,
+                    check=True,
+                )
+                real_run(
+                    ["git", "commit", "-q", "-m", "sol medium repair"],
+                    cwd=self.repository_root,
+                    env={
+                        **os.environ,
+                        "GIT_AUTHOR_NAME": "Acceptance Contract Tests",
+                        "GIT_AUTHOR_EMAIL": "acceptance-tests@example.invalid",
+                        "GIT_COMMITTER_NAME": "Acceptance Contract Tests",
+                        "GIT_COMMITTER_EMAIL": "acceptance-tests@example.invalid",
+                    },
+                    check=True,
+                )
+                result = {
+                    "schema_version": "ai-result-1",
+                    "role": "sol_medium_reviewer",
+                    "status": "IMPLEMENTED_CANDIDATE",
+                    "summary": "Repaired the exact review-two finding scope.",
+                    "claims": [],
+                    "evidence": [],
+                    "counter_checks": [],
+                    "changed_files": ["src/beta.py"],
+                    "blind_spots": [],
+                    "unresolved_questions": [],
+                    "recommended_next_state": "PRECHECK_RUNNING",
                 }
-            ),
-            encoding="utf-8",
-        )
-        receipt = repairs._v2_controller_runtime_receipt(
-            self.store, self.TASK_ID, fixer, self.task, sessions
-        )
-        self.assertEqual("workspace-write", receipt.observed_sandbox_policy)
-        self.assertEqual(
-            "assignment-scoped-write", receipt.observed_permission_profile
-        )
-        with self.store.lock(self.TASK_ID):
-            replay = repairs.replay_acceptance_ledger(self.store, self.TASK_ID)
-            self.assertIsNotNone(replay)
-            repairs._v2_start_attempt(
-                self.store,
-                self.TASK_ID,
-                replay,
-                repairs._v2_context(self.store, self.TASK_ID),
-                fixer,
-                receipt,
-                workflow.load_task(
-                    self.store._require_task(self.TASK_ID) / "task.json"
+            else:
+                self.assertEqual(peer_thread, thread_id)
+                result = {
+                    "schema_version": "ai-result-1",
+                    "role": "sol_medium_reviewer",
+                    "status": "ACCEPTANCE_RECOMMENDED",
+                    "summary": "The distinct Sol-medium peer accepts the repair.",
+                    "claims": [],
+                    "evidence": [],
+                    "counter_checks": [],
+                    "changed_files": [],
+                    "blind_spots": [],
+                    "unresolved_questions": [],
+                    "recommended_next_state": "AWAITING_OWNER_DECISION",
+                }
+            output_path.write_text(json.dumps(result), encoding="utf-8")
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout="\n".join(
+                    (
+                        json.dumps(
+                            {"type": "thread.started", "thread_id": thread_id}
+                        ),
+                        json.dumps({"type": "turn.completed"}),
+                        "",
+                    )
                 ),
-                repairs.ControllerExecutionAttestation(
-                    task_id=self.TASK_ID,
-                    task_sha256=fixer.capability.task_sha256,
-                    assignment_id=fixer.assignment_id,
-                    capability_id=fixer.capability.capability_id,
-                    candidate_commit=fixer.input_candidate_commit,
-                    actor_receipt=receipt,
+                stderr="",
+            )
+
+        with mock.patch.object(
+            workflow.subprocess, "run", side_effect=controller_process
+        ):
+            repairs.run_assignment(self.store, self.TASK_ID, fixer, sessions)
+            peer = self._issue(
+                "SOL_MEDIUM_PEER_REVIEW",
+                self._expected_actor(
+                    "sol-fixed-peer",
+                    "sol_medium_reviewer",
+                    runtime_instance_id=peer_thread,
                 ),
             )
+            repairs.run_assignment(
+                self.store, self.TASK_ID, peer, peer_sessions
+            )
+
+        replay = repairs.replay_acceptance_ledger(self.store, self.TASK_ID)
+        self.assertIsNotNone(replay)
+        self.assertEqual("COMPLETED", replay.phase_outcomes["SOL_MEDIUM_REPAIR"])
+        self.assertEqual("ACCEPT", replay.phase_outcomes["SOL_MEDIUM_PEER_REVIEW"])
+        self.assertTrue(replay.terminal)
+        started = {
+            event["assignment_id"]: event["actor_receipt"]
+            for event in self._events()
+            if event["event_type"] == "ASSIGNMENT_ATTEMPT_STARTED"
+            and event.get("assignment_id")
+            in {fixer.assignment_id, peer.assignment_id}
+        }
+        fixer_receipt = started[fixer.assignment_id]
+        peer_receipt = started[peer.assignment_id]
+        self.assertEqual("gpt-5.6-sol", fixer_receipt["observed_model"])
+        self.assertEqual("medium", fixer_receipt["observed_reasoning_effort"])
+        self.assertEqual("gpt-5.6-sol", peer_receipt["observed_model"])
+        self.assertEqual("medium", peer_receipt["observed_reasoning_effort"])
+        self.assertNotEqual(
+            (
+                fixer_receipt["execution_surface"],
+                fixer_receipt["runtime_instance_id"],
+            ),
+            (
+                peer_receipt["execution_surface"],
+                peer_receipt["runtime_instance_id"],
+            ),
+        )
+
+    def test_terra_xhigh_runtime_cannot_launch_or_complete_sol_medium_repair(self):
+        fixer_thread = str(uuid.uuid4())
+        fixer = self._issue_sol_medium_repair(fixer_thread)
+        sessions = self.repository_root.parent / "terra-as-sol-medium-sessions"
+        self._write_controller_runtime(
+            sessions,
+            fixer_thread,
+            model="gpt-5.6-terra",
+            reasoning_effort="xhigh",
+            sandbox_policy="workspace-write",
+            permission_profile="assignment-scoped-write",
+        )
+        real_run = subprocess.run
+        launches: list[list[str]] = []
+
+        def reject_codex_launch(command, *args, **kwargs):
+            if Path(command[0]).name == "codex":
+                launches.append(command)
+                raise AssertionError(
+                    "Terra-xhigh runtime passed Sol-medium model binding"
+                )
+            return real_run(command, *args, **kwargs)
+
+        with mock.patch.object(
+            workflow.subprocess, "run", side_effect=reject_codex_launch
+        ):
+            with self.assertRaisesRegex(
+                workflow.WorkflowError, "ACCEPTANCE_RECEIPT_MISMATCH"
+            ):
+                repairs.run_assignment(
+                    self.store, self.TASK_ID, fixer, sessions
+                )
+
+        self.assertEqual([], launches)
+        sol_events = [
+            event
+            for event in self._events()
+            if event.get("assignment_id") == fixer.assignment_id
+        ]
+        self.assertEqual(
+            ["ASSIGNMENT_ISSUED"],
+            [event["event_type"] for event in sol_events],
+        )
+        self.assertFalse(
+            any(
+                event["event_type"] in {
+                    "ASSIGNMENT_ATTEMPT_STARTED",
+                    "REPAIR_COMPLETED",
+                    "REVIEW_COMPLETED",
+                }
+                or event.get("terminal_state") == "TASK_TERMINAL"
+                for event in sol_events
+            )
+        )
 
     def test_controller_evidence_rejects_safe_argv_that_mutates_the_repository(self):
         tests = self.repository_root / "tests"
