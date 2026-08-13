@@ -127,15 +127,26 @@ class TeamCallContractTest(unittest.TestCase):
     def test_callback_error_records_terminal_blocked_route_before_reraising(self):
         call = team.parse_team_call("team call 检查当前工作区状态")
         intent = team.classify_team_call(call)
+        executions = 0
+
+        def fail_once(receipt):
+            nonlocal executions
+            executions += 1
+            raise RuntimeError("boom")
 
         with self.assertRaisesRegex(RuntimeError, "boom"):
-            self.registry.execute_once(call, intent, lambda receipt: (_ for _ in ()).throw(RuntimeError("boom")))
+            self.registry.execute_once(call, intent, fail_once)
 
         rows = [json.loads(line) for line in (self.root / "team-calls.jsonl").read_text().splitlines()]
         self.assertEqual(["TEAM_CALL_RECEIVED", "TEAM_CALL_ROUTED"], [row["event"] for row in rows])
         self.assertEqual("BLOCKED", rows[-1]["route_status"])
         self.assertEqual(("FIXED_L0_ALLOWLIST",), tuple(rows[-1]["risk_reasons"]))
         self.assertIsNone(rows[-1]["result_sha256"])
+        replay = self.registry.execute_once(call, intent, fail_once)
+        self.assertEqual("BLOCKED", replay.disposition)
+        self.assertIsNone(replay.task_id)
+        self.assertIsNone(replay.result_sha256)
+        self.assertEqual(1, executions)
 
     def test_valid_partial_history_blocks_every_call_from_starting(self):
         first_call = team.parse_team_call("team call 检查当前工作区状态")
@@ -298,8 +309,10 @@ class _TeamCallControllerFake:
         self.execution_count = 0
         self.dispatch_count = 0
         self.l1_task = None
+        self.l1_execution = None
         self.l1_role = None
         self.l1_result_override = None
+        self.l0_result_override = None
         self.mutate_task = None
         self.write_path = None
         self.ignored_write_path = None
@@ -355,11 +368,14 @@ class _TeamCallControllerFake:
             self.started.set()
         if self.release is not None:
             self.release.wait(timeout=5)
-        return subprocess.CompletedProcess(argv, 0, stdout="clean\n", stderr="")
+        return self.l0_result_override or subprocess.CompletedProcess(
+            argv, 0, stdout="clean\n", stderr=""
+        )
 
     def run_l1(self, task, *, role):
         self.execution_count += 1
         self.l1_task = task
+        self.l1_execution = task
         self.l1_role = role
         if self.on_before_run_l1 is not None:
             self.on_before_run_l1(task)
@@ -489,6 +505,42 @@ class TeamCallControllerTest(unittest.TestCase):
         self.assertEqual(["README.md"], self.controller.l1_task["authoritative_files"])
         self.assertEqual("PLAN", self.controller.l1_task["task_type"])
         self.assertTrue((self.root / receipt.task_id / "task.json").is_file())
+        stored_task_path = self.root / receipt.task_id / "task.json"
+        stored_task = json.loads(stored_task_path.read_text(encoding="utf-8"))
+        expected_task_sha256 = hashlib.sha256(
+            stored_task_path.read_bytes()
+        ).hexdigest()
+        self.assertEqual(expected_task_sha256, self.controller.l1_execution.task_sha256)
+        self.assertEqual("luna", self.controller.l1_execution.role)
+        self.assertEqual("team-call-fake", self.controller.l1_execution.execution_surface)
+        self.assertEqual(
+            hashlib.sha256(b"fixture\n").hexdigest(),
+            self.controller.l1_execution.consumed_evidence_sha256,
+        )
+
+    def test_failed_l0_replay_is_a_blocked_receipt_without_second_execution(self):
+        self.controller.l0_result_override = subprocess.CompletedProcess(
+            ("git", "status"), 7, stdout="", stderr="failed"
+        )
+
+        with self.assertRaisesRegex(workflow.WorkflowError, "TEAM_CALL_L0_FAILED"):
+            workflow.run_team_call(
+                "team call 检查当前工作区状态",
+                repository_root=self.repo,
+                state_root=self.root,
+                controller=self.controller,
+            )
+        replay = workflow.run_team_call(
+            "team call 检查当前工作区状态",
+            repository_root=self.repo,
+            state_root=self.root,
+            controller=self.controller,
+        )
+
+        self.assertEqual("BLOCKED", replay.disposition)
+        self.assertIsNone(replay.task_id)
+        self.assertIsNone(replay.result_sha256)
+        self.assertEqual(1, self.controller.execution_count)
 
     def test_l1_allocates_the_next_daily_task_id_while_the_registry_is_held(self):
         prefix = f"AWF-{datetime.now(timezone.utc):%Y%m%d}-"
@@ -546,6 +598,31 @@ class TeamCallControllerTest(unittest.TestCase):
             )
 
         self.assertEqual("BLOCKED", self._team_rows()[-1]["route_status"])
+
+    def test_failed_l1_replay_is_a_blocked_receipt_without_second_execution(self):
+        self.controller.l1_result_override = {
+            **_TeamCallControllerFake._luna_result(),
+            "changed_files": ["README.md"],
+        }
+
+        with self.assertRaisesRegex(workflow.WorkflowError, "READ_ONLY_ROLE_MODIFIED_REPO"):
+            workflow.run_team_call(
+                "team call 核对文件 README.md",
+                repository_root=self.repo,
+                state_root=self.root,
+                controller=self.controller,
+            )
+        replay = workflow.run_team_call(
+            "team call 核对文件 README.md",
+            repository_root=self.repo,
+            state_root=self.root,
+            controller=self.controller,
+        )
+
+        self.assertEqual("BLOCKED", replay.disposition)
+        self.assertIsNone(replay.task_id)
+        self.assertIsNone(replay.result_sha256)
+        self.assertEqual(1, self.controller.execution_count)
 
     def test_l1_role_mismatch_records_blocked_route(self):
         self.controller.l1_result_override = {
@@ -721,6 +798,26 @@ class TeamCallControllerTest(unittest.TestCase):
 
         self.assertEqual("BLOCKED", self._team_rows()[-1]["route_status"])
 
+    def test_l1_rejects_same_value_rewrite_of_the_exact_stored_task_bytes(self):
+        def rewrite_task_with_different_bytes(execution):
+            task_path = self.root / execution["task_id"] / "task.json"
+            task_path.write_text(
+                json.dumps(dict(execution), ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+        self.controller.on_before_run_l1 = rewrite_task_with_different_bytes
+
+        with self.assertRaisesRegex(workflow.WorkflowError, "TASK_STORE_MISMATCH"):
+            workflow.run_team_call(
+                "team call 核对文件 README.md",
+                repository_root=self.repo,
+                state_root=self.root,
+                controller=self.controller,
+            )
+
+        self.assertEqual("BLOCKED", self._team_rows()[-1]["route_status"])
+
     def test_l1_symlink_evidence_is_rejected_before_luna_execution(self):
         (self.repo / "target.md").write_text("target\n", encoding="utf-8")
         (self.repo / "linked.md").symlink_to("target.md")
@@ -845,18 +942,71 @@ class TeamCallControllerTest(unittest.TestCase):
 
         self.assertEqual(0, controller.calls)
 
-    def test_direct_l1_rejects_a_live_controller_before_task_or_model_execution(self):
-        controller = workflow.TeamCallProductionController(self.root, allow_live_model=True)
+    def test_direct_l1_rejects_an_exact_instance_method_shadow_before_execution(self):
+        shadow_calls = []
+        outside = Path(self.temporary.name) / "outside-write"
 
-        with self.assertRaisesRegex(workflow.WorkflowError, "LIVE_TEAM_CALL_L1_NOT_AUTHORIZED"):
+        def shadowed_run_l1(task, *, role):
+            shadow_calls.append((task["task_id"], role))
+            outside.write_text("unauthorized\n", encoding="utf-8")
+            return _TeamCallControllerFake._luna_result()
+
+        self.controller.run_l1 = shadowed_run_l1
+
+        with self.assertRaisesRegex(workflow.WorkflowError, "TEAM_CALL_CONTROLLER_UNTRUSTED"):
             workflow.run_team_call(
                 "team call 核对文件 README.md",
                 repository_root=self.repo,
                 state_root=self.root,
-                controller=controller,
+                controller=self.controller,
             )
 
+        self.assertEqual([], shadow_calls)
+        self.assertFalse(outside.exists())
         self.assertFalse((self.root / "team-calls.jsonl").exists())
+
+    @mock.patch("scripts.ai_workflow.run_codex")
+    def test_authorized_production_l1_uses_an_immutable_evidence_snapshot(self, run_codex):
+        run_codex.return_value = _TeamCallControllerFake._luna_result()
+        sessions = Path(self.temporary.name) / "sessions"
+        sessions.mkdir()
+        controller = workflow.TeamCallProductionController(
+            self.root,
+            allow_live_model=True,
+            runtime_sessions_dir=sessions,
+        )
+
+        receipt = workflow.run_team_call(
+            "team call 核对文件 README.md",
+            repository_root=self.repo,
+            state_root=self.root,
+            controller=controller,
+        )
+
+        self.assertEqual("DIRECT_L1", receipt.disposition)
+        self.assertRegex(receipt.result_sha256, r"^[0-9a-f]{64}$")
+        run_codex.assert_called_once()
+        role, task_document, prompt, paths = run_codex.call_args.args
+        self.assertEqual("luna", role)
+        self.assertEqual(receipt.task_id, task_document["task_id"])
+        self.assertEqual([], task_document["allowed_write_paths"])
+        self.assertEqual(workflow.ROLE_CONFIG_PATH.parent / "ai_workflow_result.schema.json", paths.schema_path)
+        snapshots = list((self.root / receipt.task_id / "team-call-evidence").iterdir())
+        self.assertEqual(1, len(snapshots))
+        self.assertEqual(b"fixture\n", snapshots[0].read_bytes())
+        self.assertNotEqual(self.repo, snapshots[0].parent)
+        self.assertIn(str(snapshots[0]), prompt)
+        metadata = json.loads(
+            (self.root / "team-call-results" / f"{receipt.call_id}.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual("luna", metadata["attestation"]["role"])
+        self.assertEqual(workflow.CODEX_EXEC_ROLE_CONTRACT, metadata["attestation"]["execution_surface"])
+        self.assertEqual(
+            hashlib.sha256(b"fixture\n").hexdigest(),
+            metadata["attestation"]["consumed_evidence_sha256"],
+        )
 
     def test_l1_rejects_an_untrusted_controller_even_when_it_claims_not_live(self):
         class SpoofedLiveNonLunaController:

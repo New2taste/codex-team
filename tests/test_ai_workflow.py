@@ -1687,6 +1687,78 @@ class TeamCallCliTest(unittest.TestCase):
         self.assertRegex(payload["result_sha256"], r"^[0-9a-f]{64}$")
         self.assertEqual(workflow._canonical_json(payload) + "\n", output.getvalue())
 
+    def test_team_call_cli_replays_a_failed_call_as_blocked_with_exit_two(self):
+        argv = (
+            "git",
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+        )
+        failed = subprocess.CompletedProcess(argv, 1, stdout="", stderr="failed")
+        first_output = StringIO()
+        replay_output = StringIO()
+
+        with mock.patch.object(workflow.TeamCallFakeController, "run_l0", return_value=failed):
+            with redirect_stdout(first_output):
+                first_exit = workflow.main(
+                    [
+                        "team-call",
+                        "team call 检查当前工作区状态",
+                        "--root",
+                        str(self.state_root),
+                        "--repository-root",
+                        str(self.repo),
+                        "--runner",
+                        "fake",
+                    ]
+                )
+            with redirect_stdout(replay_output):
+                replay_exit = workflow.main(
+                    [
+                        "team-call",
+                        "team call 检查当前工作区状态",
+                        "--root",
+                        str(self.state_root),
+                        "--repository-root",
+                        str(self.repo),
+                        "--runner",
+                        "fake",
+                    ]
+                )
+
+        self.assertEqual(2, first_exit)
+        self.assertIn("TEAM_CALL_L0_FAILED", first_output.getvalue())
+        self.assertEqual(2, replay_exit)
+        self.assertEqual("BLOCKED", json.loads(replay_output.getvalue())["disposition"])
+
+    def test_team_call_default_state_root_stays_outside_a_fresh_repository(self):
+        state_home = Path(self.temporary_directory.name) / "xdg-state"
+        output = StringIO()
+        original_cwd = Path.cwd()
+        try:
+            os.chdir(self.repo)
+            with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(state_home)}):
+                with redirect_stdout(output):
+                    exit_code = workflow.main(
+                        [
+                            "team-call",
+                            "team call 核对文件 README.md",
+                            "--repository-root",
+                            str(self.repo),
+                            "--runner",
+                            "fake",
+                        ]
+                    )
+        finally:
+            os.chdir(original_cwd)
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual("DIRECT_L1", json.loads(output.getvalue())["disposition"])
+        self.assertEqual("", self._git("status", "--porcelain=v1", "--untracked-files=all").stdout)
+        state_roots = list((state_home / "ai-workflow" / "team-call").iterdir())
+        self.assertEqual(1, len(state_roots))
+        self.assertTrue((state_roots[0] / "team-calls.jsonl").is_file())
+
     def test_team_call_cli_reports_missing_repository_with_exit_two(self):
         output = StringIO()
 
@@ -1733,7 +1805,42 @@ class TeamCallCliTest(unittest.TestCase):
         run_codex.assert_not_called()
 
     @mock.patch("scripts.ai_workflow.run_codex")
-    def test_team_call_live_l1_remains_blocked_even_when_live_is_authorized(self, run_codex):
+    def test_team_call_live_l1_runs_when_live_is_explicitly_authorized(self, run_codex):
+        run_codex.return_value = {
+            "schema_version": "ai-result-1",
+            "role": "luna",
+            "status": "SUPPORTED",
+            "summary": "The named file was read without modification.",
+            "claims": [
+                {
+                    "id": "claim-1",
+                    "kind": "FACT",
+                    "text": "The fixture exists.",
+                    "evidence_ids": ["evidence-1"],
+                }
+            ],
+            "evidence": [
+                {
+                    "id": "evidence-1",
+                    "type": "FILE",
+                    "locator": "README.md",
+                    "observation": "The fixture was read.",
+                }
+            ],
+            "counter_checks": [
+                {
+                    "target_claim_id": "claim-1",
+                    "method": "Read it again.",
+                    "result": "No contradiction found.",
+                }
+            ],
+            "changed_files": [],
+            "blind_spots": [],
+            "unresolved_questions": [],
+            "recommended_next_state": "EVIDENCE_READY",
+        }
+        sessions = Path(self.temporary_directory.name) / "sessions"
+        sessions.mkdir()
         output = StringIO()
 
         with redirect_stdout(output):
@@ -1748,15 +1855,14 @@ class TeamCallCliTest(unittest.TestCase):
                     "--runner",
                     "live",
                     "--allow-live-model",
+                    "--runtime-sessions-dir",
+                    str(sessions),
                 ]
             )
 
-        self.assertEqual(2, exit_code)
-        self.assertEqual(
-            "LIVE_TEAM_CALL_L1_NOT_AUTHORIZED: direct live L1 requires an explicit planned task\n",
-            output.getvalue(),
-        )
-        run_codex.assert_not_called()
+        self.assertEqual(0, exit_code)
+        self.assertEqual("DIRECT_L1", json.loads(output.getvalue())["disposition"])
+        run_codex.assert_called_once()
 
 
 class LiveLunaCliTest(unittest.TestCase):

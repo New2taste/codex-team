@@ -75,6 +75,17 @@ nor weakens the existing L0/L1/owner-gate contract. It does not auto-merge or
 auto-push, and it never replaces human approval or final whole-project
 acceptance.
 
+For the CLI, an omitted `--root` selects per-repository state below
+`$XDG_STATE_HOME/ai-workflow/team-call/` (or the user state directory), outside
+the repository under review; an explicit `--root` remains authoritative. A
+terminal failed call replays as a `BLOCKED` receipt and exits 2. An explicitly
+authorized `--runner live --allow-live-model` DIRECT_L1 uses Luna Max through a
+write-once evidence snapshot bound to the exact stored-task digest, `luna`
+role, execution surface, and consumed-evidence digest. It still requires a
+verifiable `--runtime-sessions-dir` and the repository/Git-control/zero-write
+guards. This binding does not grant review, approval, construction, or final
+acceptance authority.
+
 ## Luna distribution envelope
 
 For a Luna-owned distribution task, the writable envelope is limited to the

@@ -2488,32 +2488,31 @@ class TeamCallFakeController:
             _fail("TEAM_CALL_L0_INVALID", "L0 argv is not allowlisted")
         return subprocess.CompletedProcess(argv, 0, stdout="fake fixed L0 result\n", stderr="")
 
-    def run_l1(self, task: Mapping[str, object], *, role: Literal["luna"]) -> Mapping[str, object]:
+    def run_l1(
+        self, execution: Mapping[str, object], *, role: Literal["luna"]
+    ) -> Mapping[str, object]:
         if role != "luna":
             _fail("TEAM_CALL_ROLE_INVALID", "Team Call L1 is limited to luna")
-        if not isinstance(task, _PinnedTeamCallTask):
-            _fail("TEAM_CALL_EVIDENCE_UNPINNED", "Team Call L1 requires pinned evidence")
-        evidence_digest = hashlib.sha256(task.pinned_evidence_bytes).hexdigest()
-        result = FakeRunner().run(role, dict(task))
+        task = _validate_team_call_l1_execution(execution, "team-call-fake")
+        evidence_digest = execution.consumed_evidence_sha256  # type: ignore[attr-defined]
+        result = FakeRunner().run(role, task)
         result["evidence"][0]["observation"] = f"Pinned evidence SHA-256: {evidence_digest}."
         return result
 
 
+@dataclass(frozen=True, slots=True)
 class TeamCallProductionController:
     """Production Team Call boundary for fixed L0 and explicitly authorized Luna L1."""
 
+    state_root: Path
+    allow_live_model: bool = False
+    runtime_sessions_dir: Path | None = None
     is_live_model = True
 
-    def __init__(
-        self,
-        state_root: Path,
-        *,
-        allow_live_model: bool = False,
-        runtime_sessions_dir: Path | None = None,
-    ):
-        self.state_root = Path(state_root)
-        self.allow_live_model = allow_live_model
-        self.runtime_sessions_dir = runtime_sessions_dir
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "state_root", Path(self.state_root))
+        if self.runtime_sessions_dir is not None:
+            object.__setattr__(self, "runtime_sessions_dir", Path(self.runtime_sessions_dir))
 
     def run_l0(self, argv: tuple[str, ...], cwd: Path) -> subprocess.CompletedProcess[str]:
         if argv not in set(L0_FIXED_ARGV.values()):
@@ -2527,22 +2526,26 @@ class TeamCallProductionController:
             cwd=Path(cwd),
         )
 
-    def run_l1(self, task: Mapping[str, object], *, role: Literal["luna"]) -> Mapping[str, object]:
+    def run_l1(
+        self, execution: Mapping[str, object], *, role: Literal["luna"]
+    ) -> Mapping[str, object]:
         if role != "luna":
             _fail("TEAM_CALL_ROLE_INVALID", "Team Call L1 is limited to luna")
         if not self.allow_live_model:
             _fail("LIVE_MODEL_NOT_AUTHORIZED", "--allow-live-model is required for the live runner")
-        task_document = dict(task)
-        validate_task(task_document)
+        task_document = _validate_team_call_l1_execution(
+            execution, CODEX_EXEC_ROLE_CONTRACT
+        )
         task_dir = WorkflowStore(self.state_root)._require_task(str(task_document["task_id"]))
-        stored_task = load_task(task_dir / "task.json")
-        if stored_task != task_document:
-            _fail("TASK_STORE_MISMATCH", "Team Call task input does not match the stored task")
+        _require_exact_team_call_stored_task(task_dir / "task.json", execution)  # type: ignore[arg-type]
+        evidence_snapshot = _write_team_call_evidence_snapshot(
+            task_dir, execution  # type: ignore[arg-type]
+        )
         repository = Path(task_document["repository_root"])
         paths = RunPaths(
             repo=repository,
             output_path=task_dir / "luna-result.json",
-            schema_path=repository / "config" / "ai_workflow_result.schema.json",
+            schema_path=ROLE_CONFIG_PATH.parent / "ai_workflow_result.schema.json",
             logs_dir=task_dir / "logs",
             state_root=self.state_root,
             runtime_evidence_required=True,
@@ -2551,13 +2554,18 @@ class TeamCallProductionController:
         contract = {
             "acceptance_commands": task_document["acceptance_commands"],
             "verification_level": task_document["verification_level"],
+            "team_call_attestation": _team_call_l1_attestation_record(
+                execution  # type: ignore[arg-type]
+            ),
         }
-        return run_codex(
+        result = run_codex(
             "luna",
             task_document,
-            build_role_prompt("luna", task_document, contract, _authoritative_evidence_paths(task_document)),
+            build_role_prompt("luna", task_document, contract, (evidence_snapshot.path,)),
             paths,
         )
+        _verify_team_call_evidence_snapshot(evidence_snapshot, execution)  # type: ignore[arg-type]
+        return result
 
 
 def _team_call_error_as_workflow(error: TeamCallError) -> WorkflowError:
@@ -2593,6 +2601,30 @@ def _resolve_team_call_repository(repository_root: Path) -> Path:
     return repository
 
 
+def _default_team_call_state_root(repository_root: Path) -> Path:
+    """Choose durable per-repository Team Call state outside the target worktree."""
+
+    repository = Path(repository_root).resolve()
+    repository_digest = hashlib.sha256(str(repository).encode("utf-8")).hexdigest()
+    candidates: list[Path] = []
+    xdg_state_home = os.environ.get("XDG_STATE_HOME")
+    if xdg_state_home:
+        xdg_path = Path(xdg_state_home).expanduser()
+        if xdg_path.is_absolute():
+            candidates.append(xdg_path)
+    candidates.extend(
+        (
+            Path.home() / ".local" / "state",
+            Path(tempfile.gettempdir()).resolve() / f"ai-workflow-state-{os.getuid()}",
+        )
+    )
+    for base in candidates:
+        candidate = (base / "ai-workflow" / "team-call" / repository_digest).resolve()
+        if not candidate.is_relative_to(repository):
+            return candidate
+    return repository.parent / f".ai-workflow-team-call-state-{repository_digest}"
+
+
 @dataclass(frozen=True)
 class _TeamCallFileIdentity:
     device: int
@@ -2610,26 +2642,45 @@ class _TeamCallEvidencePin:
     evidence_bytes: bytes
 
 
-class _PinnedTeamCallTask(Mapping[str, object]):
-    """The stored task identity plus evidence bytes pinned during no-follow traversal."""
+@dataclass(frozen=True)
+class _TeamCallL1Execution(Mapping[str, object]):
+    """Immutable task/evidence attestation consumed by the closed L1 route."""
 
-    __slots__ = ("_task", "pinned_evidence_bytes")
+    task_json: str
+    stored_task_bytes: bytes
+    task_sha256: str
+    role: Literal["luna"]
+    execution_surface: str
+    evidence_path: str
+    consumed_evidence_sha256: str
+    pinned_evidence_bytes: bytes
 
-    def __init__(self, task: dict[str, object], pinned_evidence_bytes: bytes):
-        self._task = task
-        self.pinned_evidence_bytes = pinned_evidence_bytes
+    def task_document(self) -> dict[str, object]:
+        document = json.loads(self.task_json)
+        if not isinstance(document, dict):
+            _fail("TEAM_CALL_ATTESTATION_INVALID", "Team Call task attestation is invalid")
+        return document
 
     def __getitem__(self, key: str) -> object:
-        return self._task[key]
+        return self.task_document()[key]
 
     def __iter__(self):
-        return iter(self._task)
+        return iter(self.task_document())
 
     def __len__(self) -> int:
-        return len(self._task)
+        return len(self.task_document())
 
     def __setitem__(self, key: str, value: object) -> None:
-        self._task[key] = value
+        if key == "allowed_write_paths":
+            _fail("TEAM_CALL_WRITE_SCOPE_INVALID", "Team Call L1 allowed_write_paths must stay empty")
+        _fail("TEAM_CALL_TASK_MUTATED", "Team Call L1 task attestation is immutable")
+
+
+@dataclass(frozen=True)
+class _TeamCallEvidenceSnapshot:
+    path: Path
+    identity: _TeamCallFileIdentity
+    consumed_evidence_sha256: str
 
 
 def _team_call_file_identity(value: os.stat_result) -> _TeamCallFileIdentity:
@@ -2715,6 +2766,92 @@ def _revalidate_team_call_l1_evidence(
     ):
         _fail("TEAM_CALL_EVIDENCE_UNSAFE", "Team Call evidence changed before controller invocation")
     return current
+
+
+def _write_team_call_evidence_snapshot(
+    task_dir: Path, execution: _TeamCallL1Execution
+) -> _TeamCallEvidenceSnapshot:
+    """Create the content-addressed, write-once evidence handoff for Luna."""
+
+    _validate_team_call_l1_execution(execution, CODEX_EXEC_ROLE_CONTRACT)
+    snapshot_dir = Path(task_dir) / "team-call-evidence"
+    try:
+        snapshot_dir.mkdir(mode=0o700)
+        if snapshot_dir.is_symlink() or not snapshot_dir.is_dir():
+            _fail("TEAM_CALL_EVIDENCE_SNAPSHOT_INVALID", "evidence snapshot directory is unsafe")
+        snapshot_path = snapshot_dir / f"{execution.consumed_evidence_sha256}.snapshot"
+        descriptor = os.open(
+            snapshot_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o400,
+        )
+    except FileExistsError:
+        _fail("TEAM_CALL_EVIDENCE_SNAPSHOT_EXISTS", "evidence snapshot is already frozen")
+    except OSError as exc:
+        raise WorkflowError(
+            "TEAM_CALL_EVIDENCE_SNAPSHOT_INVALID",
+            "cannot create the Team Call evidence snapshot",
+        ) from exc
+    try:
+        remaining = memoryview(execution.pinned_evidence_bytes)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:
+                _fail("TEAM_CALL_EVIDENCE_SNAPSHOT_INVALID", "cannot write evidence snapshot")
+            remaining = remaining[written:]
+        os.fsync(descriptor)
+        os.fchmod(descriptor, 0o400)
+        identity = _team_call_file_identity(os.fstat(descriptor))
+    except OSError as exc:
+        raise WorkflowError(
+            "TEAM_CALL_EVIDENCE_SNAPSHOT_INVALID",
+            "cannot freeze the Team Call evidence snapshot",
+        ) from exc
+    finally:
+        os.close(descriptor)
+    snapshot = _TeamCallEvidenceSnapshot(
+        snapshot_path,
+        identity,
+        execution.consumed_evidence_sha256,
+    )
+    _verify_team_call_evidence_snapshot(snapshot, execution)
+    return snapshot
+
+
+def _verify_team_call_evidence_snapshot(
+    snapshot: _TeamCallEvidenceSnapshot, execution: _TeamCallL1Execution
+) -> None:
+    """Reopen the snapshot without following links and require the bound bytes."""
+
+    if snapshot.consumed_evidence_sha256 != execution.consumed_evidence_sha256:
+        _fail("TEAM_CALL_EVIDENCE_SNAPSHOT_INVALID", "evidence snapshot digest drifted")
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(snapshot.path, os.O_RDONLY | os.O_NOFOLLOW)
+        before = _team_call_file_identity(os.fstat(descriptor))
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = _team_call_file_identity(os.fstat(descriptor))
+    except OSError as exc:
+        raise WorkflowError(
+            "TEAM_CALL_EVIDENCE_SNAPSHOT_INVALID",
+            "cannot verify the Team Call evidence snapshot",
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    observed = b"".join(chunks)
+    if (
+        before != snapshot.identity
+        or after != snapshot.identity
+        or observed != execution.pinned_evidence_bytes
+        or hashlib.sha256(observed).hexdigest() != execution.consumed_evidence_sha256
+    ):
+        _fail("TEAM_CALL_EVIDENCE_SNAPSHOT_INVALID", "evidence snapshot identity drifted")
 
 
 def _team_call_regular_digest(file_descriptor: int) -> str:
@@ -2851,6 +2988,99 @@ def _team_call_l1_task(
     return task
 
 
+def _team_call_l1_execution(
+    task: Mapping[str, object],
+    stored_task: Mapping[str, object],
+    stored_task_path: Path,
+    evidence_pin: _TeamCallEvidencePin,
+    execution_surface: str,
+) -> _TeamCallL1Execution:
+    """Bind the exact stored task, Luna role, surface, and pinned evidence bytes."""
+
+    task_json = _canonical_json(dict(task))
+    if task_json != _canonical_json(dict(stored_task)):
+        _fail("TASK_STORE_MISMATCH", "Team Call task input does not match the stored task")
+    try:
+        stored_task_bytes = Path(stored_task_path).read_bytes()
+    except OSError as exc:
+        raise WorkflowError("TASK_READ_ERROR", "cannot hash the stored Team Call task") from exc
+    if stored_task_bytes != (task_json + "\n").encode("utf-8"):
+        _fail("TASK_STORE_MISMATCH", "Team Call stored task bytes are not canonical")
+    execution = _TeamCallL1Execution(
+        task_json=task_json,
+        stored_task_bytes=stored_task_bytes,
+        task_sha256=hashlib.sha256(stored_task_bytes).hexdigest(),
+        role="luna",
+        execution_surface=execution_surface,
+        evidence_path=evidence_pin.evidence_path,
+        consumed_evidence_sha256=hashlib.sha256(evidence_pin.evidence_bytes).hexdigest(),
+        pinned_evidence_bytes=evidence_pin.evidence_bytes,
+    )
+    _validate_team_call_l1_execution(execution, execution_surface)
+    return execution
+
+
+def _validate_team_call_l1_execution(
+    execution: object, expected_surface: str
+) -> dict[str, object]:
+    """Validate the immutable L1 execution attestation at every boundary."""
+
+    if type(execution) is not _TeamCallL1Execution:
+        _fail("TEAM_CALL_ATTESTATION_INVALID", "Team Call L1 execution is not attested")
+    if execution.role != "luna" or execution.execution_surface != expected_surface:
+        _fail("TEAM_CALL_ATTESTATION_INVALID", "Team Call L1 role or surface is not attested")
+    if execution.stored_task_bytes != (execution.task_json + "\n").encode("utf-8"):
+        _fail("TEAM_CALL_ATTESTATION_INVALID", "Team Call stored task bytes are invalid")
+    if hashlib.sha256(execution.stored_task_bytes).hexdigest() != execution.task_sha256:
+        _fail("TEAM_CALL_ATTESTATION_INVALID", "Team Call stored task digest is invalid")
+    if (
+        hashlib.sha256(execution.pinned_evidence_bytes).hexdigest()
+        != execution.consumed_evidence_sha256
+    ):
+        _fail("TEAM_CALL_ATTESTATION_INVALID", "Team Call evidence digest is invalid")
+    task = execution.task_document()
+    validate_task(task)
+    if _canonical_json(task) != execution.task_json:
+        _fail("TEAM_CALL_ATTESTATION_INVALID", "Team Call task encoding is not canonical")
+    if task["allowed_write_paths"] != []:
+        _fail("TEAM_CALL_WRITE_SCOPE_INVALID", "Team Call L1 allowed_write_paths must stay empty")
+    if task["authoritative_files"] != [execution.evidence_path]:
+        _fail("TEAM_CALL_ATTESTATION_INVALID", "Team Call evidence path is not task-bound")
+    return task
+
+
+def _team_call_l1_attestation_record(
+    execution: _TeamCallL1Execution,
+) -> dict[str, str]:
+    """Return the immutable execution identity persisted with the result."""
+
+    _validate_team_call_l1_execution(execution, execution.execution_surface)
+    return {
+        "task_sha256": execution.task_sha256,
+        "role": execution.role,
+        "execution_surface": execution.execution_surface,
+        "evidence_path": execution.evidence_path,
+        "consumed_evidence_sha256": execution.consumed_evidence_sha256,
+    }
+
+
+def _require_exact_team_call_stored_task(
+    task_path: Path, execution: _TeamCallL1Execution
+) -> dict[str, object]:
+    """Require the current frozen task artifact to retain its attested bytes."""
+
+    try:
+        current_bytes = Path(task_path).read_bytes()
+    except OSError as exc:
+        raise WorkflowError("TASK_READ_ERROR", "cannot read the stored Team Call task") from exc
+    if current_bytes != execution.stored_task_bytes:
+        _fail("TASK_STORE_MISMATCH", "Team Call stored task bytes changed during L1")
+    current = load_task(task_path)
+    if current != execution.task_document():
+        _fail("TASK_STORE_MISMATCH", "Team Call stored task identity changed during L1")
+    return current
+
+
 def _team_call_result_digest(
     state_root: Path, receipt: TeamCallReceipt, metadata: Mapping[str, object]
 ) -> str:
@@ -2901,30 +3131,67 @@ def _team_call_l0_metadata(
     }
 
 
-def _validate_team_call_l1_task(
-    task: Mapping[str, object], expected: Mapping[str, object]
-) -> None:
-    """Keep injected controllers from widening an immutable read-only handoff."""
-
-    if task.get("allowed_write_paths") != []:
-        _fail("TEAM_CALL_WRITE_SCOPE_INVALID", "Team Call L1 allowed_write_paths must stay empty")
-    actual_identity = {key: value for key, value in task.items() if key != "allowed_write_paths"}
-    expected_identity = {key: value for key, value in expected.items() if key != "allowed_write_paths"}
-    if _canonical_json(actual_identity) != _canonical_json(expected_identity):
-        _fail("TEAM_CALL_TASK_MUTATED", "Team Call L1 task changed after it was persisted")
-
-
 def _require_trusted_team_call_controller(controller: object) -> TeamCallController:
-    """Admit only the two closed controller implementations at the direct boundary."""
+    """Admit exact controllers with no instance-shadowed execution methods."""
 
     if type(controller) not in {TeamCallFakeController, TeamCallProductionController}:
         _fail(
             "TEAM_CALL_CONTROLLER_UNTRUSTED",
             "Team Call controller must hold the trusted controller capability",
         )
-    if not callable(getattr(controller, "run_l0", None)) or not callable(getattr(controller, "run_l1", None)):
+    instance_attributes = getattr(controller, "__dict__", {})
+    if isinstance(instance_attributes, dict) and {
+        "run_l0",
+        "run_l1",
+    }.intersection(instance_attributes):
+        _fail(
+            "TEAM_CALL_CONTROLLER_UNTRUSTED",
+            "Team Call controller execution methods must not be instance-shadowed",
+        )
+    controller_type = type(controller)
+    if not callable(controller_type.run_l0) or not callable(controller_type.run_l1):
         _fail("TEAM_CALL_CONTROLLER_UNTRUSTED", "Team Call controller is incomplete")
     return controller  # type: ignore[return-value]
+
+
+def _team_call_execution_surface(controller: TeamCallController) -> str:
+    if type(controller) is TeamCallFakeController:
+        return "team-call-fake"
+    if type(controller) is TeamCallProductionController:
+        return CODEX_EXEC_ROLE_CONTRACT
+    _fail("TEAM_CALL_CONTROLLER_UNTRUSTED", "Team Call controller type is not closed")
+    raise AssertionError("unreachable")
+
+
+def _run_trusted_team_call_l0(
+    controller: TeamCallController, argv: tuple[str, ...], repository: Path
+) -> object:
+    """Execute L0 through the exact class surface, never an instance-bound shadow."""
+
+    if type(controller) is TeamCallFakeController:
+        return TeamCallFakeController.run_l0(controller, argv, repository)
+    if type(controller) is TeamCallProductionController:
+        return TeamCallProductionController.run_l0(controller, argv, repository)
+    _fail("TEAM_CALL_CONTROLLER_UNTRUSTED", "Team Call controller type is not closed")
+    raise AssertionError("unreachable")
+
+
+def _run_trusted_team_call_l1(
+    controller: TeamCallController, execution: _TeamCallL1Execution
+) -> Mapping[str, object]:
+    """Execute Luna through the exact class surface and immutable attestation."""
+
+    expected_surface = _team_call_execution_surface(controller)
+    _validate_team_call_l1_execution(execution, expected_surface)
+    if type(controller) is TeamCallFakeController:
+        result = TeamCallFakeController.run_l1(controller, execution, role="luna")
+    elif type(controller) is TeamCallProductionController:
+        result = TeamCallProductionController.run_l1(controller, execution, role="luna")
+    else:
+        _fail("TEAM_CALL_CONTROLLER_UNTRUSTED", "Team Call controller type is not closed")
+        raise AssertionError("unreachable")
+    _validate_team_call_l1_execution(execution, expected_surface)
+    return result
 
 
 def run_team_call(
@@ -2946,14 +3213,6 @@ def run_team_call(
     except TeamCallError as exc:
         raise _team_call_error_as_workflow(exc) from exc
 
-    if intent.disposition == "DIRECT_L1" and isinstance(
-        trusted_controller, TeamCallProductionController
-    ):
-        _fail(
-            "LIVE_TEAM_CALL_L1_NOT_AUTHORIZED",
-            "direct live L1 requires an explicit planned task",
-        )
-
     repository: Path | None = None
     if intent.disposition in {"DIRECT_L0", "DIRECT_L1"}:
         repository = _resolve_team_call_repository(repository_root)
@@ -2968,7 +3227,7 @@ def run_team_call(
             argv = L0_FIXED_ARGV.get(intent.l0_action)
             if argv is None:
                 _fail("TEAM_CALL_L0_INVALID", "parsed L0 action is not allowlisted")
-            completed = trusted_controller.run_l0(argv, repository)
+            completed = _run_trusted_team_call_l0(trusted_controller, argv, repository)
             digest = _team_call_result_digest(
                 Path(state_root), receipt, _team_call_l0_metadata(completed, argv, repository)
             )
@@ -2990,16 +3249,22 @@ def run_team_call(
                 evidence_path=intent.evidence_path,
             )
             stored_path = store.create_task(task)
-            if load_task(stored_path) != task:
+            stored_task = load_task(stored_path)
+            if stored_task != task:
                 _fail("TASK_STORE_MISMATCH", "Team Call task was not persisted exactly")
-            expected_task = dict(task)
             repository_before = capture_repo(repository)
             repository_files_before = _team_call_filesystem_snapshot(repository)
             git_control_before = _team_call_git_control_snapshot(repository)
             invocation_pin = _revalidate_team_call_l1_evidence(repository, evidence_pin)
-            pinned_task = _PinnedTeamCallTask(task, invocation_pin.evidence_bytes)
-            result = trusted_controller.run_l1(pinned_task, role="luna")
-            _validate_team_call_l1_task(task, expected_task)
+            execution = _team_call_l1_execution(
+                task,
+                stored_task,
+                stored_path,
+                invocation_pin,
+                _team_call_execution_surface(trusted_controller),
+            )
+            result = _run_trusted_team_call_l1(trusted_controller, execution)
+            _require_exact_team_call_stored_task(stored_path, execution)
             repository_files_after = _team_call_filesystem_snapshot(repository)
             git_control_after = _team_call_git_control_snapshot(repository)
             if repository_files_after != repository_files_before:
@@ -3036,6 +3301,7 @@ def run_team_call(
                     "kind": "L1",
                     "task_id": task["task_id"],
                     "role": "luna",
+                    "attestation": _team_call_l1_attestation_record(execution),
                     "result": dict(result),
                 },
             )
@@ -4340,7 +4606,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     team_call = sub.add_parser("team-call")
     team_call.add_argument("message")
-    team_call.add_argument("--root", type=Path, default=Path("data/state/ai-workflow"))
+    team_call.add_argument("--root", type=Path)
     team_call.add_argument("--repository-root", type=Path, required=True)
     team_call.add_argument("--runner", choices=("fake", "live"), default="fake")
     team_call.add_argument("--allow-live-model", action="store_true")
@@ -4465,6 +4731,11 @@ def _run_command(args: argparse.Namespace) -> int:
     if args.command in {"resume", "abort"}:
         raise WorkflowError("NOT_IMPLEMENTED_IN_CURRENT_STAGE", f"{args.command} is not implemented")
     if args.command == "team-call":
+        state_root = (
+            Path(args.root)
+            if args.root is not None
+            else _default_team_call_state_root(args.repository_root)
+        )
         if args.runner == "live":
             if not args.allow_live_model:
                 _fail("LIVE_MODEL_NOT_AUTHORIZED", "--allow-live-model is required for the live runner")
@@ -4475,13 +4746,8 @@ def _run_command(args: argparse.Namespace) -> int:
                 intent = classify_team_call(call)
             except TeamCallError as exc:
                 raise _team_call_error_as_workflow(exc) from exc
-            if intent.disposition == "DIRECT_L1":
-                _fail(
-                    "LIVE_TEAM_CALL_L1_NOT_AUTHORIZED",
-                    "direct live L1 requires an explicit planned task",
-                )
             controller: TeamCallController = TeamCallProductionController(
-                args.root,
+                state_root,
                 allow_live_model=True,
                 runtime_sessions_dir=args.runtime_sessions_dir,
             )
@@ -4490,7 +4756,7 @@ def _run_command(args: argparse.Namespace) -> int:
         receipt = run_team_call(
             args.message,
             repository_root=args.repository_root,
-            state_root=args.root,
+            state_root=state_root,
             controller=controller,
         )
         print(_canonical_json({
@@ -4503,7 +4769,7 @@ def _run_command(args: argparse.Namespace) -> int:
             "created_at_utc": receipt.created_at_utc,
             "result_sha256": receipt.result_sha256,
         }))
-        return 0
+        return 2 if receipt.disposition == "BLOCKED" else 0
     if args.command == "report":
         output_path = Path(args.output)
         report = render_report(aggregate_metrics(args.root))

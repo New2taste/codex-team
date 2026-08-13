@@ -94,6 +94,15 @@ Team Call 不授予 Luna review、approval 或 final acceptance 权限，也不�
 L0/L1/owner-gate 语言与角色边界；它不自动合并、不自动推送，且不替代人工批准或
 最终整体验收。
 
+CLI 的 `team-call` 在未显式传入 `--root` 时，会把按仓库路径摘要隔离的状态写到
+仓库外的 `$XDG_STATE_HOME/ai-workflow/team-call/`（未设置时使用用户级 state
+目录），因此不会先把待核对仓库变脏；显式 `--root` 仍按调用者给定的位置使用。
+已终态失败的相同调用会重放为 `BLOCKED` 收据，CLI 返回退出码 2，不会把旧失败
+误报为成功。显式选择 `--runner live --allow-live-model` 的合格 L1 会交给 Luna
+Max；控制器只交付与已存 task 摘要、`luna` 角色、执行面和证据摘要绑定的只读
+快照，并继续执行仓库、Git 控制面和零写入校验。live 路径仍要求可验证的
+`--runtime-sessions-dir`，且不会因此获得 review、approval 或施工权限。
+
 ## 5. 三条主流程
 
 ### 5.1 方案规划

@@ -417,11 +417,12 @@ class TeamCallRegistry:
         return histories, pending
 
     def _receipt_from_routed_event(self, row: Mapping[str, object]) -> TeamCallReceipt:
+        disposition = "BLOCKED" if row["route_status"] == "BLOCKED" else row["disposition"]
         return TeamCallReceipt(
             call_id=row["call_id"],  # type: ignore[arg-type]
             raw_request_sha256=row["raw_request_sha256"],  # type: ignore[arg-type]
             intake_sha256=row["intake_sha256"],  # type: ignore[arg-type]
-            disposition=row["disposition"],  # type: ignore[arg-type]
+            disposition=disposition,  # type: ignore[arg-type]
             risk_reasons=tuple(row["risk_reasons"]),  # type: ignore[arg-type]
             task_id=row["task_id"],  # type: ignore[arg-type]
             created_at_utc=row["created_at_utc"],  # type: ignore[arg-type]
