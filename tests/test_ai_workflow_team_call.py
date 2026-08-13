@@ -4,6 +4,7 @@ import multiprocessing
 import tempfile
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from scripts import ai_workflow_team_call as team
@@ -131,17 +132,118 @@ class TeamCallContractTest(unittest.TestCase):
         self.assertEqual(("FIXED_L0_ALLOWLIST",), tuple(rows[-1]["risk_reasons"]))
         self.assertIsNone(rows[-1]["result_sha256"])
 
-    def test_valid_partial_history_blocks_another_executor(self):
+    def test_valid_partial_history_blocks_every_call_from_starting(self):
+        first_call = team.parse_team_call("team call 检查当前工作区状态")
+        first_intent = team.classify_team_call(first_call)
+        receipt = self.registry._new_receipt(first_call, first_intent)
+        self.registry._append_received(receipt, first_call, first_intent)
+        second_call = team.parse_team_call("team call 核对 plugin 根/镜像一致性")
+        second_intent = team.classify_team_call(second_call)
+
+        for call, intent in ((first_call, first_intent), (second_call, second_intent)):
+            with self.subTest(call=call.objective):
+                with self.assertRaisesRegex(team.TeamCallError, "TEAM_CALL_ALREADY_RUNNING"):
+                    self.registry.execute_once(
+                        call,
+                        intent,
+                        lambda original: team.TeamCallRoute(task_id=None, result_sha256="c" * 64),
+                    )
+
+    def test_execute_once_rejects_a_manually_forged_non_directive_call(self):
+        raw_message = "ordinary prose, never a directive"
+        forged = team.TeamCall(
+            raw_message,
+            "检查当前工作区状态",
+            hashlib.sha256(raw_message.encode("utf-8")).hexdigest(),
+        )
+        forged_intent = team.classify_team_call(forged)
+        executions = []
+
+        with self.assertRaisesRegex(team.TeamCallError, "TEAM_CALL_INVALID"):
+            self.registry.execute_once(
+                forged,
+                forged_intent,
+                lambda receipt: executions.append(receipt) or team.TeamCallRoute(None, "f" * 64),
+            )
+        self.assertEqual([], executions)
+
+    def test_callback_base_exceptions_record_terminal_blocked_routes(self):
+        for exception_type in (SystemExit, KeyboardInterrupt):
+            with self.subTest(exception_type=exception_type.__name__):
+                root = self.root / exception_type.__name__
+                registry = team.TeamCallRegistry(root)
+                call = team.parse_team_call("team call 检查当前工作区状态")
+                intent = team.classify_team_call(call)
+
+                with self.assertRaises(exception_type):
+                    registry.execute_once(
+                        call,
+                        intent,
+                        lambda receipt: (_ for _ in ()).throw(exception_type()),
+                    )
+
+                rows = [json.loads(line) for line in (root / "team-calls.jsonl").read_text().splitlines()]
+                self.assertEqual(["TEAM_CALL_RECEIVED", "TEAM_CALL_ROUTED"], [row["event"] for row in rows])
+                self.assertEqual("BLOCKED", rows[-1]["route_status"])
+
+    def test_invalid_utf8_ledger_is_a_stable_ledger_error(self):
+        (self.root / "team-calls.jsonl").write_bytes(b"\xff\n")
         call = team.parse_team_call("team call 检查当前工作区状态")
         intent = team.classify_team_call(call)
-        receipt = self.registry._new_receipt(call, intent)
-        self.registry._append_received(receipt, call, intent)
 
-        with self.assertRaisesRegex(team.TeamCallError, "TEAM_CALL_ALREADY_RUNNING"):
+        with self.assertRaisesRegex(team.TeamCallError, "TEAM_CALL_LEDGER_INVALID"):
             self.registry.execute_once(
                 call,
                 intent,
-                lambda original: team.TeamCallRoute(task_id=None, result_sha256="c" * 64),
+                lambda receipt: team.TeamCallRoute(None, "a" * 64),
+            )
+
+    def test_interleaved_received_and_routed_histories_are_rejected(self):
+        first_call = team.parse_team_call("team call 检查当前工作区状态")
+        first_intent = team.classify_team_call(first_call)
+        second_call = team.parse_team_call("team call 核对 plugin 根/镜像一致性")
+        second_intent = team.classify_team_call(second_call)
+        first_receipt = self.registry._new_receipt(first_call, first_intent)
+        second_receipt = self.registry._new_receipt(second_call, second_intent)
+        first_route = replace(first_receipt, result_sha256="1" * 64)
+        second_route = replace(second_receipt, result_sha256="2" * 64)
+        self.registry._append_received(first_receipt, first_call, first_intent)
+        self.registry._append_received(second_receipt, second_call, second_intent)
+        self.registry._append_event(
+            self.registry._event("TEAM_CALL_ROUTED", first_route, first_call, first_intent, route_status="ROUTED")
+        )
+        self.registry._append_event(
+            self.registry._event("TEAM_CALL_ROUTED", second_route, second_call, second_intent, route_status="ROUTED")
+        )
+
+        third_call = team.parse_team_call("team call 核对文件 docs/guide.md")
+        third_intent = team.classify_team_call(third_call)
+        with self.assertRaisesRegex(team.TeamCallError, "TEAM_CALL_LEDGER_INVALID"):
+            self.registry.execute_once(
+                third_call,
+                third_intent,
+                lambda receipt: team.TeamCallRoute(None, "3" * 64),
+            )
+
+    def test_duplicate_json_member_names_are_rejected_before_shape_validation(self):
+        call = team.parse_team_call("team call 检查当前工作区状态")
+        intent = team.classify_team_call(call)
+        receipt = self.registry._new_receipt(call, intent)
+        event = self.registry._received_event(receipt, call, intent)
+        row = json.dumps(event, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        duplicate = row.replace(
+            '"event":"TEAM_CALL_RECEIVED"',
+            '"event":"forged","event":"TEAM_CALL_RECEIVED"',
+        )
+        (self.root / "team-calls.jsonl").write_text(duplicate + "\n", encoding="utf-8")
+        second_call = team.parse_team_call("team call 核对 plugin 根/镜像一致性")
+        second_intent = team.classify_team_call(second_call)
+
+        with self.assertRaisesRegex(team.TeamCallError, "TEAM_CALL_LEDGER_INVALID"):
+            self.registry.execute_once(
+                second_call,
+                second_intent,
+                lambda original: team.TeamCallRoute(None, "4" * 64),
             )
 
     def test_identity_drift_for_existing_call_id_is_rejected(self):

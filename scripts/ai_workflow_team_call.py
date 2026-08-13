@@ -104,6 +104,19 @@ _EVENT_FIELDS = frozenset(
 )
 
 
+class _DuplicateJsonMember(ValueError):
+    """A JSON object with duplicate names is not an exact ledger event."""
+
+
+def _json_object_without_duplicate_members(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for name, member in pairs:
+        if name in value:
+            raise _DuplicateJsonMember(name)
+        value[name] = member
+    return value
+
+
 def _canonical_json(value: object) -> str:
     try:
         return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -351,45 +364,57 @@ class TeamCallRegistry:
             raise TeamCallError("TEAM_CALL_IDENTITY_DRIFT", "ledger call id disagrees with identity")
         return row
 
-    def _load_history(self) -> dict[str, list[dict[str, object]]]:
+    @staticmethod
+    def _received_and_routed_identity_match(received: Mapping[str, object], routed: Mapping[str, object]) -> bool:
+        return all(
+            received[field] == routed[field]
+            for field in (
+                "directive_version",
+                "call_id",
+                "raw_request_sha256",
+                "intake_sha256",
+                "objective",
+                "disposition",
+                "risk_reasons",
+                "l0_action",
+                "evidence_path",
+                "created_at_utc",
+            )
+        )
+
+    def _load_history(self) -> tuple[dict[str, list[dict[str, object]]], dict[str, object] | None]:
         if not self.ledger_path.exists():
-            return {}
+            return {}, None
         histories: dict[str, list[dict[str, object]]] = {}
+        pending: dict[str, object] | None = None
         try:
             with self.ledger_path.open(encoding="utf-8") as handle:
                 for line in handle:
                     if not line.endswith("\n") or not line.strip():
                         raise TeamCallError("TEAM_CALL_LEDGER_INVALID", "ledger must contain complete JSONL rows")
                     try:
-                        parsed = json.loads(line)
-                    except json.JSONDecodeError as exc:
+                        parsed = json.loads(line, object_pairs_hook=_json_object_without_duplicate_members)
+                    except (json.JSONDecodeError, _DuplicateJsonMember) as exc:
                         raise TeamCallError("TEAM_CALL_LEDGER_INVALID", "ledger JSON is invalid") from exc
                     event = self._validate_event(parsed)
-                    histories.setdefault(event["call_id"], []).append(event)  # type: ignore[index]
+                    call_id = event["call_id"]
+                    if event["event"] == "TEAM_CALL_RECEIVED":
+                        if pending is not None or call_id in histories:
+                            raise TeamCallError("TEAM_CALL_LEDGER_INVALID", "ledger received event is not globally serial")
+                        histories[call_id] = [event]  # type: ignore[index]
+                        pending = event
+                        continue
+                    if pending is None or pending["call_id"] != call_id:
+                        raise TeamCallError("TEAM_CALL_LEDGER_INVALID", "ledger routed event has no matching receipt")
+                    if not self._received_and_routed_identity_match(pending, event):
+                        raise TeamCallError("TEAM_CALL_IDENTITY_DRIFT", "received and routed identities differ")
+                    histories[call_id].append(event)  # type: ignore[index]
+                    pending = None
+        except UnicodeError as exc:
+            raise TeamCallError("TEAM_CALL_LEDGER_INVALID", "ledger is not valid UTF-8") from exc
         except OSError as exc:
             raise TeamCallError("TEAM_CALL_LEDGER_INVALID", "cannot read team call ledger") from exc
-        for events in histories.values():
-            if len(events) not in {1, 2} or events[0]["event"] != "TEAM_CALL_RECEIVED":
-                raise TeamCallError("TEAM_CALL_LEDGER_INVALID", "ledger event sequence is invalid")
-            if len(events) == 2 and events[1]["event"] != "TEAM_CALL_ROUTED":
-                raise TeamCallError("TEAM_CALL_LEDGER_INVALID", "ledger terminal event is invalid")
-            if len(events) == 2 and any(
-                events[0][field] != events[1][field]
-                for field in (
-                    "directive_version",
-                    "call_id",
-                    "raw_request_sha256",
-                    "intake_sha256",
-                    "objective",
-                    "disposition",
-                    "risk_reasons",
-                    "l0_action",
-                    "evidence_path",
-                    "created_at_utc",
-                )
-            ):
-                raise TeamCallError("TEAM_CALL_IDENTITY_DRIFT", "received and routed identities differ")
-        return histories
+        return histories, pending
 
     def _receipt_from_routed_event(self, row: Mapping[str, object]) -> TeamCallReceipt:
         return TeamCallReceipt(
@@ -425,13 +450,18 @@ class TeamCallRegistry:
 
         if not callable(executor):
             raise TeamCallError("TEAM_CALL_INVALID", "executor must be callable")
-        if not isinstance(call, TeamCall) or _sha256(call.raw_message) != call.raw_request_sha256:
-            raise TeamCallError("TEAM_CALL_INVALID", "call raw request digest is invalid")
+        if not isinstance(call, TeamCall):
+            raise TeamCallError("TEAM_CALL_INVALID", "call must be a TeamCall")
+        parsed_call = parse_team_call(call.raw_message)
+        if parsed_call is None or parsed_call != call:
+            raise TeamCallError("TEAM_CALL_INVALID", "call must be the exact parsed directive")
         if classify_team_call(call) != intent:
             raise TeamCallError("TEAM_CALL_IDENTITY_DRIFT", "intent disagrees with classifier")
         receipt = self._new_receipt(call, intent)
         with self._locked():
-            histories = self._load_history()
+            histories, pending = self._load_history()
+            if pending is not None:
+                raise TeamCallError("TEAM_CALL_ALREADY_RUNNING", "team call has a non-terminal receipt")
             existing = histories.get(receipt.call_id)
             if existing is not None:
                 first = existing[0]
@@ -447,7 +477,7 @@ class TeamCallRegistry:
             self._append_received(receipt, call, intent)
             try:
                 route = self._validate_route(executor(receipt))
-            except Exception:
+            except BaseException:
                 self._append_event(
                     self._event("TEAM_CALL_ROUTED", receipt, call, intent, route_status="BLOCKED")
                 )
