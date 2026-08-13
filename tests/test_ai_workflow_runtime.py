@@ -20,7 +20,7 @@ def runtime_expected(*, surface="NATIVE_SUBAGENT", **overrides):
         "attempt_id": "runtime-attempt-1",
         "requested_role": "luna",
         "execution_surface": surface,
-        "agent_type": "luna_worker" if surface == "NATIVE_SUBAGENT" else None,
+        "agent_type": "luna_max" if surface == "NATIVE_SUBAGENT" else None,
         "model": "gpt-5.6-luna",
         "reasoning_effort": "max",
         "sandbox_policy": "read-only",
@@ -38,7 +38,7 @@ def runtime_expected(*, surface="NATIVE_SUBAGENT", **overrides):
 def runtime_observation(*, surface="NATIVE_SUBAGENT", **overrides):
     value = {
         "execution_surface": surface,
-        "agent_type": "luna_worker" if surface == "NATIVE_SUBAGENT" else None,
+        "agent_type": "luna_max" if surface == "NATIVE_SUBAGENT" else None,
         "model": "gpt-5.6-luna",
         "reasoning_effort": "max",
         "sandbox_policy": "read-only",
@@ -156,7 +156,7 @@ class RuntimeIdentityTest(unittest.TestCase):
 
     def test_exec_surface_must_not_claim_a_custom_agent_type(self):
         observed = runtime_observation(
-            surface="CODEX_EXEC_ROLE_CONTRACT", agent_type="luna_worker"
+            surface="CODEX_EXEC_ROLE_CONTRACT", agent_type="luna_max"
         )
         with self.assertRaisesRegex(workflow.WorkflowError, "RUNTIME_IDENTITY_CONFLICT"):
             workflow.verify_runtime_identity(
@@ -240,7 +240,7 @@ class RuntimeIdentityTest(unittest.TestCase):
     def test_exec_rejects_a_nonnull_observed_agent_type_alias(self):
         observed = runtime_observation(
             surface="CODEX_EXEC_ROLE_CONTRACT",
-            observed_agent_type="luna_worker",
+            observed_agent_type="luna_max",
         )
         with self.assertRaisesRegex(workflow.WorkflowError, "RUNTIME_IDENTITY_CONFLICT"):
             workflow.verify_runtime_identity(
@@ -250,7 +250,7 @@ class RuntimeIdentityTest(unittest.TestCase):
     def test_native_metadata_and_rollout_can_complete_one_consistent_identity(self):
         native = {
             "execution_surface": "NATIVE_SUBAGENT",
-            "agent_type": "luna_worker",
+            "agent_type": "luna_max",
             "model": "gpt-5.6-luna",
             "sandbox_policy": "read-only",
             "permission_profile": "read-only",
@@ -269,6 +269,13 @@ class RuntimeIdentityTest(unittest.TestCase):
         self.assertEqual(
             ("LOCAL_ROLLOUT", "NATIVE_METADATA"), merged.evidence_sources
         )
+
+    def test_native_luna_worker_alias_is_rejected(self):
+        observed = runtime_observation(agent_type="luna_worker")
+        with self.assertRaisesRegex(
+            workflow.WorkflowError, "RUNTIME_IDENTITY_CONFLICT"
+        ):
+            workflow.verify_runtime_identity(runtime_expected(), observed)
 
     def test_broadened_exception_is_limited_to_read_only_reviewer_with_real_snapshots(self):
         expected = runtime_expected(

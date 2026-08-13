@@ -20,13 +20,14 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 PYTHON311 = Path("/Users/lee/.local/bin/python3.11")
 PLUGIN = ROOT / "plugins" / "ai-workflow"
-TEMPLATE = PLUGIN / "agents" / "luna-worker.toml"
+TEMPLATE = PLUGIN / "agents" / "luna-max.toml"
 INSTALL = PLUGIN / "scripts" / "install-agents.sh"
 UNINSTALL = PLUGIN / "scripts" / "uninstall-agents.sh"
 LIFECYCLE_HELPER = PLUGIN / "scripts" / "agent_lifecycle.py"
 STATE_NAME = ".ai-workflow-luna-worker.state"
 BACKUP_NAME = ".ai-workflow-luna-worker.backup"
 KNOWN_LEGACY_SHA256 = "60f7240ea662cd27ea0f51f2e1efa8a2e788e16c76b04a13ab1c1df4f26ef024"
+CANONICAL_TEMPLATE_SHA256 = "6237649deb278392111355490a9c71c00be66388c6fb25435694d00eb6f18bbb"
 KNOWN_LEGACY_TEMPLATE = '''name = "luna_worker"
 description = "处理由主代理明确委派的、范围有限、边界清晰且可独立完成的任务；适合只读盘点、机械核对、局部实现与独立验证，不负责改变总体目标或扩大任务范围。"
 model = "gpt-5.6-luna"
@@ -225,15 +226,21 @@ class DistributionContractTest(unittest.TestCase):
         )
 
     def test_project_and_release_agent_templates_are_byte_exact(self):
+        root_template = ROOT / ".codex" / "agents" / "luna-max.toml"
+        self.assertTrue(root_template.is_file())
+        self.assertTrue(TEMPLATE.is_file())
         self.assertEqual(
-            (ROOT / ".codex" / "agents" / "luna-worker.toml").read_bytes(),
+            root_template.read_bytes(),
             TEMPLATE.read_bytes(),
         )
+        self.assertFalse((ROOT / ".codex" / "agents" / "luna-worker.toml").exists())
+        self.assertFalse((PLUGIN / "agents" / "luna-worker.toml").exists())
 
     def test_luna_template_matches_the_project_contract(self):
+        self.assertTrue(TEMPLATE.is_file())
         with TEMPLATE.open("rb") as handle:
             agent = tomllib.load(handle)
-        self.assertEqual("luna_worker", agent["name"])
+        self.assertEqual("luna_max", agent["name"])
         self.assertEqual("gpt-5.6-luna", agent["model"])
         self.assertEqual("max", agent["model_reasoning_effort"])
         self.assertIn("L0/L1/L2", agent["developer_instructions"])
@@ -466,7 +473,8 @@ class DistributionContractTest(unittest.TestCase):
         self.assertEqual(KNOWN_LEGACY_SHA256, hashlib.sha256(KNOWN_LEGACY_TEMPLATE).hexdigest())
 
     def test_release_template_digest_is_pinned(self):
-        self.assertEqual(KNOWN_LEGACY_SHA256, sha256(TEMPLATE))
+        self.assertTrue(TEMPLATE.is_file())
+        self.assertEqual(CANONICAL_TEMPLATE_SHA256, sha256(TEMPLATE))
 
 
 class AgentLifecycleTest(unittest.TestCase):
