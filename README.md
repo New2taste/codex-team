@@ -160,7 +160,9 @@ Sol medium 只做最终整体验收（final whole-project acceptance），针对
 
 ### 7.4 Sol xhigh
 
-Sol xhigh 只接收 owner-authorized 的最小案卷，用于规划（planning）或终局升级（terminal escalation）；不得自动启动、施工、替代 Terra review 或跳过 Sol-medium final acceptance。
+Sol xhigh 只接收 owner-authorized 的最小案卷，用于规划（planning），或在 distinct Sol-medium peer 对 scoped fallback 给出 REWORK 后执行 terminal repair；不得自动启动或承担普通、常驻 construction，不得替代 Terra review 或跳过 Sol-medium final acceptance。
+
+只有上述 terminal repair 构成施工例外：它必须是 owner-authorized、assignment-scoped、一次性的 terminal repair。该 terminal repair 无 task-level review；不得据此泛化为普通 Sol-xhigh construction。
 
 ### 7.5 Task 4 冻结分配（Frozen role/lifecycle contract）
 

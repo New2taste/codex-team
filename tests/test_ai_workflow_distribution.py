@@ -354,6 +354,37 @@ class DistributionContractTest(unittest.TestCase):
             self.assertIn("sol_medium_reviewer", role_names)
             self.assertIn("sol_xhigh_planner", role_names)
 
+    def test_sol_xhigh_terminal_repair_is_narrow_exception_to_construction_ban(self):
+        """Section 7.4 forbids ordinary construction without erasing the terminal repair."""
+
+        readme = (ROOT / "README.md").read_text(encoding="utf-8").casefold()
+        match = re.search(
+            r"### 7\.4 sol xhigh\n(?P<body>.*?)(?=\n### 7\.5)",
+            readme,
+            flags=re.DOTALL,
+        )
+        self.assertIsNotNone(match, "README section 7.4 must remain published")
+        sol_xhigh_contract = match.group("body")
+
+        self.assertIn(
+            "不得自动启动或承担普通、常驻 construction",
+            sol_xhigh_contract,
+        )
+        self.assertIn(
+            "distinct sol-medium peer 对 scoped fallback 给出 rework 后",
+            sol_xhigh_contract,
+        )
+        self.assertIn(
+            "owner-authorized、assignment-scoped、一次性的 terminal repair",
+            sol_xhigh_contract,
+        )
+        self.assertIn("该 terminal repair 无 task-level review", sol_xhigh_contract)
+        self.assertIn(
+            "不得据此泛化为普通 sol-xhigh construction",
+            sol_xhigh_contract,
+        )
+        self.assertNotIn("不得自动启动、施工", sol_xhigh_contract)
+
     def test_plugin_verifier_rejects_a_tampered_mirrored_runtime_copy(self):
         """A copied release must fail verification when one mirror is changed."""
 
