@@ -2478,11 +2478,7 @@ class TeamCallController(Protocol):
         """Run exactly the pinned Luna contract for one read-only L1 task."""
 
 
-class _TrustedTeamCallController:
-    """Nominal controller capability; structural lookalikes are never trusted."""
-
-
-class TeamCallFakeController(_TrustedTeamCallController):
+class TeamCallFakeController:
     """A deterministic Team Call controller that never starts a model."""
 
     is_live_model = False
@@ -2495,10 +2491,15 @@ class TeamCallFakeController(_TrustedTeamCallController):
     def run_l1(self, task: Mapping[str, object], *, role: Literal["luna"]) -> Mapping[str, object]:
         if role != "luna":
             _fail("TEAM_CALL_ROLE_INVALID", "Team Call L1 is limited to luna")
-        return FakeRunner().run(role, dict(task))
+        if not isinstance(task, _PinnedTeamCallTask):
+            _fail("TEAM_CALL_EVIDENCE_UNPINNED", "Team Call L1 requires pinned evidence")
+        evidence_digest = hashlib.sha256(task.pinned_evidence_bytes).hexdigest()
+        result = FakeRunner().run(role, dict(task))
+        result["evidence"][0]["observation"] = f"Pinned evidence SHA-256: {evidence_digest}."
+        return result
 
 
-class TeamCallProductionController(_TrustedTeamCallController):
+class TeamCallProductionController:
     """Production Team Call boundary for fixed L0 and explicitly authorized Luna L1."""
 
     is_live_model = True
@@ -2606,6 +2607,29 @@ class _TeamCallFileIdentity:
 class _TeamCallEvidencePin:
     evidence_path: str
     components: tuple[tuple[str, _TeamCallFileIdentity], ...]
+    evidence_bytes: bytes
+
+
+class _PinnedTeamCallTask(Mapping[str, object]):
+    """The stored task identity plus evidence bytes pinned during no-follow traversal."""
+
+    __slots__ = ("_task", "pinned_evidence_bytes")
+
+    def __init__(self, task: dict[str, object], pinned_evidence_bytes: bytes):
+        self._task = task
+        self.pinned_evidence_bytes = pinned_evidence_bytes
+
+    def __getitem__(self, key: str) -> object:
+        return self._task[key]
+
+    def __iter__(self):
+        return iter(self._task)
+
+    def __len__(self) -> int:
+        return len(self._task)
+
+    def __setitem__(self, key: str, value: object) -> None:
+        self._task[key] = value
 
 
 def _team_call_file_identity(value: os.stat_result) -> _TeamCallFileIdentity:
@@ -2628,6 +2652,7 @@ def _team_call_l1_evidence(repository: Path, evidence_path: str) -> _TeamCallEvi
     root_fd: int | None = None
     current_fd: int | None = None
     identities: list[tuple[str, _TeamCallFileIdentity]] = []
+    evidence_bytes = b""
     try:
         root_fd = os.open(repository, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         current_fd = root_fd
@@ -2650,11 +2675,22 @@ def _team_call_l1_evidence(repository: Path, evidence_path: str) -> _TeamCallEvi
             if _team_call_file_identity(before) != _team_call_file_identity(after):
                 os.close(next_fd)
                 _fail("TEAM_CALL_EVIDENCE_UNSAFE", "Team Call evidence changed while being validated")
+            if final_component:
+                chunks: list[bytes] = []
+                while True:
+                    chunk = os.read(next_fd, 1024 * 1024)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                if _team_call_file_identity(os.fstat(next_fd)) != _team_call_file_identity(after):
+                    os.close(next_fd)
+                    _fail("TEAM_CALL_EVIDENCE_UNSAFE", "Team Call evidence changed while being read")
+                evidence_bytes = b"".join(chunks)
             identities.append((component, _team_call_file_identity(after)))
             if current_fd != root_fd:
                 os.close(current_fd)
             current_fd = next_fd
-        return _TeamCallEvidencePin(evidence_path, tuple(identities))
+        return _TeamCallEvidencePin(evidence_path, tuple(identities), evidence_bytes)
     except (OSError, RuntimeError, ValueError) as exc:
         raise WorkflowError(
             "TEAM_CALL_EVIDENCE_UNSAFE",
@@ -2669,12 +2705,16 @@ def _team_call_l1_evidence(repository: Path, evidence_path: str) -> _TeamCallEvi
 
 def _revalidate_team_call_l1_evidence(
     repository: Path, evidence_pin: _TeamCallEvidencePin
-) -> None:
+) -> _TeamCallEvidencePin:
     """Require the same no-follow component identities immediately before L1 launch."""
 
     current = _team_call_l1_evidence(repository, evidence_pin.evidence_path)
-    if current != evidence_pin:
+    if (
+        current.components != evidence_pin.components
+        or current.evidence_bytes != evidence_pin.evidence_bytes
+    ):
         _fail("TEAM_CALL_EVIDENCE_UNSAFE", "Team Call evidence changed before controller invocation")
+    return current
 
 
 def _team_call_regular_digest(file_descriptor: int) -> str:
@@ -2686,8 +2726,10 @@ def _team_call_regular_digest(file_descriptor: int) -> str:
         digest.update(block)
 
 
-def _team_call_filesystem_snapshot(repository: Path) -> tuple[tuple[object, ...], ...]:
-    """Snapshot every non-Git entry with no-follow metadata and regular-file content."""
+def _team_call_filesystem_snapshot(
+    repository: Path, *, exclude_git_directory: bool = True
+) -> tuple[tuple[object, ...], ...]:
+    """Snapshot a tree with no-follow metadata and regular-file content."""
 
     root_fd: int | None = None
     entries: list[tuple[object, ...]] = []
@@ -2696,10 +2738,15 @@ def _team_call_filesystem_snapshot(repository: Path) -> tuple[tuple[object, ...]
         directory_identity = _team_call_file_identity(os.fstat(directory_fd))
         entries.append((relative, directory_identity, None))
         for name in sorted(os.listdir(directory_fd)):
-            if relative == "." and name == ".git":
-                continue
             item_relative = name if relative == "." else f"{relative}/{name}"
             before = os.lstat(name, dir_fd=directory_fd)
+            if (
+                exclude_git_directory
+                and relative == "."
+                and name == ".git"
+                and stat.S_ISDIR(before.st_mode)
+            ):
+                continue
             identity = _team_call_file_identity(before)
             if stat.S_ISDIR(before.st_mode):
                 child_fd = os.open(
@@ -2737,6 +2784,26 @@ def _team_call_filesystem_snapshot(repository: Path) -> tuple[tuple[object, ...]
     finally:
         if root_fd is not None:
             os.close(root_fd)
+
+
+def _team_call_git_control_snapshot(repository: Path) -> tuple[tuple[str, object], ...]:
+    """Snapshot the per-worktree and common Git control directories."""
+
+    control_paths: set[Path] = set()
+    for argument in ("--absolute-git-dir", "--git-common-dir"):
+        raw_path = Path(git(repository, "rev-parse", argument))
+        control_path = raw_path if raw_path.is_absolute() else repository / raw_path
+        try:
+            control_paths.add(control_path.resolve(strict=True))
+        except (OSError, RuntimeError) as exc:
+            raise WorkflowError(
+                "READ_ONLY_FILESYSTEM_SNAPSHOT_INVALID",
+                "cannot resolve Git control directory",
+            ) from exc
+    return tuple(
+        (str(path), _team_call_filesystem_snapshot(path, exclude_git_directory=False))
+        for path in sorted(control_paths, key=str)
+    )
 
 
 def _next_team_call_task_id(store: WorkflowStore) -> str:
@@ -2848,9 +2915,9 @@ def _validate_team_call_l1_task(
 
 
 def _require_trusted_team_call_controller(controller: object) -> TeamCallController:
-    """Reject structural lookalikes at the public direct-execution boundary."""
+    """Admit only the two closed controller implementations at the direct boundary."""
 
-    if not isinstance(controller, _TrustedTeamCallController):
+    if type(controller) not in {TeamCallFakeController, TeamCallProductionController}:
         _fail(
             "TEAM_CALL_CONTROLLER_UNTRUSTED",
             "Team Call controller must hold the trusted controller capability",
@@ -2927,21 +2994,35 @@ def run_team_call(
                 _fail("TASK_STORE_MISMATCH", "Team Call task was not persisted exactly")
             expected_task = dict(task)
             repository_before = capture_repo(repository)
-            filesystem_before = _team_call_filesystem_snapshot(repository)
-            _revalidate_team_call_l1_evidence(repository, evidence_pin)
-            result = trusted_controller.run_l1(task, role="luna")
+            repository_files_before = _team_call_filesystem_snapshot(repository)
+            git_control_before = _team_call_git_control_snapshot(repository)
+            invocation_pin = _revalidate_team_call_l1_evidence(repository, evidence_pin)
+            pinned_task = _PinnedTeamCallTask(task, invocation_pin.evidence_bytes)
+            result = trusted_controller.run_l1(pinned_task, role="luna")
             _validate_team_call_l1_task(task, expected_task)
+            repository_files_after = _team_call_filesystem_snapshot(repository)
+            git_control_after = _team_call_git_control_snapshot(repository)
+            if repository_files_after != repository_files_before:
+                repository_after = capture_repo(repository)
+                if repository_after != repository_before:
+                    _fail(
+                        "TEAM_CALL_REPOSITORY_CHANGED",
+                        "Team Call L1 changed repository HEAD or status",
+                    )
+                _fail(
+                    "READ_ONLY_FILESYSTEM_CHANGED",
+                    "Team Call L1 changed repository filesystem state",
+                )
+            if git_control_after != git_control_before:
+                _fail(
+                    "READ_ONLY_FILESYSTEM_CHANGED",
+                    "Team Call L1 changed repository filesystem state",
+                )
             repository_after = capture_repo(repository)
             if repository_after != repository_before:
                 _fail(
                     "TEAM_CALL_REPOSITORY_CHANGED",
                     "Team Call L1 changed repository HEAD or status",
-                )
-            filesystem_after = _team_call_filesystem_snapshot(repository)
-            if filesystem_after != filesystem_before:
-                _fail(
-                    "READ_ONLY_FILESYSTEM_CHANGED",
-                    "Team Call L1 changed repository filesystem state",
                 )
             if isinstance(result, Mapping) and isinstance(result.get("changed_files"), list) and result["changed_files"]:
                 _fail("READ_ONLY_ROLE_MODIFIED_REPO", "read-only role luna claimed repository changes")

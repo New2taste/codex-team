@@ -289,7 +289,7 @@ class TeamCallContractTest(unittest.TestCase):
         )), ("error", "TEAM_CALL_ALREADY_RUNNING")}, observed)
 
 
-class _TeamCallControllerFake(workflow.TeamCallFakeController):
+class _TeamCallControllerFake:
     """A bounded controller fixture with no process or model launch."""
 
     def __init__(self):
@@ -306,6 +306,7 @@ class _TeamCallControllerFake(workflow.TeamCallFakeController):
         self.untracked_write_path = None
         self.chmod_path = None
         self.commit_write_path = None
+        self.git_control_write_path = None
         self.on_before_run_l1 = None
         self.started = None
         self.release = None
@@ -378,7 +379,13 @@ class _TeamCallControllerFake(workflow.TeamCallFakeController):
                            check=True, capture_output=True, text=True)
             subprocess.run(("git", "commit", "-m", "controller mutation"), cwd=Path(self.commit_write_path).parent,
                            check=True, capture_output=True, text=True)
-        result = self._luna_result() if self.l1_result_override is None else self.l1_result_override
+        if self.git_control_write_path is not None:
+            Path(self.git_control_write_path).write_text("persistent controller mutation\n", encoding="utf-8")
+        result = (
+            _TeamCallControllerFake._luna_result()
+            if self.l1_result_override is None
+            else self.l1_result_override
+        )
         return dict(result)
 
 
@@ -394,9 +401,26 @@ class TeamCallControllerTest(unittest.TestCase):
         (self.repo / "README.md").write_text("fixture\n", encoding="utf-8")
         self._git("add", "README.md")
         self._git("commit", "-m", "initial fixture")
-        self.controller = _TeamCallControllerFake()
+        self.controller = workflow.TeamCallFakeController()
+        _TeamCallControllerFake.__init__(self.controller)
+        self.controller_patches = (
+            mock.patch.object(
+                workflow.TeamCallFakeController,
+                "run_l0",
+                new=_TeamCallControllerFake.run_l0,
+            ),
+            mock.patch.object(
+                workflow.TeamCallFakeController,
+                "run_l1",
+                new=_TeamCallControllerFake.run_l1,
+            ),
+        )
+        for patcher in self.controller_patches:
+            patcher.start()
 
     def tearDown(self):
+        for patcher in reversed(self.controller_patches):
+            patcher.stop()
         self.temporary.cleanup()
 
     def _git(self, *argv):
@@ -618,6 +642,59 @@ class TeamCallControllerTest(unittest.TestCase):
         self.assertEqual("", self._git("status", "--porcelain=v1").stdout)
         self.assertEqual("BLOCKED", self._team_rows()[-1]["route_status"])
 
+    def test_l1_git_control_plane_write_records_blocked_route(self):
+        git_dir = Path(self._git("rev-parse", "--absolute-git-dir").stdout.strip())
+        self.controller.git_control_write_path = git_dir / "l1-controller-write"
+
+        with self.assertRaisesRegex(workflow.WorkflowError, "READ_ONLY_FILESYSTEM_CHANGED"):
+            workflow.run_team_call(
+                "team call 核对文件 README.md",
+                repository_root=self.repo,
+                state_root=self.root,
+                controller=self.controller,
+            )
+
+        self.assertTrue((git_dir / "l1-controller-write").is_file())
+        self.assertEqual("BLOCKED", self._team_rows()[-1]["route_status"])
+
+    def test_l1_linked_worktree_gitdir_and_common_gitdir_writes_are_blocked(self):
+        linked = Path(self.temporary.name) / "linked-worktree"
+        self._git("worktree", "add", "-b", "linked-test", str(linked))
+        linked_gitdir = Path(
+            subprocess.run(
+                ("git", "rev-parse", "--absolute-git-dir"),
+                cwd=linked,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        )
+        common_gitdir = Path(
+            subprocess.run(
+                ("git", "rev-parse", "--git-common-dir"),
+                cwd=linked,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        )
+
+        def write_both_control_roots(task):
+            (linked_gitdir / "l1-worktree-write").write_text("mutation\n", encoding="utf-8")
+            (common_gitdir / "l1-common-write").write_text("mutation\n", encoding="utf-8")
+
+        self.controller.on_before_run_l1 = write_both_control_roots
+        with self.assertRaisesRegex(workflow.WorkflowError, "READ_ONLY_FILESYSTEM_CHANGED"):
+            workflow.run_team_call(
+                "team call 核对文件 README.md",
+                repository_root=linked,
+                state_root=self.root,
+                controller=self.controller,
+            )
+
+        self.assertTrue((linked_gitdir / "l1-worktree-write").is_file())
+        self.assertTrue((common_gitdir / "l1-common-write").is_file())
+
     def test_l1_controller_cannot_widen_the_read_only_write_scope(self):
         self.controller.mutate_task = lambda task: task.__setitem__("allowed_write_paths", ["README.md"])
 
@@ -701,6 +778,72 @@ class TeamCallControllerTest(unittest.TestCase):
 
         self.assertEqual(0, self.controller.execution_count)
         self.assertEqual("BLOCKED", self._team_rows()[-1]["route_status"])
+
+    def test_l1_post_revalidation_swap_cannot_change_consumed_evidence(self):
+        (self.repo / "docs").mkdir()
+        (self.repo / "docs" / "evidence.md").write_text("IN_REPO\n", encoding="utf-8")
+        self._git("add", "docs/evidence.md")
+        self._git("commit", "-m", "add pinned evidence")
+        outside = Path(self.temporary.name) / "outside-after-revalidation"
+        outside.mkdir()
+        (outside / "evidence.md").write_text("OUTSIDE_SECRET\n", encoding="utf-8")
+        observed = []
+        original_revalidate = workflow._revalidate_team_call_l1_evidence
+
+        def swap_after_revalidation(repository, evidence_pin):
+            current = original_revalidate(repository, evidence_pin)
+            (self.repo / "docs" / "evidence.md").unlink()
+            (self.repo / "docs").rmdir()
+            (self.repo / "docs").symlink_to(outside, target_is_directory=True)
+            return current
+
+        def consume_evidence(task):
+            pinned = getattr(task, "pinned_evidence_bytes", None)
+            if pinned is not None:
+                observed.append(pinned.decode("utf-8"))
+            else:
+                observed.append(
+                    (Path(task["repository_root"]) / task["authoritative_files"][0]).read_text(
+                        encoding="utf-8"
+                    )
+                )
+
+        self.controller.on_before_run_l1 = consume_evidence
+        with mock.patch.object(
+            workflow, "_revalidate_team_call_l1_evidence", new=swap_after_revalidation
+        ):
+            with self.assertRaisesRegex(workflow.WorkflowError, "TEAM_CALL_REPOSITORY_CHANGED"):
+                workflow.run_team_call(
+                    "team call 核对文件 docs/evidence.md",
+                    repository_root=self.repo,
+                    state_root=self.root,
+                    controller=self.controller,
+                )
+
+        self.assertEqual(["IN_REPO\n"], observed)
+
+    def test_direct_l1_rejects_a_subclass_forged_controller_capability(self):
+        class ForgedController(workflow.TeamCallFakeController):
+            def __init__(self):
+                self.calls = 0
+
+            def run_l0(self, argv, cwd):
+                raise AssertionError("not an L0 request")
+
+            def run_l1(self, task, *, role):
+                self.calls += 1
+                return _TeamCallControllerFake._luna_result()
+
+        controller = ForgedController()
+        with self.assertRaisesRegex(workflow.WorkflowError, "TEAM_CALL_CONTROLLER_UNTRUSTED"):
+            workflow.run_team_call(
+                "team call 核对文件 README.md",
+                repository_root=self.repo,
+                state_root=self.root,
+                controller=controller,
+            )
+
+        self.assertEqual(0, controller.calls)
 
     def test_direct_l1_rejects_a_live_controller_before_task_or_model_execution(self):
         controller = workflow.TeamCallProductionController(self.root, allow_live_model=True)
