@@ -530,6 +530,62 @@ class DistributionContractTest(unittest.TestCase):
             )
             self.assertNotEqual(0, result.returncode, result.stderr)
 
+    def test_plugin_verifier_rejects_a_dangling_plugin_legacy_template(self):
+        """A dangling old Plugin template is still a shipped legacy entry."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            release_root = Path(temporary) / "release"
+            shutil.copytree(ROOT / ".codex", release_root / ".codex")
+            shutil.copytree(ROOT / "config", release_root / "config")
+            shutil.copytree(ROOT / "scripts", release_root / "scripts")
+            shutil.copytree(
+                ROOT / "plugins" / "ai-workflow",
+                release_root / "plugins" / "ai-workflow",
+            )
+            legacy = release_root / "plugins" / "ai-workflow" / "agents" / LEGACY_TARGET_NAME
+            legacy.symlink_to("missing-luna-worker.toml")
+            self.assertTrue(legacy.is_symlink())
+            self.assertFalse(legacy.exists())
+
+            result = subprocess.run(
+                ["sh", str(release_root / "plugins" / "ai-workflow" / "scripts" / "verify.sh")],
+                cwd=release_root,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertNotEqual(0, result.returncode, result.stderr)
+
+    def test_plugin_verifier_rejects_a_dangling_root_legacy_template(self):
+        """A dangling old root mirror is still a shipped legacy entry."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            release_root = Path(temporary) / "release"
+            shutil.copytree(ROOT / ".codex", release_root / ".codex")
+            shutil.copytree(ROOT / "config", release_root / "config")
+            shutil.copytree(ROOT / "scripts", release_root / "scripts")
+            shutil.copytree(
+                ROOT / "plugins" / "ai-workflow",
+                release_root / "plugins" / "ai-workflow",
+            )
+            legacy = release_root / ".codex" / "agents" / LEGACY_TARGET_NAME
+            legacy.symlink_to("missing-luna-worker.toml")
+            self.assertTrue(legacy.is_symlink())
+            self.assertFalse(legacy.exists())
+
+            result = subprocess.run(
+                ["sh", str(release_root / "plugins" / "ai-workflow" / "scripts" / "verify.sh")],
+                cwd=release_root,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertNotEqual(0, result.returncode, result.stderr)
+
 
 class AgentLifecycleTest(unittest.TestCase):
     def run_wrapper(
