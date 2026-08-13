@@ -92,12 +92,14 @@
 
 ```text
 已接受的阻断项
-→ Terra xhigh 复杂施工与第一次整改
+→ 原 owner（Luna Max 或 Terra xhigh，在原 envelope 内）提交初次修复
 → 人工批准范围
 → 创建独立 branch/worktree
-→ 独立 Terra xhigh 对抗审查
-→ 第二次 Terra 失败后才可进入 scoped Sol medium fallback + distinct peer
-→ Sol xhigh 仅在 owner 授权时终局升级
+→ 初次提交由独立 Terra xhigh adversarial review
+→ 若 REWORK，原 owner 在原 envelope 内第一次返工
+→ 第二次提交由另一独立 Terra xhigh review
+→ 仍失败才可进入 scoped Sol-medium repair + different Sol-medium peer
+→ peer 再失败才由 Sol xhigh 终局升级（无 task-level review）
 → AWAITING_OWNER_DECISION
 ```
 
@@ -111,9 +113,9 @@
 |---|---|---|
 | L0 | 命令执行、哈希、文件数、固定字符串搜索 | 无叙事性自检；由编排器保存命令、退出码和产物 |
 | L1 | 事实盘点、文档对照、证据抽取 | 最多 5 条关键主张，每条最小证据，最关键结论 1 次交叉检查，列盲区 |
-| L2 | 窄域实现、验收预审、原阻断项复验 | 目标测试，1 个有效负向样例或变异，diff 范围核对，盲区 |
+| L2 | 有界证据抽取、原阻断项负向验证 | 目标测试，1 个有效负向样例或变异，diff 范围核对，盲区 |
 
-L3 不是 Luna 的更高自检档。开放式、高风险语义任务直接转 Sol medium。
+L3 不是 Luna 的更高自检档。复杂或高风险语义任务默认转 Terra xhigh；只有 owner-authorized Sol xhigh 规划，或第二次 Terra xhigh 失败后的冻结梯级（scoped Sol-medium fallback + distinct peer）才可改变角色路径。
 
 Luna 只能返回：
 
@@ -196,7 +198,7 @@ human_gates
 
 ## 9. 风险路由
 
-存在以下任一标记的整改，必须由 Sol medium 先冻结规格：
+存在以下任一标记的整改，默认转 Terra xhigh 负责复杂施工、验证和独立对抗审查；复杂语义有歧义时必须停止并回交，不得直接注入普通 Sol medium：
 
 ```text
 CONSTITUTION
@@ -210,27 +212,33 @@ PUBLIC_API
 CROSS_CARD_CONTRACT
 ```
 
-Sol xhigh 只可在下列条件下被建议：
+Sol xhigh 只可在 owner-authorized 规划或终局升级案卷中被建议：
 
 - 权威规则实质冲突；
-- Sol medium 无法在闭集选项中稳定裁定；
 - 同类语义缺陷返工后仍未关闭；
 - 污染、PIT 或安全错误可能造成不可逆后果；
 - 重大设计存在多个不可兼容方案。
+
+Sol medium 不负责冻结规格或闭集裁定；只有第二次 Terra xhigh 失败后的冻结梯级才允许一次 scoped Sol-medium fallback + distinct peer。
 
 编排器只能进入 `ESCALATION_PROPOSED`，项目所有者批准后才能调用 Sol xhigh。
 
 ## 10. 重试与升级
 
-每项任务最多：
+每项整改最多：
 
 ```text
-1 次技术重试
-1 次同角色实现返工
-1 次跨模型升级
+1 次技术重试（每个 attempt）
+初次提交由独立 Terra xhigh adversarial review；若 REWORK，由原 owner（可为 Luna Max 或 Terra xhigh，必须在原 envelope 内）做第一次返工
+第二次提交由另一独立 Terra xhigh review
+若仍失败，才可一次 scoped Sol-medium repair + different Sol-medium peer
+peer 再失败：一次 Sol-xhigh terminal repair；无 task-level review
 ```
 
 达到上限后强制 `BLOCKED`。
+
+v2 ledger 的终局事件仍是 `TASK_TERMINAL`，并明确
+`whole_project_acceptance_required=PENDING`；Task 5 才执行独立的最终整体验收，本 Task 不新增终局 review phase。
 
 进程异常、JSON 不合法、工具超时和命令未启动属技术失败，可原角色重试一次。规格误解、语义不变量漏失或多义解释属语义失败，不得让低阶角色重复碰运气。
 

@@ -298,6 +298,40 @@ class DistributionContractTest(unittest.TestCase):
         ):
             self.assertIn(phrase, published, phrase)
 
+        for stale_phrase in (
+            "验收预审",
+            "开放式、高风险语义任务直接转 sol medium",
+            "必须由 sol medium 先冻结规格",
+            "sol medium 无法在闭集选项中稳定裁定",
+            "1 次同角色实现返工",
+            "两轮 terra xhigh owner-repair/review",
+            "第一次独立 terra review 后修复，第二次独立 terra review 再验证",
+        ):
+            self.assertNotIn(stale_phrase, published, stale_phrase)
+
+        for lifecycle_phrase in (
+            "复杂或高风险语义任务默认转 terra xhigh",
+            "owner-authorized sol xhigh 规划",
+            "初次提交由独立 terra xhigh adversarial review",
+            "若 rework",
+            "luna max 或 terra xhigh",
+            "原 owner 在原 envelope 内第一次返工",
+            "第二次提交由另一独立 terra xhigh review",
+            "仍失败才可",
+            "第二次 terra xhigh 失败后的冻结梯级",
+            "scoped sol-medium repair + different sol-medium peer",
+            "sol-xhigh terminal repair",
+            "无 task-level review",
+        ):
+            self.assertIn(lifecycle_phrase, published, lifecycle_phrase)
+
+        root_policy = tomllib.loads((ROOT / "config" / "ai_workflow.toml").read_text())
+        plugin_policy = tomllib.loads(
+            (PLUGIN / "config" / "ai_workflow.toml").read_text()
+        )
+        for config in (root_policy, plugin_policy):
+            self.assertEqual(2, config["policy"]["max_implementation_reworks"])
+
         self.assertNotIn("execution os remains terra-led", published)
         self.assertNotIn("luna is only a low-cost bounded tool process", published)
         self.assertNotIn("luna max 卡面预审", published)
