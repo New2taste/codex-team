@@ -314,6 +314,35 @@ class DistributionContractTest(unittest.TestCase):
         ).casefold()
         published = "\n".join((readme, skill, metadata))
 
+        self.assertIn("luna_max", published)
+        self.assertIn("luna max", published)
+        self.assertNotRegex(published, r"(?:require|invoke|select).*luna_worker")
+
+        for source_name, source in (("README", readme), ("orchestration skill", skill)):
+            legacy_lines = tuple(
+                line for line in source.splitlines() if "luna_worker" in line
+            )
+            self.assertTrue(
+                legacy_lines,
+                f"{source_name} must retain one explicit installer migration mention",
+            )
+            for line in legacy_lines:
+                self.assertRegex(
+                    line,
+                    r"(?:migration|迁移)",
+                    f"legacy identifier outside migration language: {line}",
+                )
+                self.assertNotRegex(
+                    line,
+                    r"(?:require|invoke|select|生成|调用|选择|角色)",
+                    f"legacy identifier presented as an execution role: {line}",
+                )
+
+        self.assertNotRegex(
+            published,
+            r"luna_worker[^\n]{0,180}(?:execution|agent|role|invoke|select|require|调用|选择|生成)",
+        )
+
         for phrase in (
             "luna max",
             "frozen envelope",

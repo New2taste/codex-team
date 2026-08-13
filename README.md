@@ -36,22 +36,28 @@
 
 它是一个可关闭、可恢复、可审计的“方案规划—工程验收—验收后整改”半自动编排器。
 
-## 3. Luna 模型、子代理与 `luna_worker`
+## 3. Luna 模型、子代理与 `luna_max`
 
 三个概念必须分开：
 
 - `gpt-5.6-luna` 是模型；
 - 子代理是由父会话派生的运行形态；
-- `luna_worker` 是固定 Luna Max 及有界规则的自定义角色。
+- `luna_max` 是固定 Luna Max 及有界规则的自定义 Agent 身份。
 
-当前 Codex 本地客户端支持在 `~/.codex/agents/*.toml` 定义自定义子代理，并在文件中固定 `model` 与 `model_reasoning_effort`。交互式父会话可按名称生成 `luna_worker`。
+当前 Codex 本地客户端支持在 `~/.codex/agents/*.toml` 定义自定义 Agent，并在文件中固定 `model` 与 `model_reasoning_effort`。交互式父会话可按名称生成 `luna_max`。
 
-`codex exec` 当前没有 `--agent luna_worker` 接口。因此：
+`codex exec` 当前没有 `--agent luna_max` 接口。因此：
 
-- 交互式工作：直接生成 `luna_worker` 子代理；
+- 交互式工作：直接生成 `luna_max` 自定义 Agent；
 - 自动编排：以 `codex exec -m gpt-5.6-luna` 启动独立 Luna Max 会话，并注入项目角色契约。
 
-`luna_worker` 予以保留，但只是交互式轻量适配器，不得成为第二套项目规则。
+当前开发 harness 可能显示内置 worker type 标签；该平台标签不属于本仓库的自定义 Agent 选项，也不改变 workflow role `luna`。
+
+### 一次性安装器迁移（installer migration）
+
+旧版安装目录若包含 `luna_worker`，安装器只能在验证旧模板、状态和备份完整后执行一次性 migration，并发布 canonical `luna-max.toml` 及对应状态文件。`luna_worker` 仅作为迁移输入；迁移失败必须保留原有用户文件。
+
+迁移完成后，当前可选择和调用的自定义 Agent 只有 `luna_max`。
 
 ## 4. 自动化边界
 
@@ -435,7 +441,7 @@ data/state/ai-workflow/<task_id>/
 
 ### 阶段 1：Luna 有界实现
 
-交互式生成现有 `luna_worker`，只负责：
+交互式生成现有 `luna_max`，只负责：
 
 - TOML 配置骨架；
 - task/result JSON Schema；
@@ -476,7 +482,7 @@ data/state/ai-workflow/<task_id>/
 
 1. 本文顶部的文档状态改为 `APPROVED_FOR_IMPLEMENTATION`（该状态不属于第 11 节的运行任务状态机）；
 2. 制定详细实施计划；
-3. 调用现有 `luna_worker` 施工阶段 1；
+3. 调用现有 `luna_max` 施工阶段 1；
 4. 主控独立复核后才能进入 Terra 工程接入。
 
 本文未获批前，不创建任何运行代码，不修改现有全局 Agent 配置。

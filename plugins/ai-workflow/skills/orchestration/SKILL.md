@@ -12,12 +12,19 @@ Agent. Resolve the installed plugin directory first, then run:
 sh "$plugin_dir/scripts/install-agents.sh" --check
 ```
 
-Stop if preflight fails. Require the exact custom Agent name `luna_worker`; do
+Stop if preflight fails. Require the exact custom Agent name `luna_max`; do
 not substitute `worker` or any built-in Agent. A native interactive
-`luna_worker` invocation and an automated
+`luna_max` invocation and an automated
 `codex exec -m gpt-5.6-luna` role-contract invocation are different execution
 surfaces. Neither surface may erase the task envelope, L0/L1/L2 evidence
 level, human owner gates, or the final-acceptance boundary.
+
+## Legacy installer migration (one-time)
+
+If an existing install contains `luna_worker` as one-time migration input, the
+installer may process it only after validating the legacy template,
+state, and backup. The old spelling is never a current selectable or invoked
+Agent; the workflow role remains `luna`.
 
 ## Frozen role and lifecycle contract
 
