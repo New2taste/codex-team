@@ -520,9 +520,9 @@ class RepairProtocolTest(unittest.TestCase):
 
         self_task_id = self.task_id
         boundary = ControllerBoundary()
-        with self.assertRaisesRegex(workflow.WorkflowError, "ACCEPTANCE_RECEIPT_MISMATCH"):
+        with self.assertRaisesRegex(workflow.WorkflowError, "REPAIR_ADAPTER_REQUIRED"):
             repairs.run_assignment(self.store, self.task_id, assignment, boundary)
-        self.assertEqual(1, boundary.attestation_calls)
+        self.assertEqual(0, boundary.attestation_calls)
         self.assertEqual(0, boundary.execution_calls)
         events = [
             json.loads(line)

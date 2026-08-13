@@ -306,6 +306,8 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
         execution_surface: str = "CODEX_EXEC_ROLE_CONTRACT",
         native_agent_uuid: str | None = None,
         codex_thread_id: str | None = None,
+        observed_sandbox_policy: str | None = None,
+        observed_permission_profile: str | None = None,
     ) -> object:
         api = self._v2()
         assignment_id = assignment_id or hashlib.sha256(
@@ -344,6 +346,8 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
                 "read-only",
                 "read-only",
             )
+        sandbox = observed_sandbox_policy or sandbox
+        permission = observed_permission_profile or permission
         native_id = source_id if execution_surface == "NATIVE_SUBAGENT" else None
         codex_id = source_id if execution_surface == "CODEX_EXEC_ROLE_CONTRACT" else None
         evidence = {
@@ -521,7 +525,18 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
                 ),
             }
         receipt = self._receipt_for(
-            assignment, label, role, **receipt_kwargs
+            assignment,
+            label,
+            role,
+            **(
+                {
+                    **receipt_kwargs,
+                    "observed_sandbox_policy": "workspace-write",
+                    "observed_permission_profile": "assignment-scoped-write",
+                }
+                if phase == "SOL_MEDIUM_REPAIR"
+                else receipt_kwargs
+            ),
         )
         self._record_runtime_evidence(receipt)
         return expected, assignment, receipt
@@ -533,15 +548,81 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
         output_candidate: str,
         changed_paths: tuple[str, ...] = ("src/alpha.py",),
     ) -> object:
-        api = self._v2()
-        return api["complete_acceptance_assignment"](
-            self.store,
-            self.TASK_ID,
-            assignment,
-            actor,
-            output_candidate,
-            changed_paths,
-        )
+        with self.store.lock(self.TASK_ID):
+            replay = repairs.replay_acceptance_ledger(self.store, self.TASK_ID)
+            self.assertIsNotNone(replay)
+            stored_task = workflow.load_task(
+                self.store._require_task(self.TASK_ID) / "task.json"
+            )
+            attestation = repairs.ControllerExecutionAttestation(
+                task_id=self.TASK_ID,
+                task_sha256=assignment.capability.task_sha256,
+                assignment_id=assignment.assignment_id,
+                capability_id=assignment.capability.capability_id,
+                candidate_commit=replay.current_candidate_commit,
+                actor_receipt=actor,
+            )
+            repairs._v2_start_attempt(
+                self.store,
+                self.TASK_ID,
+                replay,
+                repairs._v2_context(self.store, self.TASK_ID),
+                assignment,
+                actor,
+                stored_task,
+                attestation,
+            )
+        with self.store.lock(self.TASK_ID):
+            replay = repairs.replay_acceptance_ledger(self.store, self.TASK_ID)
+            self.assertIsNotNone(replay)
+            context = repairs._v2_context(self.store, self.TASK_ID)
+            stored_task = workflow.load_task(
+                self.store._require_task(self.TASK_ID) / "task.json"
+            )
+            try:
+                repairs._v2_require_issued_assignment(replay, assignment)
+                if replay.started_receipts.get(assignment.assignment_id) != actor:
+                    raise workflow.WorkflowError(
+                        "ACCEPTANCE_SEQUENCE_INVALID", "test controller receipt drifted"
+                    )
+                actual = repairs._v2_validate_repair_output(
+                    stored_task, assignment, output_candidate, changed_paths
+                )
+                fields = {
+                    "assignment_id": assignment.assignment_id,
+                    "attempt_id": assignment.attempt_id,
+                    "actor_receipt": repairs._v2_receipt_payload(actor),
+                    "changed_paths": list(actual),
+                    "actual_changed_paths": list(actual),
+                    "output_candidate_commit": output_candidate,
+                }
+                if assignment.phase == "SOL_XHIGH_TERMINAL_REPAIR":
+                    fields.update(
+                        {
+                            "terminal_state": "TASK_TERMINAL",
+                            "terminal_reason": "SOL_XHIGH_TERMINAL_REPAIR_COMPLETED",
+                            "whole_project_acceptance_required": "PENDING",
+                        }
+                    )
+                repairs._v2_append(
+                    self.store,
+                    self.TASK_ID,
+                    replay,
+                    context,
+                    "REPAIR_COMPLETED",
+                    output_candidate,
+                    fields,
+                )
+            except RuntimeError as exc:
+                repairs._v2_fail_attempt(
+                    self.store,
+                    self.TASK_ID,
+                    replay,
+                    context,
+                    assignment,
+                    exc,
+                )
+                raise
 
     def _review(
         self,
@@ -551,16 +632,115 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
         findings: tuple[object, ...] = (),
         evidence: object | None = None,
     ) -> object:
-        api = self._v2()
-        return api["record_adversarial_review"](
-            self.store,
-            self.TASK_ID,
-            assignment,
-            reviewer,
-            verdict,
-            findings,
-            evidence or self._evidence(verdict.lower()),
-        )
+        with self.store.lock(self.TASK_ID):
+            replay = repairs.replay_acceptance_ledger(self.store, self.TASK_ID)
+            self.assertIsNotNone(replay)
+            stored_task = workflow.load_task(
+                self.store._require_task(self.TASK_ID) / "task.json"
+            )
+            attestation = repairs.ControllerExecutionAttestation(
+                task_id=self.TASK_ID,
+                task_sha256=assignment.capability.task_sha256,
+                assignment_id=assignment.assignment_id,
+                capability_id=assignment.capability.capability_id,
+                candidate_commit=replay.current_candidate_commit,
+                actor_receipt=reviewer,
+            )
+            repairs._v2_start_attempt(
+                self.store,
+                self.TASK_ID,
+                replay,
+                repairs._v2_context(self.store, self.TASK_ID),
+                assignment,
+                reviewer,
+                stored_task,
+                attestation,
+            )
+        with self.store.lock(self.TASK_ID):
+            replay = repairs.replay_acceptance_ledger(self.store, self.TASK_ID)
+            self.assertIsNotNone(replay)
+            context = repairs._v2_context(self.store, self.TASK_ID)
+            stored_task = workflow.load_task(
+                self.store._require_task(self.TASK_ID) / "task.json"
+            )
+            try:
+                repairs._v2_require_issued_assignment(replay, assignment)
+                if replay.started_receipts.get(assignment.assignment_id) != reviewer:
+                    raise workflow.WorkflowError(
+                        "ACCEPTANCE_SEQUENCE_INVALID", "test controller receipt drifted"
+                    )
+                if assignment.phase not in repairs._REVIEW_PHASES or verdict not in {
+                    "ACCEPT",
+                    "REWORK",
+                }:
+                    raise workflow.WorkflowError(
+                        "ACCEPTANCE_SEQUENCE_INVALID", "test controller verdict is invalid"
+                    )
+                controller_evidence = repairs.execute_adversarial_evidence(
+                    self.store, self.TASK_ID, replay.current_candidate_commit
+                )
+                supplied_evidence = evidence or controller_evidence
+                if supplied_evidence != controller_evidence:
+                    raise workflow.WorkflowError(
+                        "ACCEPTANCE_EVIDENCE_INVALID", "test evidence was not controller-run"
+                    )
+                frozen_findings = repairs._v2_findings(findings)
+                if verdict == "ACCEPT" and frozen_findings:
+                    raise workflow.WorkflowError(
+                        "ACCEPTANCE_SEQUENCE_INVALID", "acceptance has findings"
+                    )
+                if verdict == "REWORK":
+                    if not frozen_findings:
+                        raise workflow.WorkflowError(
+                            "ACCEPTANCE_SEQUENCE_INVALID", "rework lacks findings"
+                        )
+                    repairs._v2_assert_findings_within_task(
+                        frozen_findings, stored_task
+                    )
+                    if assignment.phase != "REVIEW_1" and not set(
+                        repairs._v2_allowed_paths(frozen_findings)
+                    ).issubset(assignment.allowed_paths):
+                        raise workflow.WorkflowError(
+                            "ACCEPTANCE_SEQUENCE_INVALID", "rework expanded scope"
+                        )
+                fields = {
+                    "assignment_id": assignment.assignment_id,
+                    "attempt_id": assignment.attempt_id,
+                    "reviewer_receipt": repairs._v2_receipt_payload(reviewer),
+                    "verdict": verdict,
+                    "findings": repairs._v2_findings_payload(frozen_findings),
+                    "evidence": dataclasses.asdict(controller_evidence),
+                    "evidence_sha256": repairs._v2_sha256(
+                        dataclasses.asdict(controller_evidence)
+                    ),
+                }
+                if verdict == "ACCEPT":
+                    fields.update(
+                        {
+                            "terminal_state": "TASK_TERMINAL",
+                            "terminal_reason": f"{assignment.phase}_ACCEPTED",
+                            "whole_project_acceptance_required": "PENDING",
+                        }
+                    )
+                repairs._v2_append(
+                    self.store,
+                    self.TASK_ID,
+                    replay,
+                    context,
+                    "REVIEW_COMPLETED",
+                    replay.current_candidate_commit,
+                    fields,
+                )
+            except RuntimeError as exc:
+                repairs._v2_fail_attempt(
+                    self.store,
+                    self.TASK_ID,
+                    replay,
+                    context,
+                    assignment,
+                    exc,
+                )
+                raise
 
     def _events(self) -> list[dict[str, object]]:
         path = self.state_root / self.TASK_ID / "events.jsonl"
@@ -922,7 +1102,15 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
                 workflow.load_task(self.store._require_task(self.TASK_ID) / "task.json"),
             )
         with self.assertRaisesRegex(workflow.WorkflowError, "ASSIGNMENT_ATTEMPT_INTERRUPTED"):
-            self._review(review, reviewer_receipt, "ACCEPT")
+            repairs.record_adversarial_review(
+                self.store,
+                self.TASK_ID,
+                review,
+                reviewer_receipt,
+                "ACCEPT",
+                (),
+                self._evidence("accept"),
+            )
         events = self._events()
         self.assertEqual(
             1,
@@ -943,6 +1131,381 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
             self.assertFalse(probe.exists(), "controller must not execute a shell escape")
         finally:
             probe.unlink(missing_ok=True)
+
+    def test_controller_evidence_rejects_metacharacters_and_non_targets_before_launch(self):
+        unsafe_commands = (
+            "python3 -m unittest |",
+            "python3 -m unittest &",
+            "python3 -m unittest tests.test_alpha |",
+            "python3 -m unittest tests.test_alpha &",
+            "python3 -m unittest tests.test_alpha # comment",
+            "python3 -m unittest tests.*",
+            "python3 -m unittest ${TEST_TARGET}",
+            "python3 -m unittest tests[.]test_alpha",
+            "python3 -m unittest --help",
+            "python3 -m unittest",
+            "python3 -m unittest ''",
+            "python3 -m unittest tests.test_alpha\x01",
+        )
+        real_run = subprocess.run
+
+        def reject_python_launch(argv, *args, **kwargs):
+            if Path(argv[0]).name.startswith("python"):
+                raise AssertionError("unsafe command reached subprocess launch")
+            return real_run(argv, *args, **kwargs)
+
+        for index, command in enumerate(unsafe_commands, start=920):
+            with self.subTest(command=command):
+                task_id = f"AWF-20260809-{index}"
+                task = dict(self.task)
+                task["task_id"] = task_id
+                task["acceptance_commands"] = [command]
+                self.store.create_task(task)
+                with mock.patch.object(
+                    repairs.subprocess,
+                    "run",
+                    side_effect=reject_python_launch,
+                ) as launched:
+                    with self.assertRaisesRegex(
+                        workflow.WorkflowError, "ACCEPTANCE_EVIDENCE_INVALID"
+                    ):
+                        repairs.execute_adversarial_evidence(self.store, task_id)
+                self.assertFalse(
+                    any(
+                        Path(call.args[0][0]).name.startswith("python")
+                        for call in launched.call_args_list
+                    )
+                )
+
+    def test_public_runtime_records_and_arbitrary_boundary_cannot_authorize_accept(self):
+        self._open_with_owner("luna-owner", "luna")
+        _, review, reviewer_receipt = self._issue_with_receipt(
+            "REVIEW_1", "terra-review-one", "terra_xhigh_reviewer"
+        )
+        forged_evidence = repairs.execute_adversarial_evidence(
+            self.store, self.TASK_ID, review.input_candidate_commit
+        )
+        case = self
+
+        class CallerBoundary(repairs.ControllerAssignmentBoundary):
+            def __init__(self) -> None:
+                self.attestation_calls = 0
+                self.execution_calls = 0
+
+            def attest_execution(self, capability):
+                self.attestation_calls += 1
+                return repairs.ControllerExecutionAttestation(
+                    task_id=case.TASK_ID,
+                    task_sha256=capability.task_sha256,
+                    assignment_id=review.assignment_id,
+                    capability_id=capability.capability_id,
+                    candidate_commit=review.input_candidate_commit,
+                    actor_receipt=reviewer_receipt,
+                )
+
+            def execute_capability(self, capability):
+                self.execution_calls += 1
+                return {
+                    "verdict": "ACCEPT",
+                    "findings": (),
+                    "evidence": forged_evidence,
+                }
+
+        boundary = CallerBoundary()
+        with self.assertRaisesRegex(workflow.WorkflowError, "REPAIR_ADAPTER_REQUIRED"):
+            repairs.run_assignment(self.store, self.TASK_ID, review, boundary)
+        self.assertEqual(0, boundary.attestation_calls)
+        self.assertEqual(0, boundary.execution_calls)
+        sessions = self.repository_root.parent / "forged-sessions"
+        sessions.mkdir()
+        (sessions / f"rollout-{reviewer_receipt.runtime_instance_id}").write_text(
+            json.dumps(
+                {
+                    "thread_id": reviewer_receipt.runtime_instance_id,
+                    "agent_type": None,
+                    "model": reviewer_receipt.observed_model,
+                    "reasoning_effort": reviewer_receipt.observed_reasoning_effort,
+                    "sandbox_policy": reviewer_receipt.observed_sandbox_policy,
+                    "permission_profile": reviewer_receipt.observed_permission_profile,
+                    "cwd": reviewer_receipt.observed_cwd,
+                }
+            ),
+            encoding="utf-8",
+        )
+        real_run = subprocess.run
+
+        def no_codex_launch(command, *args, **kwargs):
+            if Path(command[0]).name == "codex":
+                raise AssertionError("caller-authored evidence reached Codex execution")
+            return real_run(command, *args, **kwargs)
+
+        with mock.patch.object(
+            workflow.subprocess, "run", side_effect=no_codex_launch
+        ) as launched:
+            with self.assertRaises(workflow.WorkflowError):
+                repairs.run_assignment(self.store, self.TASK_ID, review, sessions)
+        self.assertFalse(
+            any(Path(call.args[0][0]).name == "codex" for call in launched.call_args_list)
+        )
+        with self.assertRaisesRegex(workflow.WorkflowError, "REPAIR_ADAPTER_REQUIRED"):
+            repairs.record_adversarial_review(
+                self.store,
+                self.TASK_ID,
+                review,
+                reviewer_receipt,
+                "ACCEPT",
+                (),
+                forged_evidence,
+            )
+        replay = repairs.replay_acceptance_ledger(self.store, self.TASK_ID)
+        self.assertIsNotNone(replay)
+        self.assertFalse(replay.terminal)
+
+    def test_controller_fixed_executor_resumes_issued_runtime_and_accepts(self):
+        self._open_with_owner("luna-owner", "luna")
+        reviewer_thread = str(uuid.uuid4())
+        review = self._issue(
+            "REVIEW_1",
+            self._expected_actor(
+                "terra-controller-review",
+                "terra_xhigh_reviewer",
+                runtime_instance_id=reviewer_thread,
+            ),
+        )
+        sessions = self.repository_root.parent / "sessions"
+        sessions.mkdir()
+        (sessions / f"rollout-{reviewer_thread}").write_text(
+            json.dumps(
+                {
+                    "thread_id": reviewer_thread,
+                    "agent_type": None,
+                    "model": "gpt-5.6-terra",
+                    "reasoning_effort": "xhigh",
+                    "sandbox_policy": "read-only",
+                    "permission_profile": "read-only",
+                    "cwd": str(self.repository_root),
+                }
+            ),
+            encoding="utf-8",
+        )
+        real_run = subprocess.run
+
+        def controller_process(command, *args, **kwargs):
+            if Path(command[0]).name == "codex":
+                self.assertIn('sandbox_mode="read-only"', command)
+                output_path = Path(command[command.index("-o") + 1])
+                output_path.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": "ai-result-1",
+                            "role": "terra_xhigh_reviewer",
+                            "status": "ACCEPTANCE_RECOMMENDED",
+                            "summary": "The issued candidate meets its frozen contract.",
+                            "claims": [],
+                            "evidence": [],
+                            "counter_checks": [],
+                            "changed_files": [],
+                            "blind_spots": [],
+                            "unresolved_questions": [],
+                            "recommended_next_state": "AWAITING_OWNER_DECISION",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                events = "\n".join(
+                    (
+                        json.dumps(
+                            {"type": "thread.started", "thread_id": reviewer_thread}
+                        ),
+                        json.dumps({"type": "turn.completed"}),
+                    )
+                )
+                return subprocess.CompletedProcess(
+                    command, 0, stdout=events + "\n", stderr=""
+                )
+            return real_run(command, *args, **kwargs)
+
+        with mock.patch.object(
+            workflow.subprocess, "run", side_effect=controller_process
+        ):
+            repairs.run_assignment(self.store, self.TASK_ID, review, sessions)
+        replay = repairs.replay_acceptance_ledger(self.store, self.TASK_ID)
+        self.assertIsNotNone(replay)
+        self.assertTrue(replay.terminal)
+        events = self._events()
+        started = next(
+            event
+            for event in events
+            if event["event_type"] == "ASSIGNMENT_ATTEMPT_STARTED"
+        )
+        self.assertEqual(reviewer_thread, started["actor_receipt"]["codex_thread_id"])
+
+    def test_controller_fixed_executor_commits_only_the_issued_repair_scope(self):
+        owner_actor, _ = self._open_with_owner("luna-owner", "luna")
+        _, review, reviewer_receipt = self._issue_with_receipt(
+            "REVIEW_1", "terra-review-one", "terra_xhigh_reviewer"
+        )
+        self._review(review, reviewer_receipt, "REWORK", (self.findings[0],))
+        owner_repair = self._issue("OWNER_REPAIR", owner_actor)
+        owner_thread = owner_actor.identity.split(":", 1)[1]
+        sessions = self.repository_root.parent / "owner-sessions"
+        sessions.mkdir()
+        (sessions / f"rollout-{owner_thread}").write_text(
+            json.dumps(
+                {
+                    "thread_id": owner_thread,
+                    "agent_type": None,
+                    "model": "gpt-5.6-luna",
+                    "reasoning_effort": "max",
+                    "sandbox_policy": "workspace-write",
+                    "permission_profile": "workspace-write",
+                    "cwd": str(self.repository_root),
+                }
+            ),
+            encoding="utf-8",
+        )
+        real_run = subprocess.run
+
+        def controller_process(command, *args, **kwargs):
+            if Path(command[0]).name == "codex":
+                self.assertIn('sandbox_mode="workspace-write"', command)
+                (self.repository_root / "src" / "alpha.py").write_text(
+                    "CONTROLLER_REPAIR = True\n", encoding="utf-8"
+                )
+                real_run(
+                    ["git", "add", "src/alpha.py"],
+                    cwd=self.repository_root,
+                    check=True,
+                )
+                real_run(
+                    ["git", "commit", "-q", "-m", "controller repair"],
+                    cwd=self.repository_root,
+                    env={
+                        **os.environ,
+                        "GIT_AUTHOR_NAME": "Acceptance Contract Tests",
+                        "GIT_AUTHOR_EMAIL": "acceptance-tests@example.invalid",
+                        "GIT_COMMITTER_NAME": "Acceptance Contract Tests",
+                        "GIT_COMMITTER_EMAIL": "acceptance-tests@example.invalid",
+                    },
+                    check=True,
+                )
+                output_path = Path(command[command.index("-o") + 1])
+                output_path.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": "ai-result-1",
+                            "role": "luna",
+                            "status": "IMPLEMENTED_CANDIDATE",
+                            "summary": "Repaired the issued finding only.",
+                            "claims": [],
+                            "evidence": [],
+                            "counter_checks": [],
+                            "changed_files": ["src/alpha.py"],
+                            "blind_spots": [],
+                            "unresolved_questions": [],
+                            "recommended_next_state": "PRECHECK_RUNNING",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                events = "\n".join(
+                    (
+                        json.dumps(
+                            {"type": "thread.started", "thread_id": owner_thread}
+                        ),
+                        json.dumps({"type": "turn.completed"}),
+                    )
+                )
+                return subprocess.CompletedProcess(
+                    command, 0, stdout=events + "\n", stderr=""
+                )
+            return real_run(command, *args, **kwargs)
+
+        with mock.patch.object(
+            workflow.subprocess, "run", side_effect=controller_process
+        ):
+            repairs.run_assignment(
+                self.store, self.TASK_ID, owner_repair, sessions
+            )
+        replay = repairs.replay_acceptance_ledger(self.store, self.TASK_ID)
+        self.assertIsNotNone(replay)
+        self.assertEqual("COMPLETED", replay.phase_outcomes["OWNER_REPAIR"])
+        completion = next(
+            event
+            for event in reversed(self._events())
+            if event["event_type"] == "REPAIR_COMPLETED"
+        )
+        self.assertEqual(["src/alpha.py"], completion["actual_changed_paths"])
+
+    def test_controller_fixed_executor_binds_sol_medium_repair_write_contract(self):
+        owner_actor, _ = self._open_with_owner("terra-owner", "terra_xhigh")
+        _, first, reviewer_one_receipt = self._issue_with_receipt(
+            "REVIEW_1", "terra-review-one", "terra_xhigh_reviewer"
+        )
+        self._review(first, reviewer_one_receipt, "REWORK", self.findings)
+        _, owner_repair, owner_receipt = self._issue_with_receipt(
+            "OWNER_REPAIR", "terra-owner-repair", "terra_xhigh", expected_actor=owner_actor
+        )
+        owner_candidate = self._commit_file("src/alpha.py", "TERRA_OWNER_ALPHA = 1\n")
+        self._complete(owner_repair, owner_receipt, owner_candidate, ("src/alpha.py",))
+        _, second, reviewer_two_receipt = self._issue_with_receipt(
+            "REVIEW_2", "terra-review-two", "terra_xhigh_reviewer"
+        )
+        self._review(second, reviewer_two_receipt, "REWORK", self.findings)
+        fixer_thread = str(uuid.uuid4())
+        fixer = self._issue(
+            "SOL_MEDIUM_REPAIR",
+            self._expected_actor(
+                "sol-fixed-repair",
+                "sol_medium_reviewer",
+                runtime_instance_id=fixer_thread,
+            ),
+        )
+        sessions = self.repository_root.parent / "sol-medium-sessions"
+        sessions.mkdir()
+        (sessions / f"rollout-{fixer_thread}").write_text(
+            json.dumps(
+                {
+                    "thread_id": fixer_thread,
+                    "agent_type": None,
+                    "model": "gpt-5.6-sol",
+                    "reasoning_effort": "medium",
+                    "sandbox_policy": "workspace-write",
+                    "permission_profile": "assignment-scoped-write",
+                    "cwd": str(self.repository_root),
+                }
+            ),
+            encoding="utf-8",
+        )
+        receipt = repairs._v2_controller_runtime_receipt(
+            self.store, self.TASK_ID, fixer, self.task, sessions
+        )
+        self.assertEqual("workspace-write", receipt.observed_sandbox_policy)
+        self.assertEqual(
+            "assignment-scoped-write", receipt.observed_permission_profile
+        )
+        with self.store.lock(self.TASK_ID):
+            replay = repairs.replay_acceptance_ledger(self.store, self.TASK_ID)
+            self.assertIsNotNone(replay)
+            repairs._v2_start_attempt(
+                self.store,
+                self.TASK_ID,
+                replay,
+                repairs._v2_context(self.store, self.TASK_ID),
+                fixer,
+                receipt,
+                workflow.load_task(
+                    self.store._require_task(self.TASK_ID) / "task.json"
+                ),
+                repairs.ControllerExecutionAttestation(
+                    task_id=self.TASK_ID,
+                    task_sha256=fixer.capability.task_sha256,
+                    assignment_id=fixer.assignment_id,
+                    capability_id=fixer.capability.capability_id,
+                    candidate_commit=fixer.input_candidate_commit,
+                    actor_receipt=receipt,
+                ),
+            )
 
     def test_controller_evidence_rejects_safe_argv_that_mutates_the_repository(self):
         tests = self.repository_root / "tests"
@@ -1056,15 +1619,94 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
         with self.assertRaises(workflow.WorkflowError):
             self._issue("SOL_MEDIUM_REPAIR", self._expected_actor("sol-fixer-again", "sol_medium_reviewer"))
 
-        terminal_actor, terminal, terminal_receipt = self._issue_with_receipt(
-            "SOL_XHIGH_TERMINAL_REPAIR", "sol-xhigh", "sol_xhigh"
+        terminal_thread = str(uuid.uuid4())
+        terminal_actor = self._expected_actor(
+            "sol-xhigh", "sol_xhigh", runtime_instance_id=terminal_thread
+        )
+        terminal = self._issue(
+            "SOL_XHIGH_TERMINAL_REPAIR", terminal_actor
         )
         self._assert_assignment_binding(
             terminal, "SOL_XHIGH_TERMINAL_REPAIR", terminal_actor, sol_candidate
         )
         self.assertEqual("assignment-scoped-write", terminal.capability.write_authority)
-        terminal_candidate = self._commit_file("src/alpha.py", "SOL_XHIGH_ALPHA = 1\n")
-        self._complete(terminal, terminal_receipt, terminal_candidate, ("src/alpha.py",))
+        sessions = self.repository_root.parent / "sol-xhigh-sessions"
+        sessions.mkdir()
+        (sessions / f"rollout-{terminal_thread}").write_text(
+            json.dumps(
+                {
+                    "thread_id": terminal_thread,
+                    "agent_type": None,
+                    "model": "gpt-5.6-sol",
+                    "reasoning_effort": "xhigh",
+                    "sandbox_policy": "workspace-write",
+                    "permission_profile": "assignment-scoped-write",
+                    "cwd": str(self.repository_root),
+                }
+            ),
+            encoding="utf-8",
+        )
+        real_run = subprocess.run
+
+        def terminal_controller_process(command, *args, **kwargs):
+            if Path(command[0]).name == "codex":
+                self.assertIn('sandbox_mode="workspace-write"', command)
+                (self.repository_root / "src" / "alpha.py").write_text(
+                    "SOL_XHIGH_ALPHA = 1\n", encoding="utf-8"
+                )
+                real_run(
+                    ["git", "add", "src/alpha.py"],
+                    cwd=self.repository_root,
+                    check=True,
+                )
+                real_run(
+                    ["git", "commit", "-q", "-m", "sol terminal repair"],
+                    cwd=self.repository_root,
+                    env={
+                        **os.environ,
+                        "GIT_AUTHOR_NAME": "Acceptance Contract Tests",
+                        "GIT_AUTHOR_EMAIL": "acceptance-tests@example.invalid",
+                        "GIT_COMMITTER_NAME": "Acceptance Contract Tests",
+                        "GIT_COMMITTER_EMAIL": "acceptance-tests@example.invalid",
+                    },
+                    check=True,
+                )
+                output_path = Path(command[command.index("-o") + 1])
+                output_path.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": "ai-result-1",
+                            "role": "sol_xhigh",
+                            "status": "IMPLEMENTED_CANDIDATE",
+                            "summary": "Completed the one terminal repair scope.",
+                            "claims": [],
+                            "evidence": [],
+                            "counter_checks": [],
+                            "changed_files": ["src/alpha.py"],
+                            "blind_spots": [],
+                            "unresolved_questions": [],
+                            "recommended_next_state": "AWAITING_OWNER_DECISION",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                events = "\n".join(
+                    (
+                        json.dumps(
+                            {"type": "thread.started", "thread_id": terminal_thread}
+                        ),
+                        json.dumps({"type": "turn.completed"}),
+                    )
+                )
+                return subprocess.CompletedProcess(
+                    command, 0, stdout=events + "\n", stderr=""
+                )
+            return real_run(command, *args, **kwargs)
+
+        with mock.patch.object(
+            workflow.subprocess, "run", side_effect=terminal_controller_process
+        ):
+            repairs.run_assignment(self.store, self.TASK_ID, terminal, sessions)
         events = self._assert_chain()
         self._assert_terminal(events)
         self.assertEqual(

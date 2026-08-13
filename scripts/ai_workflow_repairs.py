@@ -15,9 +15,11 @@ import re
 import shlex
 import shutil
 import subprocess
+import time
 import uuid
 from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
@@ -91,6 +93,10 @@ _V2_COMMON_FIELDS = frozenset(
 )
 _MAX_EVIDENCE_TRANSCRIPT_BYTES = 64 * 1024
 _SAFE_EXECUTABLE_PATH = os.defpath
+_SAFE_COMMAND_TEXT_PATTERN = re.compile(r"^[A-Za-z0-9_.= -]+$")
+_UNITTEST_TARGET_PATTERN = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+$"
+)
 
 
 def _workflow():
@@ -930,11 +936,11 @@ class VerifiedActorReceipt:
 
 @dataclass(frozen=True)
 class ControllerExecutionAttestation:
-    """Controller-owned binding between an issued capability and runtime receipt.
+    """Persisted binding between an issued capability and observed execution.
 
-    ``run_assignment`` accepts this only from a
-    :class:`ControllerAssignmentBoundary`; a model callback cannot choose its
-    own role, capability, candidate, or runtime receipt at launch time.
+    This value is audit data, not executable authority.  ``run_assignment``
+    constructs it only after inspecting the issued runtime; callers cannot
+    submit one to launch or complete an assignment.
     """
 
     task_id: str
@@ -962,11 +968,11 @@ class ControllerExecutionAttestation:
 
 
 class ControllerAssignmentBoundary:
-    """The sole launch boundary for a v2 capability.
+    """Read-only compatibility marker for the superseded callback boundary.
 
-    Production controllers subclass this type to collect execution-owned
-    runtime evidence and launch the exact issued capability.  The v2 ledger
-    deliberately exposes no callback-shaped ``adapter.run_assignment`` path.
+    Public imports remain stable, but ``run_assignment`` rejects every instance
+    before either method is called.  V2 execution now uses one fixed controller
+    command and never accepts caller-provided executable behavior.
     """
 
     def attest_execution(self, capability: AssignmentCapability) -> ControllerExecutionAttestation:
@@ -1238,8 +1244,12 @@ def _v2_append(
     return event
 
 
-def _v2_validate_observed_receipt(receipt: VerifiedActorReceipt, task: Mapping[str, object]) -> None:
-    expected = {
+def _v2_validate_observed_receipt(
+    receipt: VerifiedActorReceipt,
+    task: Mapping[str, object],
+    expected_runtime: tuple[str, str, str, str] | None = None,
+) -> None:
+    expected = expected_runtime or {
         "luna": ("gpt-5.6-luna", "max", "workspace-write", "workspace-write"),
         "terra_xhigh": ("gpt-5.6-terra", "xhigh", "workspace-write", "workspace-write"),
         "terra_xhigh_reviewer": ("gpt-5.6-terra", "xhigh", "read-only", "read-only"),
@@ -1367,7 +1377,15 @@ def _v2_validate_assignment_receipt(
 ) -> None:
     if receipt.assignment_id != assignment.assignment_id:
         _fail("ACCEPTANCE_RECEIPT_MISMATCH", "receipt belongs to another assignment")
-    _v2_validate_observed_receipt(receipt, task)
+    expected_runtime = None
+    if assignment.phase == "SOL_MEDIUM_REPAIR":
+        expected_runtime = (
+            "gpt-5.6-sol",
+            "medium",
+            "workspace-write",
+            "assignment-scoped-write",
+        )
+    _v2_validate_observed_receipt(receipt, task, expected_runtime)
     if receipt.actor_identity != assignment.expected_actor:
         _fail("ACCEPTANCE_RECEIPT_MISMATCH", "receipt identity does not match the issued actor")
     _v2_verified_runtime_receipt(
@@ -1440,24 +1458,36 @@ def _v2_safe_acceptance_argv(command: str) -> list[str]:
     is never used to resolve the executable.
     """
 
+    if not isinstance(command, str) or not command.strip() or command != command.strip():
+        _fail("ACCEPTANCE_EVIDENCE_INVALID", "frozen acceptance command is empty")
+    if any(ord(character) < 32 or ord(character) == 127 for character in command):
+        _fail("ACCEPTANCE_EVIDENCE_INVALID", "frozen acceptance command contains control text")
+    if not _SAFE_COMMAND_TEXT_PATTERN.fullmatch(command):
+        _fail("ACCEPTANCE_EVIDENCE_INVALID", "frozen acceptance command contains shell syntax")
     try:
         argv = shlex.split(command)
     except ValueError:
         _fail("ACCEPTANCE_EVIDENCE_INVALID", "frozen acceptance command cannot be parsed")
     if not argv or any(not isinstance(value, str) or not value for value in argv):
         _fail("ACCEPTANCE_EVIDENCE_INVALID", "frozen acceptance command is empty")
+    if command != " ".join(argv):
+        _fail("ACCEPTANCE_EVIDENCE_INVALID", "frozen acceptance command is not canonical argv")
     executable = argv[0]
     basename = Path(executable).name.casefold()
     forbidden = {"sh", "bash", "zsh", "dash", "fish", "command", "env"}
-    if basename in forbidden or any(
-        token in command for token in (";", "&&", "||", "`", "$(", ">", "<", "\n", "\x00")
-    ):
+    if executable.casefold() != basename or basename in forbidden:
         _fail("ACCEPTANCE_EVIDENCE_INVALID", "frozen acceptance command is not safe argv")
     if basename == "git" and argv[1:] in (["diff", "--check"], ["status", "--porcelain=v1"]):
         resolved = shutil.which("git", path=_SAFE_EXECUTABLE_PATH)
     elif basename in {"python", "python3", "python3.11"} and tuple(argv[1:3]) == ("-m", "unittest"):
-        if any(value in {"-c", "-m", "-I", "-S", "-E"} for value in argv[3:]):
-            _fail("ACCEPTANCE_EVIDENCE_INVALID", "frozen acceptance interpreter arguments are not safe")
+        targets = argv[3:]
+        if not targets or any(
+            not _UNITTEST_TARGET_PATTERN.fullmatch(target) for target in targets
+        ):
+            _fail(
+                "ACCEPTANCE_EVIDENCE_INVALID",
+                "frozen unittest command requires explicit dotted test targets",
+            )
         resolved = shutil.which(basename, path=_SAFE_EXECUTABLE_PATH)
     else:
         _fail("ACCEPTANCE_EVIDENCE_INVALID", "frozen acceptance command is outside the safe argv allowlist")
@@ -2222,95 +2252,6 @@ def _v2_reject_orphaned_direct_attempt(
         )
 
 
-def _record_adversarial_review(
-    store: WorkflowStore,
-    task_id: str,
-    assignment: AcceptanceAssignment,
-    reviewer_receipt: VerifiedActorReceipt,
-    verdict: str,
-    findings: Iterable[RepairFinding],
-    evidence: AdversarialEvidence,
-    *,
-    controller_started: bool,
-) -> None:
-    """Record one independent review with exact findings and evidence binding."""
-
-    if not isinstance(assignment, AcceptanceAssignment) or not isinstance(
-        reviewer_receipt, VerifiedActorReceipt
-    ) or not isinstance(evidence, AdversarialEvidence):
-        _fail("ACCEPTANCE_SEQUENCE_INVALID", "review input is not a verified v2 value")
-    with store.lock(task_id):
-        replay = replay_acceptance_ledger(store, task_id)
-        if replay is None:
-            _fail("ACCEPTANCE_SEQUENCE_INVALID", "acceptance ledger is not open")
-        context = _v2_context(store, task_id)
-        stored_task = _workflow().load_task(store._require_task(task_id) / "task.json")
-        if not controller_started:
-            _v2_reject_orphaned_direct_attempt(
-                store, task_id, replay, context, assignment
-            )
-            replay = _v2_start_attempt(
-                store, task_id, replay, context, assignment, reviewer_receipt, stored_task
-            )
-        else:
-            _v2_require_issued_assignment(replay, assignment)
-            if replay.started_receipts.get(assignment.assignment_id) != reviewer_receipt:
-                _fail("ACCEPTANCE_SEQUENCE_INVALID", "controller-started review receipt drifted")
-        try:
-            _v2_require_issued_assignment(replay, assignment)
-            if assignment.phase not in _REVIEW_PHASES or verdict not in {"ACCEPT", "REWORK"}:
-                _fail("ACCEPTANCE_SEQUENCE_INVALID", "review verdict or phase is invalid")
-            controller_evidence = execute_adversarial_evidence(
-                store, task_id, replay.current_candidate_commit
-            )
-            if evidence != controller_evidence:
-                _fail(
-                    "ACCEPTANCE_EVIDENCE_INVALID",
-                    "review evidence was not produced by the controller for this candidate",
-                )
-            frozen_findings = _v2_findings(findings)
-            if verdict == "ACCEPT" and frozen_findings:
-                _fail("ACCEPTANCE_SEQUENCE_INVALID", "acceptance may not contain open findings")
-            if verdict == "REWORK":
-                if not frozen_findings:
-                    _fail("ACCEPTANCE_SEQUENCE_INVALID", "rework requires non-empty canonical findings")
-                _v2_assert_findings_within_task(frozen_findings, stored_task)
-                if assignment.phase != "REVIEW_1" and not set(_v2_allowed_paths(frozen_findings)).issubset(
-                    assignment.allowed_paths
-                ):
-                    _fail("ACCEPTANCE_SEQUENCE_INVALID", "rework may not expand a review's immutable scope")
-            terminal = verdict == "ACCEPT"
-            fields: dict[str, object] = {
-                "assignment_id": assignment.assignment_id,
-                "attempt_id": assignment.attempt_id,
-                "reviewer_receipt": _v2_receipt_payload(reviewer_receipt),
-                "verdict": verdict,
-                "findings": _v2_findings_payload(frozen_findings),
-                "evidence": asdict(controller_evidence),
-                "evidence_sha256": _v2_sha256(asdict(controller_evidence)),
-            }
-            if terminal:
-                fields.update(
-                    {
-                        "terminal_state": "TASK_TERMINAL",
-                        "terminal_reason": f"{assignment.phase}_ACCEPTED",
-                        "whole_project_acceptance_required": "PENDING",
-                    }
-                )
-            _v2_append(
-                store,
-                task_id,
-                replay,
-                context,
-                "REVIEW_COMPLETED",
-                replay.current_candidate_commit,
-                fields,
-            )
-        except RuntimeError as exc:
-            _v2_fail_attempt(store, task_id, replay, context, assignment, exc)
-            raise
-
-
 def record_adversarial_review(
     store: WorkflowStore,
     task_id: str,
@@ -2320,87 +2261,20 @@ def record_adversarial_review(
     findings: Iterable[RepairFinding],
     evidence: AdversarialEvidence,
 ) -> None:
-    """Record a direct review only when it starts a fresh assignment attempt."""
+    """Reject caller-authored review completion outside controller execution."""
 
-    _record_adversarial_review(
-        store,
-        task_id,
-        assignment,
-        reviewer_receipt,
-        verdict,
-        findings,
-        evidence,
-        controller_started=False,
-    )
-
-
-def _complete_acceptance_assignment(
-    store: WorkflowStore,
-    task_id: str,
-    assignment: AcceptanceAssignment,
-    actor_receipt: VerifiedActorReceipt,
-    output_candidate_commit: str,
-    changed_paths: Iterable[str],
-    *,
-    controller_started: bool,
-) -> None:
-    """Accept one actual Git-bounded repair result for the active capability."""
-
-    if not isinstance(assignment, AcceptanceAssignment) or not isinstance(
-        actor_receipt, VerifiedActorReceipt
-    ):
-        _fail("ACCEPTANCE_SEQUENCE_INVALID", "repair input is not a verified v2 value")
     with store.lock(task_id):
         replay = replay_acceptance_ledger(store, task_id)
         if replay is None:
             _fail("ACCEPTANCE_SEQUENCE_INVALID", "acceptance ledger is not open")
         context = _v2_context(store, task_id)
-        stored_task = _workflow().load_task(store._require_task(task_id) / "task.json")
-        if not controller_started:
-            _v2_reject_orphaned_direct_attempt(
-                store, task_id, replay, context, assignment
-            )
-            replay = _v2_start_attempt(
-                store, task_id, replay, context, assignment, actor_receipt, stored_task
-            )
-        else:
-            _v2_require_issued_assignment(replay, assignment)
-            if replay.started_receipts.get(assignment.assignment_id) != actor_receipt:
-                _fail("ACCEPTANCE_SEQUENCE_INVALID", "controller-started repair receipt drifted")
-        try:
-            _v2_require_issued_assignment(replay, assignment)
-            if assignment.phase not in _REPAIR_PHASES:
-                _fail("ACCEPTANCE_SEQUENCE_INVALID", "only repair phases may complete a candidate")
-            output = _v2_sha(output_candidate_commit, "output_candidate_commit", length=40)
-            actual = _v2_validate_repair_output(stored_task, assignment, output, changed_paths)
-            fields: dict[str, object] = {
-                "assignment_id": assignment.assignment_id,
-                "attempt_id": assignment.attempt_id,
-                "actor_receipt": _v2_receipt_payload(actor_receipt),
-                "changed_paths": list(tuple(sorted(_path(path, "changed_paths") for path in _tuple(changed_paths, "changed_paths")))),
-                "actual_changed_paths": list(actual),
-                "output_candidate_commit": output,
-            }
-            if assignment.phase == "SOL_XHIGH_TERMINAL_REPAIR":
-                fields.update(
-                    {
-                        "terminal_state": "TASK_TERMINAL",
-                        "terminal_reason": "SOL_XHIGH_TERMINAL_REPAIR_COMPLETED",
-                        "whole_project_acceptance_required": "PENDING",
-                    }
-                )
-            _v2_append(
-                store,
-                task_id,
-                replay,
-                context,
-                "REPAIR_COMPLETED",
-                output,
-                fields,
-            )
-        except RuntimeError as exc:
-            _v2_fail_attempt(store, task_id, replay, context, assignment, exc)
-            raise
+        _v2_reject_orphaned_direct_attempt(
+            store, task_id, replay, context, assignment
+        )
+    _fail(
+        "REPAIR_ADAPTER_REQUIRED",
+        "review completion is emitted only by the controller-owned assignment executor",
+    )
 
 
 def complete_acceptance_assignment(
@@ -2411,16 +2285,19 @@ def complete_acceptance_assignment(
     output_candidate_commit: str,
     changed_paths: Iterable[str],
 ) -> None:
-    """Complete a direct repair only when it starts a fresh assignment attempt."""
+    """Reject caller-authored repair completion outside controller execution."""
 
-    _complete_acceptance_assignment(
-        store,
-        task_id,
-        assignment,
-        actor_receipt,
-        output_candidate_commit,
-        changed_paths,
-        controller_started=False,
+    with store.lock(task_id):
+        replay = replay_acceptance_ledger(store, task_id)
+        if replay is None:
+            _fail("ACCEPTANCE_SEQUENCE_INVALID", "acceptance ledger is not open")
+        context = _v2_context(store, task_id)
+        _v2_reject_orphaned_direct_attempt(
+            store, task_id, replay, context, assignment
+        )
+    _fail(
+        "REPAIR_ADAPTER_REQUIRED",
+        "repair completion is emitted only by the controller-owned assignment executor",
     )
 
 
@@ -2463,24 +2340,236 @@ def _v2_controller_snapshot(
     return repository, snapshot
 
 
+def _v2_controller_runtime_receipt(
+    store: WorkflowStore,
+    task_id: str,
+    assignment: AcceptanceAssignment,
+    task: Mapping[str, object],
+    runtime_sessions_dir: Path,
+) -> VerifiedActorReceipt:
+    """Inspect and record the already-issued Codex runtime before resuming it."""
+
+    workflow = _workflow()
+    try:
+        execution_surface, runtime_instance_id = assignment.expected_actor.identity.split(":", 1)
+        parsed = uuid.UUID(runtime_instance_id)
+    except (ValueError, AttributeError):
+        _fail("REPAIR_ADAPTER_REQUIRED", "issued actor is not a canonical Codex runtime")
+    if (
+        execution_surface != "CODEX_EXEC_ROLE_CONTRACT"
+        or str(parsed) != runtime_instance_id.lower()
+    ):
+        _fail("REPAIR_ADAPTER_REQUIRED", "fixed executor requires an issued Codex thread")
+    sessions = Path(runtime_sessions_dir)
+    if not sessions.is_absolute() or not sessions.is_dir() or sessions.is_symlink():
+        _fail("REPAIR_ADAPTER_REQUIRED", "controller runtime sessions directory is invalid")
+    role_runtime = {
+        "luna": ("gpt-5.6-luna", "max", "workspace-write"),
+        "terra_xhigh": ("gpt-5.6-terra", "xhigh", "workspace-write"),
+        "terra_xhigh_reviewer": ("gpt-5.6-terra", "xhigh", "read-only"),
+        "sol_medium_reviewer": (
+            "gpt-5.6-sol",
+            "medium",
+            "assignment-scoped-write"
+            if assignment.phase == "SOL_MEDIUM_REPAIR"
+            else "read-only",
+        ),
+        "sol_xhigh": ("gpt-5.6-sol", "xhigh", "assignment-scoped-write"),
+    }.get(assignment.expected_actor.role)
+    if role_runtime is None:
+        _fail("REPAIR_ADAPTER_REQUIRED", "issued role has no fixed controller runtime")
+    model, effort, permission_profile = role_runtime
+    sandbox = "read-only" if assignment.phase in _REVIEW_PHASES else "workspace-write"
+    inspector = (
+        Path(__file__).resolve().parents[1]
+        / "plugins"
+        / "ai-workflow"
+        / "scripts"
+        / "inspect-agent-runtime.sh"
+    )
+    observed = workflow.inspect_agent_runtime(
+        sessions, runtime_instance_id, execution_surface, inspector
+    )
+    expected = {
+        "execution_surface": execution_surface,
+        "agent_type": None,
+        "model": model,
+        "reasoning_effort": effort,
+        "sandbox_policy": sandbox,
+        "permission_profile": permission_profile,
+    }
+    if any(observed.get(field) != value for field, value in expected.items()):
+        _fail("ACCEPTANCE_RECEIPT_MISMATCH", "issued runtime does not match its capability")
+    try:
+        observed_cwd = Path(str(observed.get("cwd"))).resolve()
+        task_cwd = Path(str(task["repository_root"])).resolve()
+    except (OSError, TypeError):
+        _fail("ACCEPTANCE_RECEIPT_MISMATCH", "issued runtime cwd is invalid")
+    if observed_cwd != task_cwd:
+        _fail("ACCEPTANCE_RECEIPT_MISMATCH", "issued runtime does not match its capability")
+    evidence = {
+        "schema_version": "runtime-evidence-1",
+        "attempt_id": assignment.attempt_id,
+        "requested_role": assignment.expected_actor.role,
+        "execution_surface": execution_surface,
+        "observed_agent_type": None,
+        "observed_model": model,
+        "observed_reasoning_effort": effort,
+        "observed_sandbox_policy": sandbox,
+        "observed_permission_profile": permission_profile,
+        "observed_cwd": str(observed_cwd),
+        "evidence_source": "LOCAL_ROLLOUT",
+        "observed_at_utc": datetime.now(timezone.utc).isoformat(),
+        "verification_status": "VERIFIED",
+        "failure_reasons": [],
+    }
+    workflow.validate_runtime_evidence(evidence)
+    evidence_sha256 = _v2_sha256(evidence)
+    workflow.write_runtime_evidence(store, task_id, evidence)
+    store.append_event(
+        task_id,
+        {
+            "event_type": "RUNTIME_EVIDENCE_RECORDED",
+            "attempt_id": assignment.attempt_id,
+            "requested_role": assignment.expected_actor.role,
+            "thread_id": runtime_instance_id,
+            "execution_surface": execution_surface,
+            "runtime_evidence_sha256": evidence_sha256,
+        },
+    )
+    return VerifiedActorReceipt(
+        assignment_id=assignment.assignment_id,
+        execution_surface=execution_surface,
+        runtime_instance_id=runtime_instance_id,
+        attempt_id=assignment.attempt_id,
+        requested_role=assignment.expected_actor.role,
+        observed_model=model,
+        observed_reasoning_effort=effort,
+        observed_sandbox_policy=sandbox,
+        observed_permission_profile=permission_profile,
+        observed_cwd=str(observed_cwd),
+        runtime_evidence_sha256=evidence_sha256,
+        native_agent_uuid=None,
+        codex_thread_id=runtime_instance_id,
+    )
+
+
+def _v2_assignment_prompt(
+    task: Mapping[str, object], assignment: AcceptanceAssignment
+) -> str:
+    action = (
+        "Review the pinned candidate and return an acceptance or rework recommendation."
+        if assignment.phase in _REVIEW_PHASES
+        else "Repair only the issued findings, commit one non-merge candidate, and report its files."
+    )
+    return "\n".join(
+        (
+            action,
+            f"Task: {_v2_canonical(dict(task))}",
+            f"Assignment: {_v2_canonical(_v2_assignment_payload_for_event(assignment))}",
+            f'Output role exactly "{assignment.expected_actor.role}" using ai-result-1 JSON.',
+            "Never merge or push. Do not widen the immutable allowed paths.",
+        )
+    )
+
+
+def _v2_validate_controller_result(
+    result: object,
+    assignment: AcceptanceAssignment,
+    actual_changed_paths: set[str],
+) -> Mapping[str, object]:
+    workflow = _workflow()
+    if not isinstance(result, Mapping):
+        _fail("REPAIR_ADAPTER_INVALID_OUTPUT", "controller assignment result is not an object")
+    if set(result) != set(workflow.RESULT_REQUIRED_FIELDS):
+        _fail("REPAIR_ADAPTER_INVALID_OUTPUT", "controller assignment result shape is invalid")
+    if result.get("schema_version") != "ai-result-1" or result.get("role") != assignment.expected_actor.role:
+        _fail("REPAIR_ADAPTER_INVALID_OUTPUT", "controller assignment result identity drifted")
+    if assignment.phase in _REVIEW_PHASES:
+        workflow.validate_role_result(assignment.expected_actor.role, result, actual_changed_paths)
+        if result.get("status") not in {
+            "ACCEPTANCE_RECOMMENDED",
+            "ACCEPTANCE_WITH_NOTES_RECOMMENDED",
+            "REWORK_RECOMMENDED",
+            "REJECT_RECOMMENDED",
+        }:
+            _fail("REPAIR_ADAPTER_INVALID_OUTPUT", "review result has no bounded verdict")
+        return result
+    if result.get("status") != "IMPLEMENTED_CANDIDATE":
+        _fail("REPAIR_ADAPTER_INVALID_OUTPUT", "repair result did not produce a candidate")
+    if not isinstance(result.get("summary"), str) or not str(result["summary"]).strip():
+        _fail("REPAIR_ADAPTER_INVALID_OUTPUT", "repair result summary is invalid")
+    if not isinstance(result.get("recommended_next_state"), str) or not str(
+        result["recommended_next_state"]
+    ).strip():
+        _fail("REPAIR_ADAPTER_INVALID_OUTPUT", "repair result next state is invalid")
+    for field in (
+        "claims",
+        "evidence",
+        "counter_checks",
+        "changed_files",
+        "blind_spots",
+        "unresolved_questions",
+    ):
+        if not isinstance(result.get(field), list):
+            _fail("REPAIR_ADAPTER_INVALID_OUTPUT", "repair result arrays are invalid")
+    try:
+        workflow._validate_result_records(
+            result["claims"],
+            "claims",
+            frozenset({"id", "kind", "text", "evidence_ids"}),
+        )
+        if any(
+            claim["kind"] not in {"FACT", "INFERENCE", "RECOMMENDATION"}
+            for claim in result["claims"]
+        ):
+            _fail("REPAIR_ADAPTER_INVALID_OUTPUT", "repair result claim kind is invalid")
+        workflow._validate_result_records(
+            result["evidence"],
+            "evidence",
+            frozenset({"id", "type", "locator", "observation"}),
+            type_values=frozenset({"FILE", "COMMAND", "HASH", "TEST"}),
+        )
+        workflow._validate_result_records(
+            result["counter_checks"],
+            "counter_checks",
+            frozenset({"target_claim_id", "method", "result"}),
+        )
+    except RuntimeError:
+        _fail("REPAIR_ADAPTER_INVALID_OUTPUT", "repair result records are invalid")
+    for field in ("blind_spots", "unresolved_questions"):
+        values = result[field]
+        if any(not isinstance(value, str) for value in values) or len(set(values)) != len(values):
+            _fail("REPAIR_ADAPTER_INVALID_OUTPUT", "repair result text arrays are invalid")
+    declared = result.get("changed_files")
+    if (
+        any(not isinstance(path, str) for path in declared)
+        or len(set(declared)) != len(declared)
+        or set(declared) != actual_changed_paths
+    ):
+        _fail("REPAIR_ADAPTER_INVALID_OUTPUT", "repair result changed files drifted")
+    return result
+
+
 def run_assignment(
     store: WorkflowStore,
     task_id: str,
     assignment: AcceptanceAssignment,
-    execution_boundary: ControllerAssignmentBoundary | object,
+    runtime_sessions_dir: Path | object,
     legacy_adapter: object | None = None,
 ) -> None:
-    """Launch one current capability through a controller-owned boundary.
+    """Resume the issued runtime through the fixed controller execution path."""
 
-    Raw model callbacks and caller-provided runtime receipts are rejected.  A
-    boundary must attest the exact live capability, and the controller guards
-    the complete repository snapshot before and after launch.
-    """
-
-    if legacy_adapter is not None or not isinstance(execution_boundary, ControllerAssignmentBoundary):
-        _fail("REPAIR_ADAPTER_REQUIRED", "v2 assignments require a controller execution boundary")
+    if legacy_adapter is not None:
+        _fail(
+            "REPAIR_ADAPTER_REQUIRED",
+            "callers cannot supply an executable v2 assignment boundary",
+        )
     if not isinstance(assignment, AcceptanceAssignment):
         _fail("REPAIR_ADAPTER_REQUIRED", "v2 boundary input is not an immutable assignment")
+    caller_boundary = isinstance(runtime_sessions_dir, ControllerAssignmentBoundary)
+    workflow = _workflow()
+    started = False
     with store.lock(task_id):
         replay = replay_acceptance_ledger(store, task_id)
         if replay is None:
@@ -2496,62 +2585,229 @@ def run_assignment(
                 "ASSIGNMENT_ATTEMPT_INTERRUPTED",
                 "started assignment was recovered; issue a new capability before retrying",
             )
+        if caller_boundary:
+            _fail(
+                "REPAIR_ADAPTER_REQUIRED",
+                "callers cannot supply an executable v2 assignment boundary",
+            )
+        if not isinstance(runtime_sessions_dir, (str, os.PathLike)):
+            _fail("REPAIR_ADAPTER_REQUIRED", "fixed executor requires controller runtime sessions")
         repository, before = _v2_controller_snapshot(stored_task, replay)
-        attestation = execution_boundary.attest_execution(assignment.capability)
-        if not isinstance(attestation, ControllerExecutionAttestation):
-            _fail("REPAIR_ADAPTER_REQUIRED", "controller did not return a verified execution attestation")
+        task_dir = store._require_task(task_id)
+        output_path = task_dir / "attempts" / f"{assignment.attempt_id}-assignment-result.json"
+        if output_path.exists():
+            _fail("REPAIR_ADAPTER_REQUIRED", "controller assignment output path is not fresh")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+    receipt = _v2_controller_runtime_receipt(
+        store,
+        task_id,
+        assignment,
+        stored_task,
+        Path(runtime_sessions_dir),
+    )
+    attestation = ControllerExecutionAttestation(
+        task_id=task_id,
+        task_sha256=assignment.capability.task_sha256,
+        assignment_id=assignment.assignment_id,
+        capability_id=assignment.capability.capability_id,
+        candidate_commit=assignment.input_candidate_commit,
+        actor_receipt=receipt,
+    )
+    with store.lock(task_id):
+        replay = replay_acceptance_ledger(store, task_id)
+        if replay is None:
+            _fail("REPAIR_ADAPTER_REQUIRED", "v2 acceptance ledger is not open")
+        context = _v2_context(store, task_id)
         replay = _v2_start_attempt(
             store,
             task_id,
             replay,
             context,
             assignment,
-            attestation.actor_receipt,
+            receipt,
             stored_task,
             attestation,
         )
+        started = True
     try:
-        output = execution_boundary.execute_capability(assignment.capability)
+        role_config = workflow._load_role_config(assignment.expected_actor.role)
+        model = role_config.get("model")
+        effort = role_config.get("reasoning_effort")
+        if not isinstance(model, str) or not isinstance(effort, str):
+            _fail("REPAIR_ADAPTER_REQUIRED", "issued role runtime configuration is incomplete")
+        codex = shutil.which("codex", path=os.environ.get("PATH", os.defpath))
+        if not isinstance(codex, str):
+            _fail("REPAIR_ADAPTER_REQUIRED", "controller Codex executable is unavailable")
+        command = [
+            codex,
+            "exec",
+            "resume",
+            "-m",
+            model,
+            "-c",
+            f'model_reasoning_effort="{effort}"',
+            "-c",
+            f'sandbox_mode="{receipt.observed_sandbox_policy}"',
+            "--json",
+            "--output-schema",
+            str(repository / "config" / "ai_workflow_result.schema.json"),
+            "-o",
+            str(output_path),
+            receipt.runtime_instance_id,
+            "-",
+        ]
+        launched_ns = time.time_ns()
         try:
-            after = _workflow().capture_repo(repository)
+            completed = subprocess.run(
+                command,
+                cwd=repository,
+                input=_v2_assignment_prompt(stored_task, assignment),
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=120,
+                shell=False,
+                env=workflow.sanitized_environment(os.environ),
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            _fail("REPAIR_ADAPTER_REQUIRED", "controller assignment process could not complete")
+        if completed.returncode != 0:
+            _fail("REPAIR_ADAPTER_REQUIRED", "controller assignment process failed")
+        events = workflow.parse_codex_jsonl(completed.stdout)
+        if workflow.extract_codex_thread_id(events) != receipt.runtime_instance_id:
+            _fail("ACCEPTANCE_RECEIPT_MISMATCH", "resumed controller thread identity drifted")
+        try:
+            output_stat = output_path.stat()
+            output = json.loads(output_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            _fail("REPAIR_ADAPTER_INVALID_OUTPUT", "controller emitted no valid fresh result")
+        if output_stat.st_mtime_ns < launched_ns:
+            _fail("REPAIR_ADAPTER_INVALID_OUTPUT", "controller result predates assignment launch")
+        try:
+            after = workflow.capture_repo(repository)
         except RuntimeError:
             _fail("REPAIR_ADAPTER_REQUIRED", "controller cannot snapshot the post-launch repository")
         if after.status:
             _fail("REPAIR_ADAPTER_REQUIRED", "controller rejects uncommitted assignment writes")
         if assignment.phase in _REVIEW_PHASES and after != before:
             _fail("REPAIR_ADAPTER_REQUIRED", "read-only review changed the repository snapshot")
-        if not isinstance(output, Mapping):
-            _fail("REPAIR_ADAPTER_INVALID_OUTPUT", "adapter output must be an object")
+        actual_changed_paths = set(
+            workflow.changed_paths(
+                repository, assignment.input_candidate_commit, after.head
+            )
+        ) if after.head != assignment.input_candidate_commit else set()
+        output = _v2_validate_controller_result(output, assignment, actual_changed_paths)
         if assignment.phase in _REPAIR_PHASES:
-            if output.get("output_candidate_commit") != after.head:
-                _fail("REPAIR_ADAPTER_INVALID_OUTPUT", "repair output is not the controller-observed commit")
-            _complete_acceptance_assignment(
+            with store.lock(task_id):
+                completion_replay = replay_acceptance_ledger(store, task_id)
+                if completion_replay is None:
+                    _fail("ACCEPTANCE_SEQUENCE_INVALID", "acceptance ledger is not open")
+                completion_context = _v2_context(store, task_id)
+                _v2_require_issued_assignment(completion_replay, assignment)
+                if completion_replay.started_receipts.get(assignment.assignment_id) != receipt:
+                    _fail("ACCEPTANCE_SEQUENCE_INVALID", "controller repair receipt drifted")
+                output_commit = _v2_sha(
+                    after.head, "output_candidate_commit", length=40
+                )
+                reported_paths = output.get("changed_files")
+                actual = _v2_validate_repair_output(
+                    stored_task, assignment, output_commit, reported_paths
+                )
+                fields: dict[str, object] = {
+                    "assignment_id": assignment.assignment_id,
+                    "attempt_id": assignment.attempt_id,
+                    "actor_receipt": _v2_receipt_payload(receipt),
+                    "changed_paths": list(actual),
+                    "actual_changed_paths": list(actual),
+                    "output_candidate_commit": output_commit,
+                }
+                if assignment.phase == "SOL_XHIGH_TERMINAL_REPAIR":
+                    fields.update(
+                        {
+                            "terminal_state": "TASK_TERMINAL",
+                            "terminal_reason": "SOL_XHIGH_TERMINAL_REPAIR_COMPLETED",
+                            "whole_project_acceptance_required": "PENDING",
+                        }
+                    )
+                _v2_append(
+                    store,
+                    task_id,
+                    completion_replay,
+                    completion_context,
+                    "REPAIR_COMPLETED",
+                    output_commit,
+                    fields,
+                )
+            return
+        status = output.get("status")
+        verdict = (
+            "ACCEPT"
+            if status in {"ACCEPTANCE_RECOMMENDED", "ACCEPTANCE_WITH_NOTES_RECOMMENDED"}
+            else "REWORK"
+        )
+        findings: tuple[RepairFinding, ...] = ()
+        if verdict == "REWORK":
+            claim_ids = tuple(
+                claim.get("id")
+                for claim in output.get("claims", ())
+                if isinstance(claim, Mapping) and isinstance(claim.get("id"), str)
+            )
+            if not claim_ids or len(set(claim_ids)) != len(claim_ids):
+                _fail("REPAIR_ADAPTER_INVALID_OUTPUT", "rework result lacks canonical findings")
+            allowed_paths = assignment.allowed_paths or tuple(stored_task["allowed_write_paths"])
+            findings = tuple(
+                RepairFinding(finding_id, allowed_paths) for finding_id in sorted(claim_ids)
+            )
+        evidence = execute_adversarial_evidence(store, task_id, after.head)
+        with store.lock(task_id):
+            completion_replay = replay_acceptance_ledger(store, task_id)
+            if completion_replay is None:
+                _fail("ACCEPTANCE_SEQUENCE_INVALID", "acceptance ledger is not open")
+            completion_context = _v2_context(store, task_id)
+            _v2_require_issued_assignment(completion_replay, assignment)
+            if completion_replay.started_receipts.get(assignment.assignment_id) != receipt:
+                _fail("ACCEPTANCE_SEQUENCE_INVALID", "controller review receipt drifted")
+            if assignment.phase not in _REVIEW_PHASES:
+                _fail("ACCEPTANCE_SEQUENCE_INVALID", "only review phases may record a verdict")
+            frozen_findings = _v2_findings(findings)
+            if verdict == "ACCEPT" and frozen_findings:
+                _fail("ACCEPTANCE_SEQUENCE_INVALID", "acceptance may not contain findings")
+            if verdict == "REWORK":
+                _v2_assert_findings_within_task(frozen_findings, stored_task)
+                if assignment.phase != "REVIEW_1" and not set(
+                    _v2_allowed_paths(frozen_findings)
+                ).issubset(assignment.allowed_paths):
+                    _fail("ACCEPTANCE_SEQUENCE_INVALID", "rework expanded immutable scope")
+            fields = {
+                "assignment_id": assignment.assignment_id,
+                "attempt_id": assignment.attempt_id,
+                "reviewer_receipt": _v2_receipt_payload(receipt),
+                "verdict": verdict,
+                "findings": _v2_findings_payload(frozen_findings),
+                "evidence": asdict(evidence),
+                "evidence_sha256": _v2_sha256(asdict(evidence)),
+            }
+            if verdict == "ACCEPT":
+                fields.update(
+                    {
+                        "terminal_state": "TASK_TERMINAL",
+                        "terminal_reason": f"{assignment.phase}_ACCEPTED",
+                        "whole_project_acceptance_required": "PENDING",
+                    }
+                )
+            _v2_append(
                 store,
                 task_id,
-                assignment,
-                attestation.actor_receipt,
-                output.get("output_candidate_commit"),
-                output.get("changed_paths"),
-                controller_started=True,
+                completion_replay,
+                completion_context,
+                "REVIEW_COMPLETED",
+                completion_replay.current_candidate_commit,
+                fields,
             )
-            return
-        evidence = output.get("evidence")
-        if isinstance(evidence, Mapping):
-            evidence = _v2_evidence(evidence)
-        _record_adversarial_review(
-            store,
-            task_id,
-            assignment,
-            attestation.actor_receipt,
-            output.get("verdict"),
-            output.get("findings", ()),
-            evidence,
-            controller_started=True,
-        )
     except BaseException as exc:
         with store.lock(task_id):
             latest = replay_acceptance_ledger(store, task_id)
-            if (
+            if started and (
                 latest is not None
                 and latest.active_assignment_id == assignment.assignment_id
                 and assignment.assignment_id in latest.started_receipts
