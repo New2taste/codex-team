@@ -1,12 +1,17 @@
 import hashlib
 import json
 import multiprocessing
+import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
+from scripts import ai_workflow as workflow
 from scripts import ai_workflow_team_call as team
 
 
@@ -282,6 +287,355 @@ class TeamCallContractTest(unittest.TestCase):
             team.parse_team_call("team call 检查当前工作区状态"),
             team.classify_team_call(team.parse_team_call("team call 检查当前工作区状态")),
         )), ("error", "TEAM_CALL_ALREADY_RUNNING")}, observed)
+
+
+class _TeamCallControllerFake:
+    """A bounded controller fixture with no process or model launch."""
+
+    def __init__(self):
+        self.executed_argv = None
+        self.executed_cwd = None
+        self.execution_count = 0
+        self.dispatch_count = 0
+        self.l1_task = None
+        self.l1_role = None
+        self.l1_result_override = None
+        self.mutate_task = None
+        self.write_path = None
+        self.started = None
+        self.release = None
+
+    @staticmethod
+    def _luna_result():
+        return {
+            "schema_version": "ai-result-1",
+            "role": "luna",
+            "status": "SUPPORTED",
+            "summary": "The named file was read without modification.",
+            "claims": [
+                {
+                    "id": "claim-1",
+                    "kind": "FACT",
+                    "text": "The named fixture exists.",
+                    "evidence_ids": ["evidence-1"],
+                }
+            ],
+            "evidence": [
+                {
+                    "id": "evidence-1",
+                    "type": "FILE",
+                    "locator": "README.md",
+                    "observation": "The fixture was read.",
+                }
+            ],
+            "counter_checks": [
+                {
+                    "target_claim_id": "claim-1",
+                    "method": "Read the fixture a second time.",
+                    "result": "No contradiction was found.",
+                }
+            ],
+            "changed_files": [],
+            "blind_spots": [],
+            "unresolved_questions": [],
+            "recommended_next_state": "EVIDENCE_READY",
+        }
+
+    def run_l0(self, argv, cwd):
+        self.execution_count += 1
+        self.executed_argv = tuple(argv)
+        self.executed_cwd = Path(cwd)
+        if self.started is not None:
+            self.started.set()
+        if self.release is not None:
+            self.release.wait(timeout=5)
+        return subprocess.CompletedProcess(argv, 0, stdout="clean\n", stderr="")
+
+    def run_l1(self, task, *, role):
+        self.execution_count += 1
+        self.l1_task = task
+        self.l1_role = role
+        if self.mutate_task is not None:
+            self.mutate_task(task)
+        if self.write_path is not None:
+            Path(self.write_path).write_text("unauthorized\n", encoding="utf-8")
+        result = self._luna_result() if self.l1_result_override is None else self.l1_result_override
+        return dict(result)
+
+
+class TeamCallControllerTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name) / "state"
+        self.repo = Path(self.temporary.name) / "repository"
+        self.repo.mkdir()
+        self._git("init")
+        self._git("config", "user.email", "team-call@example.test")
+        self._git("config", "user.name", "Team Call Test")
+        (self.repo / "README.md").write_text("fixture\n", encoding="utf-8")
+        self._git("add", "README.md")
+        self._git("commit", "-m", "initial fixture")
+        self.controller = _TeamCallControllerFake()
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def _git(self, *argv):
+        return subprocess.run(
+            ("git", *argv),
+            cwd=self.repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    def _team_rows(self):
+        return [
+            json.loads(line)
+            for line in (self.root / "team-calls.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+
+    def test_l0_runs_fixed_git_status_once_and_returns_its_receipt(self):
+        receipt = workflow.run_team_call(
+            "team call 检查当前工作区状态",
+            repository_root=self.repo,
+            state_root=self.root,
+            controller=self.controller,
+        )
+
+        self.assertEqual("DIRECT_L0", receipt.disposition)
+        self.assertEqual(
+            ("git", "status", "--porcelain=v1", "--untracked-files=all"),
+            self.controller.executed_argv,
+        )
+        self.assertEqual(self.repo.resolve(), self.controller.executed_cwd)
+        self.assertRegex(receipt.result_sha256, r"^[0-9a-f]{64}$")
+        metadata = json.loads(
+            (self.root / "team-call-results" / f"{receipt.call_id}.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual("L0", metadata["kind"])
+        self.assertEqual(
+            ["git", "status", "--porcelain=v1", "--untracked-files=all"], metadata["argv"]
+        )
+        self.assertEqual(self.repo.resolve(), Path(metadata["cwd"]))
+        self.assertEqual(
+            receipt.result_sha256,
+            hashlib.sha256(workflow._canonical_json(metadata).encode("utf-8")).hexdigest(),
+        )
+        repeated = workflow.run_team_call(
+            "team call 检查当前工作区状态",
+            repository_root=self.repo,
+            state_root=self.root,
+            controller=self.controller,
+        )
+        self.assertEqual(receipt, repeated)
+        self.assertEqual(1, self.controller.execution_count)
+
+    def test_explicit_l1_file_is_luna_only_and_cannot_write(self):
+        receipt = workflow.run_team_call(
+            "team call 核对文件 README.md",
+            repository_root=self.repo,
+            state_root=self.root,
+            controller=self.controller,
+        )
+
+        self.assertEqual("DIRECT_L1", receipt.disposition)
+        self.assertEqual("luna", self.controller.l1_role)
+        self.assertEqual([], self.controller.l1_task["allowed_write_paths"])
+        self.assertEqual("L1", self.controller.l1_task["verification_level"])
+        self.assertEqual(["README.md"], self.controller.l1_task["authoritative_files"])
+        self.assertEqual("PLAN", self.controller.l1_task["task_type"])
+        self.assertTrue((self.root / receipt.task_id / "task.json").is_file())
+
+    def test_l1_allocates_the_next_daily_task_id_while_the_registry_is_held(self):
+        prefix = f"AWF-{datetime.now(timezone.utc):%Y%m%d}-"
+        self.root.mkdir(parents=True)
+        (self.root / f"{prefix}002").mkdir()
+        (self.root / f"{prefix}007").mkdir()
+
+        receipt = workflow.run_team_call(
+            "team call 核对文件 README.md",
+            repository_root=self.repo,
+            state_root=self.root,
+            controller=self.controller,
+        )
+
+        self.assertEqual(f"{prefix}008", receipt.task_id)
+
+    def test_write_or_ambiguous_request_creates_no_dispatch_and_requires_plan(self):
+        receipt = workflow.run_team_call(
+            "team call 为 README 增加安装示例",
+            repository_root=self.repo,
+            state_root=self.root,
+            controller=self.controller,
+        )
+
+        self.assertEqual("PLAN_REQUIRED", receipt.disposition)
+        self.assertIsNone(receipt.task_id)
+        self.assertIsNone(receipt.result_sha256)
+        self.assertEqual(0, self.controller.execution_count)
+        self.assertEqual(0, self.controller.dispatch_count)
+        self.assertEqual("ROUTED", self._team_rows()[-1]["route_status"])
+
+    def test_missing_repository_fails_before_controller_execution(self):
+        with self.assertRaisesRegex(workflow.WorkflowError, "REPOSITORY_NOT_FOUND"):
+            workflow.run_team_call(
+                "team call 检查当前工作区状态",
+                repository_root=self.repo / "missing",
+                state_root=self.root,
+                controller=self.controller,
+            )
+
+        self.assertEqual(0, self.controller.execution_count)
+
+    def test_l1_nonempty_changed_files_claim_records_blocked_route(self):
+        self.controller.l1_result_override = {
+            **_TeamCallControllerFake._luna_result(),
+            "changed_files": ["README.md"],
+        }
+
+        with self.assertRaisesRegex(workflow.WorkflowError, "READ_ONLY_ROLE_MODIFIED_REPO"):
+            workflow.run_team_call(
+                "team call 核对文件 README.md",
+                repository_root=self.repo,
+                state_root=self.root,
+                controller=self.controller,
+            )
+
+        self.assertEqual("BLOCKED", self._team_rows()[-1]["route_status"])
+
+    def test_l1_role_mismatch_records_blocked_route(self):
+        self.controller.l1_result_override = {
+            **_TeamCallControllerFake._luna_result(),
+            "role": "terra",
+        }
+
+        with self.assertRaisesRegex(workflow.WorkflowError, "ROLE_MISMATCH"):
+            workflow.run_team_call(
+                "team call 核对文件 README.md",
+                repository_root=self.repo,
+                state_root=self.root,
+                controller=self.controller,
+            )
+
+        self.assertEqual("BLOCKED", self._team_rows()[-1]["route_status"])
+
+    def test_l1_actual_working_tree_diff_records_blocked_route(self):
+        self.controller.write_path = self.repo / "README.md"
+
+        with self.assertRaisesRegex(workflow.WorkflowError, "READ_ONLY_ROLE_MODIFIED_REPO"):
+            workflow.run_team_call(
+                "team call 核对文件 README.md",
+                repository_root=self.repo,
+                state_root=self.root,
+                controller=self.controller,
+            )
+
+        self.assertEqual("BLOCKED", self._team_rows()[-1]["route_status"])
+
+    def test_l1_controller_cannot_widen_the_read_only_write_scope(self):
+        self.controller.mutate_task = lambda task: task.__setitem__("allowed_write_paths", ["README.md"])
+
+        with self.assertRaisesRegex(workflow.WorkflowError, "TEAM_CALL_WRITE_SCOPE_INVALID"):
+            workflow.run_team_call(
+                "team call 核对文件 README.md",
+                repository_root=self.repo,
+                state_root=self.root,
+                controller=self.controller,
+            )
+
+        self.assertEqual("BLOCKED", self._team_rows()[-1]["route_status"])
+
+    def test_l1_controller_cannot_change_the_persisted_task_identity(self):
+        self.controller.mutate_task = lambda task: task.__setitem__("objective", "different scope")
+
+        with self.assertRaisesRegex(workflow.WorkflowError, "TEAM_CALL_TASK_MUTATED"):
+            workflow.run_team_call(
+                "team call 核对文件 README.md",
+                repository_root=self.repo,
+                state_root=self.root,
+                controller=self.controller,
+            )
+
+        self.assertEqual("BLOCKED", self._team_rows()[-1]["route_status"])
+
+    def test_l1_symlink_evidence_is_rejected_before_luna_execution(self):
+        (self.repo / "target.md").write_text("target\n", encoding="utf-8")
+        (self.repo / "linked.md").symlink_to("target.md")
+
+        with self.assertRaisesRegex(workflow.WorkflowError, "TEAM_CALL_EVIDENCE_UNSAFE"):
+            workflow.run_team_call(
+                "team call 核对文件 linked.md",
+                repository_root=self.repo,
+                state_root=self.root,
+                controller=self.controller,
+            )
+
+        self.assertEqual(0, self.controller.execution_count)
+
+    def test_direct_l1_rejects_a_live_controller_before_task_or_model_execution(self):
+        self.controller.is_live_model = True
+
+        with self.assertRaisesRegex(workflow.WorkflowError, "LIVE_TEAM_CALL_L1_NOT_AUTHORIZED"):
+            workflow.run_team_call(
+                "team call 核对文件 README.md",
+                repository_root=self.repo,
+                state_root=self.root,
+                controller=self.controller,
+            )
+
+        self.assertEqual(0, self.controller.execution_count)
+        self.assertFalse((self.root / "team-calls.jsonl").exists())
+
+    def test_simultaneous_duplicate_calls_start_exactly_one_execution(self):
+        self.controller.started = threading.Event()
+        self.controller.release = threading.Event()
+        outcome = []
+
+        def invoke():
+            try:
+                outcome.append(
+                    workflow.run_team_call(
+                        "team call 检查当前工作区状态",
+                        repository_root=self.repo,
+                        state_root=self.root,
+                        controller=self.controller,
+                    )
+                )
+            except workflow.WorkflowError as exc:
+                outcome.append(exc.code)
+
+        first = threading.Thread(target=invoke)
+        second = threading.Thread(target=invoke)
+        first.start()
+        self.assertTrue(self.controller.started.wait(timeout=5))
+        second.start()
+        second.join(timeout=5)
+        self.controller.release.set()
+        first.join(timeout=5)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(1, self.controller.execution_count)
+        self.assertEqual(1, sum(isinstance(item, team.TeamCallReceipt) for item in outcome))
+        self.assertIn("TEAM_CALL_ALREADY_RUNNING", outcome)
+
+    def test_production_l0_uses_the_fixed_argv_without_a_shell(self):
+        controller = workflow.TeamCallProductionController(self.root)
+        argv = ("git", "status", "--porcelain=v1", "--untracked-files=all")
+        expected = subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+        with mock.patch("scripts.ai_workflow.subprocess.run", return_value=expected) as run:
+            self.assertIs(expected, controller.run_l0(argv, self.repo))
+
+        run.assert_called_once_with(
+            argv,
+            check=False,
+            capture_output=True,
+            text=True,
+            shell=False,
+            cwd=self.repo,
+        )
 
 
 if __name__ == "__main__":

@@ -1638,6 +1638,127 @@ class CodexRunnerTest(unittest.TestCase):
         self.assertNotIn(long_token, events)
 
 
+class TeamCallCliTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.state_root = Path(self.temporary_directory.name) / "state"
+        self.repo = Path(self.temporary_directory.name) / "repository"
+        self.repo.mkdir()
+        self._git("init")
+        self._git("config", "user.email", "team-call-cli@example.test")
+        self._git("config", "user.name", "Team Call CLI Test")
+        (self.repo / "README.md").write_text("fixture\n", encoding="utf-8")
+        self._git("add", "README.md")
+        self._git("commit", "-m", "initial fixture")
+
+    def tearDown(self):
+        self.temporary_directory.cleanup()
+
+    def _git(self, *argv):
+        return subprocess.run(
+            ("git", *argv),
+            cwd=self.repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_team_call_fake_cli_emits_a_canonical_l0_receipt(self):
+        output = StringIO()
+
+        with redirect_stdout(output):
+            exit_code = workflow.main(
+                [
+                    "team-call",
+                    "team call 检查当前工作区状态",
+                    "--root",
+                    str(self.state_root),
+                    "--repository-root",
+                    str(self.repo),
+                    "--runner",
+                    "fake",
+                ]
+            )
+
+        self.assertEqual(0, exit_code)
+        payload = json.loads(output.getvalue())
+        self.assertEqual("DIRECT_L0", payload["disposition"])
+        self.assertIsNone(payload["task_id"])
+        self.assertRegex(payload["result_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(workflow._canonical_json(payload) + "\n", output.getvalue())
+
+    def test_team_call_cli_reports_missing_repository_with_exit_two(self):
+        output = StringIO()
+
+        with redirect_stdout(output):
+            exit_code = workflow.main(
+                [
+                    "team-call",
+                    "team call 检查当前工作区状态",
+                    "--root",
+                    str(self.state_root),
+                    "--repository-root",
+                    str(self.repo / "missing"),
+                    "--runner",
+                    "fake",
+                ]
+            )
+
+        self.assertEqual(2, exit_code)
+        self.assertEqual("REPOSITORY_NOT_FOUND: repository_root does not exist\n", output.getvalue())
+
+    @mock.patch("scripts.ai_workflow.run_codex")
+    def test_team_call_live_runner_requires_explicit_model_authorization(self, run_codex):
+        output = StringIO()
+
+        with redirect_stdout(output):
+            exit_code = workflow.main(
+                [
+                    "team-call",
+                    "team call 核对文件 README.md",
+                    "--root",
+                    str(self.state_root),
+                    "--repository-root",
+                    str(self.repo),
+                    "--runner",
+                    "live",
+                ]
+            )
+
+        self.assertEqual(2, exit_code)
+        self.assertEqual(
+            "LIVE_MODEL_NOT_AUTHORIZED: --allow-live-model is required for the live runner\n",
+            output.getvalue(),
+        )
+        run_codex.assert_not_called()
+
+    @mock.patch("scripts.ai_workflow.run_codex")
+    def test_team_call_live_l1_remains_blocked_even_when_live_is_authorized(self, run_codex):
+        output = StringIO()
+
+        with redirect_stdout(output):
+            exit_code = workflow.main(
+                [
+                    "team-call",
+                    "team call 核对文件 README.md",
+                    "--root",
+                    str(self.state_root),
+                    "--repository-root",
+                    str(self.repo),
+                    "--runner",
+                    "live",
+                    "--allow-live-model",
+                ]
+            )
+
+        self.assertEqual(2, exit_code)
+        self.assertEqual(
+            "LIVE_TEAM_CALL_L1_NOT_AUTHORIZED: direct live L1 requires an explicit planned task\n",
+            output.getvalue(),
+        )
+        run_codex.assert_not_called()
+
+
 class LiveLunaCliTest(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
