@@ -5,26 +5,21 @@ description: Use when running the AI Workflow companion-agent preflight or bound
 
 # AI Workflow preflight and distribution contract
 
-Run the installed plugin's companion preflight before relying on the custom
-Agent. Resolve the installed plugin directory first, then run:
-
-```sh
-sh "$plugin_dir/scripts/install-agents.sh" --check
-```
-
-Stop if preflight fails. Require the exact custom Agent name `luna_max`; do
-not substitute `worker` or any built-in Agent. A native interactive
-`luna_max` invocation and an automated
+The default Luna route uses a controller-dispatched native subagent. No custom
+Agent template or install preflight is required. The controller must record
+`execution_surface=NATIVE_SUBAGENT`, `model=gpt-5.6-luna`,
+`reasoning_effort=max`, native thread/agent evidence, sandbox, permission, and
+cwd before promoting a result. A native `luna` dispatch and an automated
 `codex exec -m gpt-5.6-luna` role-contract invocation are different execution
 surfaces. Neither surface may erase the task envelope, L0/L1/L2 evidence
 level, human owner gates, or the final-acceptance boundary.
 
-## Legacy installer migration (one-time)
+## Legacy Agent cleanup (explicit, one-time)
 
-If an existing install contains `luna_worker` as one-time migration input, the
-installer may process it only after validating the legacy template,
-state, and backup. The old spelling is never a current selectable or invoked
-Agent; the workflow role remains `luna`.
+If an existing user install contains `luna_worker` (one-time migration input) or the old `luna-max.toml`,
+the migration/uninstall utility may clean it only after validating the legacy
+template, state, and backup. The utility is not part of default routing and
+does not create an active Agent template. The workflow role remains `luna`.
 
 ## Frozen role and lifecycle contract
 

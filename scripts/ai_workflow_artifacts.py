@@ -663,8 +663,10 @@ def validate_runtime_evidence(value: object) -> None:
     surface = _enum(evidence["execution_surface"], "execution_surface", EXECUTION_SURFACES)
     observed_type = evidence["observed_agent_type"]
     if surface == "NATIVE_SUBAGENT":
-        if not isinstance(observed_type, str) or not observed_type.strip():
-            _raise("RUNTIME_IDENTITY_MISSING", "native subagent requires observed_agent_type")
+        if observed_type is not None and (
+            not isinstance(observed_type, str) or not observed_type.strip()
+        ):
+            _raise("RUNTIME_IDENTITY_MISSING", "native observed_agent_type must be null or non-empty")
     elif observed_type is not None:
         _raise("RUNTIME_IDENTITY_CONFLICT", "exec role contract must have null observed_agent_type")
     _enum(evidence["evidence_source"], "evidence_source", RUNTIME_EVIDENCE_SOURCES)

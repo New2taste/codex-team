@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""Fail-closed, data-preserving lifecycle operations for the Luna template.
+"""Fail-closed, data-preserving cleanup for legacy Luna Agent installs.
 
 The shell entrypoints intentionally delegate filesystem mutation here.  The
 implementation holds a directory descriptor opened component-by-component with
 ``O_NOFOLLOW`` so later path swaps cannot redirect operations.  New entries are
 published with hard links (no clobber); replacements are first moved into an
 owned tombstone directory and re-hashed before any publish or delete step.
+
+The native Luna Max workflow no longer ships an active Agent template. The
+embedded bytes below exist only so an explicitly requested historical
+migration can be completed or rolled back without reading a mutable release
+path. They are never used by default routing or preflight.
 """
 
 from __future__ import annotations
@@ -36,6 +41,34 @@ LEGACY_RELEASE_SHA256 = "60f7240ea662cd27ea0f51f2e1efa8a2e788e16c76b04a13ab1c1df
 UTC_TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 Hook = Callable[[str], None]
 FileIdentity = tuple[int, int, str]
+
+CANONICAL_TEMPLATE_BYTES = '''name = "luna_max"
+description = "Luna Max：处理由主代理明确委派的、范围有限、边界清晰且可独立完成的任务；适合只读盘点、机械核对、局部实现与独立验证，不负责改变总体目标或扩大任务范围。"
+model = "gpt-5.6-luna"
+model_reasoning_effort = "max"
+
+developer_instructions = """
+你是 Luna Max，一个只接受主代理明确、有界且可独立完成委派的执行型子代理。
+
+工作边界：
+- 只处理委派消息中明确列出的目标、输入、文件范围、允许动作和交付物。
+- 不修改总目标、验收标准或工作范围，不把相邻发现并入施工。
+- 优先读取所在仓库的持久规则和任务信封；既有修改和未跟踪文件视为他人资产，不覆盖、不删除、不夹带。
+- 只修改明确授权的文件；未经授权，不提交、合并、推送、删除或执行不可逆操作。
+- 需要宪法、PIT、安全、跨卡契约或开放式判断时立即停止并回交主代理。
+
+证据要求：
+- 按任务信封的 L0/L1/L2 要求交付最小证据包，并将事实、推断和建议分开。
+- L0 保存命令、退出码和产物；L1 最多 5 条关键主张、每条最小证据、最关键结论 1 次交叉检查并列盲区；L2 提供目标测试、1 个有效负向样例或变异、diff 范围核对并列盲区。
+- 找不到文件、命令、字段或证据时如实报告，不猜测、不伪造，不用“应该通过”代替实测。
+- 若有文件改动，逐文件核对授权范围与 diff；若为只读任务，明确声明未修改文件。
+
+交付纪律：
+- 结论只能是 SUPPORTED、PARTIALLY_SUPPORTED、NOT_SUPPORTED 或 BLOCKED。
+- 不声称最终验收、用户批准、合并或生效；自检仅供主代理独立复核，不构成最终验收。
+- 先给结论，再列已完成内容、最小证据、验证结果、盲区和未执行事项。
+"""
+'''.encode("utf-8")
 
 
 class LifecycleError(RuntimeError):
@@ -312,16 +345,10 @@ def _close_directory(directory: int) -> None:
 
 
 def _validate_template() -> tuple[bytes, str]:
-    template = Path(__file__).resolve().parent.parent / "agents" / TARGET_FILENAME
-    try:
-        status = template.lstat()
-        if stat.S_ISLNK(status.st_mode) or not stat.S_ISREG(status.st_mode):
-            _fail("invalid release template")
-        with template.open("rb") as handle:
-            content = handle.read()
-    except OSError as exc:
-        _fail("invalid release template")
-        raise AssertionError("unreachable") from exc
+    # This is a historical migration payload, not a live Agent file. Keeping
+    # it immutable in code prevents a mutable release path from becoming an
+    # authority for the default native-subagent route.
+    content = CANONICAL_TEMPLATE_BYTES
     digest = _sha256(content)
     if digest != RELEASE_SHA256:
         _fail("release template digest mismatch")

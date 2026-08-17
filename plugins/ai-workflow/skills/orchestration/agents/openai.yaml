@@ -1,4 +1,4 @@
 interface:
   display_name: "AI Workflow Orchestration"
   short_description: "Preflight bounded roles with parity and evidence gates"
-  default_prompt: "Use $ai-workflow:orchestration for a fail-closed preflight; verify the Luna Max (luna_max) identity, preserve the frozen role envelope and final Sol-medium acceptance gate."
+  default_prompt: "Use $ai-workflow:orchestration for a fail-closed native Luna Max dispatch; verify model gpt-5.6-luna, reasoning effort max, runtime evidence, the frozen role envelope, and the final Sol-medium acceptance gate."

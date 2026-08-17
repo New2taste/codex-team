@@ -20,7 +20,7 @@ def runtime_expected(*, surface="NATIVE_SUBAGENT", **overrides):
         "attempt_id": "runtime-attempt-1",
         "requested_role": "luna",
         "execution_surface": surface,
-        "agent_type": "luna_max" if surface == "NATIVE_SUBAGENT" else None,
+        "agent_type": None,
         "model": "gpt-5.6-luna",
         "reasoning_effort": "max",
         "sandbox_policy": "read-only",
@@ -38,7 +38,7 @@ def runtime_expected(*, surface="NATIVE_SUBAGENT", **overrides):
 def runtime_observation(*, surface="NATIVE_SUBAGENT", **overrides):
     value = {
         "execution_surface": surface,
-        "agent_type": "luna_max" if surface == "NATIVE_SUBAGENT" else None,
+        "agent_type": None,
         "model": "gpt-5.6-luna",
         "reasoning_effort": "max",
         "sandbox_policy": "read-only",
@@ -106,6 +106,17 @@ def write_exec_rollout(sessions: Path, *, model="gpt-5.6-luna", agent_type=None)
 
 
 class RuntimeIdentityTest(unittest.TestCase):
+    def test_native_luna_identity_uses_model_and_effort_without_custom_agent_name(self):
+        expected = runtime_expected(agent_type=None)
+        observed = runtime_observation(agent_type=None)
+
+        evidence = workflow.verify_runtime_identity(expected, observed)
+
+        self.assertEqual("VERIFIED", evidence.verification_status)
+        self.assertIsNone(evidence.observed_agent_type)
+        self.assertEqual("gpt-5.6-luna", evidence.observed_model)
+        self.assertEqual("max", evidence.observed_reasoning_effort)
+
     def test_each_pinned_terra_os_role_has_a_verifiable_runtime_identity(self):
         for role in (
             "luna_construction",
@@ -138,9 +149,9 @@ class RuntimeIdentityTest(unittest.TestCase):
                 self.assertEqual(role, evidence.requested_role)
 
     def test_every_native_identity_field_is_required(self):
-        # Removing any one identity fact must stop native-agent verification.
+        # Removing any model/effort/permission fact must stop native verification;
+        # the custom Agent name is intentionally not an identity fact anymore.
         for field in (
-            "agent_type",
             "model",
             "reasoning_effort",
             "sandbox_policy",
@@ -250,7 +261,7 @@ class RuntimeIdentityTest(unittest.TestCase):
     def test_native_metadata_and_rollout_can_complete_one_consistent_identity(self):
         native = {
             "execution_surface": "NATIVE_SUBAGENT",
-            "agent_type": "luna_max",
+            "agent_type": None,
             "model": "gpt-5.6-luna",
             "sandbox_policy": "read-only",
             "permission_profile": "read-only",
@@ -270,8 +281,8 @@ class RuntimeIdentityTest(unittest.TestCase):
             ("LOCAL_ROLLOUT", "NATIVE_METADATA"), merged.evidence_sources
         )
 
-    def test_native_luna_worker_alias_is_rejected(self):
-        observed = runtime_observation(agent_type="luna_worker")
+    def test_native_custom_agent_name_is_rejected(self):
+        observed = runtime_observation(agent_type="luna_max")
         with self.assertRaisesRegex(
             workflow.WorkflowError, "RUNTIME_IDENTITY_CONFLICT"
         ):
@@ -381,6 +392,7 @@ class RuntimeInspectorTest(unittest.TestCase):
             set(observation),
         )
         self.assertEqual(THREAD_ID, observation["thread_id"])
+        self.assertIsNone(observation["agent_type"])
         combined_output = completed.stdout + completed.stderr
         for sentinel in ("PROMPT_SECRET", "ENV_SECRET", "TOKEN_SECRET"):
             self.assertNotIn(sentinel, combined_output)

@@ -14,10 +14,10 @@ repository_root=$(CDPATH= cd -- "$plugin_root/../.." && pwd -P) || fail "reposit
 [ -f "$plugin_root/.codex-plugin/plugin.json" ] || fail "missing manifest"
 [ -f "$plugin_root/skills/orchestration/SKILL.md" ] || fail "missing orchestration skill"
 [ -f "$plugin_root/skills/orchestration/agents/openai.yaml" ] || fail "missing skill metadata"
-[ -f "$plugin_root/scripts/agent_lifecycle.py" ] || fail "missing lifecycle helper"
+[ ! -e "$repository_root/.codex/agents/luna-max.toml" ] && [ ! -L "$repository_root/.codex/agents/luna-max.toml" ] || fail "custom Agent template present"
+[ ! -e "$plugin_root/agents/luna-max.toml" ] && [ ! -L "$plugin_root/agents/luna-max.toml" ] || fail "custom Agent mirror present"
 [ ! -e "$plugin_root/agents/luna-worker.toml" ] && [ ! -L "$plugin_root/agents/luna-worker.toml" ] || fail "legacy Agent template present"
 [ ! -e "$repository_root/.codex/agents/luna-worker.toml" ] && [ ! -L "$repository_root/.codex/agents/luna-worker.toml" ] || fail "legacy Agent mirror present"
-cmp -s "$repository_root/.codex/agents/luna-max.toml" "$plugin_root/agents/luna-max.toml" || fail "Agent mirror differs"
 
 for name in \
     ai_workflow.toml \
@@ -46,8 +46,6 @@ do
 done
 
 for script in \
-    "$plugin_root/scripts/install-agents.sh" \
-    "$plugin_root/scripts/uninstall-agents.sh" \
     "$plugin_root/scripts/inspect-agent-runtime.sh" \
     "$plugin_root/scripts/verify.sh"
 do

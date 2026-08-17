@@ -74,7 +74,7 @@
       "then": {
         "properties": {
           "observed_agent_type": {
-            "type": "string",
+            "type": ["string", "null"],
             "minLength": 1
           }
         }

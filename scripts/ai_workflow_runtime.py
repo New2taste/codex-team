@@ -375,7 +375,12 @@ def _verify_source_contract(observed: RuntimeObservation) -> str:
         return _decisive_source(observed)
     if NATIVE_METADATA not in observed.evidence_sources:
         _fail("RUNTIME_IDENTITY_CONFLICT", "native identity requires native metadata")
-    for field in ("agent_type", "sandbox_policy", "permission_profile", "cwd"):
+    # Native subagents are identified by controller-issued model/effort and
+    # runtime provenance.  A custom Agent name is optional legacy metadata,
+    # not part of the native identity contract.  Model/effort may be split
+    # between native controller metadata and the fresh local rollout record;
+    # _decisive_source verifies that both facts are covered.
+    for field in ("sandbox_policy", "permission_profile", "cwd"):
         if NATIVE_METADATA not in observed.sources_for(field):
             _fail("RUNTIME_IDENTITY_CONFLICT", f"native metadata must provide {field}")
     return _decisive_source(observed)
@@ -396,12 +401,13 @@ def verify_runtime_identity(requested: object, observed: object) -> RuntimeEvide
     if actual.execution_surface != expected_surface:
         _fail("RUNTIME_IDENTITY_CONFLICT", "execution_surface")
     if expected_surface == NATIVE_SUBAGENT:
-        if not isinstance(expected["agent_type"], str) or not expected["agent_type"].strip():
-            _fail("RUNTIME_IDENTITY_MISSING", "agent_type")
-        if not isinstance(actual.agent_type, str) or not actual.agent_type.strip():
-            _fail("RUNTIME_IDENTITY_MISSING", "agent_type")
-        if actual.agent_type != expected["agent_type"]:
-            _fail("RUNTIME_IDENTITY_CONFLICT", "agent_type")
+        if expected["agent_type"] is not None:
+            if not isinstance(expected["agent_type"], str) or not expected["agent_type"].strip():
+                _fail("RUNTIME_IDENTITY_MISSING", "agent_type")
+            if actual.agent_type != expected["agent_type"]:
+                _fail("RUNTIME_IDENTITY_CONFLICT", "agent_type")
+        elif actual.agent_type is not None:
+            _fail("RUNTIME_IDENTITY_CONFLICT", "native custom agent_type is not authoritative")
     else:
         if expected["agent_type"] is not None or actual.agent_type is not None:
             _fail("RUNTIME_IDENTITY_CONFLICT", "exec is not a custom agent")
@@ -510,8 +516,10 @@ def inspect_agent_runtime(
     if execution_surface == CODEX_EXEC_ROLE_CONTRACT:
         if value.get("agent_type") is not None:
             _fail("RUNTIME_IDENTITY_CONFLICT", "exec inspector claimed a custom agent")
-    elif not isinstance(value.get("agent_type"), str) or not value["agent_type"].strip():
-        _fail("RUNTIME_EVIDENCE_INVALID", "native inspector omitted agent_type")
+    elif value.get("agent_type") is not None and (
+        not isinstance(value.get("agent_type"), str) or not value["agent_type"].strip()
+    ):
+        _fail("RUNTIME_EVIDENCE_INVALID", "native inspector emitted an invalid agent_type")
     for field in _NON_AGENT_IDENTITY_FIELDS:
         if not isinstance(value.get(field), str) or not value[field].strip():
             _fail("RUNTIME_EVIDENCE_INVALID", f"runtime inspector omitted {field}")

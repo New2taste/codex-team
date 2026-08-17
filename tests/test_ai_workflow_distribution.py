@@ -20,7 +20,6 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 PYTHON311 = Path("/Users/lee/.local/bin/python3.11")
 PLUGIN = ROOT / "plugins" / "ai-workflow"
-TEMPLATE = PLUGIN / "agents" / "luna-max.toml"
 INSTALL = PLUGIN / "scripts" / "install-agents.sh"
 UNINSTALL = PLUGIN / "scripts" / "uninstall-agents.sh"
 LIFECYCLE_HELPER = PLUGIN / "scripts" / "agent_lifecycle.py"
@@ -122,6 +121,12 @@ def load_lifecycle_helper():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def canonical_template_bytes() -> bytes:
+    """Return the immutable legacy migration payload, not an active Agent file."""
+
+    return load_lifecycle_helper().CANONICAL_TEMPLATE_BYTES
 
 
 def write_owned_state(target: Path, backup_sha256: str | None = None) -> None:
@@ -243,6 +248,19 @@ def open_fd_count() -> int:
 
 
 class DistributionContractTest(unittest.TestCase):
+    def test_native_luna_is_default_and_custom_templates_are_not_active(self):
+        verifier = (PLUGIN / "scripts" / "verify.sh").read_text(encoding="utf-8")
+        skill = (PLUGIN / "skills" / "orchestration" / "SKILL.md").read_text(
+            encoding="utf-8"
+        ).casefold()
+        self.assertFalse((ROOT / ".codex" / "agents" / "luna-max.toml").exists())
+        self.assertFalse((PLUGIN / "agents" / "luna-max.toml").exists())
+        self.assertIn("native_subagent", skill)
+        self.assertIn("gpt-5.6-luna", skill)
+        self.assertIn("reasoning_effort=max", skill)
+        self.assertNotIn("cmp -s \"$repository_root/.codex/agents/luna-max.toml\"", verifier)
+        self.assertNotIn("require the exact custom agent name", skill)
+
     def test_plugin_manifest_and_marketplace_are_versioned(self):
         manifest = json.loads((PLUGIN / ".codex-plugin" / "plugin.json").read_text())
         marketplace = json.loads((ROOT / ".agents" / "plugins" / "marketplace.json").read_text())
@@ -254,21 +272,14 @@ class DistributionContractTest(unittest.TestCase):
             "./plugins/ai-workflow", marketplace["plugins"][0]["source"]["path"]
         )
 
-    def test_project_and_release_agent_templates_are_byte_exact(self):
-        root_template = ROOT / ".codex" / "agents" / "luna-max.toml"
-        self.assertTrue(root_template.is_file())
-        self.assertTrue(TEMPLATE.is_file())
-        self.assertEqual(
-            root_template.read_bytes(),
-            TEMPLATE.read_bytes(),
-        )
+    def test_project_and_release_agent_templates_are_absent(self):
+        self.assertFalse((ROOT / ".codex" / "agents" / "luna-max.toml").exists())
+        self.assertFalse((PLUGIN / "agents" / "luna-max.toml").exists())
         self.assertFalse((ROOT / ".codex" / "agents" / LEGACY_TARGET_NAME).exists())
         self.assertFalse((PLUGIN / "agents" / LEGACY_TARGET_NAME).exists())
 
-    def test_luna_template_matches_the_project_contract(self):
-        self.assertTrue(TEMPLATE.is_file())
-        with TEMPLATE.open("rb") as handle:
-            agent = tomllib.load(handle)
+    def test_legacy_migration_payload_matches_the_historical_contract(self):
+        agent = tomllib.loads(canonical_template_bytes().decode("utf-8"))
         self.assertEqual("luna_max", agent["name"])
         self.assertEqual("gpt-5.6-luna", agent["model"])
         self.assertEqual("max", agent["model_reasoning_effort"])
@@ -394,8 +405,9 @@ class DistributionContractTest(unittest.TestCase):
         ).casefold()
         published = "\n".join((readme, skill, metadata))
 
-        self.assertIn("luna_max", published)
         self.assertIn("luna max", published)
+        self.assertIn("native_subagent", published)
+        self.assertIn("gpt-5.6-luna", published)
         self.assertNotRegex(published, r"(?:require|invoke|select).*luna_worker")
 
         for source_name, source in (("README", readme), ("orchestration skill", skill)):
@@ -618,9 +630,11 @@ class DistributionContractTest(unittest.TestCase):
     def test_known_legacy_fixture_matches_the_registered_digest(self):
         self.assertEqual(KNOWN_LEGACY_SHA256, hashlib.sha256(KNOWN_LEGACY_TEMPLATE).hexdigest())
 
-    def test_release_template_digest_is_pinned(self):
-        self.assertTrue(TEMPLATE.is_file())
-        self.assertEqual(CANONICAL_TEMPLATE_SHA256, sha256(TEMPLATE))
+    def test_legacy_migration_payload_digest_is_pinned(self):
+        self.assertEqual(
+            CANONICAL_TEMPLATE_SHA256,
+            hashlib.sha256(canonical_template_bytes()).hexdigest(),
+        )
 
     def test_plugin_verifier_rejects_a_legacy_agent_template_in_a_copied_release(self):
         """A release must not ship the old template alongside the canonical one."""
@@ -757,7 +771,7 @@ class AgentLifecycleTest(unittest.TestCase):
             self.assertFalse((target / LEGACY_TARGET_NAME).exists())
             self.assertFalse((target / LEGACY_STATE_NAME).exists())
             self.assertFalse((target / LEGACY_BACKUP_NAME).exists())
-            self.assertEqual(TEMPLATE.read_bytes(), (target / TARGET_NAME).read_bytes())
+            self.assertEqual(canonical_template_bytes(), (target / TARGET_NAME).read_bytes())
             state = json.loads((target / STATE_NAME).read_text())
             self.assertEqual(TARGET_NAME, state["target_filename"])
             self.assertEqual(CANONICAL_TEMPLATE_SHA256, state["installed_sha256"])
@@ -771,7 +785,7 @@ class AgentLifecycleTest(unittest.TestCase):
 
             self.assertEqual(0, installed.returncode, installed.stderr)
             self.assertFalse((target / LEGACY_TARGET_NAME).exists())
-            self.assertEqual(TEMPLATE.read_bytes(), (target / TARGET_NAME).read_bytes())
+            self.assertEqual(canonical_template_bytes(), (target / TARGET_NAME).read_bytes())
             self.assertTrue((target / STATE_NAME).is_file())
 
     def test_verified_legacy_backup_migrates_and_uninstall_restores_it(self):
@@ -911,7 +925,7 @@ class AgentLifecycleTest(unittest.TestCase):
             installed = self.install(target)
             self.assertEqual(0, installed.returncode, installed.stderr)
             destination = target / TARGET_NAME
-            self.assertEqual(TEMPLATE.read_bytes(), destination.read_bytes())
+            self.assertEqual(canonical_template_bytes(), destination.read_bytes())
             self.assertTrue((target / STATE_NAME).is_file())
             state = json.loads((target / STATE_NAME).read_text())
             self.assertEqual(sha256(destination), state["installed_sha256"])
@@ -941,7 +955,7 @@ class AgentLifecycleTest(unittest.TestCase):
             installed = self.install(target)
             self.assertEqual(0, installed.returncode, installed.stderr)
             self.assertFalse(destination.exists())
-            self.assertEqual(TEMPLATE.read_bytes(), (target / TARGET_NAME).read_bytes())
+            self.assertEqual(canonical_template_bytes(), (target / TARGET_NAME).read_bytes())
             self.assertEqual(sha256(unrelated), before_hashes["unrelated.toml"])
             self.assertTrue((target / STATE_NAME).is_file())
 
@@ -1059,15 +1073,16 @@ class AgentLifecycleTest(unittest.TestCase):
     def test_rejects_a_toml_valid_template_with_the_wrong_digest_before_mutation(self):
         with temporary_directory() as temporary:
             target = Path(temporary) / "agents"
-            original = TEMPLATE.read_bytes()
+            lifecycle = load_lifecycle_helper()
+            original = canonical_template_bytes()
             try:
-                TEMPLATE.write_bytes(original + b"\n")
-                before = filesystem_snapshot(Path(temporary))
-                result = self.install(target)
-                self.assertNotEqual(0, result.returncode)
+                with mock.patch.object(lifecycle, "CANONICAL_TEMPLATE_BYTES", original + b"\n"):
+                    before = filesystem_snapshot(Path(temporary))
+                    result = lifecycle.install(target)
+                self.assertEqual(1, result)
                 self.assertEqual(before, filesystem_snapshot(Path(temporary)))
             finally:
-                TEMPLATE.write_bytes(original)
+                pass
 
     def test_missing_install_does_not_clobber_a_file_created_after_preflight(self):
         lifecycle = load_lifecycle_helper()
@@ -1101,7 +1116,7 @@ class AgentLifecycleTest(unittest.TestCase):
                     home = root / name / "home"
                     default_target = home / ".codex" / "agents"
                     default_target.mkdir(parents=True)
-                    (default_target / TARGET_NAME).write_bytes(TEMPLATE.read_bytes())
+                    (default_target / TARGET_NAME).write_bytes(canonical_template_bytes())
                     write_owned_state(default_target)
                     before = filesystem_snapshot(home)
 
@@ -1164,7 +1179,7 @@ class AgentLifecycleTest(unittest.TestCase):
                 if point == "install.before_publish_missing_state":
                     (target / STATE_NAME).write_bytes(b'{"owner":"user"}\n')
                     replacement = root / "same-digest-replacement.toml"
-                    replacement.write_bytes(TEMPLATE.read_bytes())
+                    replacement.write_bytes(canonical_template_bytes())
                     replacement_inode = replacement.stat().st_ino
                     os.replace(replacement, destination)
 
@@ -1312,7 +1327,7 @@ class AgentLifecycleTest(unittest.TestCase):
                 nonlocal replacement_inode
                 if point == "install.before_publish_legacy_state":
                     replacement = root / "same-digest-replacement.toml"
-                    replacement.write_bytes(TEMPLATE.read_bytes())
+                    replacement.write_bytes(canonical_template_bytes())
                     replacement_inode = replacement.stat().st_ino
                     os.replace(replacement, target / LEGACY_TARGET_NAME)
                     raise OSError("injected")
@@ -1585,7 +1600,7 @@ class AgentLifecycleTest(unittest.TestCase):
                 nonlocal replacement_inode
                 if point == "install.after_publish_missing_state":
                     replacement = root / "same-digest-replacement.toml"
-                    replacement.write_bytes(TEMPLATE.read_bytes())
+                    replacement.write_bytes(canonical_template_bytes())
                     replacement_inode = replacement.stat().st_ino
                     os.replace(replacement, destination)
                     raise OSError("injected")
@@ -1722,7 +1737,7 @@ class AgentLifecycleTest(unittest.TestCase):
                 for index in range(16):
                     target = root / str(index) / "agents"
                     target.mkdir(parents=True)
-                    (target / TARGET_NAME).write_bytes(TEMPLATE.read_bytes())
+                    (target / TARGET_NAME).write_bytes(canonical_template_bytes())
                     write_owned_state(target)
                     self.assertNotEqual(0, lifecycle.uninstall(target))
                 after = open_fd_count()
@@ -1829,7 +1844,7 @@ class AgentLifecycleTest(unittest.TestCase):
             target = root / "agents"
             target.mkdir()
             destination = target / TARGET_NAME
-            destination.write_bytes(TEMPLATE.read_bytes())
+            destination.write_bytes(canonical_template_bytes())
             write_owned_state(target)
             user_bytes = b'name = "raced_uninstall_user"\n'
 
@@ -1850,7 +1865,7 @@ class AgentLifecycleTest(unittest.TestCase):
             target = root / "agents"
             target.mkdir()
             destination = target / TARGET_NAME
-            destination.write_bytes(TEMPLATE.read_bytes())
+            destination.write_bytes(canonical_template_bytes())
             write_owned_state(target)
             replacement_inode: int | None = None
 
@@ -1858,7 +1873,7 @@ class AgentLifecycleTest(unittest.TestCase):
                 nonlocal replacement_inode
                 if point == "uninstall.before_retire_current":
                     replacement = root / "same-digest-current"
-                    replacement.write_bytes(TEMPLATE.read_bytes())
+                    replacement.write_bytes(canonical_template_bytes())
                     replacement_inode = replacement.stat().st_ino
                     os.replace(replacement, destination)
 
@@ -1883,7 +1898,7 @@ class AgentLifecycleTest(unittest.TestCase):
                     root = Path(temporary)
                     target = root / "agents"
                     target.mkdir()
-                    (target / TARGET_NAME).write_bytes(TEMPLATE.read_bytes())
+                    (target / TARGET_NAME).write_bytes(canonical_template_bytes())
                     backup_bytes = b'name = "backup"\n'
                     backup_sha = None
                     if raced_name == BACKUP_NAME:
@@ -1936,7 +1951,7 @@ class AgentLifecycleTest(unittest.TestCase):
                     root = Path(temporary)
                     target = root / "agents"
                     target.mkdir()
-                    (target / TARGET_NAME).write_bytes(TEMPLATE.read_bytes())
+                    (target / TARGET_NAME).write_bytes(canonical_template_bytes())
                     backup_sha = None
                     if raced_name == BACKUP_NAME:
                         (target / BACKUP_NAME).write_bytes(b'name = "backup"\n')
@@ -1979,7 +1994,7 @@ class AgentLifecycleTest(unittest.TestCase):
             destination = target / TARGET_NAME
             backup = target / BACKUP_NAME
             backup_bytes = b'name = "known_legacy_backup"\n'
-            destination.write_bytes(TEMPLATE.read_bytes())
+            destination.write_bytes(canonical_template_bytes())
             backup.write_bytes(backup_bytes)
             write_owned_state(target, sha256(backup))
             self.assertEqual(0, lifecycle.uninstall(target))
@@ -1997,7 +2012,7 @@ class AgentLifecycleTest(unittest.TestCase):
                     target.mkdir(parents=True)
                     destination = target / TARGET_NAME
                     backup = target / BACKUP_NAME
-                    destination.write_bytes(TEMPLATE.read_bytes())
+                    destination.write_bytes(canonical_template_bytes())
                     backup.write_bytes(b'name = "known_legacy_backup"\n')
                     write_owned_state(target, sha256(backup))
                     if tamper == "backup":
@@ -2016,7 +2031,7 @@ class AgentLifecycleTest(unittest.TestCase):
             target.mkdir()
             destination = target / TARGET_NAME
             backup = target / BACKUP_NAME
-            destination.write_bytes(TEMPLATE.read_bytes())
+            destination.write_bytes(canonical_template_bytes())
             backup.write_bytes(b'name = "known_legacy_backup"\n')
             write_owned_state(target, sha256(backup))
             user_bytes = b'name = "raced_restore_user"\n'
