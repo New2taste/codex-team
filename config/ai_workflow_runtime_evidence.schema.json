@@ -21,6 +21,12 @@
     "observed_agent_type": {
       "type": ["string", "null"]
     },
+    "native_agent_id": {
+      "type": ["string", "null"]
+    },
+    "native_thread_id": {
+      "type": ["string", "null"]
+    },
     "observed_model": {
       "type": "string",
       "minLength": 1
@@ -74,8 +80,15 @@
       "then": {
         "properties": {
           "observed_agent_type": {
-            "type": ["string", "null"],
-            "minLength": 1
+            "type": "null"
+          },
+          "native_agent_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "native_thread_id": {
+            "type": "string",
+            "format": "uuid"
           }
         }
       }
@@ -92,6 +105,12 @@
         "properties": {
           "observed_agent_type": {
             "type": "null"
+          },
+          "native_agent_id": {
+            "type": "null"
+          },
+          "native_thread_id": {
+            "type": "null"
           }
         }
       }
@@ -103,6 +122,8 @@
     "requested_role",
     "execution_surface",
     "observed_agent_type",
+    "native_agent_id",
+    "native_thread_id",
     "observed_model",
     "observed_reasoning_effort",
     "observed_sandbox_policy",

@@ -99,6 +99,8 @@ def valid_runtime_evidence(**overrides):
         "requested_role": "luna",
         "execution_surface": "CODEX_EXEC_ROLE_CONTRACT",
         "observed_agent_type": None,
+        "native_agent_id": None,
+        "native_thread_id": None,
         "observed_model": "gpt-5.6-luna",
         "observed_reasoning_effort": "max",
         "observed_sandbox_policy": "read-only",
@@ -210,11 +212,14 @@ class ArtifactValidatorTest(unittest.TestCase):
         conditions = schema["allOf"]
         native = next(item for item in conditions if item["if"]["properties"]["execution_surface"]["const"] == "NATIVE_SUBAGENT")
         codex = next(item for item in conditions if item["if"]["properties"]["execution_surface"]["const"] == "CODEX_EXEC_ROLE_CONTRACT")
-        self.assertEqual(native["then"]["properties"]["observed_agent_type"]["type"], ["string", "null"])
-        self.assertEqual(native["then"]["properties"]["observed_agent_type"]["minLength"], 1)
+        self.assertEqual(native["then"]["properties"]["observed_agent_type"], {"type": "null"})
+        self.assertEqual(native["then"]["properties"]["native_agent_id"]["format"], "uuid")
+        self.assertEqual(native["then"]["properties"]["native_thread_id"]["format"], "uuid")
         self.assertEqual(codex["then"]["properties"]["observed_agent_type"], {"type": "null"})
+        self.assertEqual(codex["then"]["properties"]["native_agent_id"], {"type": "null"})
+        self.assertEqual(codex["then"]["properties"]["native_thread_id"], {"type": "null"})
 
-    def test_native_runtime_schema_allows_model_bound_nullable_agent_type(self):
+    def test_native_runtime_schema_requires_null_agent_type(self):
         schema = json.loads(
             (ROOT / "config" / "ai_workflow_runtime_evidence.schema.json").read_text()
         )
@@ -222,7 +227,7 @@ class ArtifactValidatorTest(unittest.TestCase):
             item for item in schema["allOf"]
             if item["if"]["properties"]["execution_surface"]["const"] == "NATIVE_SUBAGENT"
         )["then"]["properties"]["observed_agent_type"]
-        self.assertEqual(["string", "null"], native["type"])
+        self.assertEqual("null", native["type"])
 
     def test_route_decision_has_no_unvalidated_runtime_extensions(self):
         fields = set(workflow.RouteDecision.__dataclass_fields__)

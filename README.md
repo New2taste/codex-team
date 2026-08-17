@@ -58,11 +58,11 @@
 当前开发 harness 可能显示内置 native subagent 标签；该平台标签不属于本仓库的
 自定义 Agent 选项，也不改变 workflow role `luna`。
 
-### 一次性安装器迁移（installer migration）
+### 一次性清理迁移（cleanup-only migration）
 
-旧版用户目录若包含 `luna_worker`（一次性 migration/迁移输入）或旧的 `luna-max.toml`，迁移/卸载工具只能在验证
+旧版用户目录若包含 `luna_worker`（一次性 migration/迁移输入）或旧的 `luna-max.toml`，兼容的 install/uninstall 入口都只执行 cleanup：只能在验证
 模板、状态和备份完整后执行一次性清理；迁移失败必须保留原有用户文件。该工具不参与
-默认路由，也不会创建当前可调用的 Agent 模板。
+默认路由，不内嵌或发布完整 Agent TOML，也不会在缺失目录或空目录中创建或删除用户文件。
 
 默认工作流不再依赖仓库或 Plugin 中的自定义 Agent 模板。
 

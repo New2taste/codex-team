@@ -26,15 +26,25 @@ LOCAL_ROLLOUT = "LOCAL_ROLLOUT"
 EVIDENCE_SOURCES = frozenset({NATIVE_METADATA, LOCAL_ROLLOUT})
 IDENTITY_FIELDS = (
     "agent_type",
+    "native_agent_id",
+    "native_thread_id",
     "model",
     "reasoning_effort",
     "sandbox_policy",
     "permission_profile",
     "cwd",
 )
-_NON_AGENT_IDENTITY_FIELDS = IDENTITY_FIELDS[1:]
+_NON_AGENT_IDENTITY_FIELDS = (
+    "model",
+    "reasoning_effort",
+    "sandbox_policy",
+    "permission_profile",
+    "cwd",
+)
 _IDENTITY_ALIASES = {
     "agent_type": ("agent_type", "observed_agent_type"),
+    "native_agent_id": ("native_agent_id",),
+    "native_thread_id": ("native_thread_id", "thread_id"),
     "model": ("model", "observed_model"),
     "reasoning_effort": ("reasoning_effort", "observed_reasoning_effort"),
     "sandbox_policy": ("sandbox_policy", "observed_sandbox_policy"),
@@ -69,6 +79,7 @@ _PERMISSION_RANKS = {
 _INSPECTOR_FIELDS = frozenset(
     {
         "thread_id",
+        "native_agent_id",
         "agent_type",
         "model",
         "reasoning_effort",
@@ -105,6 +116,8 @@ class RuntimeObservation:
 
     execution_surface: str
     agent_type: str | None = None
+    native_agent_id: str | None = None
+    native_thread_id: str | None = None
     model: str | None = None
     reasoning_effort: str | None = None
     sandbox_policy: str | None = None
@@ -117,6 +130,8 @@ class RuntimeObservation:
         return {
             "execution_surface": self.execution_surface,
             "agent_type": self.agent_type,
+            "native_agent_id": self.native_agent_id,
+            "native_thread_id": self.native_thread_id,
             "model": self.model,
             "reasoning_effort": self.reasoning_effort,
             "sandbox_policy": self.sandbox_policy,
@@ -218,6 +233,8 @@ def _observation(value: object, *, complete: bool) -> RuntimeObservation:
         result = RuntimeObservation(
             execution_surface=surface,
             agent_type=identities["agent_type"],
+            native_agent_id=identities["native_agent_id"],
+            native_thread_id=identities["native_thread_id"],
             model=identities["model"],
             reasoning_effort=identities["reasoning_effort"],
             sandbox_policy=identities["sandbox_policy"],
@@ -267,6 +284,8 @@ def merge_runtime_observations(*observations: object) -> RuntimeObservation:
     result = RuntimeObservation(
         execution_surface=surface,
         agent_type=values.get("agent_type"),
+        native_agent_id=values.get("native_agent_id"),
+        native_thread_id=values.get("native_thread_id"),
         model=values.get("model"),
         reasoning_effort=values.get("reasoning_effort"),
         sandbox_policy=values.get("sandbox_policy"),
@@ -383,6 +402,10 @@ def _verify_source_contract(observed: RuntimeObservation) -> str:
     for field in ("sandbox_policy", "permission_profile", "cwd"):
         if NATIVE_METADATA not in observed.sources_for(field):
             _fail("RUNTIME_IDENTITY_CONFLICT", f"native metadata must provide {field}")
+    if NATIVE_METADATA not in observed.sources_for("native_agent_id"):
+        _fail("RUNTIME_IDENTITY_CONFLICT", "native agent UUID requires controller metadata")
+    if LOCAL_ROLLOUT not in observed.sources_for("native_thread_id"):
+        _fail("RUNTIME_IDENTITY_CONFLICT", "native thread UUID requires rollout evidence")
     return _decisive_source(observed)
 
 
@@ -401,16 +424,22 @@ def verify_runtime_identity(requested: object, observed: object) -> RuntimeEvide
     if actual.execution_surface != expected_surface:
         _fail("RUNTIME_IDENTITY_CONFLICT", "execution_surface")
     if expected_surface == NATIVE_SUBAGENT:
-        if expected["agent_type"] is not None:
-            if not isinstance(expected["agent_type"], str) or not expected["agent_type"].strip():
-                _fail("RUNTIME_IDENTITY_MISSING", "agent_type")
-            if actual.agent_type != expected["agent_type"]:
-                _fail("RUNTIME_IDENTITY_CONFLICT", "agent_type")
-        elif actual.agent_type is not None:
-            _fail("RUNTIME_IDENTITY_CONFLICT", "native custom agent_type is not authoritative")
-    else:
+        if role != "luna":
+            _fail("RUNTIME_IDENTITY_CONFLICT", "native subagent role must be luna")
         if expected["agent_type"] is not None or actual.agent_type is not None:
-            _fail("RUNTIME_IDENTITY_CONFLICT", "exec is not a custom agent")
+            _fail("RUNTIME_IDENTITY_CONFLICT", "native subagent agent_type must be null")
+        if expected["model"] != "gpt-5.6-luna" or actual.model != "gpt-5.6-luna":
+            _fail("RUNTIME_IDENTITY_CONFLICT", "native subagent model is controller-pinned")
+        if expected["reasoning_effort"] != "max" or actual.reasoning_effort != "max":
+            _fail("RUNTIME_IDENTITY_CONFLICT", "native subagent effort is controller-pinned")
+        for field in ("native_agent_id", "native_thread_id"):
+            expected_uuid = _canonical_uuid(expected[field], field)
+            actual_uuid = _canonical_uuid(getattr(actual, field), field)
+            if actual_uuid != expected_uuid:
+                _fail("RUNTIME_IDENTITY_CONFLICT", field)
+    else:
+        if any(expected[field] is not None or getattr(actual, field) is not None for field in ("agent_type", "native_agent_id", "native_thread_id")):
+            _fail("RUNTIME_IDENTITY_CONFLICT", "exec cannot claim native identity")
     for field in ("model", "reasoning_effort", "cwd"):
         if actual[field] != _string(expected[field], field):
             _fail("RUNTIME_IDENTITY_CONFLICT", field)
@@ -422,6 +451,8 @@ def verify_runtime_identity(requested: object, observed: object) -> RuntimeEvide
         requested_role=role,
         execution_surface=actual.execution_surface,
         observed_agent_type=actual.agent_type,
+        native_agent_id=actual.native_agent_id,
+        native_thread_id=actual.native_thread_id,
         observed_model=_string(actual.model, "model"),
         observed_reasoning_effort=_string(actual.reasoning_effort, "reasoning_effort"),
         observed_sandbox_policy=_string(actual.sandbox_policy, "sandbox_policy"),
@@ -488,16 +519,38 @@ def extract_codex_thread_id(events: Iterable[object]) -> str:
     return next(iter(identifiers))
 
 
+def _canonical_uuid(value: object, field: str) -> str:
+    if not isinstance(value, str):
+        _fail("RUNTIME_IDENTITY_MISSING", field)
+    try:
+        parsed = uuid.UUID(value)
+    except (TypeError, ValueError) as exc:
+        raise _workflow_error("RUNTIME_IDENTITY_CONFLICT", f"{field} is not a UUID") from exc
+    if str(parsed) != value.lower():
+        _fail("RUNTIME_IDENTITY_CONFLICT", f"{field} is not canonical")
+    return value
+
+
 def inspect_agent_runtime(
-    sessions_dir: Path, thread_id: str, execution_surface: str, inspector_path: Path
+    sessions_dir: Path, thread_id: str, execution_surface: str, inspector_path: Path,
+    *, native_agent_id: str | None = None,
 ) -> dict[str, object]:
     """Call the allowlisted inspector and independently validate its output."""
 
     sessions = Path(sessions_dir)
     if execution_surface not in EXECUTION_SURFACES or not sessions.is_absolute():
         _fail("RUNTIME_EVIDENCE_MISSING", "an absolute runtime sessions directory is required")
+    if execution_surface == NATIVE_SUBAGENT:
+        issued_agent_id = _canonical_uuid(native_agent_id, "native_agent_id")
+    elif native_agent_id is not None:
+        _fail("RUNTIME_IDENTITY_CONFLICT", "exec cannot claim native agent UUID")
+    else:
+        issued_agent_id = None
+    command = ["sh", str(Path(inspector_path)), "--sessions-dir", str(sessions), thread_id]
+    if issued_agent_id is not None:
+        command.extend(["--native-agent-id", issued_agent_id])
     completed = _run_inspector(
-        ["sh", str(Path(inspector_path)), "--sessions-dir", str(sessions), thread_id],
+        command,
         check=False,
         capture_output=True,
         text=True,
@@ -513,6 +566,8 @@ def inspect_agent_runtime(
         _fail("RUNTIME_EVIDENCE_INVALID", "runtime inspector emitted an invalid allowlist")
     if value.get("thread_id") != thread_id:
         _fail("RUNTIME_EVIDENCE_INVALID", "runtime inspector thread ID does not match")
+    if value.get("native_agent_id") != issued_agent_id:
+        _fail("RUNTIME_EVIDENCE_INVALID", "runtime inspector agent ID does not match")
     if execution_surface == CODEX_EXEC_ROLE_CONTRACT:
         if value.get("agent_type") is not None:
             _fail("RUNTIME_IDENTITY_CONFLICT", "exec inspector claimed a custom agent")
@@ -520,12 +575,16 @@ def inspect_agent_runtime(
         not isinstance(value.get("agent_type"), str) or not value["agent_type"].strip()
     ):
         _fail("RUNTIME_EVIDENCE_INVALID", "native inspector emitted an invalid agent_type")
+    if execution_surface == NATIVE_SUBAGENT and value.get("agent_type") is not None:
+        _fail("RUNTIME_IDENTITY_CONFLICT", "native inspector claimed a custom agent")
     for field in _NON_AGENT_IDENTITY_FIELDS:
         if not isinstance(value.get(field), str) or not value[field].strip():
             _fail("RUNTIME_EVIDENCE_INVALID", f"runtime inspector omitted {field}")
     return {
         "execution_surface": execution_surface,
         "agent_type": value["agent_type"],
+        "native_agent_id": issued_agent_id,
+        "native_thread_id": value["thread_id"] if execution_surface == NATIVE_SUBAGENT else None,
         "model": value["model"],
         "reasoning_effort": value["reasoning_effort"],
         "sandbox_policy": value["sandbox_policy"],
@@ -543,6 +602,8 @@ def codex_exec_contract(
         "requested_role": requested_role,
         "execution_surface": CODEX_EXEC_ROLE_CONTRACT,
         "agent_type": None,
+        "native_agent_id": None,
+        "native_thread_id": None,
         "model": model,
         "reasoning_effort": reasoning_effort,
         "sandbox_policy": sandbox_policy,
@@ -562,6 +623,8 @@ def codex_exec_observation(
     return {
         "execution_surface": CODEX_EXEC_ROLE_CONTRACT,
         "agent_type": None,
+        "native_agent_id": None,
+        "native_thread_id": None,
         "evidence_source": LOCAL_ROLLOUT,
         "before_repository_snapshot": before_repository_snapshot,
         "after_repository_snapshot": after_repository_snapshot,

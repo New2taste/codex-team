@@ -14,12 +14,14 @@ cwd before promoting a result. A native `luna` dispatch and an automated
 surfaces. Neither surface may erase the task envelope, L0/L1/L2 evidence
 level, human owner gates, or the final-acceptance boundary.
 
-## Legacy Agent cleanup (explicit, one-time)
+## Legacy Agent cleanup-only migration (explicit, one-time)
 
 If an existing user install contains `luna_worker` (one-time migration input) or the old `luna-max.toml`,
-the migration/uninstall utility may clean it only after validating the legacy
-template, state, and backup. The utility is not part of default routing and
-does not create an active Agent template. The workflow role remains `luna`.
+the compatibility install/uninstall entrypoints may only clean it after
+validating existing user files, state, and backup. They embed and publish no
+complete Agent TOML, never install missing/legacy entries into a canonical
+template, and leave missing or empty user directories unchanged. The utility
+is not part of default routing. The workflow role remains `luna`.
 
 ## Frozen role and lifecycle contract
 

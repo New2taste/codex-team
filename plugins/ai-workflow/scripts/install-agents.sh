@@ -1,5 +1,5 @@
 #!/bin/sh
-# POSIX entrypoint for the data-preserving companion-Agent installer.
+# POSIX compatibility entrypoint for cleanup-only historical Agent migration.
 set -eu
 
 if [ -z "${PYTHON_BIN:-}" ]; then

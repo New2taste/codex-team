@@ -9,10 +9,16 @@ fail() {
     exit 2
 }
 
-[ "$#" -eq 3 ] || fail
+[ "$#" -eq 3 ] || [ "$#" -eq 5 ] || fail
 [ "$1" = '--sessions-dir' ] || fail
 sessions_dir=$2
 thread_id=$3
+native_agent_id=null
+if [ "$#" -eq 5 ]; then
+    [ "$4" = '--native-agent-id' ] || fail
+    printf '%s' "$5" | grep -Eq '^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$' || fail
+    native_agent_id=$5
+fi
 
 case "$sessions_dir" in
     /*) ;;
@@ -46,7 +52,7 @@ trap cleanup EXIT HUP INT TERM
 # field must occur with exactly one nonempty string value; duplicate values are
 # allowed only when they are identical.  jq diagnostics are discarded so a
 # malformed rollout cannot reflect sensitive input to stderr.
-jq -ce --arg requested_thread "$thread_id" '
+jq -ce --arg requested_thread "$thread_id" --argjson issued_native_agent_id "$(printf '%s' "$native_agent_id" | jq -R 'if . == "null" then null else . end')" '
     def field($name):
       [.. | objects | select(has($name)) | .[$name]] as $values
       | if ($values | length) == 0
@@ -65,8 +71,17 @@ jq -ce --arg requested_thread "$thread_id" '
         end;
     field("thread_id") as $thread_id
     | if $thread_id != $requested_thread then error("invalid runtime rollout") else . end
+    | (if $issued_native_agent_id == null
+       then null
+       else field("native_agent_id") as $rollout_agent_id
+            | if $rollout_agent_id == $issued_native_agent_id
+              then $rollout_agent_id
+              else error("invalid runtime rollout")
+              end
+       end) as $native_agent_id
     | {
         thread_id: $thread_id,
+        native_agent_id: $native_agent_id,
         agent_type: nullable_agent_type,
         model: field("model"),
         reasoning_effort: field("reasoning_effort"),
@@ -80,9 +95,10 @@ jq -ce --arg requested_thread "$thread_id" '
 # allowlist boundary should the filter above ever be changed.
 jq -e '
     type == "object"
-    and (keys | sort == ["agent_type", "cwd", "model", "permission_profile", "reasoning_effort", "sandbox_policy", "thread_id"])
+    and (keys | sort == ["agent_type", "cwd", "model", "native_agent_id", "permission_profile", "reasoning_effort", "sandbox_policy", "thread_id"])
     and (.agent_type == null or (.agent_type | type == "string" and length > 0))
-    and all(del(.agent_type)[]; type == "string" and length > 0)
+    and (.native_agent_id == null or (.native_agent_id | type == "string" and length > 0))
+    and all(del(.agent_type, .native_agent_id)[]; type == "string" and length > 0)
 ' "$temporary" >/dev/null 2>&1 || fail
 
 cat "$temporary"

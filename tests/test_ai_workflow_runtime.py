@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests" / "fixtures" / "runtime"
 INSPECTOR = ROOT / "plugins" / "ai-workflow" / "scripts" / "inspect-agent-runtime.sh"
 THREAD_ID = "019fc73c-4d40-7c20-a82a-c5a9ae078bcf"
+AGENT_ID = "f1f17d67-8a86-4df8-8be2-c1848cf9b1e1"
 
 
 def runtime_expected(*, surface="NATIVE_SUBAGENT", **overrides):
@@ -21,14 +22,16 @@ def runtime_expected(*, surface="NATIVE_SUBAGENT", **overrides):
         "requested_role": "luna",
         "execution_surface": surface,
         "agent_type": None,
+        "native_agent_id": AGENT_ID if surface == "NATIVE_SUBAGENT" else None,
+        "native_thread_id": THREAD_ID if surface == "NATIVE_SUBAGENT" else None,
         "model": "gpt-5.6-luna",
         "reasoning_effort": "max",
         "sandbox_policy": "read-only",
         "permission_profile": "read-only",
         "cwd": str(ROOT),
-        "evidence_source": "NATIVE_METADATA"
+        "evidence_sources": ["NATIVE_METADATA", "LOCAL_ROLLOUT"]
         if surface == "NATIVE_SUBAGENT"
-        else "LOCAL_ROLLOUT",
+        else ["LOCAL_ROLLOUT"],
         "hard_read_only": True,
     }
     value.update(overrides)
@@ -39,14 +42,16 @@ def runtime_observation(*, surface="NATIVE_SUBAGENT", **overrides):
     value = {
         "execution_surface": surface,
         "agent_type": None,
+        "native_agent_id": AGENT_ID if surface == "NATIVE_SUBAGENT" else None,
+        "native_thread_id": THREAD_ID if surface == "NATIVE_SUBAGENT" else None,
         "model": "gpt-5.6-luna",
         "reasoning_effort": "max",
         "sandbox_policy": "read-only",
         "permission_profile": "read-only",
         "cwd": str(ROOT),
-        "evidence_source": "NATIVE_METADATA"
+        "evidence_sources": ["NATIVE_METADATA", "LOCAL_ROLLOUT"]
         if surface == "NATIVE_SUBAGENT"
-        else "LOCAL_ROLLOUT",
+        else ["LOCAL_ROLLOUT"],
     }
     value.update(overrides)
     return value
@@ -88,7 +93,7 @@ def blocked_luna_result():
     }
 
 
-def write_exec_rollout(sessions: Path, *, model="gpt-5.6-luna", agent_type=None):
+def write_exec_rollout(sessions: Path, *, model="gpt-5.6-luna", agent_type=None, native_agent_id=None):
     sessions.mkdir(parents=True, exist_ok=True)
     rollout = {
         "thread_id": THREAD_ID,
@@ -102,6 +107,8 @@ def write_exec_rollout(sessions: Path, *, model="gpt-5.6-luna", agent_type=None)
         "environment": "ENV_SECRET",
         "token": "TOKEN_SECRET",
     }
+    if native_agent_id is not None:
+        rollout["native_agent_id"] = native_agent_id
     (sessions / f"rollout-{THREAD_ID}").write_text(json.dumps(rollout), encoding="utf-8")
 
 
@@ -116,6 +123,58 @@ class RuntimeIdentityTest(unittest.TestCase):
         self.assertIsNone(evidence.observed_agent_type)
         self.assertEqual("gpt-5.6-luna", evidence.observed_model)
         self.assertEqual("max", evidence.observed_reasoning_effort)
+        self.assertEqual(AGENT_ID, evidence.native_agent_id)
+        self.assertEqual(THREAD_ID, evidence.native_thread_id)
+
+    def test_native_contract_is_controller_owned_and_rejects_self_consistent_wrong_model(self):
+        with self.assertRaisesRegex(workflow.WorkflowError, "RUNTIME_IDENTITY_CONFLICT"):
+            workflow.verify_runtime_identity(
+                runtime_expected(model="gpt-5.6-sol", reasoning_effort="high"),
+                runtime_observation(model="gpt-5.6-sol", reasoning_effort="high"),
+            )
+
+    def test_native_contract_rejects_non_luna_role_even_when_request_and_observation_agree(self):
+        with self.assertRaisesRegex(workflow.WorkflowError, "RUNTIME_IDENTITY_CONFLICT"):
+            workflow.verify_runtime_identity(
+                runtime_expected(requested_role="terra_xhigh"), runtime_observation()
+            )
+
+    def test_native_agent_type_must_be_null_on_both_sides(self):
+        for side in ("requested", "observed", "both"):
+            expected = runtime_expected(agent_type="luna_max" if side != "observed" else None)
+            observed = runtime_observation(agent_type="luna_max" if side != "requested" else None)
+            with self.subTest(side=side), self.assertRaisesRegex(
+                workflow.WorkflowError, "RUNTIME_IDENTITY_CONFLICT"
+            ):
+                workflow.verify_runtime_identity(expected, observed)
+
+    def test_native_requires_controller_agent_and_thread_uuids(self):
+        for field in ("native_agent_id", "native_thread_id"):
+            for value in (None, "not-a-uuid"):
+                expected = runtime_expected(**{field: value})
+                observed = runtime_observation(**{field: value})
+                with self.subTest(field=field, value=value), self.assertRaisesRegex(
+                    workflow.WorkflowError, "RUNTIME_IDENTITY_(?:MISSING|CONFLICT)"
+                ):
+                    workflow.verify_runtime_identity(expected, observed)
+
+    def test_native_metadata_without_rollout_thread_uuid_cannot_verify(self):
+        observed = runtime_observation(evidence_sources=["NATIVE_METADATA"])
+        with self.assertRaisesRegex(workflow.WorkflowError, "RUNTIME_IDENTITY_CONFLICT"):
+            workflow.verify_runtime_identity(runtime_expected(), observed)
+
+    def test_exec_uuid_fields_are_null_and_mutually_exclusive_with_native(self):
+        evidence = workflow.verify_runtime_identity(
+            runtime_expected(surface="CODEX_EXEC_ROLE_CONTRACT"),
+            runtime_observation(surface="CODEX_EXEC_ROLE_CONTRACT"),
+        )
+        self.assertIsNone(evidence.native_agent_id)
+        self.assertIsNone(evidence.native_thread_id)
+        with self.assertRaisesRegex(workflow.WorkflowError, "RUNTIME_IDENTITY_CONFLICT"):
+            workflow.verify_runtime_identity(
+                runtime_expected(surface="CODEX_EXEC_ROLE_CONTRACT", native_agent_id=AGENT_ID),
+                runtime_observation(surface="CODEX_EXEC_ROLE_CONTRACT", native_agent_id=AGENT_ID),
+            )
 
     def test_each_pinned_terra_os_role_has_a_verifiable_runtime_identity(self):
         for role in (
@@ -215,8 +274,13 @@ class RuntimeIdentityTest(unittest.TestCase):
             )
 
     def test_broadened_reviewer_needs_opt_in_prompt_guard_and_unchanged_snapshots(self):
-        expected = runtime_expected(requested_role="sol_reviewer", hard_read_only=False)
+        expected = runtime_expected(
+            surface="CODEX_EXEC_ROLE_CONTRACT",
+            requested_role="sol_reviewer",
+            hard_read_only=False,
+        )
         guarded = runtime_observation(
+            surface="CODEX_EXEC_ROLE_CONTRACT",
             sandbox_policy="workspace-write",
             permission_profile="workspace-write",
             controller_prompt_forbids_writes=True,
@@ -262,6 +326,7 @@ class RuntimeIdentityTest(unittest.TestCase):
         native = {
             "execution_surface": "NATIVE_SUBAGENT",
             "agent_type": None,
+            "native_agent_id": AGENT_ID,
             "model": "gpt-5.6-luna",
             "sandbox_policy": "read-only",
             "permission_profile": "read-only",
@@ -270,6 +335,7 @@ class RuntimeIdentityTest(unittest.TestCase):
         }
         rollout = {
             "execution_surface": "NATIVE_SUBAGENT",
+            "native_thread_id": THREAD_ID,
             "model": "gpt-5.6-luna",
             "reasoning_effort": "max",
             "evidence_source": "LOCAL_ROLLOUT",
@@ -290,10 +356,12 @@ class RuntimeIdentityTest(unittest.TestCase):
 
     def test_broadened_exception_is_limited_to_read_only_reviewer_with_real_snapshots(self):
         expected = runtime_expected(
+            surface="CODEX_EXEC_ROLE_CONTRACT",
             requested_role="terra",
             hard_read_only=False,
         )
         observed = runtime_observation(
+            surface="CODEX_EXEC_ROLE_CONTRACT",
             sandbox_policy="workspace-write",
             permission_profile="workspace-write",
             prompt_forbids_writes=True,
@@ -382,6 +450,7 @@ class RuntimeInspectorTest(unittest.TestCase):
         self.assertEqual(
             {
                 "thread_id",
+                "native_agent_id",
                 "agent_type",
                 "model",
                 "reasoning_effort",
@@ -392,6 +461,7 @@ class RuntimeInspectorTest(unittest.TestCase):
             set(observation),
         )
         self.assertEqual(THREAD_ID, observation["thread_id"])
+        self.assertIsNone(observation["native_agent_id"])
         self.assertIsNone(observation["agent_type"])
         combined_output = completed.stdout + completed.stderr
         for sentinel in ("PROMPT_SECRET", "ENV_SECRET", "TOKEN_SECRET"):
@@ -428,6 +498,21 @@ class RuntimeInspectorTest(unittest.TestCase):
             completed = self.run_inspector(sessions)
         self.assertEqual(0, completed.returncode, completed.stderr)
         self.assertIsNone(json.loads(completed.stdout)["agent_type"])
+
+    def test_native_inspector_binds_controller_agent_uuid_to_rollout(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            sessions = Path(temporary) / "sessions"
+            write_exec_rollout(sessions, native_agent_id=AGENT_ID)
+            observed = workflow.inspect_agent_runtime(
+                sessions, THREAD_ID, "NATIVE_SUBAGENT", INSPECTOR,
+                native_agent_id=AGENT_ID,
+            )
+            self.assertEqual(AGENT_ID, observed["native_agent_id"])
+            with self.assertRaisesRegex(workflow.WorkflowError, "RUNTIME_EVIDENCE_MISSING"):
+                workflow.inspect_agent_runtime(
+                    sessions, THREAD_ID, "NATIVE_SUBAGENT", INSPECTOR,
+                    native_agent_id="91df4008-d061-4fd5-a48c-a37851b182e0",
+                )
 
     def test_inspector_rejects_a_same_suffix_symlink_without_leaking_its_content(self):
         with tempfile.TemporaryDirectory() as temporary:

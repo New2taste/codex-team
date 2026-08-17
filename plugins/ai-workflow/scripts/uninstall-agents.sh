@@ -1,5 +1,5 @@
 #!/bin/sh
-# POSIX entrypoint for the data-preserving companion-Agent uninstaller.
+# POSIX entrypoint for cleanup-only historical Agent removal.
 set -eu
 
 if [ -z "${PYTHON_BIN:-}" ]; then

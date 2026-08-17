@@ -389,6 +389,8 @@ class TerraOSExecutionGuardTest(unittest.TestCase):
                 "requested_role": "luna_construction",
                 "execution_surface": "CODEX_EXEC_ROLE_CONTRACT",
                 "observed_agent_type": None,
+                "native_agent_id": None,
+                "native_thread_id": None,
                 "observed_model": "gpt-5.6-luna",
                 "observed_reasoning_effort": "max",
                 "observed_sandbox_policy": "workspace-write",

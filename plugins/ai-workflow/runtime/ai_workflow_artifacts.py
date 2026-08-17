@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 import re
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -163,6 +164,8 @@ RUNTIME_EVIDENCE_FIELDS = frozenset(
         "requested_role",
         "execution_surface",
         "observed_agent_type",
+        "native_agent_id",
+        "native_thread_id",
         "observed_model",
         "observed_reasoning_effort",
         "observed_sandbox_policy",
@@ -408,6 +411,8 @@ class RuntimeEvidence:
     requested_role: str = ""
     execution_surface: str = ""
     observed_agent_type: str | None = None
+    native_agent_id: str | None = None
+    native_thread_id: str | None = None
     observed_model: str = ""
     observed_reasoning_effort: str = ""
     observed_sandbox_policy: str = ""
@@ -425,6 +430,8 @@ class RuntimeEvidence:
             "requested_role": self.requested_role,
             "execution_surface": self.execution_surface,
             "observed_agent_type": self.observed_agent_type,
+            "native_agent_id": self.native_agent_id,
+            "native_thread_id": self.native_thread_id,
             "observed_model": self.observed_model,
             "observed_reasoning_effort": self.observed_reasoning_effort,
             "observed_sandbox_policy": self.observed_sandbox_policy,
@@ -663,12 +670,17 @@ def validate_runtime_evidence(value: object) -> None:
     surface = _enum(evidence["execution_surface"], "execution_surface", EXECUTION_SURFACES)
     observed_type = evidence["observed_agent_type"]
     if surface == "NATIVE_SUBAGENT":
-        if observed_type is not None and (
-            not isinstance(observed_type, str) or not observed_type.strip()
-        ):
-            _raise("RUNTIME_IDENTITY_MISSING", "native observed_agent_type must be null or non-empty")
-    elif observed_type is not None:
-        _raise("RUNTIME_IDENTITY_CONFLICT", "exec role contract must have null observed_agent_type")
+        if observed_type is not None:
+            _raise("RUNTIME_IDENTITY_CONFLICT", "native observed_agent_type must be null")
+        for field in ("native_agent_id", "native_thread_id"):
+            try:
+                parsed = uuid.UUID(evidence[field])
+            except (TypeError, ValueError) as exc:
+                raise ArtifactError("RUNTIME_IDENTITY_MISSING", f"{field} must be a UUID") from exc
+            if str(parsed) != evidence[field].lower():
+                _raise("RUNTIME_IDENTITY_CONFLICT", f"{field} must be canonical")
+    elif observed_type is not None or evidence["native_agent_id"] is not None or evidence["native_thread_id"] is not None:
+        _raise("RUNTIME_IDENTITY_CONFLICT", "exec role contract must have null native identity")
     _enum(evidence["evidence_source"], "evidence_source", RUNTIME_EVIDENCE_SOURCES)
     status = _enum(evidence["verification_status"], "verification_status", RUNTIME_STATUSES)
     reasons = _string_array(evidence["failure_reasons"], "failure_reasons")

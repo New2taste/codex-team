@@ -2413,6 +2413,8 @@ def _v2_controller_runtime_receipt(
         "requested_role": assignment.expected_actor.role,
         "execution_surface": execution_surface,
         "observed_agent_type": None,
+        "native_agent_id": None,
+        "native_thread_id": None,
         "observed_model": model,
         "observed_reasoning_effort": effort,
         "observed_sandbox_policy": sandbox,
