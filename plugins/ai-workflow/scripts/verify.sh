@@ -46,11 +46,16 @@ do
 done
 
 for script in \
+    "$plugin_root/scripts/install-agents.sh" \
     "$plugin_root/scripts/inspect-agent-runtime.sh" \
+    "$plugin_root/scripts/uninstall-agents.sh" \
     "$plugin_root/scripts/verify.sh"
 do
     [ -f "$script" ] || fail "missing script"
     sh -n "$script" || fail "invalid shell script"
 done
+
+[ -f "$plugin_root/scripts/agent_lifecycle.py" ] || fail "missing lifecycle helper"
+"${PYTHON_BIN:-python3}" -m py_compile "$plugin_root/scripts/agent_lifecycle.py" || fail "invalid lifecycle helper"
 
 printf '%s\n' 'ai-workflow plugin verification: ok'

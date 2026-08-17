@@ -757,6 +757,29 @@ class CleanupOnlyLifecycleTest(unittest.TestCase):
             self.assertEqual(0, lifecycle.cleanup(target))
             self.assertFalse((target / LEGACY_TARGET_NAME).exists())
 
+    def test_verified_canonical_cleanup_restores_user_backup(self):
+        lifecycle = load_lifecycle_helper()
+        with temporary_directory() as temporary:
+            target = Path(temporary) / "agents"
+            target.mkdir()
+            payload = b"historical canonical payload\n"
+            backup = b"original user backup\n"
+            (target / TARGET_NAME).write_bytes(payload)
+            (target / BACKUP_NAME).write_bytes(backup)
+            write_owned_state(target, hashlib.sha256(backup).hexdigest())
+            state = json.loads((target / STATE_NAME).read_text())
+            state["installed_sha256"] = hashlib.sha256(payload).hexdigest()
+            (target / STATE_NAME).write_text(json.dumps(state) + "\n")
+            with mock.patch.object(
+                lifecycle,
+                "CANONICAL_RELEASE_SHA256",
+                hashlib.sha256(payload).hexdigest(),
+            ):
+                self.assertEqual(0, lifecycle.cleanup(target))
+            self.assertEqual(backup, (target / TARGET_NAME).read_bytes())
+            self.assertFalse((target / STATE_NAME).exists())
+            self.assertFalse((target / BACKUP_NAME).exists())
+
     def test_tampered_mixed_and_symlink_inputs_fail_closed(self):
         lifecycle = load_lifecycle_helper()
         with temporary_directory() as temporary:
@@ -791,13 +814,163 @@ class CleanupOnlyLifecycleTest(unittest.TestCase):
                 value = original(directory, name)
                 if name == LEGACY_TARGET_NAME and value is not None:
                     calls += 1
-                    if calls > 2:
+                    if calls > 1:
                         return value[0], value[1] + 1, value[2]
                 return value
 
             with mock.patch.object(lifecycle, "_identity", side_effect=changed):
                 self.assertEqual(1, lifecycle.cleanup(target))
             self.assertTrue((target / LEGACY_TARGET_NAME).exists())
+
+    def test_unmanaged_cleanup_preserves_replacement_racing_the_retirement(self):
+        lifecycle = load_lifecycle_helper()
+        with temporary_directory() as temporary:
+            root = Path(temporary)
+            target = root / "agents"
+            prepare_known_legacy(target)
+            replacement = b"user replacement during unlink\n"
+            original_rename = lifecycle.os.rename
+            injected = False
+
+            def race_rename(source, destination, *arguments, **keywords):
+                nonlocal injected
+                if source == LEGACY_TARGET_NAME and not injected:
+                    injected = True
+                    staged = root / "replacement"
+                    staged.write_bytes(replacement)
+                    os.replace(staged, target / LEGACY_TARGET_NAME)
+                return original_rename(source, destination, *arguments, **keywords)
+
+            with mock.patch.object(lifecycle.os, "rename", side_effect=race_rename):
+                self.assertEqual(1, lifecycle.cleanup(target))
+            self.assertEqual(replacement, (target / LEGACY_TARGET_NAME).read_bytes())
+
+    def test_backup_restore_preserves_replacement_racing_the_rename(self):
+        lifecycle = load_lifecycle_helper()
+        with temporary_directory() as temporary:
+            root = Path(temporary)
+            target = root / "agents"
+            target.mkdir()
+            payload = b"historical canonical payload\n"
+            backup = b"original user backup\n"
+            replacement = b"replacement backup during restore\n"
+            (target / TARGET_NAME).write_bytes(payload)
+            (target / BACKUP_NAME).write_bytes(backup)
+            write_owned_state(target, hashlib.sha256(backup).hexdigest())
+            state = json.loads((target / STATE_NAME).read_text())
+            state["installed_sha256"] = hashlib.sha256(payload).hexdigest()
+            (target / STATE_NAME).write_text(json.dumps(state) + "\n")
+            original_rename = lifecycle.os.rename
+            injected = False
+
+            def race_rename(source, destination, *arguments, **keywords):
+                nonlocal injected
+                if source == BACKUP_NAME and not injected:
+                    injected = True
+                    staged = root / "replacement"
+                    staged.write_bytes(replacement)
+                    os.replace(staged, target / BACKUP_NAME)
+                return original_rename(source, destination, *arguments, **keywords)
+
+            with (
+                mock.patch.object(
+                    lifecycle,
+                    "CANONICAL_RELEASE_SHA256",
+                    hashlib.sha256(payload).hexdigest(),
+                ),
+                mock.patch.object(lifecycle.os, "rename", side_effect=race_rename),
+            ):
+                self.assertEqual(1, lifecycle.cleanup(target))
+            self.assertEqual(replacement, (target / BACKUP_NAME).read_bytes())
+            self.assertEqual(payload, (target / TARGET_NAME).read_bytes())
+
+    def test_cleanup_preserves_state_replacement_racing_retirement(self):
+        lifecycle = load_lifecycle_helper()
+        with temporary_directory() as temporary:
+            root = Path(temporary)
+            target = root / "agents"
+            target.mkdir()
+            payload = b"historical canonical payload\n"
+            replacement = b'{"user":"replacement state"}\n'
+            (target / TARGET_NAME).write_bytes(payload)
+            write_owned_state(target)
+            state = json.loads((target / STATE_NAME).read_text())
+            state["installed_sha256"] = hashlib.sha256(payload).hexdigest()
+            (target / STATE_NAME).write_text(json.dumps(state) + "\n")
+            original_rename = lifecycle.os.rename
+            injected = False
+
+            def race_rename(source, destination, *arguments, **keywords):
+                nonlocal injected
+                if source == STATE_NAME and not injected:
+                    injected = True
+                    staged = root / "replacement"
+                    staged.write_bytes(replacement)
+                    os.replace(staged, target / STATE_NAME)
+                return original_rename(source, destination, *arguments, **keywords)
+
+            with (
+                mock.patch.object(
+                    lifecycle,
+                    "CANONICAL_RELEASE_SHA256",
+                    hashlib.sha256(payload).hexdigest(),
+                ),
+                mock.patch.object(lifecycle.os, "rename", side_effect=race_rename),
+            ):
+                self.assertEqual(1, lifecycle.cleanup(target))
+            self.assertEqual(replacement, (target / STATE_NAME).read_bytes())
+            self.assertEqual(payload, (target / TARGET_NAME).read_bytes())
+
+
+class LifecycleVerifierTest(unittest.TestCase):
+    def _copied_release(self, temporary: str) -> Path:
+        release = Path(temporary) / "release"
+        shutil.copytree(ROOT / ".codex", release / ".codex")
+        shutil.copytree(ROOT / "config", release / "config")
+        shutil.copytree(ROOT / "scripts", release / "scripts")
+        shutil.copytree(PLUGIN, release / "plugins" / "ai-workflow")
+        return release
+
+    def _verify(
+        self, release: Path, *, environment: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["sh", str(release / "plugins" / "ai-workflow" / "scripts" / "verify.sh")],
+            cwd=release,
+            env=environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+    def test_verifier_requires_all_cleanup_lifecycle_scripts(self):
+        for name in ("agent_lifecycle.py", "install-agents.sh", "uninstall-agents.sh"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                release = self._copied_release(temporary)
+                (release / "plugins" / "ai-workflow" / "scripts" / name).unlink()
+                self.assertNotEqual(0, self._verify(release).returncode)
+
+    def test_verifier_rejects_invalid_cleanup_lifecycle_syntax(self):
+        mutations = {
+            "agent_lifecycle.py": "def broken(:\n",
+            "install-agents.sh": "if then\n",
+            "uninstall-agents.sh": "if then\n",
+        }
+        for name, content in mutations.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                release = self._copied_release(temporary)
+                (release / "plugins" / "ai-workflow" / "scripts" / name).write_text(content)
+                self.assertNotEqual(0, self._verify(release).returncode)
+
+    def test_verifier_rejects_missing_python_syntax_tool(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            release = self._copied_release(temporary)
+            environment = dict(os.environ)
+            environment["PYTHON_BIN"] = str(release / "missing-python")
+            self.assertNotEqual(
+                0, self._verify(release, environment=environment).returncode
+            )
 
 
 

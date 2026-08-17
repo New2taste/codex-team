@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import json
 import os
+import secrets
 import stat
 
 
@@ -120,6 +121,121 @@ def _state(content: bytes, target_name: str, target_sha: str) -> str | None:
     return backup_sha
 
 
+Tombstone = tuple[str, int, tuple[int, int, str]]
+
+
+def _new_tombstone(directory: int) -> tuple[str, int]:
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+    for _ in range(32):
+        name = f".ai-workflow-cleanup-{secrets.token_hex(16)}"
+        try:
+            os.mkdir(name, 0o700, dir_fd=directory)
+        except FileExistsError:
+            continue
+        return name, os.open(
+            name, flags | getattr(os, "O_NOFOLLOW", 0), dir_fd=directory
+        )
+    _fail()
+    raise AssertionError("unreachable")
+
+
+def _remove_tombstone_directory(directory: int, name: str, descriptor: int) -> None:
+    os.close(descriptor)
+    os.rmdir(name, dir_fd=directory)
+
+
+def _close_quietly(descriptor: int) -> None:
+    try:
+        os.close(descriptor)
+    except OSError:
+        pass
+
+
+def _restore_tombstone(directory: int, original_name: str, tombstone: Tombstone) -> bool:
+    tombstone_name, descriptor, expected = tombstone
+    try:
+        os.link(
+            "payload",
+            original_name,
+            src_dir_fd=descriptor,
+            dst_dir_fd=directory,
+            follow_symlinks=False,
+        )
+    except FileExistsError:
+        return False
+    except OSError:
+        return False
+    if _identity(directory, original_name) != expected:
+        return False
+    try:
+        os.unlink("payload", dir_fd=descriptor)
+        _remove_tombstone_directory(directory, tombstone_name, descriptor)
+    except OSError:
+        return False
+    return True
+
+
+def _retire_verified(
+    directory: int, name: str, expected: tuple[int, int, str]
+) -> Tombstone:
+    tombstone_name, descriptor = _new_tombstone(directory)
+    tombstone = (tombstone_name, descriptor, expected)
+    try:
+        os.rename(name, "payload", src_dir_fd=directory, dst_dir_fd=descriptor)
+    except BaseException:
+        try:
+            _remove_tombstone_directory(directory, tombstone_name, descriptor)
+        except OSError:
+            pass
+        raise
+    if _identity(descriptor, "payload") != expected:
+        if not _restore_tombstone(directory, name, tombstone):
+            _close_quietly(descriptor)
+        _fail()
+    return tombstone
+
+
+def _discard_tombstone(directory: int, tombstone: Tombstone) -> bool:
+    tombstone_name, descriptor, expected = tombstone
+    try:
+        if _identity(descriptor, "payload") != expected:
+            return False
+        os.unlink("payload", dir_fd=descriptor)
+        _remove_tombstone_directory(directory, tombstone_name, descriptor)
+        return True
+    except OSError:
+        return False
+
+
+def _rollback_tombstones(
+    directory: int, retired: dict[str, Tombstone]
+) -> None:
+    for name, tombstone in reversed(tuple(retired.items())):
+        if not _restore_tombstone(directory, name, tombstone):
+            _close_quietly(tombstone[1])
+
+
+def _retire_all(
+    directory: int, snapshots: dict[str, tuple[int, int, str]]
+) -> dict[str, Tombstone]:
+    retired: dict[str, Tombstone] = {}
+    try:
+        for name, identity in snapshots.items():
+            retired[name] = _retire_verified(directory, name, identity)
+        return retired
+    except BaseException:
+        _rollback_tombstones(directory, retired)
+        raise
+
+
+def _discard_all(directory: int, retired: dict[str, Tombstone]) -> bool:
+    discarded = True
+    for item in retired.values():
+        if not _discard_tombstone(directory, item):
+            discarded = False
+    return discarded
+
+
 def _cleanup_family(
     directory: int,
     target_name: str,
@@ -139,10 +255,8 @@ def _cleanup_family(
     if state is None:
         if backup is not None or unmanaged_sha is None or target[2] != unmanaged_sha:
             return 1
-        if _identity(directory, target_name) != target:
-            return 1
-        os.unlink(target_name, dir_fd=directory)
-        return 0
+        retired = {target_name: _retire_verified(directory, target_name, target)}
+        return 0 if _discard_all(directory, retired) else 1
     if target[2] != expected_sha:
         return 1
     state_content, state_snapshot = _read(directory, state_name)
@@ -155,14 +269,24 @@ def _cleanup_family(
         if backup is None or backup[2] != backup_sha:
             return 1
         snapshots[backup_name] = backup
-    if any(_identity(directory, name) != identity for name, identity in snapshots.items()):
-        return 1
-    if backup_sha is None:
-        os.unlink(target_name, dir_fd=directory)
-    else:
-        os.rename(backup_name, target_name, src_dir_fd=directory, dst_dir_fd=directory)
-    os.unlink(state_name, dir_fd=directory)
-    return 0
+    retired = _retire_all(directory, snapshots)
+    if backup_sha is not None:
+        backup_tombstone = retired[backup_name]
+        try:
+            os.link(
+                "payload",
+                target_name,
+                src_dir_fd=backup_tombstone[1],
+                dst_dir_fd=directory,
+                follow_symlinks=False,
+            )
+        except OSError:
+            _rollback_tombstones(directory, retired)
+            return 1
+        if _identity(directory, target_name) != backup_tombstone[2]:
+            _rollback_tombstones(directory, retired)
+            return 1
+    return 0 if _discard_all(directory, retired) else 1
 
 
 def cleanup(target_directory: str | os.PathLike[str], *, check: bool = False) -> int:
