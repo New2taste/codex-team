@@ -747,7 +747,12 @@ class CleanupOnlyLifecycleTest(unittest.TestCase):
                 hashlib.sha256(payload).hexdigest(),
             ):
                 self.assertEqual(0, lifecycle.cleanup(target))
-            self.assertEqual({}, {p.name: p for p in target.iterdir()})
+            self.assertFalse((target / TARGET_NAME).exists())
+            self.assertFalse((target / STATE_NAME).exists())
+            self.assertFalse((target / BACKUP_NAME).exists())
+            self.assertTrue(
+                any(path.name.startswith(".ai-workflow-cleanup-") for path in target.iterdir())
+            )
 
     def test_verified_legacy_cleanup_removes_known_historical_file(self):
         lifecycle = load_lifecycle_helper()
@@ -920,6 +925,69 @@ class CleanupOnlyLifecycleTest(unittest.TestCase):
                 self.assertEqual(1, lifecycle.cleanup(target))
             self.assertEqual(replacement, (target / STATE_NAME).read_bytes())
             self.assertEqual(payload, (target / TARGET_NAME).read_bytes())
+
+    def test_final_discard_never_unlinks_target_state_or_backup_replacement(self):
+        lifecycle = load_lifecycle_helper()
+        for selected in (TARGET_NAME, STATE_NAME, BACKUP_NAME):
+            with self.subTest(selected=selected), temporary_directory() as temporary:
+                root = Path(temporary)
+                target = root / "agents"
+                target.mkdir()
+                payload = b"historical canonical payload\n"
+                backup = b"original user backup\n"
+                replacement = f"replacement for {selected}\n".encode()
+                (target / TARGET_NAME).write_bytes(payload)
+                (target / BACKUP_NAME).write_bytes(backup)
+                write_owned_state(target, hashlib.sha256(backup).hexdigest())
+                state = json.loads((target / STATE_NAME).read_text())
+                state["installed_sha256"] = hashlib.sha256(payload).hexdigest()
+                (target / STATE_NAME).write_text(json.dumps(state) + "\n")
+                selected_digest = hashlib.sha256(
+                    (target / selected).read_bytes()
+                ).hexdigest()
+                original_rename = lifecycle.os.rename
+                injected = False
+
+                def race_rename(source, destination, *arguments, **keywords):
+                    nonlocal injected
+                    directory = keywords.get("src_dir_fd")
+                    if source == "payload" and directory is not None and not injected:
+                        identity = lifecycle._identity(directory, "payload")
+                        if identity is not None and identity[2] == selected_digest:
+                            injected = True
+                            descriptor = os.open(
+                                "replacement",
+                                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                                0o600,
+                                dir_fd=directory,
+                            )
+                            try:
+                                os.write(descriptor, replacement)
+                            finally:
+                                os.close(descriptor)
+                            os.replace(
+                                "replacement",
+                                "payload",
+                                src_dir_fd=directory,
+                                dst_dir_fd=directory,
+                            )
+                    return original_rename(source, destination, *arguments, **keywords)
+
+                with (
+                    mock.patch.object(
+                        lifecycle,
+                        "CANONICAL_RELEASE_SHA256",
+                        hashlib.sha256(payload).hexdigest(),
+                    ),
+                    mock.patch.object(lifecycle.os, "rename", side_effect=race_rename),
+                ):
+                    self.assertEqual(1, lifecycle.cleanup(target))
+                retained = tuple(
+                    entry["content"]
+                    for entry in filesystem_snapshot(root).values()
+                    if entry["type"] == "regular"
+                )
+                self.assertIn(replacement, retained)
 
 
 class LifecycleVerifierTest(unittest.TestCase):

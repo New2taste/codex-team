@@ -152,7 +152,7 @@ def _close_quietly(descriptor: int) -> None:
 
 
 def _restore_tombstone(directory: int, original_name: str, tombstone: Tombstone) -> bool:
-    tombstone_name, descriptor, expected = tombstone
+    _, descriptor, expected = tombstone
     try:
         os.link(
             "payload",
@@ -167,12 +167,27 @@ def _restore_tombstone(directory: int, original_name: str, tombstone: Tombstone)
         return False
     if _identity(directory, original_name) != expected:
         return False
+    return _quarantine_tombstone(tombstone)
+
+
+def _quarantine_tombstone(tombstone: Tombstone) -> bool:
+    """Move payload once, verify it, and retain it for deferred cleanup.
+
+    POSIX has no portable unlink-by-inode operation.  Performing another
+    check-then-unlink would reintroduce the replacement race this helper is
+    designed to close, so neither the retained entry nor its private directory
+    is destroyed here.
+    """
+
+    _, descriptor, expected = tombstone
+    retained_name = f"retained-{secrets.token_hex(16)}"
     try:
-        os.unlink("payload", dir_fd=descriptor)
-        _remove_tombstone_directory(directory, tombstone_name, descriptor)
+        os.rename("payload", retained_name, src_dir_fd=descriptor, dst_dir_fd=descriptor)
+        matched = _identity(descriptor, retained_name) == expected
     except OSError:
-        return False
-    return True
+        matched = False
+    _close_quietly(descriptor)
+    return matched
 
 
 def _retire_verified(
@@ -196,15 +211,8 @@ def _retire_verified(
 
 
 def _discard_tombstone(directory: int, tombstone: Tombstone) -> bool:
-    tombstone_name, descriptor, expected = tombstone
-    try:
-        if _identity(descriptor, "payload") != expected:
-            return False
-        os.unlink("payload", dir_fd=descriptor)
-        _remove_tombstone_directory(directory, tombstone_name, descriptor)
-        return True
-    except OSError:
-        return False
+    del directory
+    return _quarantine_tombstone(tombstone)
 
 
 def _rollback_tombstones(
