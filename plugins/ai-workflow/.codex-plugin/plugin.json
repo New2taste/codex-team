@@ -1,16 +1,16 @@
 {
   "name": "ai-workflow",
   "version": "0.2.0",
-  "description": "Deterministic multi-model routing, evidence, and review workflow for Codex.",
+  "description": "Codex Team: deterministic multi-model routing, evidence, and review workflow.",
   "author": {
-    "name": "AI Workflow maintainers"
+    "name": "Codex Team maintainers"
   },
   "skills": "./skills/",
   "interface": {
-    "displayName": "AI Workflow",
+    "displayName": "Codex Team",
     "shortDescription": "Route bounded Codex work with evidence gates",
-    "longDescription": "Deterministic routing, runtime evidence, and review gates for bounded Codex work.",
-    "developerName": "AI Workflow maintainers",
+    "longDescription": "Codex Team routes bounded work through native Luna Max, Terra construction, and Sol-medium final acceptance with runtime evidence and human gates.",
+    "developerName": "Codex Team maintainers",
     "category": "Developer Tools",
     "capabilities": ["Read", "Write"],
     "defaultPrompt": ["Use $ai-workflow:orchestration to route and execute this task with evidence gates."]

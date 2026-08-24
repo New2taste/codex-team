@@ -1,9 +1,87 @@
 # GPT 多模型协作工作流
 
-> 版本：v0.1  
-> 状态：`APPROVED_FOR_IMPLEMENTATION`  
-> 日期：2026-08-03  
-> 性质：全局、跨项目的实验性 AI 工作流；不属于任何一个业务仓库的宪法或任务卡。
+> 一个面向 Codex 的、可审计的半自动多模型编排器：用确定性任务信封、运行时证据和人工闸门，把规划、施工、验收与整改串成可恢复的工作流。
+
+| 项目状态 | 当前值 |
+|---|---|
+| Plugin 版本 | `0.2.0` |
+| 发布形态 | Public preview；自用优先，不承诺生产 SLA |
+| 默认 Luna 执行面 | 原生 `NATIVE_SUBAGENT`：`gpt-5.6-luna / max` |
+| 默认施工 OS | Terra xhigh；Sol medium 负责最终集中验收 |
+| 最近更新 | 2026-08-24 |
+| 许可证 | 尚未声明；公开可见不等于授予再分发许可 |
+
+## 项目简介
+
+这个仓库不是一个常驻服务，也不是替用户自动决策的“AI 项目经理”。它提供一组标准库实现、JSON Schema、Plugin 镜像、CLI 和测试，用于在额度受限的环境中安全编排多模型协作。
+
+核心原则是：低风险、有界的机械工作优先交给廉价的原生 Luna Max；复杂施工由 Terra xhigh 负责；所有工程小节完成后，由只读的 Sol medium 统一做最终、对抗式的整体验收。验收失败时，返工优先交给不同身份的 Sol medium；仍失败才进入 owner-authorized 的 Sol xhigh 终局升级。
+
+这个项目适合：
+
+- 希望把多模型协作规则固定成可验证契约的个人开发者或小团队；
+- 需要保留任务、运行时身份、成本和验收证据的 Codex 工作流；
+- 想先在假 runner 和历史任务上校准，再逐步启用真实模型调用的实验。
+
+它不适合：
+
+- 需要无人值守地修改、合并或推送生产仓库的流水线；
+- 需要跨项目并发写入、常驻队列、数据库或 Web 控制台的系统；
+- 尚未接受人工 owner gate 和最终验收约束的自动化场景。
+
+### 快速开始
+
+要求：Python 3.11+、Git、POSIX shell；Plugin 的运行时验证还需要 `jq`。项目不增加第三方 Python 依赖。
+
+```sh
+git clone https://github.com/New2taste/New2taste.git codex-team
+cd codex-team
+
+# 运行完整测试
+python3.11 -m unittest discover -s tests
+
+# 验证 Plugin、根目录与 Plugin 镜像的一致性
+sh plugins/ai-workflow/scripts/verify.sh
+```
+
+可选的 Skill 检查（需要本机已安装 Codex skill-creator）：
+
+```sh
+python3 "$CODEX_HOME/skills/.system/skill-creator/scripts/quick_validate.py" \
+  plugins/ai-workflow/skills/orchestration
+```
+
+### 最简单的调用：Codex Team
+
+Codex Team 是工具名称；`team call` 是它接受的最简单消息指令。它不会把任意文本解释成 shell 命令：
+
+```sh
+codex team "team call 检查当前工作区状态"
+
+codex team "team call 核对文件 README.md"
+```
+
+仓库内的 `team-call` CLI 是等价的本地测试入口：
+
+```sh
+python3 scripts/ai_workflow.py team-call \
+  "team call 检查当前工作区状态" \
+  --repository-root "$PWD"
+
+python3 scripts/ai_workflow.py team-call \
+  "team call 核对文件 README.md" \
+  --repository-root "$PWD"
+```
+
+只有开头为 `team call` 的三种固定形式会被解析；状态默认写到仓库外的用户级 state 目录。`DIRECT_L0` 使用控制器固定命令，`DIRECT_L1` 只读抽取文件证据，其余安全目标回到需要人工闸门的规划流程。失败收据以退出码 `2` 返回，并保持 append-only 账本。
+
+### 文档导航
+
+- [架构与角色边界](docs/ARCHITECTURE.md)：执行面、状态机、证据链和安全边界；
+- [开发与验证指南](CONTRIBUTING.md)：如何修改、测试、同步 Plugin 镜像；
+- [变更记录](CHANGELOG.md)：公开版本的能力与限制；
+- [Native Luna Max 设计](docs/superpowers/specs/2026-08-17-native-luna-max-design.md)：原生身份和迁移边界；
+- [Codex Team 设计](docs/superpowers/specs/2026-08-13-team-call-natural-language-design.md)：入口 grammar、路由和收据契约。
 
 ## 1. 目标
 
@@ -75,9 +153,9 @@
 
 编排器不使用模型解释路由规则。它只读取任务类型、风险标记和闭集状态，然后执行预先登记的流程。
 
-### Team Call 自然语言入口（受限直达）
+### Codex Team 自然语言入口（受限直达）
 
-Team Call 只接受位于消息开头、大小写不敏感的下列 grammar；`<objective>`
+Codex Team 只接受位于消息开头、大小写不敏感的下列 grammar；`<objective>`
 会压缩空白，但不会把任意自然语言解释为 shell 命令：
 
 ```text
@@ -97,7 +175,7 @@ team call：<objective>
 | `PLAN_REQUIRED` | 任何其他安全目标都停止直达路径。 | **plan fallback**：回到既有、需要 human owner gates 的规划和任务信封流程；不自动启动 Sol xhigh。 |
 | `BLOCKED` | 输入无效、已有 active receipt、缺失授权或执行失败。 | 保留阻断收据，不产生模型、任务、合并或推送承诺。 |
 
-Team Call 不授予 Luna review、approval 或 final acceptance 权限，也不改变现有
+Codex Team 不授予 Luna review、approval 或 final acceptance 权限，也不改变现有
 L0/L1/owner-gate 语言与角色边界；它不自动合并、不自动推送，且不替代人工批准或
 最终整体验收。
 
@@ -359,33 +437,32 @@ ABORTED
 - 日志不记录环境变量和完整原始数据；
 - 每个任务用独占锁防止重复运行。
 
-## 13. 最小实现
+## 13. 实现与目录结构
 
-第一版只创建：
+当前实现使用标准库处理 TOML、JSON、子进程、文件锁和哈希，不增加第三方 Python 依赖：
 
 ```text
-config/
-├── ai_workflow.toml
-├── ai_workflow_task.schema.json
-└── ai_workflow_result.schema.json
-
-scripts/
-└── ai_workflow.py
-
-tests/
-└── test_ai_workflow.py
-
-data/state/ai-workflow/   # gitignore，运行时生成
+config/                         # 任务、路由、计划、结果、运行时、成本 Schema
+scripts/ai_workflow.py          # 主 CLI、状态机和 Codex Team 生产入口
+scripts/ai_workflow_runtime.py  # native/exec 身份与 runtime evidence
+scripts/ai_workflow_artifacts.py# 严格 artifact 校验和数据类
+scripts/ai_workflow_routing.py  # Terra OS 闭集路由
+scripts/ai_workflow_planning.py # 计划、施工信封和确定性门禁
+scripts/ai_workflow_repairs.py  # acceptance repair ledger v2
+scripts/ai_workflow_team_call.py# Codex Team grammar、分类和收据
+plugins/ai-workflow/             # 对外 Plugin；runtime/config 与根目录同步
+tests/                           # fake runner、负向注入和发布一致性测试
+data/state/ai-workflow/          # gitignore；运行时生成
 ```
 
-不增加第三方依赖。使用标准库处理 TOML、JSON、子进程、文件锁和哈希。
-
-CLI 最小命令：
+CLI 命令：
 
 ```text
 new
 validate
+team-call
 run
+route
 status
 decide
 resume
@@ -393,7 +470,7 @@ abort
 report
 ```
 
-`run` 遇到人工闸门立即以可识别退出码停止，不占用进程等待。
+`run` 遇到人工闸门立即以可识别退出码停止，不占用进程等待。`team-call` 是仓库内的开发入口；面向用户的工具名称是 `codex team`。
 
 ## 14. 运行记录
 
@@ -490,7 +567,9 @@ data/state/ai-workflow/<task_id>/
 - 同一任务超过循环上限；
 - 运行记录无法对应到具体输入、模型、提交和结果。
 
-## 17. 实施分段
+## 17. 实施分段与启用梯级
+
+以下是设计阶段保留的启用梯级。当前仓库已完成假 runner、历史只读、证据门和低风险有界路径；真实 live rollout 仍必须由具体环境单独授权和验证。
 
 ### 阶段 1：Luna 有界实现
 
@@ -529,7 +608,9 @@ data/state/ai-workflow/<task_id>/
 
 任一阶段未通过不得自动进入下一阶段。
 
-## 18. 本规格的完成条件
+## 18. 原始规格完成条件
+
+本节保留原始规格的审批准入条件，便于追溯设计来源；当前公开实现已经过本仓库测试和最终 Sol-medium 集中验收，不代表自动获得业务项目的 owner approval。
 
 本文经所有者复核批准后：
 

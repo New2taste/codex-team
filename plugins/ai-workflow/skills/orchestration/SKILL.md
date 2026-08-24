@@ -1,9 +1,9 @@
 ---
 name: orchestration
-description: Use when running the AI Workflow companion-agent preflight or bounded distribution checks that require verified Luna discovery, explicit execution-surface distinctions, and evidence gates.
+description: Use when running the Codex Team companion-agent preflight or bounded distribution checks that require verified Luna discovery, explicit execution-surface distinctions, and evidence gates.
 ---
 
-# AI Workflow preflight and distribution contract
+# Codex Team preflight and distribution contract
 
 The default Luna route uses a controller-dispatched native subagent. No custom
 Agent template or install preflight is required. The controller must record
@@ -52,7 +52,7 @@ is not part of default routing. The workflow role remains `luna`.
 - **Terra medium** and **Sol high** have no default role. They must not be
   silently introduced as substitutes.
 
-## Team Call natural-language contract
+## Codex Team natural-language contract
 
 Accept only a leading, case-insensitive directive in one of these approved
 forms. `<objective>` whitespace is normalized; it is never interpreted as a
