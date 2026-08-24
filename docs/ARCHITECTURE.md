@@ -9,7 +9,7 @@ Codex Team 是一个本地、可恢复、可审计的半自动编排层。它把
 | `NATIVE_SUBAGENT` | Luna Max 默认路径 | `role=luna`、`gpt-5.6-luna/max`、`agent_type=null`、native agent/thread UUID | 由冻结 envelope 决定；通常只读或有界写 |
 | `CODEX_EXEC_ROLE_CONTRACT` | 明确授权的独立 `codex exec` 会话 | 独立记录，不能冒充原生子代理 | 由任务信封和 assignment capability 决定 |
 
-原生身份必须由控制器签发并由运行时证据闭环证明。模型、推理档、执行面、权限、沙箱、cwd 或 UUID 缺失/冲突时，流程 fail-closed；自定义 Agent 名称不能补齐证据。
+原生身份必须由控制器签发并由运行时证据闭环证明。模型、推理档、执行面、权限、沙箱、cwd 或 UUID 缺失/冲突时，流程 fail-closed；调用者自报不能补齐证据。
 
 ## 2. 默认角色
 
@@ -20,7 +20,7 @@ Codex Team 是一个本地、可恢复、可审计的半自动编排层。它把
 | Sol medium | 所有工程小节完成后的集中、只读、对抗式 final acceptance | 普通 construction、常驻 planning |
 | Sol xhigh | owner-authorized planning；Sol-medium 梯级失败后的 terminal repair | 普通施工、绕过 final acceptance |
 
-Terra medium 和 Sol high 没有默认角色。角色名称、模型和推理档是独立字段，不能用“同名路径”或调用者自报替代运行时身份。
+角色名称、模型和推理档是独立字段，必须来自闭集配置，不能用“同名路径”或调用者自报替代运行时身份。
 
 ## 3. 生命周期
 
@@ -87,9 +87,7 @@ Team Call 不授予 Luna review、approval、construction 或 final acceptance �
 - 默认不自动 merge、push、删除 worktree 或修改全局配置；
 - 写入必须在具名、隔离的 worktree 和冻结路径内进行；
 - 不把项目密钥传给子进程，日志不记录环境变量和完整原始数据；
-- 原生 Luna 不依赖仓库或 Plugin 中的自定义 Agent 模板；
-- 历史 Agent 清理工具只做 cleanup-only 迁移，不创建缺失模板；
-- 清理竞态无法安全证明最终 inode 时保留私有 deferred quarantine，不删除 replacement。
+- 任务范围、运行时身份和证据不一致时立即停止，不依赖模型自行解释。
 
 ## 7. 代码地图
 
@@ -109,7 +107,5 @@ tests/                           # 默认假 runner、负向注入和发布一�
 ## 8. 当前限制
 
 - 项目是 public preview，重点是自用和实验，不提供生产 SLA；
-- 旧格式 native rollout 缺少 native UUID 时会安全拒绝；
-- cleanup-only 的私有 quarantine 不自动 GC，需要后续设计身份安全的恢复/清理协议；
 - 真实计费数据、模型服务可用性和 live rollout 仍必须由实际环境单独验证；
 - Windows 原生生命周期不在当前验证范围内。

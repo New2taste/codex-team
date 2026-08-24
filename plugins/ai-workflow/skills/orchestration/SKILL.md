@@ -5,23 +5,14 @@ description: Use when running the Codex Team companion-agent preflight or bounde
 
 # Codex Team preflight and distribution contract
 
-The default Luna route uses a controller-dispatched native subagent. No custom
-Agent template or install preflight is required. The controller must record
+The default Luna route uses a controller-dispatched native subagent. The
+controller must record
 `execution_surface=NATIVE_SUBAGENT`, `model=gpt-5.6-luna`,
 `reasoning_effort=max`, native thread/agent evidence, sandbox, permission, and
 cwd before promoting a result. A native `luna` dispatch and an automated
 `codex exec -m gpt-5.6-luna` role-contract invocation are different execution
 surfaces. Neither surface may erase the task envelope, L0/L1/L2 evidence
 level, human owner gates, or the final-acceptance boundary.
-
-## Legacy Agent cleanup-only migration (explicit, one-time)
-
-If an existing user install contains `luna_worker` (one-time migration input) or the old `luna-max.toml`,
-the compatibility install/uninstall entrypoints may only clean it after
-validating existing user files, state, and backup. They embed and publish no
-complete Agent TOML, never install missing/legacy entries into a canonical
-template, and leave missing or empty user directories unchanged. The utility
-is not part of default routing. The workflow role remains `luna`.
 
 ## Frozen role and lifecycle contract
 
@@ -49,8 +40,8 @@ is not part of default routing. The workflow role remains `luna`.
   closed case file. Only a `REWORK` from that different Sol-medium recheck may
   authorize one terminal repair without task-level review. It never starts
   automatically and never bypasses final Sol-medium acceptance.
-- **Terra medium** and **Sol high** have no default role. They must not be
-  silently introduced as substitutes.
+- Only roles explicitly listed in the frozen configuration may be selected;
+  unspecified models and reasoning levels are never silently substituted.
 
 ## Codex Team natural-language contract
 
@@ -127,9 +118,7 @@ config/ai_workflow_cost_evidence.schema.json -> plugins/ai-workflow/config/ai_wo
 The permitted documentation and evidence files are `README.md`, this
 `SKILL.md`, `plugins/ai-workflow/skills/orchestration/agents/openai.yaml`,
 `plugins/ai-workflow/scripts/verify.sh`, and
-`tests/test_ai_workflow_distribution.py`. A report belongs at
-`.superpowers/sdd/2026-08-08-adversarial-acceptance-luna-allocation/task-4-report.md`;
-append a short entry to that directory's `progress.md`.
+`tests/test_ai_workflow_distribution.py`.
 
 ## Required checks
 
