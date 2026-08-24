@@ -93,7 +93,7 @@ class TerraOSConfigTest(unittest.TestCase):
         with (ROOT / "config" / "ai_workflow.toml").open("rb") as handle:
             self.config = tomllib.load(handle)
 
-    def test_terra_os_is_the_enforced_default_with_bounded_repairs(self):
+    def test_terra_os_is_the_enforced_default_with_final_rework_policy(self):
         self.assertEqual(
             {"mode": "enforced", "role_policy": "terra_os"},
             self.config["routing"],
@@ -103,16 +103,22 @@ class TerraOSConfigTest(unittest.TestCase):
         self.assertFalse(self.config["policy"]["automatic_sol_high"])
         self.assertFalse(self.config["policy"]["automatic_merge"])
         self.assertFalse(self.config["policy"]["automatic_push"])
+        self.assertNotIn("repair", self.config)
+
+    def test_final_sol_medium_rework_is_the_global_default(self):
         self.assertEqual(
             {
-                "terra_max_rounds": 2,
-                "round_1_fixer": "terra",
-                "round_2_fixer": "terra",
-                "post_terra_fixer": "original_sol_medium_reviewer",
-                "post_terra_reviewer": "distinct_sol_medium_peer",
+                "fixer_role": "sol_medium_reviewer",
+                "fixer_permission_profile": "assignment-scoped-write",
+                "fixer_distinct_from_acceptor": True,
+                "recheck_role": "sol_medium_reviewer",
+                "recheck_distinct_from_fixer": True,
+                "terminal_escalation_role": "sol_xhigh",
+                "terminal_review_required": False,
             },
-            self.config["repair"],
+            self.config["final_acceptance_rework"],
         )
+        self.assertNotIn("repair", self.config)
 
     def test_terra_os_roles_pin_luna_construction_and_terra_xhigh(self):
         roles = self.config["roles"]

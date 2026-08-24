@@ -30,17 +30,25 @@ is not part of default routing. The workflow role remains `luna`.
   root-to-Plugin distribution. The envelope must name every path, command,
   negative check, and artifact. Luna must never review, approve, or perform
   final acceptance.
+- **Intermediate engineering sections** are `section_self_check_only`: their
+  construction owner must run the frozen-envelope checks, target tests,
+  negative checks, scope checks, and runtime-evidence gate, then advance to
+  the next section. Do not dispatch a separate adversarial review per section.
 - **Terra xhigh** owns complex construction, integration, and open-ended
-  debugging in an isolated worktree. Every task needs an independent Terra
-  xhigh adversarial review in a distinct context; the constructor never
-  reviews itself.
-- **Sol medium** performs final whole-project acceptance. It may perform one
-  scoped fallback only after the second Terra xhigh failure, followed by a
-  distinct Sol-medium peer review. It is not an ordinary planning or
-  construction role.
+  debugging in an isolated worktree. Its construction self-check is not an
+  independent acceptance or a permission to self-approve.
+- **Sol medium** performs one read-only, adversarial **Sol-medium final
+  acceptance** after every engineering section is complete. If it returns
+  `REWORK`, a **different Sol-medium fixer** may receive one
+  owner-authorized, assignment-scoped write capability limited to the frozen
+  findings, candidate, paths, and verification commands. The accepting
+  reviewer never repairs its own verdict. A **different Sol-medium recheck**
+  (different from both acceptor and fixer) is read-only and may not widen
+  scope.
 - **Sol xhigh** handles owner-authorized planning and terminal escalation in a
-  closed case file. It never starts automatically and never bypasses final
-  Sol-medium acceptance.
+  closed case file. Only a `REWORK` from that different Sol-medium recheck may
+  authorize one terminal repair without task-level review. It never starts
+  automatically and never bypasses final Sol-medium acceptance.
 - **Terra medium** and **Sol high** have no default role. They must not be
   silently introduced as substitutes.
 
