@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-08-26 — Upgrade synchronization
+
+- 对外项目名称统一为 **Codex Team**，GitHub 仓库地址同步为 `New2taste/codex-team`；
+- 公开说明收束到当前工作流契约，README 与架构/Skill 入口的最近更新时间同步为 2026-08-26；
+- 本次为项目升级记录与发布同步，不改变已验收的运行时路由和角色配置。
+
 ## 0.2.0 — 2026-08-24
 
 当前公开预览基线。
