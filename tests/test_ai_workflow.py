@@ -2048,6 +2048,45 @@ class CodexRunnerTest(unittest.TestCase):
     )
     @mock.patch("scripts.ai_workflow.working_tree_paths", return_value=set())
     @mock.patch("scripts.ai_workflow.subprocess.run")
+    def test_codex_stderr_tail_redacts_secret_straddling_the_truncation_cut(
+        self, run, _working_tree_paths, _capture_repo
+    ):
+        task = self.valid_task()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_root = root / "state"
+            workflow.WorkflowStore(state_root).create_task(task)
+            paths = workflow.RunPaths(
+                repo=ROOT,
+                output_path=root / "luna-result.json",
+                schema_path=ROOT / "config/ai_workflow_result.schema.json",
+                logs_dir=root / "logs",
+                state_root=state_root,
+            )
+            context = self._bound_attempt_context(task, "luna-stderr-cut")
+            secret = "sk-" + "a1b2c3d4" * 8
+            # Position the secret so the 2000-character tail cut lands in the
+            # middle of its raw value; the fragment must still be redacted.
+            child_stderr = f"OPENAI_API_KEY={secret}\n" + "y" * 1990
+            run.return_value = subprocess.CompletedProcess(
+                [], 1, stdout="", stderr=child_stderr
+            )
+
+            with self.assertRaises(workflow.WorkflowError) as caught:
+                workflow.run_codex(
+                    "luna", task, "task contract", paths, attempt_context=context
+                )
+
+        message = caught.exception.message
+        self.assertNotIn(secret[-9:], message)
+        self.assertNotIn(secret, message)
+
+    @mock.patch(
+        "scripts.ai_workflow.capture_repo",
+        return_value=workflow.RepoSnapshot("pinned-head", ()),
+    )
+    @mock.patch("scripts.ai_workflow.working_tree_paths", return_value=set())
+    @mock.patch("scripts.ai_workflow.subprocess.run")
     def test_reused_successful_attempt_context_is_rejected_before_a_second_launch(
         self, run, _working_tree_paths, _capture_repo
     ):

@@ -1763,9 +1763,9 @@ def run_codex(
         _write_role_events(attempt_events, completed.stdout)
         if completed.returncode != 0:
             message = f"{role} exited with code {completed.returncode}"
-            stderr_tail = _redact_log_text(
-                str(completed.stderr or "")[-2000:]
-            ).strip()
+            # Redact before truncating: a cut through a raw secret would
+            # leave a fragment too short for the redaction patterns.
+            stderr_tail = _redact_log_text(str(completed.stderr or ""))[-2000:].strip()
             if stderr_tail:
                 message = f"{message}; stderr tail: {stderr_tail}"
             raise WorkflowError("CODEX_EXIT_NONZERO", message)
