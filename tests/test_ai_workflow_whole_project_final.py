@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import hashlib
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest import mock
@@ -582,7 +582,7 @@ class WholeProjectFinalAcceptanceTest(unittest.TestCase):
         self.assertEqual("FINAL_XHIGH_AUTHORIZED", record["new_state"])
 
         resume = StringIO()
-        with redirect_stdout(resume):
+        with redirect_stderr(resume):
             resume_exit = workflow.main(
                 [
                     "decide",
@@ -605,13 +605,13 @@ class WholeProjectFinalAcceptanceTest(unittest.TestCase):
         fx.setUp()
         try:
             fx._create_task()
-            output = StringIO()
-            with redirect_stdout(output):
+            errors = StringIO()
+            with redirect_stderr(errors):
                 exit_code = workflow.main(
                     ["decide", fx.TASK_ID, "defer", "--by", "owner", "--root", str(fx.state_root)]
                 )
             self.assertEqual(2, exit_code)
-            self.assertIn("OWNER_DECISION_NOT_APPLICABLE", output.getvalue())
+            self.assertIn("OWNER_DECISION_NOT_APPLICABLE", errors.getvalue())
             self.assertFalse((fx.state_root / fx.TASK_ID / "human-decisions.jsonl").exists())
         finally:
             fx.tearDown()

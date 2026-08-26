@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import subprocess
+import shutil
 import tempfile
 import unittest
 import uuid
@@ -22,6 +23,8 @@ from unittest import mock
 
 from scripts import ai_workflow as workflow
 from scripts import ai_workflow_repairs as repairs
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class AcceptanceContractMutationTest(unittest.TestCase):
@@ -189,7 +192,14 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
         (self.repository_root / "README.md").write_text(
             "base\n", encoding="utf-8"
         )
-        self._git("add", "README.md")
+        # The controller executor derives its provider-strict dispatch schema
+        # from the repository's canonical result schema at launch time.
+        (self.repository_root / "config").mkdir()
+        shutil.copyfile(
+            ROOT / "config" / "ai_workflow_result.schema.json",
+            self.repository_root / "config" / "ai_workflow_result.schema.json",
+        )
+        self._git("add", "README.md", "config/ai_workflow_result.schema.json")
         self._git("commit", "-q", "-m", "base")
         self.base_commit = self._git("rev-parse", "HEAD")
         (self.repository_root / "src").mkdir()
@@ -1367,6 +1377,20 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
         def controller_process(command, *args, **kwargs):
             if Path(command[0]).name == "codex":
                 self.assertIn('sandbox_mode="read-only"', command)
+                schema_arg = Path(command[command.index("--output-schema") + 1])
+                self.assertNotEqual(
+                    (
+                        self.repository_root
+                        / "config"
+                        / "ai_workflow_result.schema.json"
+                    ).resolve(),
+                    schema_arg.resolve(),
+                )
+                derived_schema = json.loads(schema_arg.read_text(encoding="utf-8"))
+                self.assertEqual(
+                    set(derived_schema["required"]),
+                    set(derived_schema["properties"]),
+                )
                 output_path = Path(command[command.index("-o") + 1])
                 output_path.write_text(
                     json.dumps(

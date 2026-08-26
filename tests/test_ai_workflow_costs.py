@@ -359,6 +359,83 @@ class CostReportTest(unittest.TestCase):
         self.assertIn("rate snapshot: rates-2026-08-03", report)
         self.assertIn("unavailable attempts: 1", report)
 
+    @staticmethod
+    def _passing_summary(case_count):
+        return {
+            f"case-{index:02d}": {
+                "net_measured_cost_delta": -1.0,
+                "quality_delta_points": 0.0,
+                "measured_attempt_count": 1,
+            }
+            for index in range(case_count)
+        }
+
+    def test_report_claim_gate_uses_pinned_minimum_cases(self):
+        summary = self._passing_summary(8)
+        metrics = {
+            "calibration_task_count": 0,
+            "experiment_task_count": 0,
+            "role_calls": {},
+            "cost_summary": summary,
+        }
+        pinned = workflow.render_report(metrics, claim_minimum_cases=8)
+        expected = workflow.evaluate_cost_claim(
+            {
+                "paired_case_count": 8,
+                "quality_delta_points": 0.0,
+                "net_measured_cost_delta": -8.0,
+            },
+            minimum_cases=8,
+        )
+        self.assertEqual("COST_REDUCTION_SUPPORTED", expected)
+        self.assertIn(f"- claim gate: {expected}", pinned)
+        default = workflow.render_report(metrics)
+        self.assertIn("- claim gate: OBSERVATION_ONLY", default)
+
+    def test_report_prints_optimization_gate_line(self):
+        summary = self._passing_summary(8)
+        metrics = {
+            "calibration_task_count": 0,
+            "experiment_task_count": 0,
+            "role_calls": {},
+            "cost_summary": summary,
+            "p0_miss_count": 0,
+            "p1_miss_count": 0,
+            "calibration_first_delivery_pass_rate": 0.5,
+            "experiment_first_delivery_pass_rate": 0.6,
+            "synthetic_cost_attempt_count": 0,
+        }
+        expected = workflow.evaluate_optimization_gate(
+            {
+                "cost_summary": summary,
+                "p0_miss_count": 0,
+                "p1_miss_count": 0,
+                "calibration_first_delivery_pass_rate": 0.5,
+                "experiment_first_delivery_pass_rate": 0.6,
+                "synthetic": False,
+            },
+            minimum_cases=8,
+        )
+        self.assertEqual("ALLOW_ENFORCED", expected)
+        report = workflow.render_report(metrics, claim_minimum_cases=8)
+        self.assertIn(f"- optimization gate: {expected}", report)
+        self.assertIn("- optimization gate: FALLBACK_FIXED", workflow.render_report(metrics))
+
+    def test_report_optimization_gate_treats_synthetic_records_as_fallback(self):
+        metrics = {
+            "calibration_task_count": 0,
+            "experiment_task_count": 0,
+            "role_calls": {},
+            "cost_summary": self._passing_summary(8),
+            "p0_miss_count": 0,
+            "p1_miss_count": 0,
+            "calibration_first_delivery_pass_rate": 0.5,
+            "experiment_first_delivery_pass_rate": 0.6,
+            "synthetic_cost_attempt_count": 3,
+        }
+        report = workflow.render_report(metrics, claim_minimum_cases=8)
+        self.assertIn("- optimization gate: FALLBACK_FIXED", report)
+
 
 if __name__ == "__main__":
     unittest.main()

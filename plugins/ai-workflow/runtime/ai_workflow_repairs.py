@@ -2873,6 +2873,11 @@ def run_assignment(
         codex = shutil.which("codex", path=os.environ.get("PATH", os.defpath))
         if not isinstance(codex, str):
             _fail("REPAIR_ADAPTER_REQUIRED", "controller Codex executable is unavailable")
+        dispatch_schema_path = workflow.materialize_dispatch_result_schema(
+            repository / "config" / "ai_workflow_result.schema.json",
+            output_path.parent,
+            f"{assignment.attempt_id}-assignment",
+        )
         command = [
             codex,
             "exec",
@@ -2885,7 +2890,7 @@ def run_assignment(
             f'sandbox_mode="{receipt.observed_sandbox_policy}"',
             "--json",
             "--output-schema",
-            str(repository / "config" / "ai_workflow_result.schema.json"),
+            str(dispatch_schema_path),
             "-o",
             str(output_path),
             receipt.runtime_instance_id,

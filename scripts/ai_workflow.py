@@ -830,6 +830,65 @@ def build_codex_command(role: str, repo: Path, output_path: Path, schema_path: P
     ]
 
 
+_DISPATCH_SCHEMA_IDENTITY_TYPES = {
+    "dispatch_id": "string",
+    "task_id": "string",
+    "step_id": "string",
+    "attempt": "integer",
+}
+
+
+def materialize_dispatch_result_schema(
+    canonical_path: Path, attempts_dir: Path, attempt_id: str
+) -> Path:
+    """Derive one provider-strict result schema for a single dispatch attempt.
+
+    Structured-output providers require ``required`` to list every property
+    key and express optionality as nullable unions. The canonical
+    ``ai-result-1`` contract keeps the scheduler identity quartet optional,
+    so each dispatch materializes a strict variant next to its attempt output
+    instead of changing the public schema file.
+    """
+
+    try:
+        document = json.loads(Path(canonical_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise WorkflowError(
+            "RESULT_SCHEMA_DERIVATION_INVALID",
+            "canonical result schema cannot be read",
+        ) from exc
+    if set(_DISPATCH_SCHEMA_IDENTITY_TYPES) != RESULT_IDENTITY_FIELDS:
+        _fail(
+            "RESULT_SCHEMA_DERIVATION_INVALID",
+            "identity nullability table drifted from RESULT_IDENTITY_FIELDS",
+        )
+    properties = document.get("properties") if isinstance(document, dict) else None
+    if (
+        not isinstance(properties, dict)
+        or set(properties) != (RESULT_REQUIRED_FIELDS | RESULT_IDENTITY_FIELDS)
+    ):
+        _fail(
+            "RESULT_SCHEMA_DERIVATION_INVALID",
+            "canonical result schema properties drifted from the pinned contract",
+        )
+    for field, expected_type in _DISPATCH_SCHEMA_IDENTITY_TYPES.items():
+        entry = properties.get(field)
+        if not isinstance(entry, dict) or entry.get("type") != expected_type:
+            _fail(
+                "RESULT_SCHEMA_DERIVATION_INVALID",
+                f"canonical identity field {field} drifted from the pinned contract",
+            )
+        entry["type"] = [expected_type, "null"]
+    document["required"] = list(properties)
+    destination = Path(attempts_dir) / f"{attempt_id}.schema.json"
+    write_json_once(
+        destination,
+        document,
+        conflict_code="RESULT_SCHEMA_DERIVATION_INVALID",
+    )
+    return destination
+
+
 def sanitized_environment(source: Mapping[str, str]) -> dict[str, str]:
     """Pass only execution essentials, never business secrets, to Codex."""
 
@@ -1068,6 +1127,28 @@ def validate_role_result(
     role_config = _load_role_config(role)
     if not isinstance(result, Mapping):
         _fail("INVALID_ROLE_RESULT", "role result must be an object")
+    present_identity = RESULT_IDENTITY_FIELDS & set(result)
+    null_identity = frozenset(
+        field for field in present_identity if result[field] is None
+    )
+    if null_identity:
+        if (
+            present_identity == RESULT_IDENTITY_FIELDS
+            and null_identity == RESULT_IDENTITY_FIELDS
+        ):
+            # Provider-strict dispatch schemas force every identity key onto
+            # live results; an all-null quartet is the wire encoding of
+            # "absent", so it normalizes to the plain non-scheduler shape.
+            result = {
+                key: value
+                for key, value in result.items()
+                if key not in RESULT_IDENTITY_FIELDS
+            }
+        else:
+            _fail(
+                "INVALID_ROLE_RESULT",
+                "scheduler result identity is partially null",
+            )
     fields = set(result)
     missing = sorted(RESULT_REQUIRED_FIELDS - fields)
     identity_fields = fields & RESULT_IDENTITY_FIELDS
@@ -1660,7 +1741,10 @@ def run_codex(
         attempt_recorded = True
 
     try:
-        command = build_codex_command(role, repo, attempt_output, paths.schema_path)
+        dispatch_schema_path = materialize_dispatch_result_schema(
+            paths.schema_path, attempt_output.parent, attempt_id
+        )
+        command = build_codex_command(role, repo, attempt_output, dispatch_schema_path)
         try:
             completed = subprocess.run(
                 command,
@@ -1678,7 +1762,13 @@ def run_codex(
             raise WorkflowError("CODEX_TIMEOUT", f"{role} exceeded {CODEX_TIMEOUT_SECONDS} seconds") from exc
         _write_role_events(attempt_events, completed.stdout)
         if completed.returncode != 0:
-            raise WorkflowError("CODEX_EXIT_NONZERO", f"{role} exited with code {completed.returncode}")
+            message = f"{role} exited with code {completed.returncode}"
+            stderr_tail = _redact_log_text(
+                str(completed.stderr or "")[-2000:]
+            ).strip()
+            if stderr_tail:
+                message = f"{message}; stderr tail: {stderr_tail}"
+            raise WorkflowError("CODEX_EXIT_NONZERO", message)
         try:
             output_stat = attempt_output.stat()
         except OSError as exc:
@@ -3186,7 +3276,9 @@ def aggregate_metrics(root: Path) -> dict:
     }
 
 
-def render_report(metrics: Mapping[str, object]) -> str:
+def render_report(
+    metrics: Mapping[str, object], *, claim_minimum_cases: int = 30
+) -> str:
     """Render the one human-facing experiment report from aggregate metrics."""
 
     if not isinstance(metrics, Mapping):
@@ -3268,14 +3360,31 @@ def render_report(metrics: Mapping[str, object]) -> str:
         cost_records = metrics.get("cost_evidence")
         if isinstance(cost_records, list):
             cost_summary = aggregate_paired_cases(cost_records)
+    synthetic_count = int(metrics.get("synthetic_cost_attempt_count", 0) or 0)
+    gate_metrics = {
+        "cost_summary": cost_summary if isinstance(cost_summary, Mapping) else None,
+        "p0_miss_count": metrics.get("p0_miss_count"),
+        "p1_miss_count": metrics.get("p1_miss_count"),
+        "calibration_first_delivery_pass_rate": metrics.get(
+            "calibration_first_delivery_pass_rate"
+        ),
+        "experiment_first_delivery_pass_rate": metrics.get(
+            "experiment_first_delivery_pass_rate"
+        ),
+        "synthetic": synthetic_count > 0,
+    }
+    optimization_gate = evaluate_optimization_gate(
+        gate_metrics, minimum_cases=claim_minimum_cases
+    )
+    lines.extend(("", f"- optimization gate: {optimization_gate}"))
     cost_sections = render_cost_sections(
         cost_summary if isinstance(cost_summary, Mapping) else None,
         metrics.get("cost_claim_summary")
         if isinstance(metrics.get("cost_claim_summary"), Mapping)
         else None,
         int(metrics.get("cost_unavailable_attempt_count", 0) or 0),
+        claim_minimum_cases=claim_minimum_cases,
     )
-    synthetic_count = int(metrics.get("synthetic_cost_attempt_count", 0) or 0)
     if synthetic_count:
         lines.extend(
             (
@@ -6355,7 +6464,13 @@ def _run_command(args: argparse.Namespace) -> int:
         return 2 if receipt.disposition == "BLOCKED" else 0
     if args.command == "report":
         output_path = Path(args.output)
-        report = render_report(aggregate_metrics(args.root))
+        # The claim gate must judge against the pinned optimization policy;
+        # an unknown threshold must never fall back to a looser default.
+        policy = resolve_optimization_policy(_load_workflow_config())
+        report = render_report(
+            aggregate_metrics(args.root),
+            claim_minimum_cases=policy.minimum_paired_cases,
+        )
         try:
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_text(report, encoding="utf-8")
@@ -6526,7 +6641,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return _run_command(args)
     except WorkflowError as exc:
-        print(f"{exc.code}: {exc.message}")
+        # stdout carries only machine-readable receipts; diagnostics go to
+        # stderr so callers can keep parsing stdout on failure.
+        print(f"{exc.code}: {exc.message}", file=sys.stderr)
         return 2
 
 

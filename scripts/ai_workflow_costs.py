@@ -666,6 +666,8 @@ def render_cost_sections(
     summary: Mapping[str, object] | Iterable[object] | None,
     claim_summary: Mapping[str, object] | None = None,
     unavailable_attempts: int = 0,
+    *,
+    claim_minimum_cases: int = 30,
 ) -> str:
     """Render measured, projection, and unavailable evidence as separate sections."""
 
@@ -687,7 +689,9 @@ def render_cost_sections(
         f"- paired-case count: {len(normalized)}",
     ]
     claim_input = dict(claim_summary) if isinstance(claim_summary, Mapping) else _claim_summary_from_cases(normalized)
-    lines.append(f"- claim gate: {evaluate_cost_claim(claim_input)}")
+    lines.append(
+        f"- claim gate: {evaluate_cost_claim(claim_input, minimum_cases=claim_minimum_cases)}"
+    )
     for heading, category in (("Measured", "measured"), ("Projection", "projection"), ("Unavailable", "unavailable")):
         lines.extend(("", f"## {heading}", ""))
         entries = [

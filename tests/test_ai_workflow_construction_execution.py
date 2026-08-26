@@ -2,7 +2,7 @@ import json
 import hashlib
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest import mock
@@ -682,8 +682,8 @@ class EnforcedConstructionExecutionTest(unittest.TestCase):
                     self.task["task_id"], runner=workflow.FakeRunner(), allow_live_model=False
                 )
 
-        output = StringIO()
-        with redirect_stdout(output):
+        errors = StringIO()
+        with redirect_stderr(errors):
             exit_code = workflow.main(
                 [
                     "run",
@@ -696,7 +696,7 @@ class EnforcedConstructionExecutionTest(unittest.TestCase):
                 ]
             )
         self.assertEqual(2, exit_code)
-        self.assertIn("CONSTRUCTION_CONTEXT_REQUIRED", output.getvalue())
+        self.assertIn("CONSTRUCTION_CONTEXT_REQUIRED", errors.getvalue())
 
 
 class LunaConstructionEnvelopeRegressionTest(unittest.TestCase):

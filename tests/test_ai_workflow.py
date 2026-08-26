@@ -4,7 +4,7 @@ import subprocess
 import tempfile
 import tomllib
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest import mock
@@ -514,6 +514,51 @@ class MetricsReportTest(unittest.TestCase):
             len({run["cost_evidence"]["attempt_id"] for run in runs}),
         )
 
+    def test_live_codex_dispatch_passes_derived_strict_schema_to_codex(self):
+        task_id = self._create_task("AWF-20260826-901")
+        task = workflow.load_task(self.state_root / task_id / "task.json")
+        adapter, launch_codex = self._live_codex_adapter(task, ["success"])
+        captured_commands = []
+
+        def recording_launch(command, *args, **kwargs):
+            captured_commands.append(list(command))
+            return launch_codex(command, *args, **kwargs)
+
+        with (
+            mock.patch.object(workflow, "WORKFLOW_STATE_ROOT", self.state_root),
+            mock.patch.object(
+                workflow,
+                "capture_repo",
+                return_value=workflow.RepoSnapshot("pinned-head", ()),
+            ),
+            mock.patch.object(workflow, "working_tree_paths", return_value=set()),
+            mock.patch(
+                "scripts.ai_workflow.subprocess.run", side_effect=recording_launch
+            ),
+        ):
+            result, _state = workflow._run_role_with_technical_retry(
+                self.store,
+                task_id,
+                task,
+                "EVIDENCE_RUNNING",
+                "luna",
+                adapter,
+                workflow.RetryBudget(),
+            )
+        self.assertEqual("SUPPORTED", result["status"])
+        command = captured_commands[0]
+        schema_arg = Path(command[command.index("--output-schema") + 1])
+        output_arg = Path(command[command.index("-o") + 1])
+        canonical = ROOT / "config" / "ai_workflow_result.schema.json"
+        self.assertNotEqual(canonical.resolve(), schema_arg.resolve())
+        self.assertEqual(output_arg.parent, schema_arg.parent)
+        self.assertEqual(
+            output_arg.name.removesuffix(".json") + ".schema.json", schema_arg.name
+        )
+        derived = json.loads(schema_arg.read_text(encoding="utf-8"))
+        self.assertEqual(set(derived["required"]), set(derived["properties"]))
+        self.assertEqual(["string", "null"], derived["properties"]["dispatch_id"]["type"])
+
     def test_invalid_role_result_is_recorded_as_failed_cost_attempt(self):
         task_id = self._create_task("AWF-20260803-008")
         task = workflow.load_task(self.state_root / task_id / "task.json")
@@ -794,6 +839,54 @@ class MetricsReportTest(unittest.TestCase):
             "This calibration report proves only that the Luna read-only path can run",
             report,
         )
+
+    def test_report_command_pins_claim_threshold_from_optimization_policy(self):
+        task_id = self._create_task("AWF-20260803-001")
+        self._record(task_id, {"role": "luna", "duration_seconds": 1.0})
+        output_path = Path(self.temporary_directory.name) / "pinned-report.md"
+
+        with (
+            mock.patch.object(
+                workflow, "render_report", wraps=workflow.render_report
+            ) as spy,
+            redirect_stdout(StringIO()),
+        ):
+            exit_code = workflow.main(
+                ["report", "--root", str(self.state_root), "--output", str(output_path)]
+            )
+
+        self.assertEqual(0, exit_code)
+        pinned = workflow.resolve_optimization_policy(
+            workflow._load_workflow_config()
+        ).minimum_paired_cases
+        self.assertEqual(
+            pinned, spy.call_args.kwargs["claim_minimum_cases"]
+        )
+
+    def test_report_command_fails_closed_on_invalid_optimization_policy(self):
+        task_id = self._create_task("AWF-20260803-001")
+        self._record(task_id, {"role": "luna", "duration_seconds": 1.0})
+        output_path = Path(self.temporary_directory.name) / "never-written.md"
+        errors = StringIO()
+        broken_config = json.loads(json.dumps(workflow._load_workflow_config()))
+        broken_config["optimization"]["minimum_paired_cases"] = -1
+
+        with (
+            mock.patch.object(
+                workflow,
+                "_load_workflow_config",
+                return_value=broken_config,
+            ),
+            redirect_stdout(StringIO()),
+            redirect_stderr(errors),
+        ):
+            exit_code = workflow.main(
+                ["report", "--root", str(self.state_root), "--output", str(output_path)]
+            )
+
+        self.assertEqual(2, exit_code)
+        self.assertFalse(output_path.exists())
+        self.assertIn("OPTIMIZATION_POLICY_INVALID", errors.getvalue())
 
 
 class FakeRunnerTest(unittest.TestCase):
@@ -1170,8 +1263,8 @@ class GatedPipelineTest(unittest.TestCase):
             state_root=self.state_root,
         )
 
-        output = StringIO()
-        with redirect_stdout(output):
+        errors = StringIO()
+        with redirect_stderr(errors):
             exit_code = workflow.main(
                 [
                     "decide",
@@ -1186,7 +1279,7 @@ class GatedPipelineTest(unittest.TestCase):
             )
 
         self.assertEqual(2, exit_code)
-        self.assertIn("LIVE_MODEL_NOT_AUTHORIZED", output.getvalue())
+        self.assertIn("LIVE_MODEL_NOT_AUTHORIZED", errors.getvalue())
         self.assertFalse(
             (self.state_root / task_id / "human-decisions.jsonl").exists()
         )
@@ -1208,10 +1301,10 @@ class GatedPipelineTest(unittest.TestCase):
         automation["allow_decide_resume"] = False
         disabled["automation"] = automation
 
-        output = StringIO()
+        errors = StringIO()
         with (
             mock.patch.object(workflow, "_load_workflow_config", return_value=disabled),
-            redirect_stdout(output),
+            redirect_stderr(errors),
         ):
             exit_code = workflow.main(
                 [
@@ -1227,7 +1320,7 @@ class GatedPipelineTest(unittest.TestCase):
             )
 
         self.assertEqual(2, exit_code)
-        self.assertIn("DECIDE_RESUME_DISABLED", output.getvalue())
+        self.assertIn("DECIDE_RESUME_DISABLED", errors.getvalue())
         self.assertFalse(
             (self.state_root / task_id / "human-decisions.jsonl").exists()
         )
@@ -1294,6 +1387,88 @@ class CodexCommandTest(unittest.TestCase):
         self.assertIn("read-only", command)
         self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", command)
         self.assertNotIn("--agent", command)
+
+
+class DispatchSchemaDerivationTest(unittest.TestCase):
+    CANONICAL = ROOT / "config" / "ai_workflow_result.schema.json"
+    IDENTITY_TYPES = {
+        "dispatch_id": "string",
+        "task_id": "string",
+        "step_id": "string",
+        "attempt": "integer",
+    }
+
+    def test_derived_variant_is_provider_strict_and_otherwise_identical(self):
+        with tempfile.TemporaryDirectory() as temp:
+            derived_path = workflow.materialize_dispatch_result_schema(
+                self.CANONICAL, Path(temp), "attempt-1"
+            )
+            self.assertEqual(Path(temp) / "attempt-1.schema.json", derived_path)
+            derived = json.loads(derived_path.read_text(encoding="utf-8"))
+        canonical = json.loads(self.CANONICAL.read_text(encoding="utf-8"))
+        self.assertEqual(set(derived["required"]), set(derived["properties"]))
+        for field, base_type in self.IDENTITY_TYPES.items():
+            self.assertEqual([base_type, "null"], derived["properties"][field]["type"])
+
+        def assert_nested_objects_are_strict(node):
+            if isinstance(node, dict):
+                if isinstance(node.get("properties"), dict):
+                    self.assertEqual(
+                        set(node.get("required", [])), set(node["properties"])
+                    )
+                for value in node.values():
+                    assert_nested_objects_are_strict(value)
+            elif isinstance(node, list):
+                for item in node:
+                    assert_nested_objects_are_strict(item)
+
+        assert_nested_objects_are_strict(derived)
+        reverted = json.loads(json.dumps(derived))
+        for field, base_type in self.IDENTITY_TYPES.items():
+            reverted["properties"][field]["type"] = base_type
+        reverted["required"] = canonical["required"]
+        self.assertEqual(canonical, reverted)
+
+    def test_derivation_rejects_unknown_canonical_property(self):
+        drifted = json.loads(self.CANONICAL.read_text(encoding="utf-8"))
+        drifted["properties"]["surprise_field"] = {"type": "string"}
+        with tempfile.TemporaryDirectory() as temp:
+            drifted_path = Path(temp) / "drifted.schema.json"
+            drifted_path.write_text(json.dumps(drifted), encoding="utf-8")
+            with self.assertRaisesRegex(
+                workflow.WorkflowError, "RESULT_SCHEMA_DERIVATION_INVALID"
+            ):
+                workflow.materialize_dispatch_result_schema(
+                    drifted_path, Path(temp), "attempt-1"
+                )
+
+    def test_derivation_rejects_identity_field_shape_drift(self):
+        drifted = json.loads(self.CANONICAL.read_text(encoding="utf-8"))
+        drifted["properties"]["attempt"]["type"] = "number"
+        with tempfile.TemporaryDirectory() as temp:
+            drifted_path = Path(temp) / "drifted.schema.json"
+            drifted_path.write_text(json.dumps(drifted), encoding="utf-8")
+            with self.assertRaisesRegex(
+                workflow.WorkflowError, "RESULT_SCHEMA_DERIVATION_INVALID"
+            ):
+                workflow.materialize_dispatch_result_schema(
+                    drifted_path, Path(temp), "attempt-1"
+                )
+
+    def test_derivation_is_write_once_per_attempt(self):
+        with tempfile.TemporaryDirectory() as temp:
+            workflow.materialize_dispatch_result_schema(
+                self.CANONICAL, Path(temp), "attempt-1"
+            )
+            with self.assertRaisesRegex(
+                workflow.WorkflowError, "RESULT_SCHEMA_DERIVATION_INVALID"
+            ):
+                workflow.materialize_dispatch_result_schema(
+                    self.CANONICAL, Path(temp), "attempt-1"
+                )
+            workflow.materialize_dispatch_result_schema(
+                self.CANONICAL, Path(temp), "attempt-2"
+            )
 
 
 class CodexRunnerTest(unittest.TestCase):
@@ -1405,6 +1580,71 @@ class CodexRunnerTest(unittest.TestCase):
         result["claims"] = [{"id": "claim-1"}]
         with self.assertRaisesRegex(workflow.WorkflowError, "INVALID_ROLE_RESULT"):
             workflow.validate_role_result("luna", result, set())
+
+    def test_result_all_null_identity_quartet_normalizes_to_absent(self):
+        result = self.valid_result()
+        result.update(
+            {"dispatch_id": None, "task_id": None, "step_id": None, "attempt": None}
+        )
+        caller_view = dict(result)
+        workflow.validate_role_result("luna", result, set())
+        self.assertEqual(result, caller_view)
+
+    def test_result_partially_null_identity_is_rejected(self):
+        full_identity = {
+            "dispatch_id": "a" * 64,
+            "task_id": "AWF-20260826-001",
+            "step_id": "step-1",
+            "attempt": 1,
+        }
+        partial_shapes = (
+            {**full_identity, "attempt": None},
+            {**full_identity, "dispatch_id": None, "task_id": None},
+            {"dispatch_id": None, "task_id": None},
+            {"attempt": None},
+        )
+        for shape in partial_shapes:
+            with self.subTest(shape=sorted(shape)):
+                result = self.valid_result()
+                result.update(shape)
+                with self.assertRaisesRegex(
+                    workflow.WorkflowError, "INVALID_ROLE_RESULT"
+                ):
+                    workflow.validate_role_result("luna", result, set())
+
+    def test_result_forged_identity_values_are_still_rejected(self):
+        base_identity = {
+            "dispatch_id": "a" * 64,
+            "task_id": "AWF-20260826-001",
+            "step_id": "step-1",
+            "attempt": 1,
+        }
+        forged_shapes = (
+            {"dispatch_id": "not-a-digest"},
+            {"attempt": 0},
+            {"attempt": True},
+            {"task_id": ""},
+        )
+        for forged in forged_shapes:
+            with self.subTest(forged=sorted(forged)):
+                result = self.valid_result()
+                result.update({**base_identity, **forged})
+                with self.assertRaisesRegex(
+                    workflow.WorkflowError, "INVALID_ROLE_RESULT"
+                ):
+                    workflow.validate_role_result("luna", result, set())
+
+    def test_result_fully_bound_identity_is_still_accepted(self):
+        result = self.valid_result()
+        result.update(
+            {
+                "dispatch_id": "a" * 64,
+                "task_id": "AWF-20260826-001",
+                "step_id": "step-1",
+                "attempt": 1,
+            }
+        )
+        workflow.validate_role_result("luna", result, set())
 
     def test_prompt_is_limited_to_task_contract_and_named_evidence(self):
         task = self.valid_task()
@@ -1763,6 +2003,51 @@ class CodexRunnerTest(unittest.TestCase):
     )
     @mock.patch("scripts.ai_workflow.working_tree_paths", return_value=set())
     @mock.patch("scripts.ai_workflow.subprocess.run")
+    def test_codex_nonzero_exit_surfaces_bounded_redacted_stderr_tail(
+        self, run, _working_tree_paths, _capture_repo
+    ):
+        task = self.valid_task()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_root = root / "state"
+            workflow.WorkflowStore(state_root).create_task(task)
+            paths = workflow.RunPaths(
+                repo=ROOT,
+                output_path=root / "luna-result.json",
+                schema_path=ROOT / "config/ai_workflow_result.schema.json",
+                logs_dir=root / "logs",
+                state_root=state_root,
+            )
+            context = self._bound_attempt_context(task, "luna-stderr-tail")
+            child_stderr = (
+                "x" * 3000
+                + "\nERROR: unsupported schema: invalid_json_schema details\n"
+                + "OPENAI_API_KEY=sk-super-secret-value\n"
+            )
+            run.return_value = subprocess.CompletedProcess(
+                [], 1, stdout="", stderr=child_stderr
+            )
+
+            with self.assertRaises(workflow.WorkflowError) as caught:
+                workflow.run_codex(
+                    "luna", task, "task contract", paths, attempt_context=context
+                )
+
+        self.assertEqual("CODEX_EXIT_NONZERO", caught.exception.code)
+        message = caught.exception.message
+        self.assertIn("luna exited with code 1", message)
+        self.assertIn("stderr tail:", message)
+        self.assertIn("invalid_json_schema", message)
+        self.assertIn("OPENAI_API_KEY=[REDACTED]", message)
+        self.assertNotIn("sk-super-secret-value", message)
+        self.assertLessEqual(len(message), 2100)
+
+    @mock.patch(
+        "scripts.ai_workflow.capture_repo",
+        return_value=workflow.RepoSnapshot("pinned-head", ()),
+    )
+    @mock.patch("scripts.ai_workflow.working_tree_paths", return_value=set())
+    @mock.patch("scripts.ai_workflow.subprocess.run")
     def test_reused_successful_attempt_context_is_rejected_before_a_second_launch(
         self, run, _working_tree_paths, _capture_repo
     ):
@@ -1990,10 +2275,11 @@ class TeamCallCliTest(unittest.TestCase):
         )
         failed = subprocess.CompletedProcess(argv, 1, stdout="", stderr="failed")
         first_output = StringIO()
+        first_errors = StringIO()
         replay_output = StringIO()
 
         with mock.patch.object(workflow.TeamCallFakeController, "run_l0", return_value=failed):
-            with redirect_stdout(first_output):
+            with redirect_stdout(first_output), redirect_stderr(first_errors):
                 first_exit = workflow.main(
                     [
                         "team-call",
@@ -2021,7 +2307,8 @@ class TeamCallCliTest(unittest.TestCase):
                 )
 
         self.assertEqual(2, first_exit)
-        self.assertIn("TEAM_CALL_L0_FAILED", first_output.getvalue())
+        self.assertIn("TEAM_CALL_L0_FAILED", first_errors.getvalue())
+        self.assertEqual("", first_output.getvalue())
         self.assertEqual(2, replay_exit)
         self.assertEqual("BLOCKED", json.loads(replay_output.getvalue())["disposition"])
 
@@ -2055,8 +2342,9 @@ class TeamCallCliTest(unittest.TestCase):
 
     def test_team_call_cli_reports_missing_repository_with_exit_two(self):
         output = StringIO()
+        errors = StringIO()
 
-        with redirect_stdout(output):
+        with redirect_stdout(output), redirect_stderr(errors):
             exit_code = workflow.main(
                 [
                     "team-call",
@@ -2071,13 +2359,17 @@ class TeamCallCliTest(unittest.TestCase):
             )
 
         self.assertEqual(2, exit_code)
-        self.assertEqual("REPOSITORY_NOT_FOUND: repository_root does not exist\n", output.getvalue())
+        self.assertEqual(
+            "REPOSITORY_NOT_FOUND: repository_root does not exist\n", errors.getvalue()
+        )
+        self.assertEqual("", output.getvalue())
 
     @mock.patch("scripts.ai_workflow.run_codex")
     def test_team_call_live_runner_requires_explicit_model_authorization(self, run_codex):
         output = StringIO()
+        errors = StringIO()
 
-        with redirect_stdout(output):
+        with redirect_stdout(output), redirect_stderr(errors):
             exit_code = workflow.main(
                 [
                     "team-call",
@@ -2094,8 +2386,9 @@ class TeamCallCliTest(unittest.TestCase):
         self.assertEqual(2, exit_code)
         self.assertEqual(
             "LIVE_MODEL_NOT_AUTHORIZED: --allow-live-model is required for the live runner\n",
-            output.getvalue(),
+            errors.getvalue(),
         )
+        self.assertEqual("", output.getvalue())
         run_codex.assert_not_called()
 
     @mock.patch("scripts.ai_workflow.run_codex")
@@ -2188,22 +2481,22 @@ class LiveLunaCliTest(unittest.TestCase):
 
     @mock.patch("scripts.ai_workflow.run_codex")
     def test_live_runner_requires_explicit_authorization(self, run_codex):
-        output = StringIO()
+        errors = StringIO()
 
-        with redirect_stdout(output):
+        with redirect_stderr(errors):
             exit_code = workflow.main(
                 ["run", str(self.task_path), "--runner", "live", "--root", str(self.state_root)]
             )
 
         self.assertEqual(exit_code, 2)
-        self.assertIn("LIVE_MODEL_NOT_AUTHORIZED", output.getvalue())
+        self.assertIn("LIVE_MODEL_NOT_AUTHORIZED", errors.getvalue())
         run_codex.assert_not_called()
 
     @mock.patch("scripts.ai_workflow.run_codex")
     def test_live_runner_rejects_non_luna_roles(self, run_codex):
-        output = StringIO()
+        errors = StringIO()
 
-        with redirect_stdout(output):
+        with redirect_stderr(errors):
             exit_code = workflow.main(
                 [
                     "run",
@@ -2219,7 +2512,7 @@ class LiveLunaCliTest(unittest.TestCase):
             )
 
         self.assertEqual(exit_code, 2)
-        self.assertIn("LIVE_ROLE_NOT_ALLOWED", output.getvalue())
+        self.assertIn("LIVE_ROLE_NOT_ALLOWED", errors.getvalue())
         run_codex.assert_not_called()
 
     @mock.patch("scripts.ai_workflow.run_codex")
@@ -2633,7 +2926,14 @@ class FinalSafetyRegressionTest(unittest.TestCase):
             workflow.run_codex("luna", self._task(), "bounded", paths)
             workflow.run_codex("luna", self._task(), "bounded", paths)
 
-        self.assertEqual(len(list((output_path.parent / "attempts").glob("luna-*.json"))), 2)
+        attempts_dir = output_path.parent / "attempts"
+        result_outputs = [
+            path
+            for path in attempts_dir.glob("luna-*.json")
+            if not path.name.endswith(".schema.json")
+        ]
+        self.assertEqual(len(result_outputs), 2)
+        self.assertEqual(len(list(attempts_dir.glob("luna-*.schema.json"))), 2)
         self.assertEqual(len(list(paths.logs_dir.glob("luna-*.jsonl"))), 2)
         self.assertEqual(json.loads(output_path.read_text(encoding="utf-8")), self._luna_result())
 
