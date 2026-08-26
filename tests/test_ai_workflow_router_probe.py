@@ -446,6 +446,20 @@ class RouterProbeRunnerTest(unittest.TestCase):
         self.assertEqual(75, result.cached_input_tokens)
         self.assertEqual("blocked", result.recommended_route)
 
+    @mock.patch("scripts.ai_workflow_router_probe.subprocess.run")
+    def test_live_executor_rejects_model_effort_pair_drift(self, run):
+        with self.assertRaisesRegex(
+            probe.RouterProbeError, "model and reasoning effort pair"
+        ):
+            probe.CodexProbeExecutor(codex_binary="/safe/codex").run(
+                model="gpt-5.6-luna",
+                reasoning_effort="xhigh",
+                prompt="bounded prompt",
+                arm_id="luna_resident",
+                case_id="case-1",
+            )
+        run.assert_not_called()
+
     @mock.patch("scripts.ai_workflow_router_probe.run_probe_batch")
     def test_live_cli_requires_explicit_model_authorization(self, run_batch):
         with tempfile.TemporaryDirectory() as temporary:
@@ -512,7 +526,7 @@ class RouterProbeAnalysisTest(unittest.TestCase):
                         if resident
                         else f"{family}_control_fresh"
                     )
-                    attempt_id = f"{arm_id}-{case_index:03d}"
+                    attempt_id = f"measured-batch-{arm_id}-case-{case_index:03d}"
                     condition = (
                         "cold_start"
                         if resident and case_index == 0
@@ -584,10 +598,51 @@ class RouterProbeAnalysisTest(unittest.TestCase):
                             },
                         }
                     )
+        strata = ("l0", "l1", "plan_required", "adversarial")
+        expected_by_stratum = {
+            "l0": "direct",
+            "l1": "direct",
+            "plan_required": "sol_only",
+            "adversarial": "blocked",
+        }
         source_manifest = {
             "schema_version": "router-probe-manifest-1",
+            "batch_id": "measured-batch",
+            "seed": 0,
+            "prompt_template_version": "router-probe-v1",
             "data_origin": origin,
+            "created_at_utc": "2026-08-26T12:00:00Z",
+            "cases": [
+                {
+                    "case_id": f"case-{case_index:03d}",
+                    "paired_case_id": f"router-case-{case_index:03d}",
+                    "stratum": strata[case_index % 4],
+                    "route": expected_by_stratum[strata[case_index % 4]],
+                    "intake": f"intake-{case_index:03d}",
+                    "expected_route": expected_by_stratum[strata[case_index % 4]],
+                }
+                for case_index in range(case_count)
+            ],
+            "arms": [
+                {
+                    "arm_id": arm_id,
+                    "model": model,
+                    "reasoning_effort": effort,
+                    "cache_condition": condition,
+                }
+                for arm_id, (model, effort, condition) in probe.ARM_CONTRACTS.items()
+            ],
         }
+        cases_by_id = {case["case_id"]: case for case in source_manifest["cases"]}
+        arms_by_id = {arm["arm_id"]: arm for arm in source_manifest["arms"]}
+        for row in manifest_rows:
+            prompt = probe.build_probe_prompt(
+                cases_by_id[row["case_id"]],
+                template_version="router-probe-v1",
+                cache_condition=arms_by_id[row["arm_id"]]["cache_condition"],
+            )
+            row["prefix_sha256"] = probe.prompt_prefix_sha256(prompt)
+            row["prompt_bytes"] = len(prompt.encode("utf-8"))
         return manifest_rows, cost_rows, source_manifest
 
     def test_measured_complete_matrix_reports_cache_curve_and_luna_candidate(self):
@@ -617,6 +672,27 @@ class RouterProbeAnalysisTest(unittest.TestCase):
             "cost_winner=UNAVAILABLE_WITHOUT_RATE_SNAPSHOT_AND_DOWNSTREAM_COUNTERFACTUAL",
             report,
         )
+
+    def test_analysis_binds_rows_to_the_frozen_source_manifest(self):
+        mutations = []
+        rows, cost_rows, source = self.measured_matrix()
+        source["cases"][0]["intake"] = "different-frozen-intake"
+        mutations.append((rows, cost_rows, source))
+
+        rows, cost_rows, source = self.measured_matrix()
+        source["cases"][1]["expected_route"] = "blocked"
+        mutations.append((rows, cost_rows, source))
+
+        for rows, cost_rows, source in mutations:
+            with self.subTest(source=source):
+                summary = probe.aggregate_probe_results(
+                    rows, cost_rows, source_manifest=source
+                )
+                self.assertFalse(summary["complete_matrix"])
+                self.assertEqual(
+                    "OBSERVATION_ONLY",
+                    probe.evaluate_probe_decision(summary, minimum_cases=32),
+                )
 
     def test_analysis_fails_closed_on_insufficient_synthetic_or_incomplete_evidence(self):
         scenarios = []
@@ -674,6 +750,9 @@ class RouterProbeAnalysisTest(unittest.TestCase):
         rows, costs_rows, source = self.measured_matrix()
         costs_rows[0]["cost_evidence"]["paired_case_id"] = "wrong-pair"
         scenarios.append(("cost pair drift", rows, costs_rows, source))
+        rows, costs_rows, source = self.measured_matrix()
+        costs_rows[0]["cost_evidence"]["duration_seconds"] = float("inf")
+        scenarios.append(("non-finite duration", rows, costs_rows, source))
 
         for label, rows, evidence, source in scenarios:
             with self.subTest(label=label):

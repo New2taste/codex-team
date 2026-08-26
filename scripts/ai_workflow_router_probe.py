@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -99,6 +100,15 @@ class ProbeExecutor(Protocol):
         arm_id: str,
         case_id: str,
     ) -> ProbeAttempt: ...
+
+
+def _is_finite_number(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 def _fail(message: str) -> None:
@@ -297,6 +307,7 @@ def _validated_attempt(value: object) -> ProbeAttempt:
     if (
         isinstance(value.duration_seconds, bool)
         or not isinstance(value.duration_seconds, (int, float))
+        or not _is_finite_number(value.duration_seconds)
         or value.duration_seconds < 0
     ):
         _fail("executor duration is invalid")
@@ -519,13 +530,17 @@ def aggregate_probe_results(
 ) -> dict[str, object]:
     """Aggregate one immutable six-arm batch without enabling production routing."""
 
-    if not isinstance(source_manifest, Mapping):
-        _fail("source manifest is invalid")
-    data_origin = source_manifest.get("data_origin")
-    if data_origin not in {"measured", "synthetic"}:
-        _fail("source manifest data origin is invalid")
+    source = validate_probe_manifest(source_manifest)
+    data_origin = source["data_origin"]
     if not isinstance(manifest_rows, list) or not isinstance(cost_rows, list):
         _fail("probe result rows must be arrays")
+
+    source_cases = {
+        str(case["case_id"]): case for case in source["cases"]
+    }
+    source_arms = {
+        str(arm["arm_id"]): arm for arm in source["arms"]
+    }
 
     attempts: dict[str, dict[str, object]] = {}
     pair_arms: dict[str, set[str]] = {}
@@ -540,6 +555,7 @@ def aggregate_probe_results(
         row = dict(raw)
         attempt_id = row.get("attempt_id")
         arm_id = row.get("arm_id")
+        case_id = row.get("case_id")
         paired_case_id = row.get("paired_case_id")
         if (
             not isinstance(attempt_id, str)
@@ -547,6 +563,7 @@ def aggregate_probe_results(
             or attempt_id in attempts
             or not isinstance(arm_id, str)
             or arm_id not in ARM_CONTRACTS
+            or not isinstance(case_id, str)
             or not isinstance(paired_case_id, str)
             or not paired_case_id
         ):
@@ -570,6 +587,40 @@ def aggregate_probe_results(
             or row.get("recommended_route") not in ROUTES
         ):
             row_contracts_valid = False
+        source_case = source_cases.get(case_id)
+        source_arm = source_arms.get(arm_id)
+        if source_case is None or source_arm is None:
+            row_contracts_valid = False
+        else:
+            expected_prompt = build_probe_prompt(
+                source_case,
+                template_version=str(source["prompt_template_version"]),
+                cache_condition=str(source_arm["cache_condition"]),
+            )
+            expected_attempt_id = (
+                f"{source['batch_id']}-{arm_id}-{source_case['case_id']}"
+            )
+            expected_intake_sha256 = hashlib.sha256(
+                str(source_case["intake"]).encode("utf-8")
+            ).hexdigest()
+            if (
+                row.get("schema_version") != "router-probe-attempt-1"
+                or row.get("attempt_id") != expected_attempt_id
+                or row.get("batch_id") != source["batch_id"]
+                or row.get("case_id") != source_case["case_id"]
+                or row.get("paired_case_id") != source_case["paired_case_id"]
+                or row.get("stratum") != source_case["stratum"]
+                or row.get("route") != source_case["route"]
+                or row.get("expected_route") != source_case["expected_route"]
+                or row.get("intake_sha256") != expected_intake_sha256
+                or row.get("model") != source_arm["model"]
+                or row.get("reasoning_effort") != source_arm["reasoning_effort"]
+                or row.get("prefix_sha256")
+                != prompt_prefix_sha256(expected_prompt)
+                or row.get("prompt_bytes")
+                != len(expected_prompt.encode("utf-8"))
+            ):
+                row_contracts_valid = False
         arms = pair_arms.setdefault(paired_case_id, set())
         if arm_id in arms:
             duplicate_pair_arm = True
@@ -640,17 +691,13 @@ def aggregate_probe_results(
             output_tokens = evidence.get("output_tokens")
             duration = evidence.get("duration_seconds")
             valid_numbers = (
-                not isinstance(input_tokens, bool)
-                and isinstance(input_tokens, (int, float))
+                _is_finite_number(input_tokens)
                 and input_tokens >= 0
-                and not isinstance(cached_tokens, bool)
-                and isinstance(cached_tokens, (int, float))
+                and _is_finite_number(cached_tokens)
                 and 0 <= cached_tokens <= input_tokens
-                and not isinstance(output_tokens, bool)
-                and isinstance(output_tokens, (int, float))
+                and _is_finite_number(output_tokens)
                 and output_tokens >= 0
-                and not isinstance(duration, bool)
-                and isinstance(duration, (int, float))
+                and _is_finite_number(duration)
                 and duration >= 0
                 and evidence.get("evidence_class") == "measured"
                 and evidence.get("schema_version") == "cost-evidence-1"
@@ -795,11 +842,14 @@ def evaluate_probe_decision(
             or resident.get("route_match_rate") != 1
             or not isinstance(warm_uncached, (int, float))
             or isinstance(warm_uncached, bool)
+            or not _is_finite_number(warm_uncached)
             or not isinstance(control_uncached, (int, float))
             or isinstance(control_uncached, bool)
+            or not _is_finite_number(control_uncached)
             or control_uncached <= 0
             or not isinstance(duration, (int, float))
             or isinstance(duration, bool)
+            or not _is_finite_number(duration)
         ):
             continue
         reduction = (float(control_uncached) - float(warm_uncached)) / float(
@@ -913,11 +963,14 @@ class CodexProbeExecutor:
         arm_id: str,
         case_id: str,
     ) -> ProbeAttempt:
-        del arm_id, case_id
+        del case_id
+        if arm_id not in ARM_CONTRACTS:
+            _fail("live arm is not in the closed probe set")
+        expected_model, expected_effort, _ = ARM_CONTRACTS[arm_id]
         if model not in {contract[0] for contract in ARM_CONTRACTS.values()}:
             _fail("live model is not in the closed probe set")
-        if reasoning_effort not in {"max", "medium", "xhigh"}:
-            _fail("live reasoning effort is not supported")
+        if (model, reasoning_effort) != (expected_model, expected_effort):
+            _fail("live model and reasoning effort pair is not in the closed probe set")
         schema = {
             "type": "object",
             "additionalProperties": False,

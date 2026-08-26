@@ -162,6 +162,8 @@ CLI 命令：`new`、`validate`、`team-call`、`run`、`route`、`schedule-batc
 
 `scripts/ai_workflow_router_probe.py` 是独立的常驻路由研究工具，不接入生产路由，也不写 task store。这里的“常驻”仅指固定模型、冻结 prompt 前缀、每次新会话和时间聚簇；不复用跨任务长线程。候选闭集只有 Luna、Sol、Terra，并为每个模型保留冷前缀对照。项目说明建议：若要常驻一个模型做入口分类，优先选 Luna max（高频短沟通、单价更低）；这不是实测成本赢家，也不改生产 `effective_route`，实际仍以使用者选择为准。默认 `dry-run` 为零模型；fake 示例：
 
+该探针是根目录的研究工具，刻意不复制到 Plugin runtime；Plugin 只分发生产运行时以及探针所需的配置和 Schema。
+
 ```sh
 python3.11 scripts/ai_workflow_router_probe.py \
   tests/fixtures/router-probe/cases.json \

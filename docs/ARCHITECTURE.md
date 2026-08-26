@@ -112,6 +112,8 @@ write-once。分析只有在 measured、六臂完整、至少 32 个 paired case
 `effective_route=UNCHANGED`；缺证据返回 `OBSERVATION_ONLY`，无缓存收益返回
 `KEEP_DETERMINISTIC_BASELINE`。项目说明建议常驻入口分类优先用 Luna max；
 这只是文档建议，生产生效路由仍由确定性规则决定，live 探针与模型选择由使用者显式指定。
+探针脚本是根目录的研究工具，刻意不进入 Plugin runtime 分发；Plugin 仅镜像生产运行时
+以及探针所需的配置和 Schema。
 
 ### 恢复与终止
 

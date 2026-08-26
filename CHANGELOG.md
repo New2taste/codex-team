@@ -8,7 +8,7 @@
 
 - live runtime 合同修复：完整 rollout 解析、受限身份归一化和安全诊断输出；
 - provider-strict dispatch schema 投影，保持 `ai-result-1` canonical contract 不变；
-- 独立、shadow-only 的 Luna/Sol/Terra 常驻路由探针，支持 dry-run、fake、live 双钥匙、配对分析和报告；
+- 独立、shadow-only 的 Luna/Sol/Terra 常驻路由探针，支持 dry-run、fake、live 双钥匙、配对分析和报告；探针脚本保持根目录研究工具定位，不进入 Plugin runtime 分发；
 - Git 控制面只读快照比较，以及 router-probe manifest / cost evidence 契约。
 
 ### Changed
@@ -19,7 +19,7 @@
 
 ### Verification snapshot
 
-- `sh scripts/verify_all.sh`：583 tests passed，8 个既有 repair-ledger-v1 intentional skips；
+- `sh scripts/verify_all.sh`：585 tests passed，8 个既有 repair-ledger-v1 intentional skips；
 - root/Plugin parity、runtime inspector、router probe、scheduler、repair 和分发测试纳入同一验证入口。
 
 ### Known limitations
