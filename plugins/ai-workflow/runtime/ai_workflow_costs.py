@@ -63,6 +63,7 @@ _ALIASES = {
     "retry": "retry_kind",
 }
 _TOKEN_FIELDS = ("input_tokens", "cached_input_tokens", "output_tokens")
+COST_EVIDENCE_ROLES = (ROLES - {"host"}) | {"router_probe"}
 _PRICE_FIELDS = frozenset(
     {
         "cost",
@@ -294,7 +295,7 @@ def normalize_cost_evidence(value: object) -> CostEvidence:
     if route not in ROUTES:
         _fail("COST_EVIDENCE_INVALID", "route is not supported")
     role = _nonempty_string(raw.get("role"), "role")
-    if role not in (ROLES - {"host"}):
+    if role not in COST_EVIDENCE_ROLES:
         _fail("COST_EVIDENCE_INVALID", "role is not supported")
     surface = _nonempty_string(
         raw.get("execution_surface"),

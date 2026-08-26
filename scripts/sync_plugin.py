@@ -19,6 +19,7 @@ CONFIG_FILES = (
     "ai_workflow_plan.schema.json",
     "ai_workflow_runtime_evidence.schema.json",
     "ai_workflow_cost_evidence.schema.json",
+    "ai_workflow_router_probe_manifest.schema.json",
     "ai_workflow_scheduler.schema.json",
 )
 RUNTIME_FILES = (

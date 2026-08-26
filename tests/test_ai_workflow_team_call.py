@@ -746,6 +746,40 @@ class TeamCallControllerTest(unittest.TestCase):
         self.assertTrue((git_dir / "l1-controller-write").is_file())
         self.assertEqual("BLOCKED", self._team_rows()[-1]["route_status"])
 
+    def test_l1_existing_git_control_file_content_change_is_blocked(self):
+        git_dir = Path(self._git("rev-parse", "--absolute-git-dir").stdout.strip())
+        control_file = git_dir / "description"
+        self.assertTrue(control_file.is_file())
+        original = control_file.read_text(encoding="utf-8")
+        self.controller.on_before_run_l1 = lambda task: control_file.write_text(
+            f"{original}persistent mutation\n", encoding="utf-8"
+        )
+
+        with self.assertRaisesRegex(
+            workflow.WorkflowError, "READ_ONLY_FILESYSTEM_CHANGED"
+        ):
+            workflow.run_team_call(
+                "team call 核对文件 README.md",
+                repository_root=self.repo,
+                state_root=self.root,
+                controller=self.controller,
+            )
+
+    def test_l1_read_only_git_status_does_not_fail_on_transient_lock_metadata(self):
+        self.controller.on_before_run_l1 = lambda task: self._git(
+            "status", "--porcelain=v1", "--untracked-files=all"
+        )
+
+        route = workflow.run_team_call(
+            "team call 核对文件 README.md",
+            repository_root=self.repo,
+            state_root=self.root,
+            controller=self.controller,
+        )
+
+        self.assertEqual("DIRECT_L1", route.disposition)
+        self.assertEqual("ROUTED", self._team_rows()[-1]["route_status"])
+
     def test_l1_linked_worktree_gitdir_and_common_gitdir_writes_are_blocked(self):
         linked = Path(self.temporary.name) / "linked-worktree"
         self._git("worktree", "add", "-b", "linked-test", str(linked))

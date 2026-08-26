@@ -117,3 +117,20 @@ sandbox = "read-only"
 requires_owner_approval = true
 allowed_statuses = ["OPTION_A", "OPTION_B", "OPTION_C", "INSUFFICIENT_EVIDENCE"]
 instructions = """Plan only an owner-authorized large project in its closed case file. Do not implement, review local task acceptance, or invent an unlisted option. Do not over-design; propose only the smallest change needed to satisfy the frozen objective and acceptance criteria."""
+
+[router_probe]
+enabled = false
+prompt_template_version = "router-probe-v1"
+minimum_paired_cases = 32
+
+[router_probe.models.luna]
+model = "gpt-5.6-luna"
+reasoning_effort = "max"
+
+[router_probe.models.sol]
+model = "gpt-5.6-sol"
+reasoning_effort = "medium"
+
+[router_probe.models.terra]
+model = "gpt-5.6-terra"
+reasoning_effort = "xhigh"

@@ -34,7 +34,11 @@ command -v jq >/dev/null 2>&1 || fail
 # Enumerate every matching directory entry before deciding whether it is a
 # regular file.  ``find -type f`` alone would silently ignore a same-suffix
 # symlink and could therefore turn an ambiguous rollout set into one match.
-matches=$(find "$sessions_dir" -name "*$thread_id" -print 2>/dev/null) || fail
+matches=$(
+    find "$sessions_dir" \
+        \( -name "*$thread_id" -o -name "*$thread_id.jsonl" \) \
+        -print 2>/dev/null
+) || fail
 [ -n "$matches" ] || fail
 match_count=$(printf '%s\n' "$matches" | awk 'END { print NR }')
 [ "$match_count" -eq 1 ] || fail
@@ -48,28 +52,123 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
-# ``field`` collects every duplicate occurrence recursively.  Each requested
-# field must occur with exactly one nonempty string value; duplicate values are
-# allowed only when they are identical.  jq diagnostics are discarded so a
-# malformed rollout cannot reflect sensitive input to stderr.
-jq -ce --arg requested_thread "$thread_id" --argjson issued_native_agent_id "$(printf '%s' "$native_agent_id" | jq -R 'if . == "null" then null else . end')" '
-    def field($name):
-      [.. | objects | select(has($name)) | .[$name]] as $values
-      | if ($values | length) == 0
-           or any($values[]; type != "string" or length == 0)
-        then error("invalid runtime rollout")
-        else ($values | unique)
-             | if length == 1 then .[0] else error("invalid runtime rollout") end
-        end;
-    def nullable_agent_type:
-      [.. | objects | select(has("agent_type")) | .agent_type] as $values
-      | if ($values | length) == 0
-           or any($values[]; (type != "string" and type != "null") or (type == "string" and length == 0))
-        then error("invalid runtime rollout")
-        else ($values | unique)
-             | if length == 1 then .[0] else error("invalid runtime rollout") end
-        end;
-    field("thread_id") as $thread_id
+# Parse the complete JSONL stream as one array.  Real Codex rollouts spread
+# identity facts across records, unlike the legacy one-object test fixture.
+# Diagnostics are discarded so malformed input cannot reflect secrets.
+jq -cse --arg requested_thread "$thread_id" --argjson issued_native_agent_id "$(printf '%s' "$native_agent_id" | jq -R 'if . == "null" then null else . end')" '
+    . as $records
+    | def one_string($values):
+        $values
+        | if length == 0
+             or any(.[]; type != "string" or length == 0)
+          then error("invalid runtime rollout")
+          else unique
+               | if length == 1 then .[0] else error("invalid runtime rollout") end
+          end;
+      def field($name):
+        one_string([
+          $records[]
+          | .. | objects
+          | select(has($name))
+          | .[$name]
+        ]);
+      def rollout_thread:
+        one_string(
+          [
+            $records[]
+            | .. | objects
+            | select(has("thread_id"))
+            | .thread_id
+          ]
+          +
+          [
+            $records[]
+            | select(.type == "session_meta" and (.payload | type == "object"))
+            | .payload
+            | .id?, .session_id?
+            | select(. != null)
+          ]
+        );
+      def nullable_agent_type:
+        [
+          $records[]
+          | .. | objects
+          | select(has("agent_type"))
+          | .agent_type
+        ] as $values
+        | if ($values | length) == 0
+          then null
+          elif any(
+            $values[];
+            (type != "string" and type != "null")
+            or (type == "string" and length == 0)
+          )
+          then error("invalid runtime rollout")
+          else ($values | unique)
+               | if length == 1 then .[0] else error("invalid runtime rollout") end
+          end;
+      def runtime_cwd:
+        one_string([
+          $records[]
+          | if (.type == "session_meta" or .type == "turn_context")
+               and (.payload | type == "object")
+               and (.payload | has("cwd"))
+            then .payload.cwd
+            elif (has("type") | not)
+            then [.. | objects | select(has("cwd")) | .cwd][]
+            else empty
+            end
+        ]);
+      def sandbox_policy:
+        [
+          $records[]
+          | .. | objects
+          | select(has("sandbox_policy"))
+          | .sandbox_policy
+          | if type == "string" and length > 0
+            then .
+            elif type == "object"
+                 and (keys == ["type"])
+                 and .type == "read-only"
+            then "read-only"
+            else error("invalid runtime rollout")
+            end
+        ]
+        | one_string(.);
+      def permission_profile:
+        [
+          $records[]
+          | .. | objects
+          | select(has("permission_profile"))
+          | .permission_profile
+          | if type == "string" and length > 0
+            then .
+            elif type == "object"
+                 and (keys == ["file_system", "network", "type"])
+                 and .type == "managed"
+                 and .network == "restricted"
+                 and (.file_system | type == "object")
+                 and (.file_system | keys == ["entries", "type"])
+                 and .file_system.type == "restricted"
+                 and (.file_system.entries | type == "array" and length > 0)
+                 and all(
+                   .file_system.entries[];
+                   type == "object"
+                   and (keys == ["access", "path"])
+                   and .access == "read"
+                   and (.path | type == "object")
+                   and (.path | keys == ["type", "value"])
+                   and .path.type == "special"
+                   and (.path.value | type == "object")
+                   and (.path.value | keys == ["kind"])
+                   and .path.value.kind == "root"
+                 )
+            then "read-only"
+            else error("invalid runtime rollout")
+            end
+        ]
+        | one_string(.);
+    rollout_thread as $thread_id
     | if $thread_id != $requested_thread then error("invalid runtime rollout") else . end
     | (if $issued_native_agent_id == null
        then null
@@ -85,9 +184,9 @@ jq -ce --arg requested_thread "$thread_id" --argjson issued_native_agent_id "$(p
         agent_type: nullable_agent_type,
         model: field("model"),
         reasoning_effort: field("reasoning_effort"),
-        sandbox_policy: field("sandbox_policy"),
-        permission_profile: field("permission_profile"),
-        cwd: field("cwd")
+        sandbox_policy: sandbox_policy,
+        permission_profile: permission_profile,
+        cwd: runtime_cwd
       }
 ' "$matches" >"$temporary" 2>/dev/null || fail
 

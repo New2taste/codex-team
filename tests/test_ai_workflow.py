@@ -1590,6 +1590,77 @@ class CodexRunnerTest(unittest.TestCase):
         workflow.validate_role_result("luna", result, set())
         self.assertEqual(result, caller_view)
 
+    def test_result_exact_bound_task_id_echo_normalizes_to_absent(self):
+        result = self.valid_result()
+        result.update(
+            {
+                "dispatch_id": None,
+                "task_id": "AWF-20260826-001",
+                "step_id": None,
+                "attempt": None,
+            }
+        )
+        caller_view = dict(result)
+        workflow.validate_role_result(
+            "luna",
+            result,
+            set(),
+            expected_task_id="AWF-20260826-001",
+        )
+        self.assertEqual(result, caller_view)
+
+    def test_result_task_id_echo_requires_exact_controller_binding(self):
+        echo = {
+            "dispatch_id": None,
+            "task_id": "AWF-20260826-001",
+            "step_id": None,
+            "attempt": None,
+        }
+        for expected_task_id in (
+            None,
+            "",
+            "AWF-20260826-999",
+        ):
+            with self.subTest(expected_task_id=expected_task_id):
+                result = self.valid_result()
+                result.update(echo)
+                with self.assertRaisesRegex(
+                    workflow.WorkflowError, "INVALID_ROLE_RESULT"
+                ):
+                    workflow.validate_role_result(
+                        "luna",
+                        result,
+                        set(),
+                        expected_task_id=expected_task_id,
+                    )
+
+    def test_result_task_id_echo_rejects_non_null_reserved_identity(self):
+        for field, value in (
+            ("dispatch_id", "a" * 64),
+            ("step_id", "step-1"),
+            ("attempt", 1),
+        ):
+            with self.subTest(field=field):
+                result = self.valid_result()
+                result.update(
+                    {
+                        "dispatch_id": None,
+                        "task_id": "AWF-20260826-001",
+                        "step_id": None,
+                        "attempt": None,
+                        field: value,
+                    }
+                )
+                with self.assertRaisesRegex(
+                    workflow.WorkflowError, "INVALID_ROLE_RESULT"
+                ):
+                    workflow.validate_role_result(
+                        "luna",
+                        result,
+                        set(),
+                        expected_task_id="AWF-20260826-001",
+                    )
+
     def test_result_partially_null_identity_is_rejected(self):
         full_identity = {
             "dispatch_id": "a" * 64,
@@ -1646,6 +1717,26 @@ class CodexRunnerTest(unittest.TestCase):
         )
         workflow.validate_role_result("luna", result, set())
 
+    def test_live_bound_validation_rejects_model_supplied_scheduler_identity(self):
+        result = self.valid_result()
+        result.update(
+            {
+                "dispatch_id": "a" * 64,
+                "task_id": "AWF-20260826-001",
+                "step_id": "step-1",
+                "attempt": 1,
+            }
+        )
+        with self.assertRaisesRegex(
+            workflow.WorkflowError, "INVALID_ROLE_RESULT"
+        ):
+            workflow.validate_role_result(
+                "luna",
+                result,
+                set(),
+                expected_task_id="AWF-20260826-001",
+            )
+
     def test_prompt_is_limited_to_task_contract_and_named_evidence(self):
         task = self.valid_task()
         contract = {"acceptance": "run unit tests"}
@@ -1667,6 +1758,10 @@ class CodexRunnerTest(unittest.TestCase):
         self.assertIn('Output "role" exactly as "luna".', prompt)
         self.assertIn(
             'Output "status" as exactly one of: SUPPORTED, PARTIALLY_SUPPORTED, NOT_SUPPORTED, BLOCKED.',
+            prompt,
+        )
+        self.assertIn(
+            "Set dispatch_id, task_id, step_id, and attempt to null; controller identity is reserved.",
             prompt,
         )
         self.assertIn(
@@ -1953,6 +2048,62 @@ class CodexRunnerTest(unittest.TestCase):
             retry_kind=retry_kind,
             attempt_id=attempt_id,
         )
+
+    @mock.patch(
+        "scripts.ai_workflow.capture_repo",
+        return_value=workflow.RepoSnapshot("pinned-head", ()),
+    )
+    @mock.patch("scripts.ai_workflow.working_tree_paths", return_value=set())
+    @mock.patch("scripts.ai_workflow.subprocess.run")
+    def test_run_codex_keeps_task_id_echo_in_raw_attempt_but_returns_normalized_result(
+        self, run, _working_tree_paths, _capture_repo
+    ):
+        task = self.valid_task()
+        result = self.valid_result()
+        result.update(
+            {
+                "dispatch_id": None,
+                "task_id": task["task_id"],
+                "step_id": None,
+                "attempt": None,
+            }
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_root = root / "state"
+            workflow.WorkflowStore(state_root).create_task(task)
+            paths = workflow.RunPaths(
+                repo=ROOT,
+                output_path=root / "luna-result.json",
+                schema_path=ROOT / "config/ai_workflow_result.schema.json",
+                logs_dir=root / "logs",
+                state_root=state_root,
+            )
+            context = self._bound_attempt_context(task, "luna-task-id-echo")
+            run.side_effect = lambda command, *args, **kwargs: write_codex_result(
+                command, result
+            )
+
+            returned = workflow.run_codex(
+                "luna",
+                task,
+                "task contract",
+                paths,
+                attempt_context=context,
+            )
+            raw = json.loads(
+                (
+                    root
+                    / "attempts"
+                    / "luna-task-id-echo.json"
+                ).read_text(encoding="utf-8")
+            )
+
+        self.assertNotIn("task_id", returned)
+        self.assertEqual(task["task_id"], raw["task_id"])
+        self.assertIsNone(raw["dispatch_id"])
+        self.assertIsNone(raw["step_id"])
+        self.assertIsNone(raw["attempt"])
 
     @mock.patch(
         "scripts.ai_workflow.capture_repo",
