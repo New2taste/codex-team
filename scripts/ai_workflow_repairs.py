@@ -2716,6 +2716,26 @@ def _v2_validate_controller_result(
     workflow = _workflow()
     if not isinstance(result, Mapping):
         _fail("REPAIR_ADAPTER_INVALID_OUTPUT", "controller assignment result is not an object")
+    # The provider-strict dispatch schema forces the scheduler identity
+    # quartet onto every live result; an all-null quartet is the wire
+    # encoding of "absent". Anything partially null is a forgery attempt.
+    identity_fields = workflow.RESULT_IDENTITY_FIELDS
+    present_identity = identity_fields & set(result)
+    null_identity = frozenset(
+        field for field in present_identity if result[field] is None
+    )
+    if null_identity:
+        if present_identity == identity_fields and null_identity == identity_fields:
+            result = {
+                key: value
+                for key, value in result.items()
+                if key not in identity_fields
+            }
+        else:
+            _fail(
+                "REPAIR_ADAPTER_INVALID_OUTPUT",
+                "controller assignment result identity is partially null",
+            )
     if set(result) != set(workflow.RESULT_REQUIRED_FIELDS):
         _fail("REPAIR_ADAPTER_INVALID_OUTPUT", "controller assignment result shape is invalid")
     if result.get("schema_version") != "ai-result-1" or result.get("role") != assignment.expected_actor.role:
@@ -2873,6 +2893,11 @@ def run_assignment(
         codex = shutil.which("codex", path=os.environ.get("PATH", os.defpath))
         if not isinstance(codex, str):
             _fail("REPAIR_ADAPTER_REQUIRED", "controller Codex executable is unavailable")
+        dispatch_schema_path = workflow.materialize_dispatch_result_schema(
+            repository / "config" / "ai_workflow_result.schema.json",
+            output_path.parent,
+            f"{assignment.attempt_id}-assignment",
+        )
         command = [
             codex,
             "exec",
@@ -2885,7 +2910,7 @@ def run_assignment(
             f'sandbox_mode="{receipt.observed_sandbox_policy}"',
             "--json",
             "--output-schema",
-            str(repository / "config" / "ai_workflow_result.schema.json"),
+            str(dispatch_schema_path),
             "-o",
             str(output_path),
             receipt.runtime_instance_id,

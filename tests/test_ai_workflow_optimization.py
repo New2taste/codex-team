@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 import tomllib
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest import mock
@@ -1091,10 +1091,10 @@ class RouteCliShadowAdviceTest(unittest.TestCase):
         with mock.patch.object(
             workflow.WorkflowStore, "append_event", autospec=True, side_effect=fail_route_event
         ):
-            output = StringIO()
-            with redirect_stdout(output):
+            errors = StringIO()
+            with redirect_stderr(errors):
                 self.assertEqual(2, workflow.main(self._route_argv(request_path)))
-            self.assertIn("APPEND_FAILED", output.getvalue())
+            self.assertIn("APPEND_FAILED", errors.getvalue())
         self.assertTrue(
             (self.state_root / self.task["task_id"] / "route-decision.json").is_file()
         )
@@ -1139,12 +1139,12 @@ class RouteCliShadowAdviceTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         different = self._write_request(route_request("BOUNDED", "WRITE"))
-        output = StringIO()
-        with redirect_stdout(output):
+        errors = StringIO()
+        with redirect_stderr(errors):
             exit_code = workflow.main(self._route_argv(different))
 
         self.assertEqual(2, exit_code)
-        self.assertIn("ROUTE_ALREADY_FROZEN", output.getvalue())
+        self.assertIn("ROUTE_ALREADY_FROZEN", errors.getvalue())
         self.assertEqual(
             stored,
             (self.state_root / self.task["task_id"] / "route-decision.json").read_text(
@@ -1174,12 +1174,12 @@ class RouteCliShadowAdviceTest(unittest.TestCase):
             self.state_root / self.task["task_id"] / "route-decision.json"
         ).read_text(encoding="utf-8")
 
-        output = StringIO()
-        with redirect_stdout(output):
+        errors = StringIO()
+        with redirect_stderr(errors):
             exit_code = workflow.main(self._route_argv(request_path, mode="enforced"))
 
         self.assertEqual(2, exit_code)
-        self.assertIn("ROUTE_ALREADY_FROZEN", output.getvalue())
+        self.assertIn("ROUTE_ALREADY_FROZEN", errors.getvalue())
         self.assertEqual(
             stored,
             (self.state_root / self.task["task_id"] / "route-decision.json").read_text(

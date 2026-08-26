@@ -13,15 +13,19 @@ import hashlib
 import json
 import os
 import subprocess
+import shutil
 import tempfile
 import unittest
 import uuid
 from collections import Counter
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from scripts import ai_workflow as workflow
 from scripts import ai_workflow_repairs as repairs
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class AcceptanceContractMutationTest(unittest.TestCase):
@@ -39,6 +43,54 @@ class AcceptanceContractMutationTest(unittest.TestCase):
         "base_commit",
         "candidate_commit",
     }
+
+    @staticmethod
+    def _strict_wire_review_result():
+        return {
+            "schema_version": "ai-result-1",
+            "dispatch_id": None,
+            "task_id": None,
+            "step_id": None,
+            "attempt": None,
+            "role": "terra_xhigh_reviewer",
+            "status": "ACCEPTANCE_RECOMMENDED",
+            "summary": "The issued candidate meets its frozen contract.",
+            "claims": [],
+            "evidence": [],
+            "counter_checks": [],
+            "changed_files": [],
+            "blind_spots": [],
+            "unresolved_questions": [],
+            "recommended_next_state": "AWAITING_OWNER_DECISION",
+        }
+
+    def test_controller_result_accepts_all_null_identity_wire_shape(self):
+        assignment = SimpleNamespace(
+            phase="REVIEW_1",
+            expected_actor=SimpleNamespace(role="terra_xhigh_reviewer"),
+        )
+        validated = repairs._v2_validate_controller_result(
+            self._strict_wire_review_result(), assignment, set()
+        )
+        self.assertEqual("ACCEPTANCE_RECOMMENDED", validated["status"])
+        self.assertNotIn("dispatch_id", validated)
+
+    def test_controller_result_rejects_partially_null_identity(self):
+        assignment = SimpleNamespace(
+            phase="REVIEW_1",
+            expected_actor=SimpleNamespace(role="terra_xhigh_reviewer"),
+        )
+        partial_shapes = (
+            {"attempt": 1},
+            {"dispatch_id": "a" * 64, "task_id": "AWF-20260826-001"},
+        )
+        for overrides in partial_shapes:
+            with self.subTest(overrides=sorted(overrides)):
+                result = {**self._strict_wire_review_result(), **overrides}
+                with self.assertRaisesRegex(
+                    workflow.WorkflowError, "REPAIR_ADAPTER_INVALID_OUTPUT"
+                ):
+                    repairs._v2_validate_controller_result(result, assignment, set())
 
     def test_receipt_identity_contract_kills_assignment_attempt_only_verifier(self):
         expected = {
@@ -189,7 +241,14 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
         (self.repository_root / "README.md").write_text(
             "base\n", encoding="utf-8"
         )
-        self._git("add", "README.md")
+        # The controller executor derives its provider-strict dispatch schema
+        # from the repository's canonical result schema at launch time.
+        (self.repository_root / "config").mkdir()
+        shutil.copyfile(
+            ROOT / "config" / "ai_workflow_result.schema.json",
+            self.repository_root / "config" / "ai_workflow_result.schema.json",
+        )
+        self._git("add", "README.md", "config/ai_workflow_result.schema.json")
         self._git("commit", "-q", "-m", "base")
         self.base_commit = self._git("rev-parse", "HEAD")
         (self.repository_root / "src").mkdir()
@@ -1367,11 +1426,29 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
         def controller_process(command, *args, **kwargs):
             if Path(command[0]).name == "codex":
                 self.assertIn('sandbox_mode="read-only"', command)
+                schema_arg = Path(command[command.index("--output-schema") + 1])
+                self.assertNotEqual(
+                    (
+                        self.repository_root
+                        / "config"
+                        / "ai_workflow_result.schema.json"
+                    ).resolve(),
+                    schema_arg.resolve(),
+                )
+                derived_schema = json.loads(schema_arg.read_text(encoding="utf-8"))
+                self.assertEqual(
+                    set(derived_schema["required"]),
+                    set(derived_schema["properties"]),
+                )
                 output_path = Path(command[command.index("-o") + 1])
                 output_path.write_text(
                     json.dumps(
                         {
                             "schema_version": "ai-result-1",
+                            "dispatch_id": None,
+                            "task_id": None,
+                            "step_id": None,
+                            "attempt": None,
                             "role": "terra_xhigh_reviewer",
                             "status": "ACCEPTANCE_RECOMMENDED",
                             "summary": "The issued candidate meets its frozen contract.",
@@ -1471,6 +1548,10 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
                     json.dumps(
                         {
                             "schema_version": "ai-result-1",
+                            "dispatch_id": None,
+                            "task_id": None,
+                            "step_id": None,
+                            "attempt": None,
                             "role": "luna",
                             "status": "IMPLEMENTED_CANDIDATE",
                             "summary": "Repaired the issued finding only.",
@@ -1569,6 +1650,10 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
                 )
                 result = {
                     "schema_version": "ai-result-1",
+                    "dispatch_id": None,
+                    "task_id": None,
+                    "step_id": None,
+                    "attempt": None,
                     "role": "sol_medium_reviewer",
                     "status": "IMPLEMENTED_CANDIDATE",
                     "summary": "Repaired the exact review-two finding scope.",
@@ -1584,6 +1669,10 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
                 self.assertEqual(peer_thread, thread_id)
                 result = {
                     "schema_version": "ai-result-1",
+                    "dispatch_id": None,
+                    "task_id": None,
+                    "step_id": None,
+                    "attempt": None,
                     "role": "sol_medium_reviewer",
                     "status": "ACCEPTANCE_RECOMMENDED",
                     "summary": "The distinct Sol-medium peer accepts the repair.",
@@ -1883,6 +1972,10 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
                     json.dumps(
                         {
                             "schema_version": "ai-result-1",
+                            "dispatch_id": None,
+                            "task_id": None,
+                            "step_id": None,
+                            "attempt": None,
                             "role": "sol_xhigh",
                             "status": "IMPLEMENTED_CANDIDATE",
                             "summary": "Completed the one terminal repair scope.",
