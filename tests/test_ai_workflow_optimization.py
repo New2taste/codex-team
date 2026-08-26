@@ -1,6 +1,7 @@
 import copy
 import inspect
 import json
+import os
 import subprocess
 import tempfile
 import tomllib
@@ -596,6 +597,36 @@ class RouteAdvicePersistenceTest(unittest.TestCase):
                 request_sha256=workflow.artifact_sha256(self.request),
             )
 
+    def test_existing_route_advice_rejects_symlink_and_hardlink(self):
+        advice = self._advice()
+        path = workflow.record_route_advice(
+            self.store,
+            self.task["task_id"],
+            advice,
+            request_sha256=workflow.artifact_sha256(self.request),
+        )
+        outside = Path(self.temporary_directory.name) / "route-advice-outside.json"
+        path.replace(outside)
+
+        path.symlink_to(outside)
+        with self.assertRaisesRegex(workflow.WorkflowError, "ROUTE_ADVICE_UNSAFE"):
+            workflow.record_route_advice(
+                self.store,
+                self.task["task_id"],
+                advice,
+                request_sha256=workflow.artifact_sha256(self.request),
+            )
+        path.unlink()
+
+        os.link(outside, path)
+        with self.assertRaisesRegex(workflow.WorkflowError, "ROUTE_ADVICE_UNSAFE"):
+            workflow.record_route_advice(
+                self.store,
+                self.task["task_id"],
+                advice,
+                request_sha256=workflow.artifact_sha256(self.request),
+            )
+
 
 class RoutingAtomicPersistenceTest(unittest.TestCase):
     def _fault_patch(self, stage):
@@ -640,8 +671,8 @@ class RoutingAtomicPersistenceTest(unittest.TestCase):
             )
         return mock.patch.object(
             workflow.os,
-            "replace",
-            side_effect=OSError("injected replace failure"),
+            "link",
+            side_effect=OSError("injected no-replace publish failure"),
         )
 
     def _case(self, root):

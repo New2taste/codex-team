@@ -724,6 +724,52 @@ class SchedulerDispatchTest(SchedulerHarness):
         self.assertFalse((outside / target.name).exists())
         self.assertFalse((backup / target.name).exists())
 
+    def test_write_json_once_does_not_replace_target_created_after_check(self):
+        parent = Path(self.temporary_directory.name) / "no-replace-parent"
+        parent.mkdir()
+        target = parent / "artifact.json"
+        attacker_bytes = b'{"attacker":true}\n'
+        real_link = workflow.os.link
+        injected = False
+
+        def create_target_then_link(source, destination, *args, **kwargs):
+            nonlocal injected
+            if not injected and destination == target.name:
+                injected = True
+                target.write_bytes(attacker_bytes)
+            return real_link(source, destination, *args, **kwargs)
+
+        with mock.patch.object(workflow.os, "link", side_effect=create_target_then_link):
+            with self.assertRaisesRegex(workflow.WorkflowError, "CONFLICT"):
+                workflow.write_json_once(target, {"safe": True}, conflict_code="CONFLICT")
+        self.assertEqual(attacker_bytes, target.read_bytes())
+
+    def test_write_json_once_reports_publish_when_parent_swaps_after_link(self):
+        parent = Path(self.temporary_directory.name) / "post-publish-parent"
+        parent.mkdir()
+        target = parent / "artifact.json"
+        outside = Path(self.temporary_directory.name) / "post-publish-outside"
+        backup = Path(self.temporary_directory.name) / "post-publish-original"
+        real_fsync = workflow.os.fsync
+        fsync_calls = 0
+
+        def swap_on_parent_fsync(descriptor):
+            nonlocal fsync_calls
+            fsync_calls += 1
+            if fsync_calls == 2:
+                outside.mkdir()
+                parent.rename(backup)
+                parent.symlink_to(outside, target_is_directory=True)
+            return real_fsync(descriptor)
+
+        with mock.patch.object(workflow.os, "fsync", side_effect=swap_on_parent_fsync):
+            with self.assertRaisesRegex(
+                workflow.WorkflowError, "ATOMIC_WRITE_PUBLISHED_UNSYNCED"
+            ):
+                workflow.write_json_once(target, {"safe": True}, conflict_code="CONFLICT")
+        self.assertFalse((outside / target.name).exists())
+        self.assertTrue((backup / target.name).is_file())
+
     def test_corrupt_scheduler_history_fails_closed_without_rewrite(self):
         scheduler.dispatch_ready_batch(self.store, self.frozen)
         path = self.store.root / self.frozen.task_id / "scheduler.jsonl"

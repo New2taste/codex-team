@@ -1034,10 +1034,19 @@ def record_route_advice(
         has_matching_event = any(
             _advice_event_matches(event, document) for event in existing_events
         )
-        if path.exists():
+        try:
+            from .ai_workflow import _read_regular_file
+        except (ImportError, ModuleNotFoundError):
+            from ai_workflow import _read_regular_file
+        existing_bytes = _read_regular_file(
+            path,
+            error_code="ROUTE_ADVICE_UNSAFE",
+            missing_ok=True,
+        )
+        if existing_bytes is not None:
             try:
-                existing = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
+                existing = json.loads(existing_bytes.decode("utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
                 _fail("ROUTE_ADVICE_CONFLICT", "existing route advice is unreadable")
                 raise AssertionError("unreachable") from exc
             if _canonical_json(existing) != _canonical_json(document):

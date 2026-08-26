@@ -2062,7 +2062,11 @@ def _open_parent_directory(path: Path, *, error_code: str) -> int:
         descriptor = os.open(path, flags)
     except OSError as exc:
         raise WorkflowError(error_code, f"cannot open parent directory for {path.name}") from exc
-    metadata = os.fstat(descriptor)
+    try:
+        metadata = os.fstat(descriptor)
+    except OSError as exc:
+        os.close(descriptor)
+        raise WorkflowError(error_code, f"cannot inspect parent directory for {path.name}") from exc
     if not stat.S_ISDIR(metadata.st_mode):
         os.close(descriptor)
         raise WorkflowError(error_code, f"parent directory for {path.name} is not a directory")
@@ -2181,23 +2185,36 @@ def write_json_once(path: Path, value: object, *, conflict_code: str) -> str:
                 error_code="ATOMIC_WRITE_FAILED",
                 label=temporary_name,
             )
-            os.replace(
-                temporary_name,
-                target.name,
-                src_dir_fd=parent_descriptor,
-                dst_dir_fd=parent_descriptor,
-            )
+            try:
+                # A same-directory hard-link is the portable POSIX no-replace
+                # primitive: it succeeds only when the destination is absent.
+                os.link(
+                    temporary_name,
+                    target.name,
+                    src_dir_fd=parent_descriptor,
+                    dst_dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileExistsError as exc:
+                _fail(conflict_code, f"{target.name} is already frozen")
+                raise AssertionError("unreachable") from exc
+            published = True
+            os.unlink(temporary_name, dir_fd=parent_descriptor)
+            temporary = None
         finally:
             if temp_descriptor >= 0:
                 os.close(temp_descriptor)
-        temporary = None
-        published = True
         if not _directory_identity_matches(target.parent, parent_descriptor):
             raise WorkflowError(
-                "ATOMIC_WRITE_FAILED",
+                "ATOMIC_WRITE_PUBLISHED_UNSYNCED",
                 f"parent directory changed while publishing {target.name}",
             )
         os.fsync(parent_descriptor)
+        if not _directory_identity_matches(target.parent, parent_descriptor):
+            raise WorkflowError(
+                "ATOMIC_WRITE_PUBLISHED_UNSYNCED",
+                f"parent directory changed after publishing {target.name}",
+            )
         return digest
     except WorkflowError:
         raise
