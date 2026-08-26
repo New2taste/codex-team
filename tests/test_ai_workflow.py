@@ -24,6 +24,56 @@ def write_codex_result(command, result):
     return subprocess.CompletedProcess(command, 0, stdout='{"event":"done"}\n', stderr="")
 
 
+class WriteJsonOnceAtomicityTest(unittest.TestCase):
+    def test_content_write_failure_leaves_no_frozen_target_and_retry_succeeds(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            target = Path(temporary_directory) / "frozen.json"
+            real_named_temporary_file = tempfile.NamedTemporaryFile
+
+            class FailingTemporary:
+                def __init__(self, *args, **kwargs):
+                    self.handle = real_named_temporary_file(*args, **kwargs)
+                    self.name = self.handle.name
+
+                def __enter__(self):
+                    self.handle.__enter__()
+                    return self
+
+                def write(self, _value):
+                    raise OSError("injected content write failure")
+
+                def __exit__(self, exc_type, exc, traceback):
+                    return self.handle.__exit__(exc_type, exc, traceback)
+
+            with mock.patch.object(
+                workflow.tempfile,
+                "NamedTemporaryFile",
+                side_effect=FailingTemporary,
+            ):
+                with self.assertRaisesRegex(
+                    workflow.WorkflowError, "ATOMIC_WRITE_FAILED"
+                ):
+                    workflow.write_json_once(
+                        target,
+                        {"value": 1},
+                        conflict_code="FROZEN_CONFLICT",
+                    )
+            self.assertFalse(target.exists())
+
+            workflow.write_json_once(
+                target,
+                {"value": 1},
+                conflict_code="FROZEN_CONFLICT",
+            )
+            self.assertEqual({"value": 1}, json.loads(target.read_text(encoding="utf-8")))
+            with self.assertRaisesRegex(workflow.WorkflowError, "FROZEN_CONFLICT"):
+                workflow.write_json_once(
+                    target,
+                    {"value": 2},
+                    conflict_code="FROZEN_CONFLICT",
+                )
+
+
 class ContractFilesTest(unittest.TestCase):
     def test_role_models_and_efforts_are_pinned(self):
         with (ROOT / "config/ai_workflow.toml").open("rb") as handle:
@@ -262,7 +312,7 @@ class MetricsReportTest(unittest.TestCase):
     def test_unpaired_cost_attempt_is_reported_unavailable_and_not_aggregated(self):
         task_id = self._create_task("AWF-20260803-004")
         with mock.patch.object(workflow, "WORKFLOW_STATE_ROOT", self.state_root):
-            workflow.record_metrics(
+            workflow._record_controller_metrics(
                 task_id,
                 {
                     "role": "luna",
@@ -284,7 +334,6 @@ class MetricsReportTest(unittest.TestCase):
                         "rate_snapshot_id": None,
                     },
                 },
-                _controller_owned=True,
             )
         metrics = workflow.aggregate_metrics(self.state_root)
         self.assertEqual({}, metrics["cost_summary"])
@@ -549,6 +598,7 @@ class MetricsReportTest(unittest.TestCase):
             "none",
             "SUPPORTED",
             self.state_root,
+            base_metric_run={"period": "experiment", "data_origin": "runtime"},
         )
         fixture = json.loads(
             (ROOT / "tests" / "fixtures" / "paired-cases.json").read_text(
@@ -556,12 +606,14 @@ class MetricsReportTest(unittest.TestCase):
             )
         )
         synthetic_attempt = dict(fixture["cases"][0]["attempts"][0])
-        synthetic_attempt["evidence_origin"] = "synthetic_fixture"
-        workflow.record_metrics(
+        workflow._record_controller_metrics(
             task_id,
-            {"role": "terra", "cost_evidence": synthetic_attempt},
+            {
+                "role": "terra",
+                "data_origin": "synthetic_fixture",
+                "cost_evidence": synthetic_attempt,
+            },
             state_root=self.state_root,
-            _controller_owned=True,
         )
         metrics = workflow.aggregate_metrics(self.state_root)
         self.assertEqual({"case-production"}, set(metrics["cost_summary"]))
@@ -629,6 +681,59 @@ class MetricsReportTest(unittest.TestCase):
         self.assertEqual(metrics["semantic_reworks"], 1)
         self.assertEqual(metrics["full_suite_runs"], 1)
         self.assertEqual(metrics["end_to_end_seconds"], 10.5)
+
+    def test_aggregate_metrics_reports_calls_gates_prompt_and_cache_efficiency(self):
+        task_id = self._create_task(
+            "AWF-20260803-003", paired_case_id="case-efficiency"
+        )
+        task = workflow.load_task(self.state_root / task_id / "task.json")
+        for prompt_bytes, input_tokens, cached_tokens in (
+            (100, 100, 10),
+            (300, 300, 60),
+        ):
+            workflow._controller_cost_attempt(
+                task_id,
+                task,
+                "luna",
+                workflow.NATIVE_SUBAGENT,
+                1.0,
+                prompt_bytes,
+                {
+                    "input_tokens": input_tokens,
+                    "cached_input_tokens": cached_tokens,
+                    "output_tokens": 5,
+                },
+                "none",
+                "SUPPORTED",
+                self.state_root,
+            )
+        self.store.append_event(
+            task_id,
+            {"event_type": "OWNER_GATE_REACHED", "new_state": "AWAITING_OWNER_DECISION"},
+        )
+        self.store.append_event(
+            task_id,
+            {
+                "event_type": "CONSTRUCTION_OWNER_GATE_REACHED",
+                "new_state": "AWAITING_OWNER_DECISION",
+            },
+        )
+        self.store.append_event(
+            task_id,
+            {"event_type": "OWNER_DECISION", "new_state": "CLOSED"},
+        )
+
+        metrics = workflow.aggregate_metrics(self.state_root)
+
+        self.assertEqual(2, metrics["model_call_count"])
+        self.assertEqual(1, metrics["closed_task_count"])
+        self.assertEqual(2.0, metrics["model_calls_per_closed_task"])
+        self.assertEqual(2, metrics["owner_gate_count"])
+        self.assertEqual(200.0, metrics["average_prompt_bytes"])
+        self.assertEqual(0.175, metrics["cache_hit_ratio"])
+        report = workflow.render_report(metrics)
+        self.assertIn("Model calls per closed task: 2.000", report)
+        self.assertIn("Owner gates reached: 2", report)
 
     def test_report_redacts_secrets_and_high_entropy_event_values(self):
         task_id = self._create_task("AWF-20260803-001")
@@ -964,6 +1069,174 @@ class GatedPipelineTest(unittest.TestCase):
         self.assertEqual(record["new_state"], "DEFERRED")
         self.assertIn("task_sha256", record)
 
+    def test_resume_command_continues_an_authorized_task_idempotently(self):
+        task_id = self._create_task(self._task("REMEDIATION"))
+        workflow.run_until_gate(
+            task_id,
+            runner=ScriptedRunner([]),
+            allow_live_model=False,
+            state_root=self.state_root,
+        )
+        workflow._apply_owner_decision(
+            self.store, task_id, "approve_execution", "owner"
+        )
+
+        first = StringIO()
+        with redirect_stdout(first):
+            first_exit = workflow.main(
+                ["resume", task_id, "--runner", "fake", "--root", str(self.state_root)]
+            )
+        events_after_first = (
+            self.state_root / task_id / "events.jsonl"
+        ).read_text(encoding="utf-8").splitlines()
+        second = StringIO()
+        with redirect_stdout(second):
+            second_exit = workflow.main(
+                ["resume", task_id, "--runner", "fake", "--root", str(self.state_root)]
+            )
+
+        self.assertEqual(0, first_exit)
+        self.assertEqual(0, second_exit)
+        self.assertEqual("BLOCKED\n", first.getvalue())
+        self.assertEqual("BLOCKED\n", second.getvalue())
+        events_after_second = (
+            self.state_root / task_id / "events.jsonl"
+        ).read_text(encoding="utf-8").splitlines()
+        self.assertEqual(
+            events_after_first,
+            events_after_second,
+        )
+
+    def test_abort_command_preserves_task_evidence(self):
+        task_id = self._create_task(self._task("REMEDIATION"))
+        workflow.run_until_gate(
+            task_id,
+            runner=ScriptedRunner([]),
+            allow_live_model=False,
+            state_root=self.state_root,
+        )
+
+        output = StringIO()
+        with redirect_stdout(output):
+            exit_code = workflow.main(
+                ["abort", task_id, "--by", "owner", "--root", str(self.state_root)]
+            )
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual("ABORTED\n", output.getvalue())
+        self.assertTrue((self.state_root / task_id / "task.json").is_file())
+        self.assertEqual("ABORTED", workflow._current_state(self.store, task_id))
+
+    def test_abort_is_available_from_every_nonterminal_runtime_state(self):
+        for state, targets in workflow.TRANSITIONS.items():
+            with self.subTest(state=state):
+                self.assertIn("ABORTED", targets)
+
+    def test_decide_resume_is_one_explicit_fake_command(self):
+        task_id = self._create_task(self._task("REMEDIATION"))
+        workflow.run_until_gate(
+            task_id,
+            runner=ScriptedRunner([]),
+            allow_live_model=False,
+            state_root=self.state_root,
+        )
+
+        output = StringIO()
+        with redirect_stdout(output):
+            exit_code = workflow.main(
+                [
+                    "decide",
+                    task_id,
+                    "approve_execution",
+                    "--resume",
+                    "--runner",
+                    "fake",
+                    "--root",
+                    str(self.state_root),
+                ]
+            )
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual(
+            "DECISION_RECORDED\nBLOCKED\n", output.getvalue()
+        )
+
+    def test_decide_resume_rejects_live_before_recording_the_decision(self):
+        task_id = self._create_task(self._task("REMEDIATION"))
+        workflow.run_until_gate(
+            task_id,
+            runner=ScriptedRunner([]),
+            allow_live_model=False,
+            state_root=self.state_root,
+        )
+
+        output = StringIO()
+        with redirect_stdout(output):
+            exit_code = workflow.main(
+                [
+                    "decide",
+                    task_id,
+                    "approve_execution",
+                    "--resume",
+                    "--runner",
+                    "live",
+                    "--root",
+                    str(self.state_root),
+                ]
+            )
+
+        self.assertEqual(2, exit_code)
+        self.assertIn("LIVE_MODEL_NOT_AUTHORIZED", output.getvalue())
+        self.assertFalse(
+            (self.state_root / task_id / "human-decisions.jsonl").exists()
+        )
+
+    def test_decide_resume_disabled_does_not_write_owner_decision(self):
+        task_id = self._create_task(self._task("REMEDIATION"))
+        workflow.run_until_gate(
+            task_id,
+            runner=ScriptedRunner([]),
+            allow_live_model=False,
+            state_root=self.state_root,
+        )
+        state_before = workflow._current_state(self.store, task_id)
+        events_before = (
+            self.state_root / task_id / "events.jsonl"
+        ).read_text(encoding="utf-8")
+        disabled = dict(workflow._load_workflow_config())
+        automation = dict(disabled.get("automation") or {})
+        automation["allow_decide_resume"] = False
+        disabled["automation"] = automation
+
+        output = StringIO()
+        with (
+            mock.patch.object(workflow, "_load_workflow_config", return_value=disabled),
+            redirect_stdout(output),
+        ):
+            exit_code = workflow.main(
+                [
+                    "decide",
+                    task_id,
+                    "approve_execution",
+                    "--resume",
+                    "--runner",
+                    "fake",
+                    "--root",
+                    str(self.state_root),
+                ]
+            )
+
+        self.assertEqual(2, exit_code)
+        self.assertIn("DECIDE_RESUME_DISABLED", output.getvalue())
+        self.assertFalse(
+            (self.state_root / task_id / "human-decisions.jsonl").exists()
+        )
+        self.assertEqual(state_before, workflow._current_state(self.store, task_id))
+        self.assertEqual(
+            events_before,
+            (self.state_root / task_id / "events.jsonl").read_text(encoding="utf-8"),
+        )
+
     def test_owner_authorization_edges_cannot_be_crossed_by_state_table_alone(self):
         for current, target in (
             ("DEFERRED", "TASK_VALIDATED"),
@@ -988,6 +1261,27 @@ class RetryBudgetTest(unittest.TestCase):
             budget.consume_rework()
         with self.assertRaisesRegex(workflow.WorkflowError, "RETRY_BUDGET_EXHAUSTED"):
             budget.consume_escalation()
+
+    def test_retry_budget_consumes_explicit_configured_limits(self):
+        limits = workflow._retry_limits_from_config(
+            {
+                "policy": {
+                    "max_technical_retries": 2,
+                    "max_implementation_reworks": 1,
+                    "max_cross_model_escalations": 1,
+                }
+            }
+        )
+        budget = workflow.RetryBudget(limits=limits)
+
+        budget.consume_technical()
+        budget.consume_technical()
+        with self.assertRaisesRegex(workflow.WorkflowError, "RETRY_BUDGET_EXHAUSTED"):
+            budget.consume_technical()
+
+        budget.consume_rework()
+        with self.assertRaisesRegex(workflow.WorkflowError, "RETRY_BUDGET_EXHAUSTED"):
+            budget.consume_rework()
 
 
 class CodexCommandTest(unittest.TestCase):
@@ -1232,7 +1526,7 @@ class CodexRunnerTest(unittest.TestCase):
     )
     @mock.patch("scripts.ai_workflow.working_tree_paths", return_value=set())
     @mock.patch("scripts.ai_workflow.subprocess.run")
-    @mock.patch("scripts.ai_workflow.record_metrics")
+    @mock.patch("scripts.ai_workflow._record_controller_metrics")
     def test_codex_non_runtime_usage_is_unavailable_without_verified_runtime_identity(
         self, record_metrics, run, _working_tree_paths, _capture_repo
     ):

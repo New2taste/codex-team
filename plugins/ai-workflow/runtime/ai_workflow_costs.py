@@ -585,6 +585,47 @@ def evaluate_cost_claim(
     return "COST_REDUCTION_SUPPORTED"
 
 
+def evaluate_optimization_gate(
+    metrics: Mapping[str, object],
+    minimum_cases: int = 8,
+    quality_margin_points: float = 5.0,
+) -> str:
+    """Allow enforced advice only when every measured gate is fully true."""
+
+    if not isinstance(metrics, Mapping) or metrics.get("synthetic") is True:
+        return "FALLBACK_FIXED"
+    cost_summary = metrics.get("cost_summary")
+    if not isinstance(cost_summary, Mapping):
+        return "FALLBACK_FIXED"
+    try:
+        claim = evaluate_cost_claim(
+            cost_summary,
+            minimum_cases=minimum_cases,
+            quality_margin_points=quality_margin_points,
+        )
+    except Exception:
+        return "FALLBACK_FIXED"
+    if claim != "COST_REDUCTION_SUPPORTED":
+        return "FALLBACK_FIXED"
+    for field in ("p0_miss_count", "p1_miss_count"):
+        value = metrics.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value != 0:
+            return "FALLBACK_FIXED"
+    calibration = metrics.get("calibration_first_delivery_pass_rate")
+    experiment = metrics.get("experiment_first_delivery_pass_rate")
+    if (
+        isinstance(calibration, bool)
+        or not isinstance(calibration, (int, float))
+        or not math.isfinite(calibration)
+        or isinstance(experiment, bool)
+        or not isinstance(experiment, (int, float))
+        or not math.isfinite(experiment)
+        or experiment < calibration
+    ):
+        return "FALLBACK_FIXED"
+    return "ALLOW_ENFORCED"
+
+
 def _case_category(case: Mapping[str, object]) -> tuple[str, ...]:
     categories: list[str] = []
     if case.get("measured_attempt_count", 0):
@@ -709,6 +750,7 @@ __all__ = [
     "CostEvidence",
     "aggregate_paired_cases",
     "evaluate_cost_claim",
+    "evaluate_optimization_gate",
     "finite_nonnegative_or_none",
     "finite_signed_or_none",
     "normalize_cost_evidence",

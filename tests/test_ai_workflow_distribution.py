@@ -65,6 +65,13 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+class FullVerificationEntrypointTest(unittest.TestCase):
+    def test_untracked_files_are_included_in_whitespace_checks(self):
+        script = (ROOT / "scripts" / "verify_all.sh").read_text(encoding="utf-8")
+        self.assertIn("git ls-files --others --exclude-standard -z", script)
+        self.assertIn("git diff --no-index --check", script)
+
+
 def filesystem_snapshot(root: Path) -> dict[str, dict[str, object]]:
     """Capture every entry type and content without following symlinks."""
 
@@ -290,9 +297,11 @@ class DistributionContractTest(unittest.TestCase):
             "ai_workflow_result.schema.json",
             "ai_workflow_route_request.schema.json",
             "ai_workflow_route_decision.schema.json",
+            "ai_workflow_route_advice.schema.json",
             "ai_workflow_plan.schema.json",
             "ai_workflow_runtime_evidence.schema.json",
             "ai_workflow_cost_evidence.schema.json",
+            "ai_workflow_scheduler.schema.json",
         )
         runtimes = (
             "ai_workflow.py",
@@ -303,6 +312,7 @@ class DistributionContractTest(unittest.TestCase):
             "ai_workflow_costs.py",
             "ai_workflow_repairs.py",
             "ai_workflow_team_call.py",
+            "ai_workflow_scheduler.py",
         )
         for name in configs:
             self.assertEqual((ROOT / "config" / name).read_bytes(), (PLUGIN / "config" / name).read_bytes())
@@ -444,6 +454,10 @@ class DistributionContractTest(unittest.TestCase):
             "different sol-medium fixer",
             "different sol-medium recheck",
             "owner-authorized sol-xhigh terminal repair",
+            "dual-key",
+            "compact_prompts",
+            "armed field projection",
+            "do not participate in compact",
         ):
             self.assertIn(lifecycle_phrase, published, lifecycle_phrase)
         self.assertRegex(
@@ -462,7 +476,7 @@ class DistributionContractTest(unittest.TestCase):
             (PLUGIN / "config" / "ai_workflow.toml").read_text()
         )
         for config in (root_policy, plugin_policy):
-            self.assertEqual(2, config["policy"]["max_implementation_reworks"])
+            self.assertEqual(1, config["policy"]["max_implementation_reworks"])
             self.assertEqual(
                 {
                     "fixer_role": "sol_medium_reviewer",
@@ -476,6 +490,14 @@ class DistributionContractTest(unittest.TestCase):
                 config["final_acceptance_rework"],
             )
             self.assertNotIn("repair", config)
+            for name, role in config["roles"].items():
+                if (
+                    role["model"] == "gpt-5.6-sol"
+                    and role["reasoning_effort"] in {"medium", "xhigh"}
+                ):
+                    with self.subTest(role=name):
+                        self.assertIn("Do not over-design", role["instructions"])
+                        self.assertIn("smallest change", role["instructions"])
 
         self.assertNotIn("execution os remains terra-led", published)
         self.assertNotIn("luna is only a low-cost bounded tool process", published)

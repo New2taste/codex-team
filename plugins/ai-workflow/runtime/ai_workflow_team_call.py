@@ -75,12 +75,14 @@ L0_FIXED_ARGV: Mapping[str, tuple[str, ...]] = MappingProxyType(
     {
         "workspace_status": ("git", "status", "--porcelain=v1", "--untracked-files=all"),
         "plugin_mirror_verify": ("sh", "plugins/ai-workflow/scripts/verify.sh"),
+        "workflow_verify": ("sh", "scripts/verify_all.sh"),
     }
 )
 _L0_OBJECTIVES: Mapping[str, str] = MappingProxyType(
     {
         "检查当前工作区状态": "workspace_status",
         "核对 plugin 根/镜像一致性": "plugin_mirror_verify",
+        "运行完整验证": "workflow_verify",
     }
 )
 

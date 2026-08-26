@@ -2,7 +2,7 @@ version = "ai-workflow-1"
 
 [policy]
 max_technical_retries = 1
-max_implementation_reworks = 2
+max_implementation_reworks = 1
 max_cross_model_escalations = 1
 automatic_xhigh = false
 automatic_sol_high = false
@@ -12,6 +12,16 @@ automatic_push = false
 [routing]
 mode = "enforced"
 role_policy = "terra_os"
+
+[automation]
+max_parallel_read_only = 2
+max_active_writers = 1
+allow_decide_resume = true
+
+[optimization]
+mode = "shadow"
+minimum_paired_cases = 8
+compact_prompts = false
 
 [final_acceptance_rework]
 fixer_role = "sol_medium_reviewer"
@@ -48,14 +58,14 @@ model = "gpt-5.6-sol"
 reasoning_effort = "medium"
 sandbox = "read-only"
 allowed_statuses = ["PLAN_READY", "NEEDS_OWNER_DECISION", "INSUFFICIENT_EVIDENCE"]
-instructions = """Convert evidence into a bounded plan with frozen invariants and decidable acceptance criteria. Do not implement."""
+instructions = """Convert evidence into a bounded plan with frozen invariants and decidable acceptance criteria. Do not implement. Do not over-design; make only the smallest change needed to satisfy the frozen objective and acceptance criteria."""
 
 [roles.sol_reviewer]
 model = "gpt-5.6-sol"
 reasoning_effort = "medium"
 sandbox = "read-only"
 allowed_statuses = ["ACCEPTANCE_RECOMMENDED", "ACCEPTANCE_WITH_NOTES_RECOMMENDED", "REWORK_RECOMMENDED", "REJECT_RECOMMENDED", "ESCALATION_PROPOSED"]
-instructions = """Review the pinned candidate against the task contract and evidence. Recommend a verdict but never enact owner decisions."""
+instructions = """Review the pinned candidate against the task contract and evidence. Recommend a verdict but never enact owner decisions. Do not over-design; require only the smallest change needed to satisfy the frozen objective and acceptance criteria."""
 
 [roles.sol_xhigh]
 model = "gpt-5.6-sol"
@@ -63,7 +73,7 @@ reasoning_effort = "xhigh"
 sandbox = "read-only"
 requires_owner_approval = true
 allowed_statuses = ["OPTION_A", "OPTION_B", "OPTION_C", "INSUFFICIENT_EVIDENCE"]
-instructions = """Decide only the closed-set dispute in the authorized case file. Do not implement or invent an unlisted option."""
+instructions = """Decide only the closed-set dispute in the authorized case file. Do not implement or invent an unlisted option. Do not over-design; choose only the smallest change needed to satisfy the frozen objective and acceptance criteria."""
 
 [roles.terra_xhigh]
 model = "gpt-5.6-terra"
@@ -91,14 +101,14 @@ model = "gpt-5.6-sol"
 reasoning_effort = "medium"
 sandbox = "read-only"
 allowed_statuses = ["PLAN_READY", "NEEDS_OWNER_DECISION", "INSUFFICIENT_EVIDENCE"]
-instructions = """Reserved for legacy compatibility only. Do not select this role for ordinary terra_os task planning, construction, or local acceptance."""
+instructions = """Reserved for legacy compatibility only. Do not select this role for ordinary terra_os task planning, construction, or local acceptance. Do not over-design; make only the smallest change needed to satisfy the frozen objective and acceptance criteria."""
 
 [roles.sol_medium_reviewer]
 model = "gpt-5.6-sol"
 reasoning_effort = "medium"
 sandbox = "read-only"
 allowed_statuses = ["ACCEPTANCE_RECOMMENDED", "ACCEPTANCE_WITH_NOTES_RECOMMENDED", "REWORK_RECOMMENDED", "REJECT_RECOMMENDED", "ESCALATION_PROPOSED"]
-instructions = """Reserved for the scoped fallback repair and peer-review ladder. Do not select this role for ordinary terra_os task planning, construction, or local acceptance."""
+instructions = """Reserved for the scoped fallback repair and peer-review ladder. Do not select this role for ordinary terra_os task planning, construction, or local acceptance. Do not over-design; make or require only the smallest change needed to satisfy the frozen objective and acceptance criteria."""
 
 [roles.sol_xhigh_planner]
 model = "gpt-5.6-sol"
@@ -106,4 +116,4 @@ reasoning_effort = "xhigh"
 sandbox = "read-only"
 requires_owner_approval = true
 allowed_statuses = ["OPTION_A", "OPTION_B", "OPTION_C", "INSUFFICIENT_EVIDENCE"]
-instructions = """Plan only an owner-authorized large project in its closed case file. Do not implement, review local task acceptance, or invent an unlisted option."""
+instructions = """Plan only an owner-authorized large project in its closed case file. Do not implement, review local task acceptance, or invent an unlisted option. Do not over-design; propose only the smallest change needed to satisfy the frozen objective and acceptance criteria."""

@@ -29,8 +29,9 @@ Codex Team 是一个本地、可恢复、可审计的半自动编排层。它把
 ```text
 用户目标
   → task envelope / Schema 校验
-  → Luna 事实盘点或有界施工（如获授权）
-  → Terra 复杂施工（需要时）
+  → 控制器确定性检查或 DIRECT_L1 Luna 有界事实抽取（需要时）
+  → Terra 只读规划（仅缺少可执行计划时）
+  → Luna 有界施工或 Terra 复杂施工
   → 各工程小节完成自检
   → 固定 candidate commit
   → Sol medium 集中 final acceptance
@@ -38,6 +39,10 @@ Codex Team 是一个本地、可恢复、可审计的半自动编排层。它把
 ```
 
 中间工程小节不再单独派发对抗式审查，但施工 owner 仍必须执行冻结信封内的目标测试、负向检查、范围核对和运行时证据门。这里的自检不能被写成“独立验收”。
+
+`ACCEPTANCE` task 的 Terra xhigh reviewer 是显式本地审查的兼容入口，不代表全工程终验。正常计划调度在全部工程小节 receipt 完成后生成唯一 whole-project `ACCEPTANCE` child。final candidate 可以不同于 FrozenPlan 初始 candidate，但必须是当前 clean HEAD、初始 candidate 的 git 祖先后代，且 diff 落在授权 write union 内；parent ledger 用 `acceptance_task_sha256` 绑定完整 child，child 的 `scheduler-parent.json` 反向定向绑定唯一 parent task、plan、final event 和 candidate，分类时不扫描无关任务。`schedule-final` 通过现有 adversarial-acceptance-1 API 只签发一次 Sol-medium `REVIEW_1`，open 后 assignment 失败可续签。standalone `ACCEPTANCE` 兼容入口不变。
+
+生产 CLI 的零模型调度控制面是 `schedule-batch` → `schedule-result` → `schedule-receipt` → `schedule-final`。`schedule-result` 接收既有执行边界产出的 `ai-result-1`，由 controller 补齐并核对 `dispatch_id/task_id/step_id/attempt`，输出位置不能由调用方指定：controller 从已重放 dispatch 唯一确定 `<state_root>/<task_id>/scheduler-results/<dispatch_id>.json` 并原子冻结，再按该文件 bytes 生成 receipt。结果读取按已打开的目录 fd 定位，拒绝目录换绑、symlink、hardlink 和超限文件。`schedule-final` 先创建 child；同时提供已记录 runtime evidence 对应的 `--owner-receipt` 与 Sol-medium `--acceptor` 时签发 `REVIEW_1`。后续 repair ladder 到达 terminal 授权点后使用 `decide <child_id> authorize_final_xhigh`。
 
 ### Final acceptance 返工路径
 
@@ -74,13 +79,21 @@ Team Call 不授予 Luna review、approval、construction 或 final acceptance �
 
 所有任务都围绕固定 `base_commit`、`candidate_commit` 和授权文件集合运行。关键证据包括：
 
-- task / route / plan / result 的严格 Schema；
+- task / route / route-advice / plan / result 的严格 Schema；
+- optimization 默认 shadow，由已验证 `[optimization]` 计算，与 routing mode 分开；建议只记 sidecar，不改 effective route/roles；enforced 需内部四门全过且推荐为成本降级，否则固定链回退；缺 miss 或缺省 period/origin 不能开门；
+- compact prompt 是双钥匙 armed 字段投影：公开 builder 只读 pinned `[optimization]` 与 `aggregate_metrics(state_root)`，`compact_prompts=true` 且 `evaluate_optimization_gate==ALLOW_ENFORCED` 且 `mode=enforced` 且 compact bytes 小于 full 才生效；shadow、无 state_root 或缺/非法 metrics 回完整 prompt。只去掉可重建包装，不改角色、权限、worktree 或 acceptance；task_id、角色指令、objective、commits、scope、forbidden actions、commands、human gates、plan/step id、hashes、授权票与两条证据授权句存在则逐字保真。acceptance repair ladder 的 assignment prompt 明确不参与 compact，永远 full；
 - runtime evidence（模型、推理档、执行面、sandbox、permission、cwd、native UUID）；
 - cost evidence（实测、投影和 unavailable 明确区分）；
 - append-only events、human decisions 和 assignment capability；
 - 真实 diff、工作树、Git 控制面和测试输出。
 
 状态机遇到 HEAD 漂移、只读角色写入、范围越界、重复 attempt、证据缺失或非法跳转时停止并记录 `BLOCKED`，不依赖模型解释来“继续”。
+
+### 恢复与终止
+
+`resume <task_id>` 只从持久化状态继续。施工首次到达 owner gate 前，控制器会冻结最小恢复上下文（plan、route request、step、attempt）；后续恢复重新校验这些 artifact，并依赖已有 dispatch 记录防止重复派发。`decide ... --resume` 先完整预检恢复参数，再写入 owner decision；live 恢复不会继承上次授权。
+
+`abort <task_id>` 是 owner 决策，可从 `TRANSITIONS` 中的非终态进入 `ABORTED`（这些状态都有 `ABORTED` 出边）。`BLOCKED`、`CLOSED` 与 `ABORTED` 是终态、无出边，不能再 abort。它只追加决策和状态事件，不删除 task、result、runtime evidence 或历史账本。`decide <task_id> authorize_final_xhigh` 只写入 whole-project xhigh 授权票，不改变 REMEDIATION 状态机，且拒绝 `--resume`。
 
 ## 6. 安全边界
 
@@ -92,14 +105,17 @@ Team Call 不授予 Luna review、approval、construction 或 final acceptance �
 ## 7. 代码地图
 
 ```text
-config/                         # 任务、路由、计划、结果、运行时与成本 Schema
+config/                         # 任务、路由、计划、结果、运行时、成本与 route-advice Schema
 scripts/ai_workflow.py          # 主 CLI、任务状态机、Team Call 生产入口
 scripts/ai_workflow_runtime.py  # 原生/exec 运行时身份与证据
 scripts/ai_workflow_artifacts.py# 严格 artifact 校验和数据类
-scripts/ai_workflow_routing.py  # Terra OS 闭集路由
+scripts/ai_workflow_routing.py  # Terra OS 闭集路由与 shadow/enforced advice wrapper
 scripts/ai_workflow_planning.py # 计划和施工信封
+scripts/ai_workflow_scheduler.py# 计划调度与 final ACCEPTANCE child
 scripts/ai_workflow_repairs.py  # acceptance repair ledger v2
 scripts/ai_workflow_team_call.py# Codex Team grammar、分类和收据
+scripts/sync_plugin.py           # 固定 manifest 的 Plugin 检查/原子同步
+scripts/verify_all.sh            # 零模型完整验证入口
 plugins/ai-workflow/             # 对外 Plugin；runtime/config 必须与根目录一致
 tests/                           # 默认假 runner、负向注入和发布一致性测试
 ```
@@ -109,3 +125,7 @@ tests/                           # 默认假 runner、负向注入和发布一�
 - 项目是 public preview，重点是自用和实验，不提供生产 SLA；
 - 真实计费数据、模型服务可用性和 live rollout 仍必须由实际环境单独验证；
 - Windows 原生生命周期不在当前验证范围内。
+
+## 9. 权威与历史材料
+
+当前运行时真值依次来自根目录 `config/` 与 `scripts/`、严格 Schema、分发测试以及本架构说明/README。`docs/superpowers/` 下的早期实验设计和实施计划保留为审计材料；它们不会被重写，且与当前运行时冲突时不参与路由或角色判定。

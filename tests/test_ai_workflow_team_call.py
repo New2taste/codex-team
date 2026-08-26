@@ -72,6 +72,18 @@ class TeamCallContractTest(unittest.TestCase):
         with self.assertRaisesRegex(team.TeamCallError, "TEAM_CALL_UNSAFE_INPUT"):
             team.classify_team_call(unsafe)
 
+    def test_full_verification_is_a_fixed_zero_model_action(self):
+        intent = team.classify_team_call(
+            team.parse_team_call("team call 运行完整验证")
+        )
+
+        self.assertEqual("DIRECT_L0", intent.disposition)
+        self.assertEqual("workflow_verify", intent.l0_action)
+        self.assertEqual(
+            ("sh", "scripts/verify_all.sh"),
+            team.L0_FIXED_ARGV[intent.l0_action],
+        )
+
     def test_every_shell_metacharacter_is_rejected_before_routing(self):
         for character in (";", "|", "&", "$", "`", "\n", "\r", "\\"):
             with self.subTest(character=repr(character)):

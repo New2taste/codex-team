@@ -1,0 +1,218 @@
+{
+  "$defs": {
+    "receipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "type": "string",
+          "const": "construction-receipt-1"
+        },
+        "task_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "subtask_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "dispatch_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "plan_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "task_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "candidate_commit": {
+          "type": "string",
+          "minLength": 1
+        },
+        "result_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["IMPLEMENTED_CANDIDATE", "NEEDS_CLARIFICATION", "BLOCKED"]
+        }
+      },
+      "required": [
+        "schema_version",
+        "task_id",
+        "subtask_id",
+        "dispatch_id",
+        "plan_sha256",
+        "task_sha256",
+        "candidate_commit",
+        "result_sha256",
+        "status"
+      ]
+    },
+    "common": {
+      "schema_version": {
+        "type": "string",
+        "const": "plan-scheduler-1"
+      },
+      "event_index": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "event_id": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{64}$"
+      },
+      "previous_event_id": {
+        "type": ["string", "null"]
+      },
+      "timestamp": {
+        "type": "string",
+        "minLength": 1
+      },
+      "task_id": {
+        "type": "string",
+        "minLength": 1
+      },
+      "plan_sha256": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{64}$"
+      },
+      "task_sha256": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{64}$"
+      }
+    }
+  },
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {"type": "string", "const": "plan-scheduler-1"},
+        "event_type": {"type": "string", "const": "SCHEDULER_OPENED"},
+        "event_index": {"$ref": "#/$defs/common/event_index"},
+        "event_id": {"$ref": "#/$defs/common/event_id"},
+        "previous_event_id": {"$ref": "#/$defs/common/previous_event_id"},
+        "timestamp": {"$ref": "#/$defs/common/timestamp"},
+        "task_id": {"$ref": "#/$defs/common/task_id"},
+        "plan_sha256": {"$ref": "#/$defs/common/plan_sha256"},
+        "task_sha256": {"$ref": "#/$defs/common/task_sha256"},
+        "candidate_commit": {"type": "string", "minLength": 1}
+      },
+      "required": [
+        "schema_version",
+        "event_type",
+        "event_index",
+        "event_id",
+        "previous_event_id",
+        "timestamp",
+        "task_id",
+        "plan_sha256",
+        "task_sha256",
+        "candidate_commit"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {"type": "string", "const": "plan-scheduler-1"},
+        "event_type": {"type": "string", "const": "STEP_DISPATCHED"},
+        "event_index": {"$ref": "#/$defs/common/event_index"},
+        "event_id": {"$ref": "#/$defs/common/event_id"},
+        "previous_event_id": {"$ref": "#/$defs/common/previous_event_id"},
+        "timestamp": {"$ref": "#/$defs/common/timestamp"},
+        "task_id": {"$ref": "#/$defs/common/task_id"},
+        "plan_sha256": {"$ref": "#/$defs/common/plan_sha256"},
+        "task_sha256": {"$ref": "#/$defs/common/task_sha256"},
+        "subtask_id": {"type": "string", "minLength": 1},
+        "dispatch_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "owner_role": {"type": "string", "minLength": 1},
+        "worktree_path": {"type": "string", "minLength": 1},
+        "attempt": {"type": "integer", "minimum": 1},
+        "scope_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "required": [
+        "schema_version",
+        "event_type",
+        "event_index",
+        "event_id",
+        "previous_event_id",
+        "timestamp",
+        "task_id",
+        "plan_sha256",
+        "task_sha256",
+        "subtask_id",
+        "dispatch_id",
+        "owner_role",
+        "worktree_path",
+        "attempt",
+        "scope_sha256"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {"type": "string", "const": "plan-scheduler-1"},
+        "event_type": {"type": "string", "const": "STEP_RECEIPTED"},
+        "event_index": {"$ref": "#/$defs/common/event_index"},
+        "event_id": {"$ref": "#/$defs/common/event_id"},
+        "previous_event_id": {"$ref": "#/$defs/common/previous_event_id"},
+        "timestamp": {"$ref": "#/$defs/common/timestamp"},
+        "task_id": {"$ref": "#/$defs/common/task_id"},
+        "plan_sha256": {"$ref": "#/$defs/common/plan_sha256"},
+        "task_sha256": {"$ref": "#/$defs/common/task_sha256"},
+        "receipt": {"$ref": "#/$defs/receipt"}
+      },
+      "required": [
+        "schema_version",
+        "event_type",
+        "event_index",
+        "event_id",
+        "previous_event_id",
+        "timestamp",
+        "task_id",
+        "plan_sha256",
+        "task_sha256",
+        "receipt"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {"type": "string", "const": "plan-scheduler-1"},
+        "event_type": {"type": "string", "const": "FINAL_ACCEPTANCE_OPENED"},
+        "event_index": {"$ref": "#/$defs/common/event_index"},
+        "event_id": {"$ref": "#/$defs/common/event_id"},
+        "previous_event_id": {"$ref": "#/$defs/common/previous_event_id"},
+        "timestamp": {"$ref": "#/$defs/common/timestamp"},
+        "task_id": {"$ref": "#/$defs/common/task_id"},
+        "plan_sha256": {"$ref": "#/$defs/common/plan_sha256"},
+        "task_sha256": {"$ref": "#/$defs/common/task_sha256"},
+        "acceptance_task_id": {"type": "string", "minLength": 1},
+        "candidate_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "acceptance_task_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "required": [
+        "schema_version",
+        "event_type",
+        "event_index",
+        "event_id",
+        "previous_event_id",
+        "timestamp",
+        "task_id",
+        "plan_sha256",
+        "task_sha256",
+        "acceptance_task_id",
+        "candidate_commit",
+        "acceptance_task_sha256"
+      ]
+    }
+  ]
+}

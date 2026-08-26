@@ -91,6 +91,31 @@ _V2_COMMON_FIELDS = frozenset(
         "candidate_commit",
     }
 )
+_FINAL_XHIGH_DECISION = "authorize_final_xhigh"
+_FINAL_XHIGH_STATE = "FINAL_XHIGH_AUTHORIZED"
+_FINAL_XHIGH_TICKET_FIELDS = frozenset(
+    {
+        "event_type",
+        "decision",
+        "actor",
+        "timestamp_utc",
+        "previous_state",
+        "new_state",
+        "task_sha256",
+        "candidate_commit",
+        "acceptance_event_id",
+    }
+)
+_FROZEN_FINAL_ACCEPTANCE_REWORK = {
+    "fixer_role": "sol_medium_reviewer",
+    "fixer_permission_profile": "assignment-scoped-write",
+    "fixer_distinct_from_acceptor": True,
+    "recheck_role": "sol_medium_reviewer",
+    "recheck_distinct_from_fixer": True,
+    "terminal_escalation_role": "sol_xhigh",
+    "terminal_review_required": False,
+}
+REPAIR_PROMPT_COMPACT_POLICY = "full_only"
 _MAX_EVIDENCE_TRANSCRIPT_BYTES = 64 * 1024
 _SAFE_EXECUTABLE_PATH = os.defpath
 _SAFE_COMMAND_TEXT_PATTERN = re.compile(r"^[A-Za-z0-9_.= -]+$")
@@ -340,11 +365,26 @@ class _TaskContext:
     allowed_write_paths: tuple[str, ...]
 
 
-def _task_context(store: WorkflowStore, task_id: str) -> _TaskContext:
+def _is_whole_project_final(
+    task: Mapping[str, object], *, store: WorkflowStore | None = None
+) -> bool:
+    gates = task.get("human_gates")
+    if not (
+        task.get("task_type") == "ACCEPTANCE"
+        and isinstance(gates, list)
+        and "FINAL_ACCEPTANCE" in gates
+        and store is not None
+    ):
+        return False
+    try:
+        from .ai_workflow_scheduler import verify_final_acceptance_child_binding
+    except ImportError:
+        from ai_workflow_scheduler import verify_final_acceptance_child_binding
+    return verify_final_acceptance_child_binding(store, task)
+
+
+def _frozen_task_context(store: WorkflowStore, task_id: str, task: Mapping[str, object]) -> _TaskContext:
     workflow = _workflow()
-    task = workflow.load_task(store._require_task(task_id) / "task.json")
-    if task.get("task_type") != "REMEDIATION":
-        _fail("REPAIR_INPUT_INVALID", "repairs require a REMEDIATION task")
     base = task.get("base_commit")
     candidate = task.get("candidate_commit")
     if (
@@ -365,6 +405,14 @@ def _task_context(store: WorkflowStore, task_id: str) -> _TaskContext:
         workflow._task_sha256(store, task_id),
         tuple(allowed_write_paths),
     )
+
+
+def _task_context(store: WorkflowStore, task_id: str) -> _TaskContext:
+    workflow = _workflow()
+    task = workflow.load_task(store._require_task(task_id) / "task.json")
+    if task.get("task_type") != "REMEDIATION":
+        _fail("REPAIR_INPUT_INVALID", "repairs require a REMEDIATION task")
+    return _frozen_task_context(store, task_id, task)
 
 
 def _common_event_fields(assignment: RepairAssignment, context: _TaskContext) -> dict[str, object]:
@@ -1139,6 +1187,7 @@ class _AcceptanceReplay:
     started_attestations: dict[str, ControllerExecutionAttestation]
     finished_assignment_ids: set[str]
     repairer_identities: dict[str, str]
+    whole_project_final: bool = False
 
 
 def _v2_receipt_payload(receipt: VerifiedActorReceipt) -> dict[str, object]:
@@ -1195,7 +1244,14 @@ def _v2_event_records(store: WorkflowStore, task_id: str) -> list[dict[str, obje
 
 
 def _v2_context(store: WorkflowStore, task_id: str) -> _TaskContext:
-    return _task_context(store, task_id)
+    workflow = _workflow()
+    task = workflow.load_task(store._require_task(task_id) / "task.json")
+    if task.get("task_type") == "REMEDIATION":
+        return _task_context(store, task_id)
+    if _is_whole_project_final(task, store=store):
+        return _frozen_task_context(store, task_id, task)
+    _fail("REPAIR_INPUT_INVALID", "repairs require a REMEDIATION task")
+    raise AssertionError("unreachable")
 
 
 def _v2_event_id(event: Mapping[str, object]) -> str:
@@ -1251,6 +1307,7 @@ def _v2_validate_observed_receipt(
 ) -> None:
     expected = expected_runtime or {
         "luna": ("gpt-5.6-luna", "max", "workspace-write", "workspace-write"),
+        "luna_construction": ("gpt-5.6-luna", "max", "workspace-write", "workspace-write"),
         "terra_xhigh": ("gpt-5.6-terra", "xhigh", "workspace-write", "workspace-write"),
         "terra_xhigh_reviewer": ("gpt-5.6-terra", "xhigh", "read-only", "read-only"),
         "sol_medium_reviewer": ("gpt-5.6-sol", "medium", "read-only", "read-only"),
@@ -1771,7 +1828,10 @@ def open_task_acceptance(
         _v2_verified_runtime_receipt(
             store, task_id, owner_receipt, stored, expected_attempt_id=None
         )
-        if owner_receipt.requested_role not in {"luna", "terra_xhigh"}:
+        allowed_owners = {"luna", "terra_xhigh"}
+        if _is_whole_project_final(stored, store=store):
+            allowed_owners = {"luna", "terra_xhigh", "luna_construction"}
+        if owner_receipt.requested_role not in allowed_owners:
             _fail("ACCEPTANCE_RECEIPT_MISMATCH", "only Luna or Terra xhigh may own acceptance")
         owner_actor = owner_receipt.actor_identity
         event = _v2_append(
@@ -1850,6 +1910,7 @@ def replay_acceptance_ledger(store: WorkflowStore, task_id: str) -> _AcceptanceR
                 {},
                 set(),
                 {},
+                whole_project_final=_is_whole_project_final(stored_task, store=store),
             )
         else:
             assert replay is not None
@@ -2001,6 +2062,24 @@ def replay_acceptance_ledger(store: WorkflowStore, task_id: str) -> _AcceptanceR
     return replay
 
 
+def _final_acceptance_rework_policy() -> Mapping[str, object]:
+    config = _workflow()._load_workflow_config()
+    policy = config.get("final_acceptance_rework")
+    if not isinstance(policy, Mapping) or dict(policy) != _FROZEN_FINAL_ACCEPTANCE_REWORK:
+        _fail(
+            "ACCEPTANCE_SEQUENCE_INVALID",
+            "final_acceptance_rework policy is not the frozen contract",
+        )
+    return policy
+
+
+def _assert_automatic_xhigh_disabled() -> None:
+    config = _workflow()._load_workflow_config()
+    policy = config.get("policy")
+    if not isinstance(policy, Mapping) or policy.get("automatic_xhigh") is not False:
+        _fail("ACCEPTANCE_SEQUENCE_INVALID", "automatic_xhigh must remain disabled")
+
+
 def _v2_next_phase(replay: _AcceptanceReplay) -> tuple[str, tuple[RepairFinding, ...]]:
     if replay.terminal or replay.active_assignment_id is not None:
         _fail("ACCEPTANCE_SEQUENCE_INVALID", "acceptance ladder has no issuable step")
@@ -2009,6 +2088,16 @@ def _v2_next_phase(replay: _AcceptanceReplay) -> tuple[str, tuple[RepairFinding,
         return "REVIEW_1", ()
     if outcomes["REVIEW_1"] != "REWORK":
         _fail("ACCEPTANCE_SEQUENCE_INVALID", "accepted review already terminally closed the task")
+    if replay.whole_project_final:
+        if "SOL_MEDIUM_REPAIR" not in outcomes:
+            return "SOL_MEDIUM_REPAIR", replay.pending_findings
+        if "SOL_MEDIUM_PEER_REVIEW" not in outcomes:
+            return "SOL_MEDIUM_PEER_REVIEW", replay.pending_findings
+        if outcomes["SOL_MEDIUM_PEER_REVIEW"] != "REWORK":
+            _fail("ACCEPTANCE_SEQUENCE_INVALID", "Sol peer acceptance already terminally closed the task")
+        if "SOL_XHIGH_TERMINAL_REPAIR" not in outcomes:
+            return "SOL_XHIGH_TERMINAL_REPAIR", replay.pending_findings
+        _fail("ACCEPTANCE_SEQUENCE_INVALID", "terminal Sol repair already closed the task")
     if "OWNER_REPAIR" not in outcomes:
         return "OWNER_REPAIR", replay.pending_findings
     if "REVIEW_2" not in outcomes:
@@ -2026,9 +2115,45 @@ def _v2_next_phase(replay: _AcceptanceReplay) -> tuple[str, tuple[RepairFinding,
     _fail("ACCEPTANCE_SEQUENCE_INVALID", "terminal Sol repair already closed the task")
 
 
+def _v2_validate_whole_project_phase_actor(
+    replay: _AcceptanceReplay, assignment: AcceptanceAssignment
+) -> None:
+    phase = assignment.phase
+    actor = assignment.expected_actor
+    policy = _final_acceptance_rework_policy()
+    if phase in {"OWNER_REPAIR", "REVIEW_2"} or actor.role == "terra_xhigh_reviewer":
+        _fail(
+            "ACCEPTANCE_SEQUENCE_INVALID",
+            "whole-project final does not use OWNER_REPAIR, REVIEW_2, or terra_xhigh_reviewer",
+        )
+    if phase == "REVIEW_1":
+        if actor.role != _SOL_MEDIUM_REVIEWER:
+            _fail("ACCEPTANCE_SEQUENCE_INVALID", "whole-project REVIEW_1 requires Sol medium acceptor")
+        return
+    if phase == "SOL_MEDIUM_REPAIR":
+        if actor.role != policy["fixer_role"] or actor.identity in replay.reviewer_identities:
+            _fail("ACCEPTANCE_SEQUENCE_INVALID", "Sol fixer must be distinct from the acceptor")
+        return
+    if phase == "SOL_MEDIUM_PEER_REVIEW":
+        fixer = replay.repairer_identities.get("SOL_MEDIUM_REPAIR")
+        if (
+            actor.role != policy["recheck_role"]
+            or actor.identity == fixer
+            or actor.identity in replay.reviewer_identities
+        ):
+            _fail("ACCEPTANCE_SEQUENCE_INVALID", "Sol recheck must be distinct from acceptor and fixer")
+        return
+    if phase == "SOL_XHIGH_TERMINAL_REPAIR" and actor.role == policy["terminal_escalation_role"]:
+        return
+    _fail("ACCEPTANCE_SEQUENCE_INVALID", "assignment role is not allowed for this ladder phase")
+
+
 def _v2_validate_phase_actor(
     replay: _AcceptanceReplay, assignment: AcceptanceAssignment
 ) -> None:
+    if replay.whole_project_final:
+        _v2_validate_whole_project_phase_actor(replay, assignment)
+        return
     phase = assignment.phase
     actor = assignment.expected_actor
     if phase == "OWNER_REPAIR":
@@ -2092,6 +2217,11 @@ def issue_acceptance_assignment(
             forbidden,
         )
         _v2_validate_phase_actor(replay, assignment)
+        if replay.whole_project_final and phase == "SOL_XHIGH_TERMINAL_REPAIR":
+            _assert_automatic_xhigh_disabled()
+            if any(item.phase == "SOL_XHIGH_TERMINAL_REPAIR" for item in replay.assignments.values()):
+                _fail("ACCEPTANCE_SEQUENCE_INVALID", "terminal Sol xhigh may be issued only once")
+            _require_one_final_xhigh_ticket(store, task_id, replay)
         _v2_append(
             store,
             task_id,
@@ -2102,6 +2232,107 @@ def issue_acceptance_assignment(
             _v2_assignment_payload_for_event(assignment),
         )
         return assignment
+
+
+def _final_xhigh_decision_records(store: WorkflowStore, task_id: str) -> list[dict[str, object]]:
+    path = store._require_task(task_id) / "human-decisions.jsonl"
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        raise _workflow().WorkflowError("DECISION_READ_ERROR", f"cannot read decisions for {task_id}") from exc
+    records: list[dict[str, object]] = []
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise _workflow().WorkflowError(
+                "INVALID_DECISION_RECORD", f"invalid decision JSON for {task_id}"
+            ) from exc
+        if not isinstance(record, dict):
+            _fail("INVALID_DECISION_RECORD", "decision record must be an object")
+        if record.get("decision") == _FINAL_XHIGH_DECISION:
+            records.append(record)
+    return records
+
+
+def _final_xhigh_ticket_is_valid(
+    record: Mapping[str, object],
+    store: WorkflowStore,
+    task_id: str,
+    replay: _AcceptanceReplay,
+) -> bool:
+    if set(record) != _FINAL_XHIGH_TICKET_FIELDS:
+        return False
+    if (
+        record.get("event_type") != "OWNER_DECISION"
+        or record.get("decision") != _FINAL_XHIGH_DECISION
+        or record.get("new_state") != _FINAL_XHIGH_STATE
+    ):
+        return False
+    actor = record.get("actor")
+    if not isinstance(actor, str) or not actor.strip():
+        return False
+    for field in ("timestamp_utc", "previous_state"):
+        value = record.get(field)
+        if not isinstance(value, str) or not value.strip():
+            return False
+    return (
+        record.get("task_sha256") == _workflow()._task_sha256(store, task_id)
+        and record.get("candidate_commit") == replay.current_candidate_commit
+        and record.get("acceptance_event_id") == replay.last_event_id
+    )
+
+
+def _require_one_final_xhigh_ticket(
+    store: WorkflowStore, task_id: str, replay: _AcceptanceReplay
+) -> Mapping[str, object]:
+    tickets = _final_xhigh_decision_records(store, task_id)
+    if any(not _final_xhigh_ticket_is_valid(ticket, store, task_id, replay) for ticket in tickets):
+        _fail("ACCEPTANCE_SEQUENCE_INVALID", "final-xhigh authorization ticket is invalid")
+    if len(tickets) != 1:
+        _fail("ACCEPTANCE_SEQUENCE_INVALID", "exactly one final-xhigh authorization ticket is required")
+    return tickets[0]
+
+
+def authorize_final_xhigh(store: WorkflowStore, task_id: str, actor: str) -> None:
+    """Record one owner-authorized Sol xhigh for whole-project final acceptance."""
+
+    if not isinstance(actor, str) or not actor.strip():
+        _fail("INVALID_ACTOR", "actor must be a non-empty string")
+    workflow = _workflow()
+    with store.lock(task_id):
+        stored = workflow.load_task(store._require_task(task_id) / "task.json")
+        if not _is_whole_project_final(stored, store=store):
+            _fail(
+                "ACCEPTANCE_SEQUENCE_INVALID",
+                "xhigh authorization is reserved for whole-project final acceptance",
+            )
+        replay = replay_acceptance_ledger(store, task_id)
+        if replay is None:
+            _fail("ACCEPTANCE_SEQUENCE_INVALID", "acceptance must be opened before authorizing xhigh")
+        if replay.phase_outcomes.get("SOL_MEDIUM_PEER_REVIEW") != "REWORK":
+            _fail("ACCEPTANCE_SEQUENCE_INVALID", "xhigh authorization requires peer REWORK")
+        if any(item.phase == "SOL_XHIGH_TERMINAL_REPAIR" for item in replay.assignments.values()):
+            _fail("ACCEPTANCE_SEQUENCE_INVALID", "terminal Sol xhigh has already been used")
+        _assert_automatic_xhigh_disabled()
+        if _final_xhigh_decision_records(store, task_id):
+            _fail("ACCEPTANCE_SEQUENCE_INVALID", "whole-project xhigh is already authorized")
+        store.record_decision(
+            task_id,
+            {
+                "event_type": "OWNER_DECISION",
+                "decision": _FINAL_XHIGH_DECISION,
+                "actor": actor.strip(),
+                "timestamp_utc": _event_timestamp(),
+                "previous_state": workflow._current_state(store, task_id),
+                "new_state": _FINAL_XHIGH_STATE,
+                "task_sha256": workflow._task_sha256(store, task_id),
+                "candidate_commit": replay.current_candidate_commit,
+                "acceptance_event_id": replay.last_event_id,
+            },
+        )
 
 
 def _v2_require_issued_assignment(
@@ -2459,6 +2690,8 @@ def _v2_controller_runtime_receipt(
 def _v2_assignment_prompt(
     task: Mapping[str, object], assignment: AcceptanceAssignment
 ) -> str:
+    """Always emit the full assignment prompt; compact projection is not used here."""
+
     action = (
         "Review the pinned candidate and return an acceptance or rework recommendation."
         if assignment.phase in _REVIEW_PHASES

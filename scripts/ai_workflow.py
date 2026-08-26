@@ -18,7 +18,7 @@ import tempfile
 import time
 import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Protocol, Sequence
@@ -93,6 +93,7 @@ RESULT_REQUIRED_FIELDS = frozenset(
         "recommended_next_state",
     }
 )
+RESULT_IDENTITY_FIELDS = frozenset({"dispatch_id", "task_id", "step_id", "attempt"})
 READ_ONLY_ROLES = frozenset(
     {
         "luna",
@@ -156,6 +157,7 @@ try:
         ArtifactError,
         CostEvidence,
         PlanArtifact,
+        RouteAdvice,
         RouteDecision,
         RouteRequest,
         RuntimeEvidence,
@@ -163,6 +165,7 @@ try:
         load_artifact,
         validate_cost_evidence,
         validate_plan_shape,
+        validate_route_advice,
         validate_route_decision,
         validate_route_request,
         validate_runtime_evidence,
@@ -172,6 +175,7 @@ except ImportError:  # direct script execution
         ArtifactError,
         CostEvidence,
         PlanArtifact,
+        RouteAdvice,
         RouteDecision,
         RouteRequest,
         RuntimeEvidence,
@@ -179,6 +183,7 @@ except ImportError:  # direct script execution
         load_artifact,
         validate_cost_evidence,
         validate_plan_shape,
+        validate_route_advice,
         validate_route_decision,
         validate_route_request,
         validate_runtime_evidence,
@@ -229,6 +234,7 @@ try:
     from .ai_workflow_costs import (
         aggregate_paired_cases,
         evaluate_cost_claim,
+        evaluate_optimization_gate,
         finite_nonnegative_or_none,
         normalize_cost_evidence,
         render_cost_sections,
@@ -237,6 +243,7 @@ except ImportError:  # direct script execution
     from ai_workflow_costs import (
         aggregate_paired_cases,
         evaluate_cost_claim,
+        evaluate_optimization_gate,
         finite_nonnegative_or_none,
         normalize_cost_evidence,
         render_cost_sections,
@@ -450,18 +457,122 @@ def _load_role_config(role: str) -> dict[str, object]:
     return role_config
 
 
-def build_role_prompt(
-    role: str,
-    task: Mapping[str, object],
-    contract: Mapping[str, object],
-    evidence_paths: Sequence[Path],
-) -> str:
-    """Build the bounded prompt from only the supplied task, contract, and evidence."""
+_COMPACT_GATE_TOKEN = object()
 
-    role_config = _load_role_config(role)
-    validate_task(task)
-    if not isinstance(contract, Mapping):
-        _fail("INVALID_CONTRACT", "contract must be an object")
+
+@dataclass(frozen=True)
+class PromptBuildResult:
+    """Deterministic prompt render: full or compact projection, never a summary."""
+
+    prompt: str
+    mode: str
+    reason: str
+    prompt_bytes: int
+    _gate_token: object = field(default=None, repr=False, compare=False)
+
+
+TASK_COMPACT_REQUIRED_FIELDS = (
+    "task_id",
+    "schema_version",
+    "task_type",
+    "objective",
+    "repository_root",
+    "source_worktree",
+    "base_commit",
+    "candidate_commit",
+    "authoritative_files",
+    "allowed_write_paths",
+    "forbidden_actions",
+    "risk_flags",
+    "acceptance_commands",
+    "verification_level",
+    "human_gates",
+)
+TASK_COMPACT_OPTIONAL_FIELDS = ("paired_case_id",)
+EVIDENCE_AUTHORIZATION_SENTENCES = (
+    "Read the named evidence files at the listed paths before evaluating the task.",
+    "Use only the task contract and named evidence above; no additional source material is authorized.",
+)
+CONTRACT_COMPACT_REQUIRED_FIELDS = (
+    "schema_version",
+    "role",
+    "dispatch_id",
+    "plan_id",
+    "plan_sha256",
+    "task_sha256",
+    "request_sha256",
+    "subtask_id",
+    "step_id",
+    "write_scope",
+    "read_scope",
+    "do_not_touch",
+    "acceptance_criteria",
+    "acceptance",
+    "acceptance_commands",
+    "verification_commands",
+    "verification_level",
+    "dependencies",
+    "depends_on",
+    "permission_profile",
+    "candidate_sha256",
+    "candidate_commit",
+    "evidence_sha256",
+    "first_artifact",
+    "construction_envelope",
+    "runtime_session_id",
+    "session_id",
+    "native_agent_id",
+    "native_thread_id",
+    "owner_decision",
+    "owner_decisions",
+    "authorization_ticket",
+    "authorization_tickets",
+    "output_schema",
+    "output_schema_path",
+    "output_path",
+    "required_output_schema",
+    "required_output_path",
+    "team_call_attestation",
+)
+
+
+def resolve_compact_prompt_decision(
+    *,
+    config: object = None,
+    metrics: object = None,
+) -> tuple[bool, str]:
+    """Arm compact prompts only from validated config plus the data gate."""
+
+    if config is None:
+        try:
+            config = _load_workflow_config()
+        except Exception:
+            return False, "config_unavailable"
+    try:
+        policy = resolve_optimization_policy(config)
+    except Exception:
+        return False, "policy_invalid"
+    if policy.mode != "enforced":
+        return False, "mode_not_enforced"
+    if policy.compact_prompts is not True:
+        return False, "compact_flag_false"
+    if not isinstance(metrics, Mapping):
+        return False, "metrics_missing"
+    if metrics.get("synthetic") is True:
+        return False, "synthetic"
+    try:
+        gate = evaluate_optimization_gate(
+            metrics,
+            minimum_cases=policy.minimum_paired_cases,
+        )
+    except Exception:
+        return False, "metrics_invalid"
+    if gate != "ALLOW_ENFORCED":
+        return False, "gate_not_armed"
+    return True, "armed"
+
+
+def _named_evidence(evidence_paths: Sequence[Path]) -> list[dict[str, str]]:
     evidence = []
     for evidence_path in evidence_paths:
         path = Path(evidence_path)
@@ -470,37 +581,224 @@ def build_role_prompt(
         except OSError as exc:
             raise WorkflowError("EVIDENCE_READ_ERROR", f"cannot read evidence {path}") from exc
         evidence.append({"path": str(path), "sha256": digest})
+    return evidence
+
+
+def _role_prompt_suffix(
+    role: str,
+    role_config: Mapping[str, object],
+    task: Mapping[str, object],
+) -> tuple[str, ...]:
+    return (
+        f'Output "role" exactly as "{role}".',
+        'Output "status" as exactly one of: '
+        + ", ".join(role_config["allowed_statuses"])
+        + ".",
+        *(
+            (
+                "For Luna L1, output 1 to 5 claims and exactly 1 counter_check unless status is BLOCKED; "
+                "if BLOCKED, output at most 5 claims and at most 1 counter_check. "
+                "Every claim must reference existing evidence and every counter_check must target an existing claim.",
+            )
+            if role == "luna" and task["verification_level"] == "L1"
+            else ()
+        ),
+        *(
+            (
+                "Do not write, modify, delete, stage, commit, merge, or push repository files.",
+            )
+            if role in READ_ONLY_ROLES
+            else ()
+        ),
+        *EVIDENCE_AUTHORIZATION_SENTENCES,
+    )
+
+
+def _render_full_role_prompt(
+    role: str,
+    role_config: Mapping[str, object],
+    task: Mapping[str, object],
+    contract: Mapping[str, object],
+    evidence: Sequence[Mapping[str, str]],
+) -> str:
     return "\n".join(
         (
             f"Role instructions: {role_config['instructions']}",
             f"Task envelope: {_canonical_json(dict(task))}",
             f"Task contract: {_canonical_json(dict(contract))}",
-            f"Named evidence: {_canonical_json(evidence)}",
-            f'Output "role" exactly as "{role}".',
-            'Output "status" as exactly one of: '
-            + ", ".join(role_config["allowed_statuses"])
-            + ".",
-            *(
-                (
-                    "For Luna L1, output 1 to 5 claims and exactly 1 counter_check unless status is BLOCKED; "
-                    "if BLOCKED, output at most 5 claims and at most 1 counter_check. "
-                    "Every claim must reference existing evidence and every counter_check must target an existing claim.",
-                )
-                if role == "luna" and task["verification_level"] == "L1"
-                else ()
-            ),
-            *(
-                (
-                    "Do not write, modify, delete, stage, commit, merge, or push repository files.",
-                )
-                if role in READ_ONLY_ROLES
-                else ()
-            ),
-            "Read the named evidence files at the listed paths before evaluating the task.",
-            "Use only the task contract and named evidence above; no additional source material is authorized.",
+            f"Named evidence: {_canonical_json(list(evidence))}",
+            *_role_prompt_suffix(role, role_config, task),
             "only output ai-result-1 JSON",
         )
     )
+
+
+def _project_compact_context(
+    task: Mapping[str, object],
+    contract: Mapping[str, object],
+) -> dict[str, object] | None:
+    projected: dict[str, object] = {}
+    for key in TASK_COMPACT_REQUIRED_FIELDS:
+        if key in task:
+            projected[key] = task[key]
+    for key in TASK_COMPACT_OPTIONAL_FIELDS:
+        if key in task:
+            projected[key] = task[key]
+    for key, value in contract.items():
+        if not isinstance(key, str):
+            return None
+        if key in projected and projected[key] == value:
+            continue
+        projected[f"contract.{key}" if key in projected else key] = value
+    return projected
+
+
+def _canonical_equal(left: object, right: object) -> bool:
+    try:
+        return _canonical_json(left) == _canonical_json(right)
+    except WorkflowError:
+        return False
+
+
+def _read_compact_context(prompt: str) -> dict[str, object] | None:
+    for line in prompt.splitlines():
+        if not line.startswith("Context: "):
+            continue
+        try:
+            value = json.loads(line.removeprefix("Context: "))
+        except json.JSONDecodeError:
+            return None
+        return value if isinstance(value, dict) else None
+    return None
+
+
+def _compact_projection_is_faithful(
+    prompt: str,
+    role: str,
+    role_config: Mapping[str, object],
+    task: Mapping[str, object],
+    contract: Mapping[str, object],
+) -> bool:
+    if str(role_config["instructions"]) not in prompt:
+        return False
+    if f'Output "role" exactly as "{role}".' not in prompt:
+        return False
+    if any(sentence not in prompt for sentence in EVIDENCE_AUTHORIZATION_SENTENCES):
+        return False
+    expected = _project_compact_context(task, contract)
+    actual = _read_compact_context(prompt)
+    if expected is None or actual is None or set(actual) != set(expected):
+        return False
+    return all(_canonical_equal(actual[key], value) for key, value in expected.items())
+
+
+def _render_compact_role_prompt(
+    role: str,
+    role_config: Mapping[str, object],
+    task: Mapping[str, object],
+    contract: Mapping[str, object],
+    evidence: Sequence[Mapping[str, str]],
+) -> str | None:
+    projected = _project_compact_context(task, contract)
+    if projected is None:
+        return None
+    try:
+        context_json = _canonical_json(projected)
+        parsed = json.loads(context_json)
+        evidence_json = _canonical_json(list(evidence))
+    except (WorkflowError, json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(parsed, dict) or set(parsed) != set(projected):
+        return None
+    if any(not _canonical_equal(parsed[key], value) for key, value in projected.items()):
+        return None
+    prompt = "\n".join(
+        (
+            f"Role instructions: {role_config['instructions']}",
+            f"Context: {context_json}",
+            f"Named evidence: {evidence_json}",
+            *_role_prompt_suffix(role, role_config, task),
+            "only output ai-result-1 JSON",
+        )
+    )
+    if not _compact_projection_is_faithful(prompt, role, role_config, task, contract):
+        return None
+    return prompt
+
+
+def _builder_compact_decision(state_root: Path | None) -> tuple[bool, str]:
+    try:
+        config = _load_workflow_config()
+    except Exception:
+        return False, "config_unavailable"
+    metrics = None
+    if state_root is not None:
+        try:
+            metrics = aggregate_metrics(Path(state_root))
+        except Exception:
+            return False, "metrics_invalid"
+    return resolve_compact_prompt_decision(config=config, metrics=metrics)
+
+
+def build_role_prompt_result(
+    role: str,
+    task: Mapping[str, object],
+    contract: Mapping[str, object],
+    evidence_paths: Sequence[Path],
+    *,
+    state_root: Path | None = None,
+) -> PromptBuildResult:
+    """Build a full or compact role prompt from pinned config and state metrics."""
+
+    role_config = _load_role_config(role)
+    validate_task(task)
+    if not isinstance(contract, Mapping):
+        _fail("INVALID_CONTRACT", "contract must be an object")
+    evidence = _named_evidence(evidence_paths)
+    full_prompt = _render_full_role_prompt(role, role_config, task, contract, evidence)
+    armed, reason = _builder_compact_decision(state_root)
+    if armed:
+        compact_prompt = _render_compact_role_prompt(
+            role, role_config, task, contract, evidence
+        )
+        if compact_prompt is not None:
+            compact_bytes = len(compact_prompt.encode("utf-8"))
+            if compact_bytes < len(full_prompt.encode("utf-8")):
+                return PromptBuildResult(
+                    prompt=compact_prompt,
+                    mode="compact",
+                    reason=reason,
+                    prompt_bytes=compact_bytes,
+                    _gate_token=_COMPACT_GATE_TOKEN,
+                )
+            reason = "compact_not_smaller"
+        else:
+            reason = "compact_unfaithful"
+    return PromptBuildResult(
+        prompt=full_prompt,
+        mode="full",
+        reason=reason,
+        prompt_bytes=len(full_prompt.encode("utf-8")),
+    )
+
+
+def build_role_prompt(
+    role: str,
+    task: Mapping[str, object],
+    contract: Mapping[str, object],
+    evidence_paths: Sequence[Path],
+    *,
+    state_root: Path | None = None,
+) -> str:
+    """Build the bounded prompt from only the supplied task, contract, and evidence."""
+
+    return build_role_prompt_result(
+        role,
+        task,
+        contract,
+        evidence_paths,
+        state_root=state_root,
+    ).prompt
 
 
 def build_codex_command(role: str, repo: Path, output_path: Path, schema_path: Path) -> list[str]:
@@ -693,6 +991,7 @@ def _controller_cost_attempt(
     attempt_id: str | None = None,
     verification_seconds: float = 0.0,
     base_metric_run: Mapping[str, object] | None = None,
+    compact_applied: bool = False,
 ) -> None:
     """Append controller-owned cost evidence for one success or failed attempt."""
 
@@ -705,6 +1004,7 @@ def _controller_cost_attempt(
         "role": role,
         "status": quality_outcome,
         "duration_seconds": duration_seconds,
+        "compact_applied": compact_applied is True,
     })
     metric_run["cost_evidence"] = {
         "schema_version": "cost-evidence-1",
@@ -726,11 +1026,10 @@ def _controller_cost_attempt(
     }
     if attempt_id is not None:
         metric_run["cost_evidence"]["attempt_id"] = attempt_id
-    record_metrics(
+    _record_controller_metrics(
         task_id,
         metric_run,
         state_root=state_root,
-        _controller_owned=True,
     )
 
 
@@ -771,12 +1070,29 @@ def validate_role_result(
         _fail("INVALID_ROLE_RESULT", "role result must be an object")
     fields = set(result)
     missing = sorted(RESULT_REQUIRED_FIELDS - fields)
-    unknown = sorted(fields - RESULT_REQUIRED_FIELDS)
+    identity_fields = fields & RESULT_IDENTITY_FIELDS
+    unknown = sorted(fields - RESULT_REQUIRED_FIELDS - RESULT_IDENTITY_FIELDS)
+    if identity_fields and identity_fields != RESULT_IDENTITY_FIELDS:
+        missing_identity = sorted(RESULT_IDENTITY_FIELDS - identity_fields)[0]
+        _fail("INVALID_ROLE_RESULT", f"unexpected result field {missing_identity}")
     if missing or unknown:
         field = missing[0] if missing else unknown[0]
         _fail("INVALID_ROLE_RESULT", f"unexpected result field {field}")
     if result["schema_version"] != "ai-result-1":
         _fail("INVALID_ROLE_RESULT", "schema_version must be ai-result-1")
+    if identity_fields:
+        if (
+            not isinstance(result["dispatch_id"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", result["dispatch_id"])
+            or not isinstance(result["task_id"], str)
+            or not result["task_id"]
+            or not isinstance(result["step_id"], str)
+            or not result["step_id"]
+            or not isinstance(result["attempt"], int)
+            or isinstance(result["attempt"], bool)
+            or result["attempt"] < 1
+        ):
+            _fail("INVALID_ROLE_RESULT", "scheduler result identity is invalid")
     if result["role"] != role:
         _fail("ROLE_MISMATCH", f"result role does not match {role}")
     status = result["status"]
@@ -1141,6 +1457,85 @@ def _require_runtime_sessions_directory(value: Path | None) -> Path:
     return value
 
 
+def _construction_prompt_candidates(
+    task: Mapping[str, object],
+    context: ConstructionExecutionContext,
+) -> tuple[str, str | None]:
+    """Render legal full/compact contract candidates without reading the gate."""
+
+    role_config = _load_role_config(context.role)
+    contract = context.contract()
+    full_prompt = _render_full_role_prompt(context.role, role_config, task, contract, ())
+    compact_prompt = _render_compact_role_prompt(
+        context.role, role_config, task, contract, ()
+    )
+    if compact_prompt is None:
+        return full_prompt, None
+    if len(compact_prompt.encode("utf-8")) >= len(full_prompt.encode("utf-8")):
+        return full_prompt, None
+    return full_prompt, compact_prompt
+
+
+def _reconcile_construction_prompt(
+    task: Mapping[str, object],
+    context: ConstructionExecutionContext,
+    prompt: str,
+    prompt_result: PromptBuildResult | None,
+) -> str:
+    """Require the prompt to equal a frozen contract candidate, never a later gate."""
+
+    full_prompt, compact_prompt = _construction_prompt_candidates(task, context)
+    if prompt == full_prompt:
+        matched = "full"
+    elif (
+        compact_prompt is not None
+        and prompt == compact_prompt
+        and prompt_result is not None
+        and prompt_result._gate_token is _COMPACT_GATE_TOKEN
+    ):
+        matched = "compact"
+    else:
+        _fail(
+            "CONSTRUCTION_PROMPT_MISMATCH",
+            "construction prompt must be generated from the frozen contract",
+        )
+    if prompt_result is not None and prompt_result.mode != matched:
+        _fail(
+            "CONSTRUCTION_PROMPT_MISMATCH",
+            "construction prompt result mode does not match the frozen contract candidate",
+        )
+    return matched
+
+
+def _require_self_consistent_prompt_result(
+    prompt: str,
+    prompt_result: PromptBuildResult | None,
+) -> PromptBuildResult | None:
+    """Accept only a self-consistent builder result; forged compact metadata is rejected."""
+
+    if prompt_result is None:
+        return None
+    if not isinstance(prompt_result, PromptBuildResult) or prompt_result.prompt != prompt:
+        _fail("INVALID_PROMPT", "prompt result does not match the supplied prompt")
+    if prompt_result.prompt_bytes != len(prompt.encode("utf-8")):
+        _fail("INVALID_PROMPT", "prompt result bytes do not match the prompt")
+    if prompt_result.mode not in {"full", "compact"}:
+        _fail("INVALID_PROMPT", "prompt result mode is invalid")
+    if prompt_result.mode == "compact":
+        if (
+            prompt_result.reason != "armed"
+            or prompt_result._gate_token is not _COMPACT_GATE_TOKEN
+        ):
+            _fail("INVALID_PROMPT", "compact prompt result reason is invalid")
+        if "Context: " not in prompt or "Task envelope:" in prompt:
+            _fail("INVALID_PROMPT", "compact prompt result is not a compact projection")
+        if any(sentence not in prompt for sentence in EVIDENCE_AUTHORIZATION_SENTENCES):
+            _fail("INVALID_PROMPT", "compact prompt result dropped evidence authorization")
+    elif "Task envelope:" not in prompt:
+        _fail("INVALID_PROMPT", "full prompt result is not a full prompt")
+    return prompt_result
+
+
 def run_codex(
     role: str,
     task: dict,
@@ -1151,12 +1546,14 @@ def run_codex(
     construction_plan: object | None = None,
     construction_step_id: object = None,
     construction_context: ConstructionExecutionContext | None = None,
+    prompt_result: PromptBuildResult | None = None,
 ) -> dict:
     """Run one pinned Codex role and accept only a validated output document."""
 
     validate_task(task)
     if not isinstance(prompt, str):
         _fail("INVALID_PROMPT", "prompt must be a string")
+    accepted_prompt_result = _require_self_consistent_prompt_result(prompt, prompt_result)
     luna_construction_step: FrozenSubtask | None = None
     if role == "luna_construction":
         if task["task_type"] != "REMEDIATION" or task["risk_flags"]:
@@ -1179,9 +1576,13 @@ def run_codex(
             != validate_plan(construction_plan, task).plan_sha256
         ):
             _fail("LUNA_ENVELOPE_INVALID", "luna construction context does not bind the supplied step")
-        expected_prompt = build_construction_role_prompt(task, construction_context)
-        if prompt != expected_prompt:
-            _fail("CONSTRUCTION_PROMPT_MISMATCH", "construction prompt must be generated from the frozen contract")
+    if construction_context is not None and role in {"luna_construction", "terra_xhigh"}:
+        _reconcile_construction_prompt(
+            task,
+            construction_context,
+            prompt,
+            accepted_prompt_result,
+        )
     accounting_context = _require_attempt_accounting_context(
         attempt_context, task["task_id"], role
     )
@@ -1250,6 +1651,11 @@ def run_codex(
             quality_outcome,
             paths.state_root,
             attempt_id=attempt_id,
+            compact_applied=(
+                accepted_prompt_result is not None
+                and accepted_prompt_result.mode == "compact"
+                and accepted_prompt_result._gate_token is _COMPACT_GATE_TOKEN
+            ),
         )
         attempt_recorded = True
 
@@ -1541,11 +1947,11 @@ TRANSITIONS = {
     "EVIDENCE_RUNNING": frozenset({"EVIDENCE_READY", "BLOCKED", "ABORTED"}),
     "EVIDENCE_READY": frozenset({"PLAN_OR_REVIEW_RUNNING", "BLOCKED", "ABORTED"}),
     "PLAN_OR_REVIEW_RUNNING": frozenset(
-        {"PLAN_READY", "REVIEW_READY", "BLOCKED", "ESCALATION_PROPOSED"}
+        {"PLAN_READY", "REVIEW_READY", "BLOCKED", "ESCALATION_PROPOSED", "ABORTED"}
     ),
-    "PLAN_READY": frozenset({"AWAITING_OWNER_DECISION"}),
-    "REVIEW_READY": frozenset({"AWAITING_OWNER_DECISION"}),
-    "ESCALATION_PROPOSED": frozenset({"AWAITING_OWNER_DECISION"}),
+    "PLAN_READY": frozenset({"AWAITING_OWNER_DECISION", "ABORTED"}),
+    "REVIEW_READY": frozenset({"AWAITING_OWNER_DECISION", "ABORTED"}),
+    "ESCALATION_PROPOSED": frozenset({"AWAITING_OWNER_DECISION", "ABORTED"}),
     "AWAITING_OWNER_DECISION": frozenset(
         {
             "APPROVED_FOR_EXECUTION",
@@ -1561,10 +1967,16 @@ TRANSITIONS = {
     "ESCALATION_AUTHORIZED": frozenset({"PLAN_OR_REVIEW_RUNNING", "ABORTED"}),
     "DEFERRED": frozenset({"TASK_VALIDATED", "CLOSED", "ABORTED"}),
     "WORKTREE_READY": frozenset({"IMPLEMENTATION_RUNNING", "BLOCKED", "ABORTED"}),
-    "IMPLEMENTATION_RUNNING": frozenset({"IMPLEMENTED_CANDIDATE", "BLOCKED", "NEEDS_REPLAN"}),
-    "IMPLEMENTED_CANDIDATE": frozenset({"PRECHECK_RUNNING", "BLOCKED"}),
-    "PRECHECK_RUNNING": frozenset({"PRECHECK_READY", "BLOCKED"}),
-    "PRECHECK_READY": frozenset({"PLAN_OR_REVIEW_RUNNING", "BLOCKED"}),
+    "IMPLEMENTATION_RUNNING": frozenset(
+        {"IMPLEMENTED_CANDIDATE", "BLOCKED", "NEEDS_REPLAN", "ABORTED"}
+    ),
+    "IMPLEMENTED_CANDIDATE": frozenset(
+        {"PRECHECK_RUNNING", "BLOCKED", "ABORTED"}
+    ),
+    "PRECHECK_RUNNING": frozenset({"PRECHECK_READY", "BLOCKED", "ABORTED"}),
+    "PRECHECK_READY": frozenset(
+        {"PLAN_OR_REVIEW_RUNNING", "BLOCKED", "ABORTED"}
+    ),
     "NEEDS_REPLAN": frozenset({"AWAITING_OWNER_DECISION", "BLOCKED", "ABORTED"}),
 }
 WORKFLOW_STATES = frozenset(TRANSITIONS) | frozenset(
@@ -1626,26 +2038,56 @@ def atomic_write_json(path: Path, value: object) -> None:
                 pass
 
 
-def write_json_once(path: Path, value: object, *, conflict_code: str) -> None:
-    """Create a frozen JSON artifact with O_EXCL/O_NOFOLLOW semantics."""
+def write_json_once(path: Path, value: object, *, conflict_code: str) -> str:
+    """Atomically publish one frozen JSON artifact without replacing an existing one."""
 
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
+    payload = (_canonical_json(value) + "\n").encode("utf-8")
+    digest = hashlib.sha256(payload).hexdigest()
+    temporary: Path | None = None
+    parent_descriptor = -1
+    published = False
     try:
-        descriptor = os.open(
-            target,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-            0o600,
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        parent_descriptor = os.open(
+            target.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
         )
-    except FileExistsError:
-        _fail(conflict_code, f"{target.name} is already frozen")
+        fcntl.flock(parent_descriptor, fcntl.LOCK_EX)
+        if target.exists() or target.is_symlink():
+            _fail(conflict_code, f"{target.name} is already frozen")
+        os.replace(temporary, target)
+        temporary = None
+        published = True
+        os.fsync(parent_descriptor)
+        return digest
+    except WorkflowError:
+        raise
     except OSError as exc:
-        raise WorkflowError("ATOMIC_WRITE_FAILED", f"cannot create {target.name}") from exc
-    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-        handle.write(_canonical_json(value))
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
+        code = (
+            "ATOMIC_WRITE_PUBLISHED_UNSYNCED"
+            if published
+            else "ATOMIC_WRITE_FAILED"
+        )
+        raise WorkflowError(code, f"cannot write {target.name}") from exc
+    finally:
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def append_jsonl(path: Path, record: Mapping[str, object]) -> None:
@@ -1802,17 +2244,31 @@ class WorkflowStore:
 
 try:
     from .ai_workflow_routing import (
+        OptimizationAdviceResult,
+        OptimizationPolicy,
         RuntimeRouteDecision,
+        apply_route_advice as _apply_route_advice,
         decide_route as _decide_route,
+        evaluate_and_apply_route_advice as _evaluate_and_apply_route_advice,
+        persist_or_reuse_route_decision as _persist_or_reuse_route_decision,
+        record_route_advice as _record_route_advice,
         record_route_decision as _record_route_decision,
+        resolve_optimization_policy as _resolve_optimization_policy,
         resolve_role_policy as _resolve_role_policy,
         terra_os_read_only_role as _terra_os_read_only_role,
     )
 except ImportError:  # direct script execution
     from ai_workflow_routing import (
+        OptimizationAdviceResult,
+        OptimizationPolicy,
         RuntimeRouteDecision,
+        apply_route_advice as _apply_route_advice,
         decide_route as _decide_route,
+        evaluate_and_apply_route_advice as _evaluate_and_apply_route_advice,
+        persist_or_reuse_route_decision as _persist_or_reuse_route_decision,
+        record_route_advice as _record_route_advice,
         record_route_decision as _record_route_decision,
+        resolve_optimization_policy as _resolve_optimization_policy,
         resolve_role_policy as _resolve_role_policy,
         terra_os_read_only_role as _terra_os_read_only_role,
     )
@@ -1865,6 +2321,80 @@ def record_route_decision(
     """Persist a strict route artifact and its append-only decision event."""
 
     return _record_route_decision(store, task_id, decision)
+
+
+def persist_or_reuse_route_decision(
+    store: WorkflowStore, task_id: str, decision: RuntimeRouteDecision
+) -> RuntimeRouteDecision:
+    """Write a route decision, or reuse the stored wire when retry semantics match."""
+
+    return _persist_or_reuse_route_decision(store, task_id, decision)
+
+
+def resolve_optimization_policy(config: object) -> OptimizationPolicy:
+    """Read the closed optimization policy without writing configuration."""
+
+    return _resolve_optimization_policy(config)
+
+
+def evaluate_and_apply_route_advice(
+    decision: RuntimeRouteDecision,
+    *,
+    recommended_route: object = None,
+    state_root: Path | None = None,
+    task: object = None,
+    request: object = None,
+    construction_plan: object | None = None,
+    construction_step_id: object = None,
+) -> OptimizationAdviceResult:
+    """Compute the optimization gate from verified config and metrics."""
+
+    return _evaluate_and_apply_route_advice(
+        decision,
+        recommended_route=recommended_route,
+        state_root=state_root,
+        task=task,
+        request=request,
+        construction_plan=construction_plan,
+        construction_step_id=construction_step_id,
+    )
+
+
+def apply_route_advice(
+    decision: RuntimeRouteDecision,
+    *,
+    recommended_route: object = None,
+    state_root: Path | None = None,
+    task: object = None,
+    request: object = None,
+    construction_plan: object | None = None,
+    construction_step_id: object = None,
+) -> OptimizationAdviceResult:
+    """Public wrapper with no caller-supplied gate_result shortcut."""
+
+    return _apply_route_advice(
+        decision,
+        recommended_route=recommended_route,
+        state_root=state_root,
+        task=task,
+        request=request,
+        construction_plan=construction_plan,
+        construction_step_id=construction_step_id,
+    )
+
+
+def record_route_advice(
+    store: WorkflowStore,
+    task_id: str,
+    advice: object,
+    *,
+    request_sha256: str | None = None,
+) -> Path:
+    """Persist a write-once route-advice sidecar bound to the stored decision."""
+
+    return _record_route_advice(
+        store, task_id, advice, request_sha256=request_sha256
+    )
 
 
 try:
@@ -1934,9 +2464,12 @@ class ConstructionExecutionContext:
         }
 
 
-def build_construction_role_prompt(
-    task: Mapping[str, object], context: ConstructionExecutionContext
-) -> str:
+def build_construction_role_prompt_result(
+    task: Mapping[str, object],
+    context: ConstructionExecutionContext,
+    *,
+    state_root: Path | None = None,
+) -> PromptBuildResult:
     """Create the only prompt allowed for a bounded construction launch."""
 
     if not isinstance(context, ConstructionExecutionContext):
@@ -1945,7 +2478,28 @@ def build_construction_role_prompt(
         _fail("CONSTRUCTION_CONTEXT_INVALID", "construction context has an invalid owner role")
     if context.role == "luna_construction" and context.step.construction_envelope is None:
         _fail("LUNA_ENVELOPE_INVALID", "luna construction context lacks its envelope")
-    return build_role_prompt(context.role, task, context.contract(), ())
+    return build_role_prompt_result(
+        context.role,
+        task,
+        context.contract(),
+        (),
+        state_root=state_root,
+    )
+
+
+def build_construction_role_prompt(
+    task: Mapping[str, object],
+    context: ConstructionExecutionContext,
+    *,
+    state_root: Path | None = None,
+) -> str:
+    """Create the only prompt allowed for a bounded construction launch."""
+
+    return build_construction_role_prompt_result(
+        task,
+        context,
+        state_root=state_root,
+    ).prompt
 
 
 def _parse_metric_number(value: object) -> int | float | None:
@@ -1969,6 +2523,12 @@ def _metric_duration(value: object) -> float:
     if parsed is None or parsed < 0:
         return 0.0
     return float(parsed)
+
+
+def _metric_nonneg_int_or_none(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
 
 
 def _metric_identifiers(value: object) -> list[str]:
@@ -2007,14 +2567,22 @@ def _normalize_metric_run(
     if not adopted_ids:
         adopted_ids = _metric_identifiers(run.get("adopted_finding_ids"))
     period = run.get("period")
-    if period not in {"calibration", "experiment"}:
+    period_declared = period in {"calibration", "experiment"}
+    if not period_declared:
         period = "experiment"
     workflow_state = run.get("workflow_state")
     activity = run.get("activity")
     status = run.get("status")
+    data_origin = run.get("data_origin")
+    origin_declared = data_origin in {"runtime", "synthetic_fixture"}
+    if not origin_declared:
+        data_origin = "runtime"
     normalized = {
         "role": role,
         "timestamp_utc": _utc_timestamp(),
+        "data_origin": data_origin,
+        "period_declared": period_declared,
+        "origin_declared": origin_declared,
         "duration_seconds": _metric_duration(run.get("duration_seconds")),
         "token_usage": token_usage,
         "period": period,
@@ -2027,6 +2595,12 @@ def _normalize_metric_run(
         "full_suite_run": run.get("full_suite_run") is True,
         "status": status if isinstance(status, str) else None,
     }
+    if run.get("compact_applied") is True:
+        normalized["compact_applied"] = True
+    if "p0_miss_count" in run:
+        normalized["p0_miss_count"] = _metric_nonneg_int_or_none(run.get("p0_miss_count"))
+    if "p1_miss_count" in run:
+        normalized["p1_miss_count"] = _metric_nonneg_int_or_none(run.get("p1_miss_count"))
     # Preserve explicitly supplied cost-attempt fields as an append-only
     # nested record.  Legacy metric runs that have no paired-case identity do
     # not acquire synthetic token or price values.
@@ -2111,24 +2685,54 @@ def _load_metrics_document(path: Path, task_id: str) -> dict[str, object]:
     return document
 
 
-def record_metrics(
+def _record_metrics(
     task_id: str,
     run: Mapping[str, object],
     *,
-    state_root: Path | None = None,
-    _controller_owned: bool = False,
+    state_root: Path | None,
+    controller_owned: bool,
 ) -> None:
-    """Record one role attempt; cost evidence is accepted only from controller code."""
-
     store = WorkflowStore(WORKFLOW_STATE_ROOT if state_root is None else state_root)
     path = store.metrics_path(task_id)
     document = _load_metrics_document(path, task_id)
-    normalized_run = _normalize_metric_run(run, controller_owned=_controller_owned)
+    normalized_run = _normalize_metric_run(run, controller_owned=controller_owned)
     document["runs"].append(normalized_run)
     # The top-level value describes this newest raw attempt. It is null when
     # Codex JSONL did not explicitly provide a parseable usage number.
     document["token_usage"] = normalized_run["token_usage"]
     atomic_write_json(path, document)
+
+
+def record_metrics(
+    task_id: str,
+    run: Mapping[str, object],
+    *,
+    state_root: Path | None = None,
+) -> None:
+    """Record untrusted observation metrics without accepting cost provenance."""
+
+    _record_metrics(
+        task_id,
+        run,
+        state_root=state_root,
+        controller_owned=False,
+    )
+
+
+def _record_controller_metrics(
+    task_id: str,
+    run: Mapping[str, object],
+    *,
+    state_root: Path | None = None,
+) -> None:
+    """Controller-only cost-attempt persistence boundary."""
+
+    _record_metrics(
+        task_id,
+        run,
+        state_root=state_root,
+        controller_owned=True,
+    )
 
 
 def _read_metrics_runs(task_dir: Path, task_id: str) -> list[dict[str, object]]:
@@ -2184,10 +2788,24 @@ def aggregate_metrics(root: Path) -> dict:
     semantic_reworks = 0
     full_suite_runs = 0
     end_to_end_seconds = 0.0
+    prompt_bytes_total = 0
+    prompt_record_count = 0
+    compact_applied_count = 0
+    input_tokens_total = 0
+    cached_input_tokens_total = 0
+    owner_gate_count = 0
+    closed_task_ids: set[str] = set()
     stop_line_events: list[dict[str, object]] = []
     cost_records: list[Mapping[str, object]] = []
     cost_unavailable_attempts = 0
     synthetic_cost_attempts = 0
+    p0_miss_total = 0
+    p1_miss_total = 0
+    p0_miss_missing = False
+    p1_miss_missing = False
+    gate_covered_runs = 0
+    gate_periods: dict[str, set[str]] = {}
+    gate_terra_first_status: dict[str, str | None] = {}
     try:
         task_dirs = sorted(
             (path for path in root.iterdir() if path.is_dir() and TASK_ID_PATTERN.fullmatch(path.name)),
@@ -2202,8 +2820,7 @@ def aggregate_metrics(root: Path) -> dict:
         for run in _read_metrics_runs(task_dir, task_id):
             cost_record = run.get("cost_evidence")
             if (
-                isinstance(cost_record, Mapping)
-                and cost_record.get("evidence_origin") == "synthetic_fixture"
+                run.get("data_origin") == "synthetic_fixture"
             ):
                 synthetic_cost_attempts += 1
                 continue
@@ -2236,15 +2853,68 @@ def aggregate_metrics(root: Path) -> dict:
             if role == "terra" and task_id not in terra_first_status:
                 status = run.get("status")
                 terra_first_status[task_id] = status if isinstance(status, str) else None
+            if run.get("compact_applied") is True:
+                compact_applied_count += 1
+            gate_covered = (
+                run.get("origin_declared") is True
+                and run.get("data_origin") == "runtime"
+                and run.get("period_declared") is True
+            )
+            if gate_covered:
+                gate_covered_runs += 1
+                period = run.get("period")
+                if period in {"calibration", "experiment"}:
+                    gate_periods.setdefault(task_id, set()).add(period)
+                if role == "terra" and task_id not in gate_terra_first_status:
+                    status = run.get("status")
+                    gate_terra_first_status[task_id] = status if isinstance(status, str) else None
+                if "p0_miss_count" not in run:
+                    p0_miss_missing = True
+                else:
+                    miss = run.get("p0_miss_count")
+                    if isinstance(miss, bool) or not isinstance(miss, int) or miss < 0:
+                        p0_miss_missing = True
+                    else:
+                        p0_miss_total += miss
+                if "p1_miss_count" not in run:
+                    p1_miss_missing = True
+                else:
+                    miss = run.get("p1_miss_count")
+                    if isinstance(miss, bool) or not isinstance(miss, int) or miss < 0:
+                        p1_miss_missing = True
+                    else:
+                        p1_miss_total += miss
             if isinstance(cost_record, Mapping):
+                prompt_bytes = cost_record.get("prompt_bytes")
+                if isinstance(prompt_bytes, int) and not isinstance(prompt_bytes, bool):
+                    prompt_bytes_total += prompt_bytes
+                    prompt_record_count += 1
+                input_tokens = cost_record.get("input_tokens")
+                cached_input_tokens = cost_record.get("cached_input_tokens")
+                if (
+                    isinstance(input_tokens, int)
+                    and not isinstance(input_tokens, bool)
+                    and isinstance(cached_input_tokens, int)
+                    and not isinstance(cached_input_tokens, bool)
+                ):
+                    input_tokens_total += input_tokens
+                    cached_input_tokens_total += cached_input_tokens
                 paired_case_id = cost_record.get("paired_case_id")
                 if isinstance(paired_case_id, str) and paired_case_id.strip():
-                    cost_records.append(dict(cost_record))
+                    if gate_covered:
+                        cost_records.append(dict(cost_record))
                 elif run.get("cost_evidence") is not None:
                     # Controller evidence without a pre-registered pair is
                     # retained as unavailable rather than assigned a pair.
                     cost_unavailable_attempts += 1
         for event in _read_task_events(task_dir, task_id):
+            if event.get("event_type") in {
+                "OWNER_GATE_REACHED",
+                "CONSTRUCTION_OWNER_GATE_REACHED",
+            }:
+                owner_gate_count += 1
+            if event.get("new_state") == "CLOSED":
+                closed_task_ids.add(task_id)
             if event.get("new_state") == "NEEDS_REPLAN" or event.get("event_type") == "SEMANTIC_REWORK":
                 semantic_reworks += 1
             if event.get("event_type") == "FULL_SUITE_COMPLETED":
@@ -2257,16 +2927,59 @@ def aggregate_metrics(root: Path) -> dict:
         status == "IMPLEMENTED_CANDIDATE" for status in terra_first_status.values()
     )
     first_delivery_total = len(terra_first_status)
+
+    def _cohort_for(task_id: str) -> str | None:
+        task_periods = gate_periods.get(task_id, set())
+        if "experiment" in task_periods:
+            return "experiment"
+        if "calibration" in task_periods:
+            return "calibration"
+        return None
+
+    def _first_delivery_rate(cohort: str) -> float | None:
+        statuses = [
+            status
+            for task_id, status in gate_terra_first_status.items()
+            if _cohort_for(task_id) == cohort
+        ]
+        if not statuses:
+            return None
+        return sum(status == "IMPLEMENTED_CANDIDATE" for status in statuses) / len(statuses)
     cost_summary = aggregate_paired_cases(cost_records) if cost_records else {}
+    model_call_count = sum(role_calls.values())
+    closed_task_count = len(closed_task_ids)
     return {
         "calibration_task_count": calibration_tasks,
         "experiment_task_count": experiment_tasks,
         "role_calls": dict(sorted(role_calls.items())),
+        "model_call_count": model_call_count,
+        "closed_task_count": closed_task_count,
+        "model_calls_per_closed_task": (
+            model_call_count / closed_task_count if closed_task_count else None
+        ),
+        "owner_gate_count": owner_gate_count,
+        "average_prompt_bytes": (
+            prompt_bytes_total / prompt_record_count if prompt_record_count else None
+        ),
+        "compact_applied_count": compact_applied_count,
+        "cache_hit_ratio": (
+            cached_input_tokens_total / input_tokens_total
+            if input_tokens_total
+            else None
+        ),
         "sol_participation_count": sum(
             count for role, count in role_calls.items() if role.startswith("sol_")
         ),
         "first_delivery_pass_rate": (
             first_delivery_passes / first_delivery_total if first_delivery_total else None
+        ),
+        "calibration_first_delivery_pass_rate": _first_delivery_rate("calibration"),
+        "experiment_first_delivery_pass_rate": _first_delivery_rate("experiment"),
+        "p0_miss_count": (
+            None if gate_covered_runs == 0 or p0_miss_missing else p0_miss_total
+        ),
+        "p1_miss_count": (
+            None if gate_covered_runs == 0 or p1_miss_missing else p1_miss_total
         ),
         "luna_unique_findings": len(luna_finding_ids),
         "luna_findings_adopted_by_sol": len(luna_finding_ids & adopted_luna_finding_ids),
@@ -2304,6 +3017,32 @@ def render_report(metrics: Mapping[str, object]) -> str:
         "",
     ]
     lines.extend(f"- {role}: {count}" for role, count in sorted(role_calls.items()))
+    calls_per_closed = metrics.get("model_calls_per_closed_task")
+    calls_per_closed_text = (
+        "n/a" if calls_per_closed is None else f"{float(calls_per_closed):.3f}"
+    )
+    average_prompt = metrics.get("average_prompt_bytes")
+    average_prompt_text = (
+        "n/a" if average_prompt is None else f"{float(average_prompt):.1f}"
+    )
+    cache_hit_ratio = metrics.get("cache_hit_ratio")
+    cache_hit_text = (
+        "n/a" if cache_hit_ratio is None else f"{float(cache_hit_ratio):.1%}"
+    )
+    lines.extend(
+        (
+            "",
+            "## Efficiency",
+            "",
+            f"- Model calls: {metrics.get('model_call_count', 0)}",
+            f"- Closed tasks: {metrics.get('closed_task_count', 0)}",
+            f"- Model calls per closed task: {calls_per_closed_text}",
+            f"- Owner gates reached: {metrics.get('owner_gate_count', 0)}",
+            f"- Average prompt bytes: {average_prompt_text}",
+            f"- Compact prompts applied: {metrics.get('compact_applied_count', 0)}",
+            f"- Cached input ratio: {cache_hit_text}",
+        )
+    )
     pass_rate = metrics.get("first_delivery_pass_rate")
     pass_rate_text = "n/a" if pass_rate is None else f"{float(pass_rate):.1%}"
     lines.extend(
@@ -2558,11 +3297,19 @@ class TeamCallProductionController:
                 execution  # type: ignore[arg-type]
             ),
         }
+        prompt_result = build_role_prompt_result(
+            "luna",
+            task_document,
+            contract,
+            (evidence_snapshot.path,),
+            state_root=self.state_root,
+        )
         result = run_codex(
             "luna",
             task_document,
-            build_role_prompt("luna", task_document, contract, (evidence_snapshot.path,)),
+            prompt_result.prompt,
             paths,
+            prompt_result=prompt_result,
         )
         _verify_team_call_evidence_snapshot(evidence_snapshot, execution)  # type: ignore[arg-type]
         return result
@@ -3350,15 +4097,21 @@ class CodexConstructionRunner:
             runtime_evidence_required=True,
             runtime_sessions_dir=self.runtime_sessions_dir,
         )
+        prompt_result = build_construction_role_prompt_result(
+            task,
+            context,
+            state_root=self.state_root,
+        )
         return run_codex(
             role,
             task,
-            build_construction_role_prompt(task, context),
+            prompt_result.prompt,
             paths,
             attempt_context=attempt_context,
             construction_plan=context.plan.to_dict(),
             construction_step_id=context.step.id,
             construction_context=context,
+            prompt_result=prompt_result,
         )
 
 
@@ -3388,16 +4141,49 @@ class Runner(Protocol):
         """Run only a prompt generated from the provided frozen construction context."""
 
 
+@dataclass(frozen=True)
+class RetryLimits:
+    """Configured closed-set limits for each retry class."""
+
+    technical_retries: int
+    implementation_reworks: int
+    cross_model_escalations: int
+
+
+def _retry_limits_from_config(config: object) -> RetryLimits:
+    if not isinstance(config, Mapping):
+        _fail("INVALID_POLICY", "workflow configuration must be an object")
+    policy = config.get("policy")
+    if not isinstance(policy, Mapping):
+        _fail("INVALID_POLICY", "workflow policy configuration is required")
+    values: list[int] = []
+    for name in (
+        "max_technical_retries",
+        "max_implementation_reworks",
+        "max_cross_model_escalations",
+    ):
+        value = policy.get(name)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            _fail("INVALID_POLICY", f"policy.{name} must be a non-negative integer")
+        values.append(value)
+    return RetryLimits(*values)
+
+
+def _configured_retry_limits() -> RetryLimits:
+    return _retry_limits_from_config(_load_workflow_config())
+
+
 @dataclass
 class RetryBudget:
-    """The one-time retry allowances specified by the workflow contract."""
+    """Retry counters bounded by the pinned workflow policy."""
 
     technical_retries: int = 0
     implementation_reworks: int = 0
     cross_model_escalations: int = 0
+    limits: RetryLimits = field(default_factory=_configured_retry_limits)
 
     def _consume(self, field: str, detail: str) -> None:
-        if getattr(self, field) >= 1:
+        if getattr(self, field) >= getattr(self.limits, field):
             raise WorkflowError("RETRY_BUDGET_EXHAUSTED", detail)
         setattr(self, field, getattr(self, field) + 1)
 
@@ -4200,6 +4986,189 @@ def _freeze_or_require_construction_plan(
     return frozen
 
 
+def _construction_resume_document(
+    request: Mapping[str, object], step_id: str, attempt: int
+) -> dict[str, object]:
+    return {
+        "schema_version": "construction-resume-1",
+        "request": dict(request),
+        "step_id": step_id,
+        "attempt": attempt,
+    }
+
+
+def _freeze_or_require_construction_resume(
+    store: WorkflowStore,
+    task_id: str,
+    request: Mapping[str, object],
+    step_id: str,
+    attempt: int,
+    state: str,
+) -> dict[str, object]:
+    """Persist only the validated values needed to resume an approved dispatch."""
+
+    path = store._require_task(task_id) / "construction-resume.json"
+    document = _construction_resume_document(request, step_id, attempt)
+    if not path.exists():
+        if state not in {"DRAFT", "TASK_VALIDATED"}:
+            _fail(
+                "CONSTRUCTION_CONTEXT_MISSING",
+                "construction resume context must be frozen before owner approval",
+            )
+        write_json_once(
+            path, document, conflict_code="CONSTRUCTION_CONTEXT_MISMATCH"
+        )
+        store.append_event(
+            task_id,
+            {
+                "event_type": "CONSTRUCTION_RESUME_CONTEXT_FROZEN",
+                "timestamp_utc": _utc_timestamp(),
+                "context_sha256": artifact_sha256(document),
+            },
+        )
+        return document
+    try:
+        recorded = load_artifact(path)
+    except ArtifactError as exc:
+        raise WorkflowError(
+            "CONSTRUCTION_CONTEXT_MISMATCH",
+            "construction resume context cannot be read",
+        ) from exc
+    if recorded == document:
+        if state == "REWORK_AUTHORIZED" and not any(
+            event.get("event_type") == "CONSTRUCTION_RESUME_CONTEXT_UPDATED"
+            and event.get("context_sha256") == artifact_sha256(document)
+            for event in _load_event_records(store, task_id)
+        ):
+            _fail(
+                "CONSTRUCTION_CONTEXT_MISMATCH",
+                "rework dispatch must advance to the next attempt",
+            )
+        return document
+    if (
+        state != "REWORK_AUTHORIZED"
+        or recorded.get("request") != document["request"]
+        or recorded.get("step_id") != step_id
+        or not isinstance(recorded.get("attempt"), int)
+        or attempt != recorded["attempt"] + 1
+    ):
+        _fail(
+            "CONSTRUCTION_CONTEXT_MISMATCH",
+            "construction resume context differs from frozen authority",
+        )
+    previous_sha256 = artifact_sha256(recorded)
+    atomic_write_json(path, document)
+    store.append_event(
+        task_id,
+        {
+            "event_type": "CONSTRUCTION_RESUME_CONTEXT_UPDATED",
+            "timestamp_utc": _utc_timestamp(),
+            "previous_context_sha256": previous_sha256,
+            "context_sha256": artifact_sha256(document),
+        },
+    )
+    return document
+
+
+def _record_or_recover_enforced_dispatch(
+    store: WorkflowStore,
+    task_id: str,
+    frozen: FrozenPlan,
+    step: FrozenSubtask,
+    attempt: int,
+    route_wire: Mapping[str, object],
+    role: str,
+    *,
+    record_missing: bool = True,
+) -> str:
+    route_fields = {
+        field: route_wire[field] for field in ("route", "rule_id", "routing_mode")
+    }
+    identity = dispatch_id(
+        frozen.plan_sha256,
+        frozen.task_sha256,
+        step.id,
+        attempt,
+        str(frozen.candidate_commit),
+        request_sha256=str(route_wire["request_sha256"]),
+        route_fields=route_fields,
+        role=role,
+    )
+    expected = {
+        "event_type": "DISPATCH_RECORDED",
+        "owner_task_id": step.id,
+        "owner_role": step.owner_role,
+        "plan_sha256": frozen.plan_sha256,
+        "task_sha256": frozen.task_sha256,
+        "scope_sha256": artifact_sha256(
+            {
+                "read_scope": list(step.read_scope),
+                "write_scope": list(step.write_scope),
+                "do_not_touch": list(step.do_not_touch),
+            }
+        ),
+        "subtask_id": step.id,
+        "attempt": attempt,
+        "candidate_commit": frozen.candidate_commit,
+        "request_sha256": route_wire["request_sha256"],
+        "route_fields": route_fields,
+        "role": role,
+        "dispatch_id": identity,
+    }
+    ledger = store._require_task(task_id) / "dispatches.jsonl"
+    try:
+        lines = ledger.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        lines = []
+    except OSError as exc:
+        raise WorkflowError("DISPATCH_READ_ERROR", "cannot read dispatch ledger") from exc
+    recovered = False
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise WorkflowError(
+                "DISPATCH_IDENTITY_DRIFT", "dispatch ledger contains invalid JSON"
+            ) from exc
+        if not isinstance(record, Mapping):
+            _fail("DISPATCH_IDENTITY_DRIFT", "dispatch ledger contains an invalid record")
+        same_attempt = (
+            record.get("subtask_id") == step.id and record.get("attempt") == attempt
+        )
+        if record.get("dispatch_id") == identity or same_attempt:
+            if dict(record) != expected or recovered:
+                _fail(
+                    "ORPHAN_DISPATCH_MISMATCH",
+                    "existing dispatch record does not match this construction attempt",
+                )
+            recovered = True
+        elif (
+            record.get("subtask_id") == step.id
+            and isinstance(record.get("attempt"), int)
+            and int(record["attempt"]) > attempt
+        ):
+            _fail(
+                "ORPHAN_DISPATCH_MISMATCH",
+                "dispatch ledger contains a later construction attempt",
+            )
+    if recovered:
+        return identity
+    if not record_missing:
+        return identity
+    return record_dispatch(
+        store,
+        task_id,
+        frozen,
+        step.id,
+        attempt,
+        str(frozen.candidate_commit),
+        store_locked=True,
+        request_sha256=str(route_wire["request_sha256"]),
+        route_fields=route_fields,
+        role=role,
+    )
+
+
 def run_enforced_construction(
     task_id: str,
     *,
@@ -4236,8 +5205,23 @@ def run_enforced_construction(
         frozen = _freeze_or_require_construction_plan(
             store, task_id, task, frozen, step, role, route_wire, state
         )
+        _freeze_or_require_construction_resume(
+            store,
+            task_id,
+            dict(request),
+            step.id,
+            attempt,
+            state,
+        )
         step = next(candidate for candidate in frozen.tasks if candidate.id == step.id)
-        if state in {"BLOCKED", "CLOSED", "ABORTED", "DEFERRED", "AWAITING_OWNER_DECISION"}:
+        if state in {
+            "BLOCKED",
+            "CLOSED",
+            "ABORTED",
+            "DEFERRED",
+            "AWAITING_OWNER_DECISION",
+            "IMPLEMENTED_CANDIDATE",
+        }:
             return state
         if state == "DRAFT":
             state = _transition(store, task_id, state, "TASK_VALIDATED", budget)
@@ -4263,20 +5247,14 @@ def run_enforced_construction(
                 budget,
                 owner_authorized=True,
             )
-        if state == "WORKTREE_READY":
-            state = _transition(store, task_id, state, "IMPLEMENTATION_RUNNING", budget)
         if state == "REWORK_AUTHORIZED":
             if not _authorization_is_recorded(store, task_id, state, "authorize_rework"):
                 return state
-            state = _transition(
-                store,
-                task_id,
-                state,
-                "IMPLEMENTATION_RUNNING",
-                budget,
-                owner_authorized=True,
-            )
-        if state != "IMPLEMENTATION_RUNNING":
+        if state not in {
+            "WORKTREE_READY",
+            "REWORK_AUTHORIZED",
+            "IMPLEMENTATION_RUNNING",
+        }:
             _fail("CONSTRUCTION_STATE_INVALID", "construction step is not in an implementation state")
         authority = _construction_authority(frozen, step, role, route_wire)
         if _frozen_construction_authority(store, task_id) != authority:
@@ -4285,6 +5263,19 @@ def run_enforced_construction(
         if not owner_decision or owner_decision.get("construction_authority_sha256") != artifact_sha256(authority):
             _fail("CONSTRUCTION_AUTHORITY_DRIFT", "owner decision is not bound to frozen construction authority")
         if has_active_repair_assignment(store, task_id):
+            if state == "WORKTREE_READY":
+                state = _transition(
+                    store, task_id, state, "IMPLEMENTATION_RUNNING", budget
+                )
+            elif state == "REWORK_AUTHORIZED":
+                state = _transition(
+                    store,
+                    task_id,
+                    state,
+                    "IMPLEMENTATION_RUNNING",
+                    budget,
+                    owner_authorized=True,
+                )
             return _transition(
                 store,
                 task_id,
@@ -4293,21 +5284,22 @@ def run_enforced_construction(
                 budget,
                 event_type="REPAIR_EXECUTION_INTEGRATION_BLOCKED",
             )
-        launch_id = record_dispatch(
-            store,
-            task_id,
-            frozen,
-            step.id,
-            attempt,
-            str(frozen.candidate_commit),
-            store_locked=True,
-            request_sha256=str(route_wire["request_sha256"]),
-            route_fields={
-                field: route_wire[field]
-                for field in ("route", "rule_id", "routing_mode")
-            },
-            role=role,
+        launch_id = _record_or_recover_enforced_dispatch(
+            store, task_id, frozen, step, attempt, route_wire, role
         )
+        if state == "WORKTREE_READY":
+            state = _transition(
+                store, task_id, state, "IMPLEMENTATION_RUNNING", budget
+            )
+        elif state == "REWORK_AUTHORIZED":
+            state = _transition(
+                store,
+                task_id,
+                state,
+                "IMPLEMENTATION_RUNNING",
+                budget,
+                owner_authorized=True,
+            )
         context = ConstructionExecutionContext(
             plan=frozen,
             step=step,
@@ -4591,6 +5583,170 @@ def _apply_owner_decision(
         return target
 
 
+def _load_construction_resume(
+    store: WorkflowStore, task_id: str
+) -> tuple[object, Mapping[str, object], str, int] | None:
+    task_dir = store._require_task(task_id)
+    context_path = task_dir / "construction-resume.json"
+    if not context_path.exists():
+        return None
+    try:
+        context = load_artifact(context_path)
+        plan = load_artifact(task_dir / "construction-plan.json")
+    except ArtifactError as exc:
+        raise WorkflowError(
+            "CONSTRUCTION_CONTEXT_MISMATCH",
+            "frozen construction resume artifacts cannot be read",
+        ) from exc
+    if (
+        set(context) != {"schema_version", "request", "step_id", "attempt"}
+        or context.get("schema_version") != "construction-resume-1"
+        or not isinstance(context.get("request"), Mapping)
+        or not isinstance(context.get("step_id"), str)
+        or not context["step_id"]
+        or isinstance(context.get("attempt"), bool)
+        or not isinstance(context.get("attempt"), int)
+        or context["attempt"] < 1
+    ):
+        _fail(
+            "CONSTRUCTION_CONTEXT_MISMATCH",
+            "frozen construction resume context is invalid",
+        )
+    return (
+        plan,
+        dict(context["request"]),
+        context["step_id"],
+        context["attempt"],
+    )
+
+
+def _resume_enabled(config: Mapping[str, object]) -> bool:
+    automation = config.get("automation")
+    return (
+        isinstance(automation, Mapping)
+        and automation.get("allow_decide_resume") is True
+    )
+
+
+def _assert_resume_dispatch_available(
+    store: WorkflowStore,
+    task_id: str,
+    context: tuple[object, Mapping[str, object], str, int],
+) -> None:
+    plan, request, step_id, attempt = context
+    _, frozen, step, role, route_wire = _load_enforced_construction_artifacts(
+        store, task_id, plan, request, step_id
+    )
+    _record_or_recover_enforced_dispatch(
+        store,
+        task_id,
+        frozen,
+        step,
+        attempt,
+        route_wire,
+        role,
+        record_missing=False,
+    )
+
+
+def _prepare_resume(
+    store: WorkflowStore,
+    task_id: str,
+    args: argparse.Namespace,
+    *,
+    decision: str | None = None,
+) -> tuple[
+    Runner,
+    tuple[object, Mapping[str, object], str, int] | None,
+]:
+    context = _load_construction_resume(store, task_id)
+    state = _current_state(store, task_id)
+    events = _load_event_records(store, task_id)
+    latest_rework_authorization = max(
+        (
+            index
+            for index, event in enumerate(events)
+            if event.get("event_type") == "OWNER_DECISION"
+            and event.get("decision") == "authorize_rework"
+        ),
+        default=-1,
+    )
+    latest_matching_context_update = -1
+    if context is not None:
+        _plan, request, step_id, attempt = context
+        current_digest = artifact_sha256(
+            _construction_resume_document(request, step_id, attempt)
+        )
+        latest_matching_context_update = max(
+            (
+                index
+                for index, event in enumerate(events)
+                if event.get("event_type") == "CONSTRUCTION_RESUME_CONTEXT_UPDATED"
+                and event.get("context_sha256") == current_digest
+            ),
+            default=-1,
+        )
+    context_was_advanced = (
+        latest_matching_context_update > latest_rework_authorization
+    )
+    if context is not None and (
+        decision == "authorize_rework"
+        or (state == "REWORK_AUTHORIZED" and not context_was_advanced)
+    ):
+        plan, request, step_id, attempt = context
+        context = (plan, request, step_id, attempt + 1)
+    if context is not None and (
+        state in {"APPROVED_FOR_EXECUTION", "WORKTREE_READY", "REWORK_AUTHORIZED"}
+        or decision in {"approve_execution", "authorize_rework"}
+    ):
+        _assert_resume_dispatch_available(store, task_id, context)
+    if args.runner == "fake":
+        return FakeRunner(), context
+    if not args.allow_live_model:
+        _fail(
+            "LIVE_MODEL_NOT_AUTHORIZED",
+            "--allow-live-model is required for a live resume",
+        )
+    if context is None:
+        _fail(
+            "LIVE_RESUME_CONTEXT_REQUIRED",
+            "live resume requires a frozen construction dispatch",
+        )
+    sessions = args.runtime_sessions_dir
+    if sessions is None or not sessions.is_absolute() or not sessions.is_dir():
+        _fail(
+            "RUNTIME_SESSIONS_DIR_INVALID",
+            "live resume requires an existing absolute --runtime-sessions-dir",
+        )
+    return CodexConstructionRunner(store.root, sessions), context
+
+
+def _resume_stored_task(
+    store: WorkflowStore,
+    task_id: str,
+    runner: Runner,
+    context: tuple[object, Mapping[str, object], str, int] | None,
+) -> str:
+    if context is not None:
+        plan, request, step_id, attempt = context
+        return run_enforced_construction(
+            task_id,
+            construction_plan=plan,
+            request=request,
+            step_id=step_id,
+            attempt=attempt,
+            runner=runner,
+            allow_live_model=getattr(runner, "is_live_model", False),
+            state_root=store.root,
+        )
+    return run_until_gate(
+        task_id,
+        runner=runner,
+        allow_live_model=False,
+        state_root=store.root,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="ai-workflow")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -4653,6 +5809,10 @@ def build_parser() -> argparse.ArgumentParser:
     decide.add_argument("--decision", dest="decision_option")
     decide.add_argument("--by", default="owner")
     decide.add_argument("--root", type=Path, default=Path("data/state/ai-workflow"))
+    decide.add_argument("--resume", action="store_true")
+    decide.add_argument("--runner", choices=("fake", "live"), default="fake")
+    decide.add_argument("--allow-live-model", action="store_true")
+    decide.add_argument("--runtime-sessions-dir", type=Path, metavar="ABSOLUTE_DIR")
 
     route_command = sub.add_parser("route")
     route_command.add_argument("--task", type=Path, required=True)
@@ -4664,8 +5824,52 @@ def build_parser() -> argparse.ArgumentParser:
     )
     route_command.add_argument("--root", type=Path, default=Path("data/state/ai-workflow"))
 
-    for name in ("resume", "abort"):
-        sub.add_parser(name)
+    schedule_batch = sub.add_parser("schedule-batch")
+    schedule_batch.add_argument("--task", type=Path, required=True)
+    schedule_batch.add_argument("--plan", type=Path, required=True)
+    schedule_batch.add_argument(
+        "--root", type=Path, default=Path("data/state/ai-workflow")
+    )
+
+    schedule_result = sub.add_parser("schedule-result")
+    schedule_result.add_argument("task_id")
+    schedule_result.add_argument("--plan", type=Path, required=True)
+    schedule_result.add_argument("--dispatch-id", required=True)
+    schedule_result.add_argument("--result", type=Path, required=True)
+    schedule_result.add_argument(
+        "--root", type=Path, default=Path("data/state/ai-workflow")
+    )
+
+    schedule_receipt = sub.add_parser("schedule-receipt")
+    schedule_receipt.add_argument("task_id")
+    schedule_receipt.add_argument("--plan", type=Path, required=True)
+    schedule_receipt.add_argument("--receipt", type=Path, required=True)
+    schedule_receipt.add_argument(
+        "--root", type=Path, default=Path("data/state/ai-workflow")
+    )
+
+    schedule_final = sub.add_parser("schedule-final")
+    schedule_final.add_argument("task_id")
+    schedule_final.add_argument("--plan", type=Path, required=True)
+    schedule_final.add_argument("--acceptance-task-id", required=True)
+    schedule_final.add_argument("--candidate-commit", required=True)
+    schedule_final.add_argument("--owner-receipt", type=Path)
+    schedule_final.add_argument("--acceptor", type=Path)
+    schedule_final.add_argument(
+        "--root", type=Path, default=Path("data/state/ai-workflow")
+    )
+
+    resume = sub.add_parser("resume")
+    resume.add_argument("task_id")
+    resume.add_argument("--runner", choices=("fake", "live"), default="fake")
+    resume.add_argument("--allow-live-model", action="store_true")
+    resume.add_argument("--runtime-sessions-dir", type=Path, metavar="ABSOLUTE_DIR")
+    resume.add_argument("--root", type=Path, default=Path("data/state/ai-workflow"))
+
+    abort = sub.add_parser("abort")
+    abort.add_argument("task_id")
+    abort.add_argument("--by", default="owner")
+    abort.add_argument("--root", type=Path, default=Path("data/state/ai-workflow"))
     report = sub.add_parser("report")
     report.add_argument("--root", type=Path, default=Path("data/state/ai-workflow"))
     report.add_argument("--output", type=Path, required=True)
@@ -4723,13 +5927,201 @@ def _run_live_luna(task: dict[str, object], args: argparse.Namespace) -> dict:
         runtime_evidence_required=True,
         runtime_sessions_dir=args.runtime_sessions_dir,
     )
-    prompt = build_role_prompt("luna", task, contract, _authoritative_evidence_paths(task))
-    return run_codex("luna", task, prompt, paths)
+    prompt_result = build_role_prompt_result(
+        "luna",
+        task,
+        contract,
+        _authoritative_evidence_paths(task),
+        state_root=args.root,
+    )
+    return run_codex("luna", task, prompt_result.prompt, paths, prompt_result=prompt_result)
+
+
+def _scheduler_runtime():
+    try:
+        from . import ai_workflow_scheduler as scheduler
+    except ImportError:
+        import ai_workflow_scheduler as scheduler
+    return scheduler
+
+
+def _load_scheduler_cli_plan(
+    store: WorkflowStore,
+    task_id: str,
+    plan_path: Path,
+) -> FrozenPlan:
+    try:
+        plan = load_artifact(plan_path)
+    except ArtifactError as exc:
+        raise WorkflowError(exc.code, exc.message) from exc
+    task = load_task(store._require_task(task_id) / "task.json")
+    return validate_plan(plan, task)
+
+
+def _scheduler_receipt_status(role: str, status: object) -> str:
+    if role == "luna":
+        mapped = {
+            "SUPPORTED": "IMPLEMENTED_CANDIDATE",
+            "PARTIALLY_SUPPORTED": "NEEDS_CLARIFICATION",
+            "BLOCKED": "BLOCKED",
+        }.get(status)
+    else:
+        mapped = status if status in {
+            "IMPLEMENTED_CANDIDATE",
+            "NEEDS_CLARIFICATION",
+            "BLOCKED",
+        } else None
+    if not isinstance(mapped, str):
+        _fail("RECEIPT_RESULT_IDENTITY_MISMATCH", "result status cannot form a scheduler receipt")
+    return mapped
+
+
+def _schedule_result(
+    store: WorkflowStore,
+    frozen: FrozenPlan,
+    dispatch_identity: str,
+    source_path: Path,
+) -> dict[str, object]:
+    scheduler = _scheduler_runtime()
+    replay = scheduler.replay_scheduler(store, frozen)
+    dispatch = replay.dispatches.get(dispatch_identity)
+    if dispatch is None:
+        _fail("DISPATCH_IDENTITY_DRIFT", "scheduler result references an unknown dispatch")
+    try:
+        result = load_artifact(source_path)
+    except ArtifactError as exc:
+        raise WorkflowError(exc.code, exc.message) from exc
+    role = str(dispatch["owner_role"])
+    identity = {
+        "dispatch_id": dispatch_identity,
+        "task_id": frozen.task_id,
+        "step_id": dispatch["subtask_id"],
+        "attempt": dispatch["attempt"],
+    }
+    for field, expected in identity.items():
+        if field in result and result[field] != expected:
+            _fail(
+                "RECEIPT_RESULT_IDENTITY_MISMATCH",
+                f"scheduler result {field} does not match dispatch",
+            )
+        result[field] = expected
+    changed = result.get("changed_files")
+    if not isinstance(changed, list) or any(not isinstance(item, str) for item in changed):
+        _fail("INVALID_ROLE_RESULT", "scheduler result changed_files is invalid")
+    validate_role_result(role, result, set(changed))
+    result_path = (
+        store._require_task(frozen.task_id)
+        / "scheduler-results"
+        / f"{dispatch_identity}.json"
+    )
+    digest = write_json_once(
+        result_path,
+        result,
+        conflict_code="RECEIPT_RESULT_CONFLICT",
+    )
+    return {
+        "schema_version": "construction-receipt-1",
+        "task_id": frozen.task_id,
+        "subtask_id": dispatch["subtask_id"],
+        "dispatch_id": dispatch_identity,
+        "plan_sha256": frozen.plan_sha256,
+        "task_sha256": frozen.task_sha256,
+        "candidate_commit": frozen.candidate_commit,
+        "result_sha256": digest,
+        "status": _scheduler_receipt_status(role, result.get("status")),
+    }
 
 
 def _run_command(args: argparse.Namespace) -> int:
-    if args.command in {"resume", "abort"}:
-        raise WorkflowError("NOT_IMPLEMENTED_IN_CURRENT_STAGE", f"{args.command} is not implemented")
+    if args.command == "schedule-batch":
+        store = WorkflowStore(args.root)
+        task = load_task(args.task)
+        stored = load_task(store._require_task(task["task_id"]) / "task.json")
+        if task != stored:
+            _fail("TASK_STORE_MISMATCH", "scheduler task input does not match stored task")
+        frozen = _load_scheduler_cli_plan(store, task["task_id"], args.plan)
+        proposals = _scheduler_runtime().dispatch_ready_batch(store, frozen)
+        print(_canonical_json(list(proposals)))
+        return 0
+    if args.command == "schedule-result":
+        store = WorkflowStore(args.root)
+        frozen = _load_scheduler_cli_plan(store, args.task_id, args.plan)
+        receipt = _schedule_result(
+            store,
+            frozen,
+            args.dispatch_id,
+            args.result,
+        )
+        print(_canonical_json(receipt))
+        return 0
+    if args.command == "schedule-receipt":
+        store = WorkflowStore(args.root)
+        frozen = _load_scheduler_cli_plan(store, args.task_id, args.plan)
+        try:
+            receipt = load_artifact(args.receipt)
+        except ArtifactError as exc:
+            raise WorkflowError(exc.code, exc.message) from exc
+        event = _scheduler_runtime().record_step_receipt(store, frozen, receipt)
+        print(_canonical_json(event))
+        return 0
+    if args.command == "schedule-final":
+        store = WorkflowStore(args.root)
+        frozen = _load_scheduler_cli_plan(store, args.task_id, args.plan)
+        scheduler = _scheduler_runtime()
+        child = scheduler.create_final_acceptance_case(
+            store,
+            frozen,
+            args.acceptance_task_id,
+            args.candidate_commit,
+        )
+        issue_values = (args.owner_receipt, args.acceptor)
+        if any(value is not None for value in issue_values):
+            if any(value is None for value in issue_values):
+                _fail(
+                    "ACCEPTANCE_INPUT_INVALID",
+                    "--owner-receipt and --acceptor are required together",
+                )
+            try:
+                owner_document = load_artifact(args.owner_receipt)
+                acceptor_document = load_artifact(args.acceptor)
+            except ArtifactError as exc:
+                raise WorkflowError(exc.code, exc.message) from exc
+            try:
+                owner = VerifiedActorReceipt(**owner_document)
+                acceptor = ActorIdentity(**acceptor_document)
+            except (TypeError, RuntimeError) as exc:
+                raise WorkflowError(
+                    "ACCEPTANCE_INPUT_INVALID",
+                    "final acceptance identity artifact is invalid",
+                ) from exc
+            assignment = scheduler.issue_final_acceptance(
+                store,
+                frozen,
+                child["task_id"],
+                owner,
+                acceptor,
+            )
+            print(
+                _canonical_json(
+                    {
+                        "task_id": assignment.task_id,
+                        "assignment_id": assignment.assignment_id,
+                        "phase": assignment.phase,
+                    }
+                )
+            )
+            return 0
+        print(_canonical_json(child))
+        return 0
+    if args.command == "resume":
+        store = WorkflowStore(args.root)
+        runner, context = _prepare_resume(store, args.task_id, args)
+        print(_resume_stored_task(store, args.task_id, runner, context))
+        return 0
+    if args.command == "abort":
+        store = WorkflowStore(args.root)
+        print(_apply_owner_decision(store, args.task_id, "abort", args.by))
+        return 0
     if args.command == "team-call":
         state_root = (
             Path(args.root)
@@ -4795,8 +6187,21 @@ def _run_command(args: argparse.Namespace) -> int:
             request = load_artifact(args.request)
         except ArtifactError as exc:
             raise WorkflowError(exc.code, exc.message) from exc
-        decision = decide_route(task, request, args.mode)
-        record_route_decision(WorkflowStore(args.root), task["task_id"], decision)
+        computed = decide_route(task, request, args.mode)
+        store = WorkflowStore(args.root)
+        decision = persist_or_reuse_route_decision(store, task["task_id"], computed)
+        record_route_advice(
+            store,
+            task["task_id"],
+            evaluate_and_apply_route_advice(
+                decision,
+                recommended_route=decision.route,
+                state_root=args.root,
+                task=task,
+                request=request,
+            ),
+            request_sha256=artifact_sha256(request),
+        )
         print(_canonical_json(decision.to_dict()))
         return 0
     if args.command == "status":
@@ -4812,8 +6217,38 @@ def _run_command(args: argparse.Namespace) -> int:
         decision = args.decision_option or args.decision
         if not decision:
             raise WorkflowError("DECISION_REQUIRED", "decision is required")
-        _apply_owner_decision(WorkflowStore(args.root), args.task_id, decision, args.by)
+        store = WorkflowStore(args.root)
+        if decision == "authorize_final_xhigh":
+            if args.resume:
+                _fail(
+                    "DECIDE_RESUME_INVALID",
+                    "authorize_final_xhigh cannot be combined with --resume",
+                )
+            try:
+                from .ai_workflow_repairs import authorize_final_xhigh
+            except ImportError:
+                from ai_workflow_repairs import authorize_final_xhigh
+            authorize_final_xhigh(store, args.task_id, args.by)
+            print("DECISION_RECORDED")
+            return 0
+        prepared: tuple[
+            Runner,
+            tuple[object, Mapping[str, object], str, int] | None,
+        ] | None = None
+        if args.resume:
+            if not _resume_enabled(_load_workflow_config()):
+                _fail(
+                    "DECIDE_RESUME_DISABLED",
+                    "decide --resume is disabled by workflow policy",
+                )
+            prepared = _prepare_resume(
+                store, args.task_id, args, decision=decision
+            )
+        _apply_owner_decision(store, args.task_id, decision, args.by)
         print("DECISION_RECORDED")
+        if prepared is not None:
+            runner, context = prepared
+            print(_resume_stored_task(store, args.task_id, runner, context))
         return 0
     if args.command == "run":
         construction_values = (

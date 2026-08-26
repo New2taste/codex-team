@@ -76,6 +76,10 @@ RISK_FLAGS = frozenset(
 )
 ROUTES = frozenset({"direct", "sol_only", "delegated", "blocked"})
 ROUTING_MODES = frozenset({"legacy", "shadow", "enforced"})
+OPTIMIZATION_MODES = frozenset({"shadow", "enforced"})
+OPTIMIZATION_GATE_RESULTS = frozenset(
+    {"KEEP_SHADOW", "ALLOW_ENFORCED", "FALLBACK_FIXED"}
+)
 EXECUTION_SURFACES = frozenset({"NATIVE_SUBAGENT", "CODEX_EXEC_ROLE_CONTRACT"})
 EVIDENCE_CLASSES = frozenset(
     {"measured", "sample_validated_projection", "unavailable"}
@@ -123,6 +127,19 @@ ROUTE_DECISION_FIELDS = frozenset(
         "decided_at_utc",
         "routing_mode",
         "evidence_class",
+    }
+)
+ROUTE_ADVICE_FIELDS = frozenset(
+    {
+        "schema_version",
+        "task_id",
+        "actual_route",
+        "recommended_route",
+        "optimization_mode",
+        "gate_result",
+        "applied",
+        "task_sha256",
+        "request_sha256",
     }
 )
 PLAN_FIELDS = frozenset(
@@ -380,6 +397,35 @@ class RouteDecision:
 
 
 @dataclass(frozen=True)
+class RouteAdvice:
+    schema_version: str = "ai-route-advice-1"
+    task_id: str = ""
+    actual_route: str = ""
+    recommended_route: str = ""
+    optimization_mode: str = ""
+    gate_result: str = ""
+    applied: bool = False
+    task_sha256: str = ""
+    request_sha256: str = ""
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "task_id": self.task_id,
+            "actual_route": self.actual_route,
+            "recommended_route": self.recommended_route,
+            "optimization_mode": self.optimization_mode,
+            "gate_result": self.gate_result,
+            "applied": self.applied,
+            "task_sha256": self.task_sha256,
+            "request_sha256": self.request_sha256,
+        }
+
+    def __getitem__(self, key: str) -> object:
+        return self.to_dict()[key]
+
+
+@dataclass(frozen=True)
 class PlanArtifact:
     schema_version: str = "ai-plan-1"
     plan_id: str = ""
@@ -543,6 +589,30 @@ def validate_route_decision(value: object) -> None:
     _string(decision["decided_at_utc"], "decided_at_utc")
     _enum(decision["routing_mode"], "routing_mode", ROUTING_MODES)
     _enum(decision["evidence_class"], "evidence_class", EVIDENCE_CLASSES)
+
+
+def validate_route_advice(value: object) -> None:
+    advice = _check_fields(value, ROUTE_ADVICE_FIELDS, "ai-route-advice-1")
+    _string(advice["task_id"], "task_id")
+    _enum(advice["actual_route"], "actual_route", ROUTES)
+    _enum(advice["recommended_route"], "recommended_route", ROUTES)
+    _enum(advice["optimization_mode"], "optimization_mode", OPTIMIZATION_MODES)
+    _enum(advice["gate_result"], "gate_result", OPTIMIZATION_GATE_RESULTS)
+    if not isinstance(advice["applied"], bool):
+        _raise("INVALID_TYPE", "applied must be a boolean")
+    _string(advice["task_sha256"], "task_sha256")
+    _string(advice["request_sha256"], "request_sha256")
+    mode = advice["optimization_mode"]
+    gate = advice["gate_result"]
+    applied = advice["applied"]
+    if mode == "shadow" and (gate != "KEEP_SHADOW" or applied is not False):
+        _raise("ROUTE_ADVICE_INVALID", "shadow advice must be KEEP_SHADOW and not applied")
+    if gate == "KEEP_SHADOW" and (mode != "shadow" or applied is not False):
+        _raise("ROUTE_ADVICE_INVALID", "KEEP_SHADOW requires shadow mode and applied false")
+    if gate == "ALLOW_ENFORCED" and (mode != "enforced" or applied is not True):
+        _raise("ROUTE_ADVICE_INVALID", "ALLOW_ENFORCED requires enforced mode and applied true")
+    if gate == "FALLBACK_FIXED" and (mode != "enforced" or applied is not False):
+        _raise("ROUTE_ADVICE_INVALID", "FALLBACK_FIXED requires enforced mode and applied false")
 
 
 def validate_plan_shape(value: object) -> None:
