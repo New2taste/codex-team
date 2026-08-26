@@ -148,6 +148,7 @@ scripts/ai_workflow_planning.py # 计划和施工 envelope
 scripts/ai_workflow_scheduler.py# 计划调度、receipt 与 final ACCEPTANCE child
 scripts/ai_workflow_repairs.py  # acceptance repair ledger v2
 scripts/ai_workflow_team_call.py# Codex Team grammar、分类和收据
+scripts/ai_workflow_router_probe.py # 常驻路由器离线 shadow 探针与报告
 scripts/sync_plugin.py           # 固定 manifest 的 Plugin 检查/同步
 scripts/verify_all.sh            # 零模型完整验证入口
 plugins/ai-workflow/             # 对外 Plugin；runtime/config 与根目录同步
@@ -157,6 +158,22 @@ tests/                           # fake runner、负向注入和发布一致性�
 CLI 命令：`new`、`validate`、`team-call`、`run`、`route`、`schedule-batch`、`schedule-result`、`schedule-receipt`、`schedule-final`、`status`、`decide`、`resume`、`abort`、`report`。调度链按 `schedule-batch --task TASK --plan PLAN` 取得冻结批次；小节执行在既有 runner 边界外完成后，controller 用 `schedule-result TASK_ID --plan PLAN --dispatch-id ID --result RESULT` 将 `ai-result-1` 补齐并严格核对 `dispatch_id/task_id/step_id/attempt` 自绑定后，原子写入由 dispatch 唯一确定的 `scheduler-results/<dispatch_id>.json` 并输出 receipt；结果文件拒绝 symlink、hardlink、目录换绑和超限内容。`schedule-receipt` 记录该 receipt。全部完成后，`schedule-final` 创建集中终验 child；再次同时提供 `--owner-receipt` 与 `--acceptor` 时签发首个 Sol-medium `REVIEW_1`。终验返工梯到达授权点后，owner 仍使用 `decide <child_id> authorize_final_xhigh`。
 
 `[optimization]` 默认 `mode=shadow`，由 `evaluate_and_apply_route_advice` 读取，与 `route --mode` 的 routing 模式分开。`actual_route`/`recommended_route` 只进入 runtime advice 与 `ai-route-advice-1` sidecar，永不改 `ai-route-decision-1` 九字段或生效 roles。`mode=enforced` 仅当内部计算的四门全过且推荐是闭集成本降级时才应用；否则固定链回退。缺 miss 报告或缺省 period/origin 不能开门。Scheduler 在 shadow 下不执行推荐。
+
+`scripts/ai_workflow_router_probe.py` 是独立的常驻路由研究工具，不接入生产路由，也不写 task store。这里的“常驻”仅指固定模型、冻结 prompt 前缀、每次新会话和时间聚簇；不复用跨任务长线程。候选闭集只有 Luna、Sol、Terra，并为每个模型保留冷前缀对照。默认 `dry-run` 为零模型；fake 示例：
+
+```sh
+python3.11 scripts/ai_workflow_router_probe.py \
+  tests/fixtures/router-probe/cases.json \
+  --runner dry-run
+
+output_root="$(mktemp -d)"
+python3.11 scripts/ai_workflow_router_probe.py \
+  tests/fixtures/router-probe/cases.json \
+  --runner fake \
+  --output-root "$output_root"
+```
+
+live 历史案例重放必须先把 pinned `[router_probe].enabled` 设为 true，并同时显式传 `--runner live --allow-live-model`；配置中的三模型/推理档与代码闭集不一致时直接失败。输出根目录必须位于所有 Git 仓库之外的已存在绝对目录。未达到 32 个完整配对案例（四层各至少 8 个）、使用 synthetic/unavailable 数据、缺臂、前缀漂移或 token 缺失时，报告只能给出 `OBSERVATION_ONLY`。即使出现 `CACHE_MECHANISM_CANDIDATE_*`，它也只说明哪个模型的热前缀节省了更多 uncached input；缺少带日期/来源的费率快照和下游反事实成本时，真实成本赢家仍标为 unavailable。`effective_route` 固定为 `UNCHANGED`，R4 生产集成不在当前范围。
 
 compact prompt 是双钥匙 armed 字段投影，不改变角色语义，也不做摘要或 LLM 压缩。公开 `build_role_prompt` / `build_construction_role_prompt` 只从 pinned `[optimization]` 与 `aggregate_metrics(state_root)` 决策，调用方不能传 config/metrics 武装 compact；无 state_root、shadow、缺/非法 metrics 或门未过时一律完整 prompt。只有 `[optimization].compact_prompts=true`、`mode=enforced`，且 `evaluate_optimization_gate==ALLOW_ENFORCED`，并且 compact UTF-8 bytes 小于 full 才生效。投影必须逐字保留 task_id、schema/role 身份与角色指令、objective、repository_root/source_worktree、base_commit/candidate_commit、authoritative_files、allowed_write_paths、forbidden_actions、risk_flags、acceptance_commands、verification_level、human_gates，以及调用上下文中的 frozen plan/step id、write_scope、acceptance criteria、dependencies、permission profile、candidate/evidence hashes、runtime/session bindings、owner decisions/authorization tickets 和 required output schema/path；并保留 full prompt 中的证据授权句。未知关键字段默认保留或禁用 compact。acceptance repair ladder 的 assignment prompt 不参与 compact，永远 full。
 

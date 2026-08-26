@@ -548,6 +548,28 @@ class SchedulerDispatchTest(SchedulerHarness):
             ).exists()
         )
 
+    def test_schedule_result_rejects_bound_task_id_echo_before_generic_normalization(self):
+        proposal = scheduler.dispatch_ready_batch(self.store, self.frozen)[0]
+        source = Path(self.temporary_directory.name) / "task-id-echo.json"
+        result = workflow.FakeRunner().run(proposal["owner_role"], self.task)
+        result.update(
+            {
+                "dispatch_id": None,
+                "task_id": self.frozen.task_id,
+                "step_id": None,
+                "attempt": None,
+            }
+        )
+        source.write_text(
+            workflow._canonical_json(result) + "\n", encoding="utf-8"
+        )
+        with self.assertRaisesRegex(
+            workflow.WorkflowError, "RECEIPT_RESULT_IDENTITY_MISMATCH"
+        ):
+            workflow._schedule_result(
+                self.store, self.frozen, proposal["dispatch_id"], source
+            )
+
     def test_dispatch_replays_ledger_then_calls_ready_batch(self):
         with mock.patch.object(scheduler, "ready_batch", wraps=planning.ready_batch) as ready:
             proposals = scheduler.dispatch_ready_batch(self.store, self.frozen)

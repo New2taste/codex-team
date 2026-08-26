@@ -94,6 +94,10 @@ RESULT_REQUIRED_FIELDS = frozenset(
     }
 )
 RESULT_IDENTITY_FIELDS = frozenset({"dispatch_id", "task_id", "step_id", "attempt"})
+RESULT_IDENTITY_PROMPT = (
+    "Set dispatch_id, task_id, step_id, and attempt to null; "
+    "controller identity is reserved."
+)
 READ_ONLY_ROLES = frozenset(
     {
         "luna",
@@ -628,6 +632,7 @@ def _render_full_role_prompt(
             f"Task contract: {_canonical_json(dict(contract))}",
             f"Named evidence: {_canonical_json(list(evidence))}",
             *_role_prompt_suffix(role, role_config, task),
+            RESULT_IDENTITY_PROMPT,
             "only output ai-result-1 JSON",
         )
     )
@@ -718,6 +723,7 @@ def _render_compact_role_prompt(
             f"Context: {context_json}",
             f"Named evidence: {evidence_json}",
             *_role_prompt_suffix(role, role_config, task),
+            RESULT_IDENTITY_PROMPT,
             "only output ai-result-1 JSON",
         )
     )
@@ -1119,36 +1125,65 @@ def _validate_result_records(
             _fail("INVALID_ROLE_RESULT", f"{field}.type is not supported")
 
 
+def normalize_result_identity(
+    result: Mapping[str, object],
+    *,
+    expected_task_id: str | None = None,
+    error_code: str = "INVALID_ROLE_RESULT",
+) -> Mapping[str, object]:
+    """Normalize only provider-null identity or an exact bound task-id echo."""
+
+    present_identity = RESULT_IDENTITY_FIELDS & set(result)
+    null_identity = frozenset(
+        field for field in present_identity if result[field] is None
+    )
+    if not null_identity:
+        return result
+    all_null = (
+        present_identity == RESULT_IDENTITY_FIELDS
+        and null_identity == RESULT_IDENTITY_FIELDS
+    )
+    bound_task_echo = (
+        present_identity == RESULT_IDENTITY_FIELDS
+        and null_identity == RESULT_IDENTITY_FIELDS - {"task_id"}
+        and isinstance(expected_task_id, str)
+        and TASK_ID_PATTERN.fullmatch(expected_task_id) is not None
+        and result["task_id"] == expected_task_id
+    )
+    if all_null or bound_task_echo:
+        return {
+            key: value
+            for key, value in result.items()
+            if key not in RESULT_IDENTITY_FIELDS
+        }
+    _fail(error_code, "result identity is partially null")
+
+
 def validate_role_result(
-    role: str, result: Mapping[str, object], changed_files: set[str]
-) -> None:
+    role: str,
+    result: Mapping[str, object],
+    changed_files: set[str],
+    *,
+    expected_task_id: str | None = None,
+) -> Mapping[str, object]:
     """Reject malformed output, role/status confusion, and untrusted change claims."""
 
     role_config = _load_role_config(role)
     if not isinstance(result, Mapping):
         _fail("INVALID_ROLE_RESULT", "role result must be an object")
-    present_identity = RESULT_IDENTITY_FIELDS & set(result)
-    null_identity = frozenset(
-        field for field in present_identity if result[field] is None
+    result = normalize_result_identity(
+        result,
+        expected_task_id=expected_task_id,
+        error_code="INVALID_ROLE_RESULT",
     )
-    if null_identity:
-        if (
-            present_identity == RESULT_IDENTITY_FIELDS
-            and null_identity == RESULT_IDENTITY_FIELDS
-        ):
-            # Provider-strict dispatch schemas force every identity key onto
-            # live results; an all-null quartet is the wire encoding of
-            # "absent", so it normalizes to the plain non-scheduler shape.
-            result = {
-                key: value
-                for key, value in result.items()
-                if key not in RESULT_IDENTITY_FIELDS
-            }
-        else:
-            _fail(
-                "INVALID_ROLE_RESULT",
-                "scheduler result identity is partially null",
-            )
+    if (
+        expected_task_id is not None
+        and RESULT_IDENTITY_FIELDS <= set(result)
+    ):
+        _fail(
+            "INVALID_ROLE_RESULT",
+            "controller-reserved scheduler identity is not allowed on live results",
+        )
     fields = set(result)
     missing = sorted(RESULT_REQUIRED_FIELDS - fields)
     identity_fields = fields & RESULT_IDENTITY_FIELDS
@@ -1226,6 +1261,7 @@ def validate_role_result(
         _fail("READ_ONLY_ROLE_MODIFIED_REPO", f"read-only role {role} changed the repository")
     if set(declared_changes) != changed_files:
         _fail("CHANGED_FILES_MISMATCH", "declared changed_files differ from the real diff")
+    return result
 
 
 def _construction_evidence_observation(check: ConstructionCheck) -> str:
@@ -1881,7 +1917,14 @@ def run_codex(
                     ).hexdigest(),
                 },
             )
-        validate_role_result(role, result, actual_changes)
+        result = dict(
+            validate_role_result(
+                role,
+                result,
+                actual_changes,
+                expected_task_id=accounting_context.task_id,
+            )
+        )
         validate_verification_package(
             role,
             task,
@@ -3741,6 +3784,12 @@ def _team_call_file_identity(value: os.stat_result) -> _TeamCallFileIdentity:
     )
 
 
+def _team_call_directory_identity(value: os.stat_result) -> tuple[int, int, int]:
+    """Pin durable directory identity without transient entry-lock timestamps."""
+
+    return (value.st_dev, value.st_ino, value.st_mode)
+
+
 def _team_call_l1_evidence(repository: Path, evidence_path: str) -> _TeamCallEvidencePin:
     """Pin every evidence component with component-wise no-follow identities."""
 
@@ -3919,7 +3968,7 @@ def _team_call_filesystem_snapshot(
     entries: list[tuple[object, ...]] = []
 
     def walk(directory_fd: int, relative: str) -> None:
-        directory_identity = _team_call_file_identity(os.fstat(directory_fd))
+        directory_identity = _team_call_directory_identity(os.fstat(directory_fd))
         entries.append((relative, directory_identity, None))
         for name in sorted(os.listdir(directory_fd)):
             item_relative = name if relative == "." else f"{relative}/{name}"
@@ -3931,18 +3980,19 @@ def _team_call_filesystem_snapshot(
                 and stat.S_ISDIR(before.st_mode)
             ):
                 continue
-            identity = _team_call_file_identity(before)
             if stat.S_ISDIR(before.st_mode):
+                identity = _team_call_directory_identity(before)
                 child_fd = os.open(
                     name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory_fd
                 )
                 try:
-                    if _team_call_file_identity(os.fstat(child_fd)) != identity:
+                    if _team_call_directory_identity(os.fstat(child_fd)) != identity:
                         _fail("READ_ONLY_FILESYSTEM_SNAPSHOT_INVALID", "filesystem changed during snapshot")
                     walk(child_fd, item_relative)
                 finally:
                     os.close(child_fd)
                 continue
+            identity = _team_call_file_identity(before)
             if stat.S_ISREG(before.st_mode):
                 child_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
                 try:
@@ -3971,7 +4021,20 @@ def _team_call_filesystem_snapshot(
 
 
 def _team_call_git_control_snapshot(repository: Path) -> tuple[tuple[str, object], ...]:
-    """Snapshot the per-worktree and common Git control directories."""
+    """Snapshot durable Git state while tolerating same-content index refreshes."""
+
+    def durable_git_entries(path: Path) -> tuple[tuple[object, ...], ...]:
+        durable: list[tuple[object, ...]] = []
+        for relative, identity, digest in _team_call_filesystem_snapshot(
+            path, exclude_git_directory=False
+        ):
+            if isinstance(identity, _TeamCallFileIdentity) and digest is not None:
+                durable.append(
+                    (relative, (identity.mode, identity.size), digest)
+                )
+            else:
+                durable.append((relative, identity, digest))
+        return tuple(durable)
 
     control_paths: set[Path] = set()
     for argument in ("--absolute-git-dir", "--git-common-dir"):
@@ -3985,7 +4048,7 @@ def _team_call_git_control_snapshot(repository: Path) -> tuple[tuple[str, object
                 "cannot resolve Git control directory",
             ) from exc
     return tuple(
-        (str(path), _team_call_filesystem_snapshot(path, exclude_git_directory=False))
+        (str(path), durable_git_entries(path))
         for path in sorted(control_paths, key=str)
     )
 

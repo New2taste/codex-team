@@ -84,10 +84,33 @@ Team Call 不授予 Luna review、approval、construction 或 final acceptance �
 - compact prompt 是双钥匙 armed 字段投影：公开 builder 只读 pinned `[optimization]` 与 `aggregate_metrics(state_root)`，`compact_prompts=true` 且 `evaluate_optimization_gate==ALLOW_ENFORCED` 且 `mode=enforced` 且 compact bytes 小于 full 才生效；shadow、无 state_root 或缺/非法 metrics 回完整 prompt。只去掉可重建包装，不改角色、权限、worktree 或 acceptance；task_id、角色指令、objective、commits、scope、forbidden actions、commands、human gates、plan/step id、hashes、授权票与两条证据授权句存在则逐字保真。acceptance repair ladder 的 assignment prompt 明确不参与 compact，永远 full；
 - runtime evidence（模型、推理档、执行面、sandbox、permission、cwd、native UUID）；
 - cost evidence（实测、投影和 unavailable 明确区分）；
+- router-probe manifest（Luna/Sol/Terra 热前缀臂、逐模型冷对照、固定 seed 与配对案例）；
 - append-only events、human decisions 和 assignment capability；
 - 真实 diff、工作树、Git 控制面和测试输出。
 
 状态机遇到 HEAD 漂移、只读角色写入、范围越界、重复 attempt、证据缺失或非法跳转时停止并记录 `BLOCKED`，不依赖模型解释来“继续”。
+
+只读 Team Call 的 Git 控制面快照比较持久状态：路径集合、文件 mode/size/hash
+和引用内容。`git status` 可能用字节完全相同的新 index 原子替换旧 index，因此
+单独的 inode/mtime/ctime 漂移不算持久修改；新增文件、内容变化、权限变化和
+引用变化仍阻断。快照不能证明执行窗口内“修改后又恢复”的瞬态历史，第一安全
+边界仍是已验证的 read-only sandbox 与 runtime permission。
+
+### 常驻路由研究面
+
+`ai_workflow_router_probe.py` 与生产状态机隔离：它不 import 任务存储，不写
+events/task ledger，也不能调用 route application。常驻的最小定义是
+“固定模型 + 冻结前缀 + 每次新会话”，避免线程污染。每个历史 intake 在 Luna、Sol、
+Terra 的热前缀臂及对应冷对照中只执行入口分类；真实写任务不会重复执行。
+
+runner 默认 `dry-run`，live 必须双重显式选择。批次先在输出根目录内写临时目录，
+完成 manifest、cost evidence、summary 和 report 后再原子发布；同 batch id
+write-once。分析只有在 measured、六臂完整、至少 32 个 paired cases、前缀稳定
+且 token 完整、四个任务层各至少 8 个时才允许输出
+`CACHE_MECHANISM_CANDIDATE_*`。它只比较热前缀的 uncached-input 机制，不冒充
+真实成本赢家；缺少费率快照和下游反事实成本时 cost winner 明确 unavailable。
+`effective_route=UNCHANGED`；缺证据返回 `OBSERVATION_ONLY`，无缓存收益返回
+`KEEP_DETERMINISTIC_BASELINE`。
 
 ### 恢复与终止
 
@@ -114,6 +137,7 @@ scripts/ai_workflow_planning.py # 计划和施工信封
 scripts/ai_workflow_scheduler.py# 计划调度与 final ACCEPTANCE child
 scripts/ai_workflow_repairs.py  # acceptance repair ledger v2
 scripts/ai_workflow_team_call.py# Codex Team grammar、分类和收据
+scripts/ai_workflow_router_probe.py # 常驻路由器离线 shadow 探针、聚合和报告
 scripts/sync_plugin.py           # 固定 manifest 的 Plugin 检查/原子同步
 scripts/verify_all.sh            # 零模型完整验证入口
 plugins/ai-workflow/             # 对外 Plugin；runtime/config 必须与根目录一致

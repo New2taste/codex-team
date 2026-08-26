@@ -92,6 +92,84 @@ class AcceptanceContractMutationTest(unittest.TestCase):
                 ):
                     repairs._v2_validate_controller_result(result, assignment, set())
 
+    def test_controller_result_accepts_exact_bound_task_id_echo(self):
+        assignment = SimpleNamespace(
+            phase="REVIEW_1",
+            expected_actor=SimpleNamespace(role="terra_xhigh_reviewer"),
+        )
+        result = self._strict_wire_review_result()
+        result["task_id"] = "AWF-20260826-001"
+        caller_view = dict(result)
+        validated = repairs._v2_validate_controller_result(
+            result,
+            assignment,
+            set(),
+            expected_task_id="AWF-20260826-001",
+        )
+        self.assertNotIn("task_id", validated)
+        self.assertEqual(result, caller_view)
+
+    def test_controller_result_rejects_unbound_or_wrong_task_id_echo(self):
+        assignment = SimpleNamespace(
+            phase="REVIEW_1",
+            expected_actor=SimpleNamespace(role="terra_xhigh_reviewer"),
+        )
+        for expected_task_id in (None, "", "AWF-20260826-999"):
+            with self.subTest(expected_task_id=expected_task_id):
+                result = self._strict_wire_review_result()
+                result["task_id"] = "AWF-20260826-001"
+                with self.assertRaisesRegex(
+                    workflow.WorkflowError, "REPAIR_ADAPTER_INVALID_OUTPUT"
+                ):
+                    repairs._v2_validate_controller_result(
+                        result,
+                        assignment,
+                        set(),
+                        expected_task_id=expected_task_id,
+                    )
+
+    def test_controller_result_rejects_model_supplied_scheduler_identity(self):
+        assignment = SimpleNamespace(
+            phase="REVIEW_1",
+            expected_actor=SimpleNamespace(role="terra_xhigh_reviewer"),
+        )
+        result = self._strict_wire_review_result()
+        result.update(
+            {
+                "dispatch_id": "a" * 64,
+                "task_id": "AWF-20260826-001",
+                "step_id": "step-1",
+                "attempt": 1,
+            }
+        )
+        with self.assertRaisesRegex(
+            workflow.WorkflowError, "REPAIR_ADAPTER_INVALID_OUTPUT"
+        ):
+            repairs._v2_validate_controller_result(
+                result,
+                assignment,
+                set(),
+                expected_task_id="AWF-20260826-001",
+            )
+
+    def test_assignment_prompt_reserves_controller_identity_fields(self):
+        assignment = SimpleNamespace(
+            phase="REVIEW_1",
+            expected_actor=SimpleNamespace(role="terra_xhigh_reviewer"),
+        )
+        with mock.patch.object(
+            repairs,
+            "_v2_assignment_payload_for_event",
+            return_value={"assignment_id": "assignment-1"},
+        ):
+            prompt = repairs._v2_assignment_prompt(
+                {"task_id": "AWF-20260826-001"}, assignment
+            )
+        self.assertIn(
+            "Set dispatch_id, task_id, step_id, and attempt to null; controller identity is reserved.",
+            prompt,
+        )
+
     def test_receipt_identity_contract_kills_assignment_attempt_only_verifier(self):
         expected = {
             "assignment_id": "assignment-001",

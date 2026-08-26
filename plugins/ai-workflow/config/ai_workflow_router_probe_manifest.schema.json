@@ -1,0 +1,122 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "router-probe-manifest-1"
+    },
+    "batch_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
+    "seed": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "prompt_template_version": {
+      "type": "string",
+      "const": "router-probe-v1"
+    },
+    "data_origin": {
+      "type": "string",
+      "enum": ["measured", "synthetic"]
+    },
+    "created_at_utc": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "cases": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "case_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+          },
+          "paired_case_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+          },
+          "stratum": {
+            "type": "string",
+            "enum": ["l0", "l1", "plan_required", "adversarial"]
+          },
+          "route": {
+            "type": "string",
+            "enum": ["direct", "sol_only", "delegated", "blocked"]
+          },
+          "intake": {
+            "type": "string",
+            "minLength": 1
+          },
+          "expected_route": {
+            "type": "string",
+            "enum": ["direct", "sol_only", "delegated", "blocked"]
+          }
+        },
+        "required": [
+          "case_id",
+          "paired_case_id",
+          "stratum",
+          "route",
+          "intake",
+          "expected_route"
+        ]
+      }
+    },
+    "arms": {
+      "type": "array",
+      "minItems": 6,
+      "maxItems": 6,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "arm_id": {
+            "type": "string",
+            "enum": [
+              "luna_resident",
+              "sol_resident",
+              "terra_resident",
+              "luna_control_fresh",
+              "sol_control_fresh",
+              "terra_control_fresh"
+            ]
+          },
+          "model": {
+            "type": "string",
+            "enum": ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"]
+          },
+          "reasoning_effort": {
+            "type": "string",
+            "enum": ["max", "medium", "xhigh"]
+          },
+          "cache_condition": {
+            "type": "string",
+            "enum": ["resident", "cold_control"]
+          }
+        },
+        "required": [
+          "arm_id",
+          "model",
+          "reasoning_effort",
+          "cache_condition"
+        ]
+      }
+    }
+  },
+  "required": [
+    "schema_version",
+    "batch_id",
+    "seed",
+    "prompt_template_version",
+    "data_origin",
+    "created_at_utc",
+    "cases",
+    "arms"
+  ]
+}

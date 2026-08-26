@@ -2703,6 +2703,7 @@ def _v2_assignment_prompt(
             f"Task: {_v2_canonical(dict(task))}",
             f"Assignment: {_v2_canonical(_v2_assignment_payload_for_event(assignment))}",
             f'Output role exactly "{assignment.expected_actor.role}" using ai-result-1 JSON.',
+            _workflow().RESULT_IDENTITY_PROMPT,
             "Never merge or push. Do not widen the immutable allowed paths.",
         )
     )
@@ -2712,36 +2713,28 @@ def _v2_validate_controller_result(
     result: object,
     assignment: AcceptanceAssignment,
     actual_changed_paths: set[str],
+    *,
+    expected_task_id: str | None = None,
 ) -> Mapping[str, object]:
     workflow = _workflow()
     if not isinstance(result, Mapping):
         _fail("REPAIR_ADAPTER_INVALID_OUTPUT", "controller assignment result is not an object")
-    # The provider-strict dispatch schema forces the scheduler identity
-    # quartet onto every live result; an all-null quartet is the wire
-    # encoding of "absent". Anything partially null is a forgery attempt.
-    identity_fields = workflow.RESULT_IDENTITY_FIELDS
-    present_identity = identity_fields & set(result)
-    null_identity = frozenset(
-        field for field in present_identity if result[field] is None
+    result = workflow.normalize_result_identity(
+        result,
+        expected_task_id=expected_task_id,
+        error_code="REPAIR_ADAPTER_INVALID_OUTPUT",
     )
-    if null_identity:
-        if present_identity == identity_fields and null_identity == identity_fields:
-            result = {
-                key: value
-                for key, value in result.items()
-                if key not in identity_fields
-            }
-        else:
-            _fail(
-                "REPAIR_ADAPTER_INVALID_OUTPUT",
-                "controller assignment result identity is partially null",
-            )
     if set(result) != set(workflow.RESULT_REQUIRED_FIELDS):
         _fail("REPAIR_ADAPTER_INVALID_OUTPUT", "controller assignment result shape is invalid")
     if result.get("schema_version") != "ai-result-1" or result.get("role") != assignment.expected_actor.role:
         _fail("REPAIR_ADAPTER_INVALID_OUTPUT", "controller assignment result identity drifted")
     if assignment.phase in _REVIEW_PHASES:
-        workflow.validate_role_result(assignment.expected_actor.role, result, actual_changed_paths)
+        result = workflow.validate_role_result(
+            assignment.expected_actor.role,
+            result,
+            actual_changed_paths,
+            expected_task_id=expected_task_id,
+        )
         if result.get("status") not in {
             "ACCEPTANCE_RECOMMENDED",
             "ACCEPTANCE_WITH_NOTES_RECOMMENDED",
@@ -2956,7 +2949,12 @@ def run_assignment(
                 repository, assignment.input_candidate_commit, after.head
             )
         ) if after.head != assignment.input_candidate_commit else set()
-        output = _v2_validate_controller_result(output, assignment, actual_changed_paths)
+        output = _v2_validate_controller_result(
+            output,
+            assignment,
+            actual_changed_paths,
+            expected_task_id=stored_task["task_id"],
+        )
         if assignment.phase in _REPAIR_PHASES:
             with store.lock(task_id):
                 completion_replay = replay_acceptance_ledger(store, task_id)

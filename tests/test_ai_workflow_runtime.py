@@ -440,6 +440,108 @@ class RuntimeInspectorTest(unittest.TestCase):
             text=True,
         )
 
+    def test_inspector_parses_redacted_real_codex_0150_jsonl(self):
+        fixture = FIXTURES / "codex-0.150-real"
+        source = next(fixture.glob("*.jsonl"))
+        records = [
+            json.loads(line)
+            for line in source.read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertEqual(
+            "0.150.0-alpha.8", records[0]["payload"]["cli_version"]
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            sessions = Path(temporary) / "sessions"
+            shutil.copytree(fixture, sessions)
+            completed = self.run_inspector(sessions)
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertEqual(
+            {
+                "thread_id": THREAD_ID,
+                "native_agent_id": None,
+                "agent_type": None,
+                "model": "gpt-5.6-luna",
+                "reasoning_effort": "max",
+                "sandbox_policy": "read-only",
+                "permission_profile": "read-only",
+                "cwd": records[0]["payload"]["cwd"],
+            },
+            json.loads(completed.stdout),
+        )
+
+    def test_real_jsonl_shape_mutations_fail_closed_without_leaking(self):
+        fixture = FIXTURES / "codex-0.150-real"
+        source = next(fixture.glob("*.jsonl"))
+        original = [
+            json.loads(line)
+            for line in source.read_text(encoding="utf-8").splitlines()
+        ]
+
+        def missing_session(records):
+            records[0]["payload"].pop("id")
+            records[0]["payload"].pop("session_id")
+
+        def conflicting_model(records):
+            records.append(
+                {
+                    "type": "turn_context",
+                    "payload": {"model": "gpt-5.6-sol"},
+                }
+            )
+
+        def unknown_sandbox(records):
+            records[1]["payload"]["sandbox_policy"] = {
+                "type": "PROMPT_SECRET-future"
+            }
+
+        def unknown_permission(records):
+            records[1]["payload"]["permission_profile"] = {
+                "type": "managed",
+                "file_system": {"type": "PROMPT_SECRET-future"},
+                "network": "restricted",
+            }
+
+        def extra_permission_capability(records):
+            records[1]["payload"]["permission_profile"]["allow_write"] = True
+
+        def conflicting_turn_cwd(records):
+            records[1]["payload"]["cwd"] = "/tmp/PROMPT_SECRET-runtime-drift"
+
+        for label, mutate in (
+            ("missing-session", missing_session),
+            ("conflicting-model", conflicting_model),
+            ("unknown-sandbox", unknown_sandbox),
+            ("unknown-permission", unknown_permission),
+            ("extra-permission-capability", extra_permission_capability),
+            ("conflicting-turn-cwd", conflicting_turn_cwd),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                records = json.loads(json.dumps(original))
+                mutate(records)
+                sessions = Path(temporary) / "sessions"
+                sessions.mkdir()
+                (sessions / f"rollout-{THREAD_ID}").write_text(
+                    "\n".join(json.dumps(record) for record in records) + "\n",
+                    encoding="utf-8",
+                )
+                completed = self.run_inspector(sessions)
+                self.assertNotEqual(0, completed.returncode)
+                self.assertNotIn(
+                    "PROMPT_SECRET", completed.stdout + completed.stderr
+                )
+
+    def test_inspector_rejects_malformed_real_jsonl_without_reflection(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            sessions = Path(temporary) / "sessions"
+            sessions.mkdir()
+            (sessions / f"rollout-{THREAD_ID}").write_text(
+                '{"type":"session_meta","payload":{"id":"PROMPT_SECRET"}\n',
+                encoding="utf-8",
+            )
+            completed = self.run_inspector(sessions)
+        self.assertNotEqual(0, completed.returncode)
+        self.assertNotIn("PROMPT_SECRET", completed.stdout + completed.stderr)
+
     def test_allowlisted_inspection_never_leaks_sensitive_fixture_values(self):
         with tempfile.TemporaryDirectory() as temporary:
             sessions = Path(temporary) / "sessions"
