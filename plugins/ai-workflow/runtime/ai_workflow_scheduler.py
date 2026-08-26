@@ -344,11 +344,18 @@ def replay_scheduler(store: object, plan: FrozenPlan) -> SchedulerReplay:
 
     path = _ledger_path(store, plan.task_id)
     try:
-        raw = path.read_text(encoding="utf-8")
+        raw_bytes = _workflow()._read_regular_file(
+            path,
+            error_code="SCHEDULER_LEDGER_INVALID",
+            missing_ok=True,
+        )
+        if raw_bytes is None:
+            return SchedulerReplay()
+        raw = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _workflow_error("SCHEDULER_LEDGER_INVALID", "scheduler ledger is not valid UTF-8") from exc
     except FileNotFoundError:
         return SchedulerReplay()
-    except OSError as exc:
-        raise _workflow_error("SCHEDULER_LEDGER_INVALID", "cannot read scheduler ledger") from exc
 
     replay = SchedulerReplay()
     tasks_by_id = {task.id: task for task in plan.tasks}
@@ -405,6 +412,17 @@ def replay_scheduler(store: object, plan: FrozenPlan) -> SchedulerReplay:
                 _fail("SCHEDULER_LEDGER_INVALID", "STEP_DISPATCHED dispatch_id does not match planning identity")
             if event.get("scope_sha256") != _scope_sha256(selected):
                 _fail("SCHEDULER_LEDGER_INVALID", "STEP_DISPATCHED scope_sha256 does not match the frozen step")
+            ready = ready_batch(
+                plan,
+                replay.completed,
+                replay.dispatched,
+                capacity=len(plan.tasks),
+            )
+            if subtask_id not in ready:
+                _fail(
+                    "SCHEDULER_LEDGER_INVALID",
+                    "STEP_DISPATCHED references a step that was not ready",
+                )
             replay.dispatched.add(subtask_id)
             replay.in_flight[subtask_id] = owner_role
             replay.worktree_paths[subtask_id] = worktree_path
@@ -687,11 +705,18 @@ def _load_dispatch_record(store: object, task_id: str, identity: str) -> dict[st
         _fail("PLAN_INVALID", "scheduler requires the workflow append-only store")
     path = Path(require_task(task_id)) / "dispatches.jsonl"
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        raw = _workflow()._read_regular_file(
+            path,
+            error_code="DISPATCH_READ_ERROR",
+            missing_ok=True,
+        )
+        if raw is None:
+            return None
+        lines = raw.decode("utf-8").splitlines()
+    except UnicodeDecodeError as exc:
+        raise _workflow_error("DISPATCH_READ_ERROR", "dispatch ledger is not valid UTF-8") from exc
     except FileNotFoundError:
         return None
-    except OSError as exc:
-        raise _workflow_error("DISPATCH_READ_ERROR", "cannot read dispatch ledger") from exc
     matched: dict[str, object] | None = None
     for line in lines:
         try:
@@ -814,6 +839,15 @@ def dispatch_step(
     with lock(plan.task_id):
         plan = _ensure_plan_artifact(store, plan)
         replay = replay_scheduler(store, plan)
+        _reject_locked_dispatch(replay, subtask_id)
+        ready = ready_batch(
+            plan,
+            replay.completed,
+            replay.dispatched,
+            len(plan.tasks),
+        )
+        if subtask_id not in ready:
+            _fail("STEP_NOT_READY", "subtask dependencies or stage barrier are not satisfied")
         return _dispatch_step_locked(store, plan, stored_task, subtask_id, attempt, replay)
 
 

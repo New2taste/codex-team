@@ -640,6 +640,90 @@ class SchedulerDispatchTest(SchedulerHarness):
             )
         self.assertEqual(original, ledger_bytes(self.store, self.frozen.task_id))
 
+    def test_scheduler_ledger_rejects_symlink_and_hardlink_replay(self):
+        scheduler.dispatch_ready_batch(self.store, self.frozen)
+        path = self.store.root / self.frozen.task_id / "scheduler.jsonl"
+        outside = Path(self.temporary_directory.name) / "scheduler-ledger-outside.jsonl"
+        original = path.read_bytes()
+        path.replace(outside)
+
+        path.symlink_to(outside)
+        with self.assertRaisesRegex(workflow.WorkflowError, "SCHEDULER_LEDGER_INVALID"):
+            scheduler.replay_scheduler(self.store, self.frozen)
+        self.assertEqual(original, outside.read_bytes())
+
+        path.unlink()
+        os.link(outside, path)
+        with self.assertRaisesRegex(workflow.WorkflowError, "SCHEDULER_LEDGER_INVALID"):
+            scheduler.replay_scheduler(self.store, self.frozen)
+        self.assertEqual(original, outside.read_bytes())
+
+    def test_scheduler_and_dispatch_ledgers_reject_linked_append_targets(self):
+        task_dir = self.store.root / self.frozen.task_id
+        outside_scheduler = Path(self.temporary_directory.name) / "empty-scheduler.jsonl"
+        outside_scheduler.write_bytes(b"")
+        (task_dir / "scheduler.jsonl").symlink_to(outside_scheduler)
+        with self.assertRaisesRegex(workflow.WorkflowError, "SCHEDULER_LEDGER_INVALID"):
+            scheduler.dispatch_ready_batch(self.store, self.frozen)
+        self.assertEqual(b"", outside_scheduler.read_bytes())
+
+        (task_dir / "scheduler.jsonl").unlink()
+        outside_dispatch = Path(self.temporary_directory.name) / "empty-dispatch.jsonl"
+        outside_dispatch.write_bytes(b"")
+        (task_dir / "dispatches.jsonl").symlink_to(outside_dispatch)
+        with self.assertRaisesRegex(workflow.WorkflowError, "DISPATCH_READ_ERROR"):
+            scheduler.dispatch_ready_batch(self.store, self.frozen)
+        self.assertEqual(b"", outside_dispatch.read_bytes())
+
+        (task_dir / "dispatches.jsonl").unlink()
+        os.link(outside_dispatch, task_dir / "dispatches.jsonl")
+        with self.assertRaisesRegex(workflow.WorkflowError, "DISPATCH_READ_ERROR"):
+            scheduler.dispatch_ready_batch(self.store, self.frozen)
+        self.assertEqual(b"", outside_dispatch.read_bytes())
+
+        append_path = task_dir / "append-only.jsonl"
+        append_path.symlink_to(outside_dispatch)
+        with self.assertRaisesRegex(workflow.WorkflowError, "APPEND_UNSAFE"):
+            workflow.append_jsonl(append_path, {"event": "blocked"})
+        append_path.unlink()
+        os.link(outside_dispatch, append_path)
+        with self.assertRaisesRegex(workflow.WorkflowError, "APPEND_UNSAFE"):
+            workflow.append_jsonl(append_path, {"event": "blocked"})
+        self.assertEqual(b"", outside_dispatch.read_bytes())
+
+    def test_direct_dispatch_rejects_step_outside_current_ready_batch(self):
+        original = ledger_bytes(self.store, self.frozen.task_id)
+        with self.assertRaisesRegex(workflow.WorkflowError, "STEP_NOT_READY"):
+            scheduler.dispatch_step(self.store, self.frozen, "write-d", attempt=1)
+        self.assertEqual(original, ledger_bytes(self.store, self.frozen.task_id))
+
+    def test_write_json_once_rejects_parent_directory_swap_before_publish(self):
+        parent = Path(self.temporary_directory.name) / "artifact-parent"
+        parent.mkdir()
+        target = parent / "artifact.json"
+        outside = Path(self.temporary_directory.name) / "artifact-outside"
+        backup = Path(self.temporary_directory.name) / "artifact-parent-original"
+        real_open = workflow.os.open
+        swapped = False
+
+        def swap_parent_after_open(path, flags, *args, **kwargs):
+            nonlocal swapped
+            descriptor = real_open(path, flags, *args, **kwargs)
+            if not swapped and Path(path) == parent and flags & os.O_DIRECTORY:
+                swapped = True
+                outside.mkdir()
+                parent.rename(backup)
+                temporary = next(backup.glob(f".{target.name}.*.tmp"))
+                (outside / temporary.name).write_bytes(temporary.read_bytes())
+                parent.symlink_to(outside, target_is_directory=True)
+            return descriptor
+
+        with mock.patch.object(workflow.os, "open", side_effect=swap_parent_after_open):
+            with self.assertRaisesRegex(workflow.WorkflowError, "ATOMIC_WRITE_FAILED"):
+                workflow.write_json_once(target, {"safe": True}, conflict_code="CONFLICT")
+        self.assertFalse((outside / target.name).exists())
+        self.assertFalse((backup / target.name).exists())
+
     def test_corrupt_scheduler_history_fails_closed_without_rewrite(self):
         scheduler.dispatch_ready_batch(self.store, self.frozen)
         path = self.store.root / self.frozen.task_id / "scheduler.jsonl"

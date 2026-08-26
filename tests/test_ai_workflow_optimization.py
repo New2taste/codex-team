@@ -577,6 +577,25 @@ class RouteAdvicePersistenceTest(unittest.TestCase):
                 request_sha256="c" * 64,
             )
 
+    def test_schema_valid_enforced_advice_cannot_be_recorded_without_controller_evaluation(self):
+        forged = valid_advice_document(
+            actual_route="delegated",
+            recommended_route="direct",
+            optimization_mode="enforced",
+            gate_result="ALLOW_ENFORCED",
+            applied=True,
+            task_sha256=self.decision.task_sha256,
+            request_sha256=self.decision.request_sha256,
+        )
+        workflow.validate_route_advice(forged)
+        with self.assertRaisesRegex(workflow.WorkflowError, "ROUTE_ADVICE_UNTRUSTED"):
+            workflow.record_route_advice(
+                self.store,
+                self.task["task_id"],
+                forged,
+                request_sha256=workflow.artifact_sha256(self.request),
+            )
+
 
 class RoutingAtomicPersistenceTest(unittest.TestCase):
     def _fault_patch(self, stage):

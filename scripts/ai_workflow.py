@@ -2038,6 +2038,98 @@ def atomic_write_json(path: Path, value: object) -> None:
                 pass
 
 
+def _directory_identity_matches(path: Path, descriptor: int) -> bool:
+    """Return whether a path still names the directory pinned by ``descriptor``."""
+
+    try:
+        current = os.stat(path, follow_symlinks=False)
+        opened = os.fstat(descriptor)
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(current.st_mode)
+        and stat.S_ISDIR(opened.st_mode)
+        and current.st_dev == opened.st_dev
+        and current.st_ino == opened.st_ino
+    )
+
+
+def _open_parent_directory(path: Path, *, error_code: str) -> int:
+    """Open a target parent without following a replacement directory symlink."""
+
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise WorkflowError(error_code, f"cannot open parent directory for {path.name}") from exc
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISDIR(metadata.st_mode):
+        os.close(descriptor)
+        raise WorkflowError(error_code, f"parent directory for {path.name} is not a directory")
+    return descriptor
+
+
+def _validate_regular_descriptor(
+    descriptor: int,
+    *,
+    error_code: str,
+    label: str,
+    max_bytes: int | None = None,
+) -> os.stat_result:
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        raise WorkflowError(error_code, f"{label} must be a private regular file")
+    if max_bytes is not None and metadata.st_size > max_bytes:
+        raise WorkflowError(error_code, f"{label} is too large")
+    return metadata
+
+
+def _read_regular_file(
+    path: Path,
+    *,
+    error_code: str,
+    missing_ok: bool = False,
+    max_bytes: int | None = None,
+) -> bytes | None:
+    """Read one regular, single-link file relative to a pinned parent directory."""
+
+    target = Path(path)
+    parent_descriptor = -1
+    descriptor = -1
+    try:
+        parent_descriptor = _open_parent_directory(target.parent, error_code=error_code)
+        flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        try:
+            descriptor = os.open(target.name, flags, dir_fd=parent_descriptor)
+        except FileNotFoundError:
+            if missing_ok:
+                return None
+            raise
+        _validate_regular_descriptor(
+            descriptor,
+            error_code=error_code,
+            label=target.name,
+            max_bytes=max_bytes,
+        )
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1
+            raw = handle.read()
+        if not _directory_identity_matches(target.parent, parent_descriptor):
+            raise WorkflowError(error_code, f"parent directory changed while reading {target.name}")
+        return raw
+    except WorkflowError:
+        raise
+    except FileNotFoundError as exc:
+        raise WorkflowError(error_code, f"{target.name} is missing") from exc
+    except OSError as exc:
+        raise WorkflowError(error_code, f"cannot read {target.name}") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
+
+
 def write_json_once(path: Path, value: object, *, conflict_code: str) -> str:
     """Atomically publish one frozen JSON artifact without replacing an existing one."""
 
@@ -2061,14 +2153,50 @@ def write_json_once(path: Path, value: object, *, conflict_code: str) -> str:
             handle.flush()
             os.fsync(handle.fileno())
         parent_descriptor = os.open(
-            target.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            target.parent,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
         )
         fcntl.flock(parent_descriptor, fcntl.LOCK_EX)
-        if target.exists() or target.is_symlink():
+        if not _directory_identity_matches(target.parent, parent_descriptor):
+            raise WorkflowError(
+                "ATOMIC_WRITE_FAILED",
+                f"parent directory changed before publishing {target.name}",
+            )
+        try:
+            existing = os.stat(target.name, dir_fd=parent_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None:
             _fail(conflict_code, f"{target.name} is already frozen")
-        os.replace(temporary, target)
+        temporary_name = Path(temporary.name).name
+        temp_descriptor = -1
+        try:
+            temp_descriptor = os.open(
+                temporary_name,
+                os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=parent_descriptor,
+            )
+            _validate_regular_descriptor(
+                temp_descriptor,
+                error_code="ATOMIC_WRITE_FAILED",
+                label=temporary_name,
+            )
+            os.replace(
+                temporary_name,
+                target.name,
+                src_dir_fd=parent_descriptor,
+                dst_dir_fd=parent_descriptor,
+            )
+        finally:
+            if temp_descriptor >= 0:
+                os.close(temp_descriptor)
         temporary = None
         published = True
+        if not _directory_identity_matches(target.parent, parent_descriptor):
+            raise WorkflowError(
+                "ATOMIC_WRITE_FAILED",
+                f"parent directory changed while publishing {target.name}",
+            )
         os.fsync(parent_descriptor)
         return digest
     except WorkflowError:
@@ -2081,13 +2209,16 @@ def write_json_once(path: Path, value: object, *, conflict_code: str) -> str:
         )
         raise WorkflowError(code, f"cannot write {target.name}") from exc
     finally:
-        if parent_descriptor >= 0:
-            os.close(parent_descriptor)
         if temporary is not None:
             try:
-                temporary.unlink()
+                if parent_descriptor >= 0:
+                    os.unlink(Path(temporary.name).name, dir_fd=parent_descriptor)
+                else:
+                    temporary.unlink()
             except FileNotFoundError:
                 pass
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
 
 
 def append_jsonl(path: Path, record: Mapping[str, object]) -> None:
@@ -2098,13 +2229,45 @@ def append_jsonl(path: Path, record: Mapping[str, object]) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     line = _canonical_json(dict(record)) + "\n"
+    parent_descriptor = -1
+    descriptor = -1
     try:
-        with target.open("a", encoding="utf-8") as handle:
-            handle.write(line)
-            handle.flush()
-            os.fsync(handle.fileno())
+        parent_descriptor = _open_parent_directory(target.parent, error_code="APPEND_UNSAFE")
+        descriptor = os.open(
+            target.name,
+            os.O_WRONLY
+            | os.O_APPEND
+            | os.O_CREAT
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=parent_descriptor,
+        )
+        _validate_regular_descriptor(
+            descriptor,
+            error_code="APPEND_UNSAFE",
+            label=target.name,
+        )
+        payload = line.encode("utf-8")
+        written = 0
+        while written < len(payload):
+            written += os.write(descriptor, payload[written:])
+        os.fsync(descriptor)
+        if not _directory_identity_matches(target.parent, parent_descriptor):
+            raise WorkflowError(
+                "APPEND_UNSAFE",
+                f"parent directory changed while appending {target.name}",
+            )
+    except WorkflowError:
+        raise
     except OSError as exc:
-        raise WorkflowError("APPEND_FAILED", f"cannot append {target.name}") from exc
+        code = "APPEND_UNSAFE" if exc.errno in {errno.ELOOP, errno.ENOTDIR} else "APPEND_FAILED"
+        raise WorkflowError(code, f"cannot append {target.name}") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
 
 
 class WorkflowStore:
@@ -2190,9 +2353,20 @@ class WorkflowStore:
         task_dir = self._require_task(task_id)
         ledger = task_dir / "dispatches.jsonl"
         try:
-            lines = ledger.read_text(encoding="utf-8").splitlines()
+            raw = _read_regular_file(
+                ledger,
+                error_code="DISPATCH_READ_ERROR",
+                missing_ok=True,
+            )
+            lines = [] if raw is None else raw.decode("utf-8").splitlines()
+        except UnicodeDecodeError as exc:
+            raise WorkflowError(
+                "DISPATCH_READ_ERROR", "dispatch ledger is not valid UTF-8"
+            ) from exc
         except FileNotFoundError:
             lines = []
+        except WorkflowError:
+            raise
         except OSError as exc:
             raise WorkflowError("DISPATCH_READ_ERROR", "cannot read dispatch ledger") from exc
         for line in lines:

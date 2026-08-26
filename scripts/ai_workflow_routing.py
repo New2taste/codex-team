@@ -12,7 +12,7 @@ import json
 import os
 import tempfile
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -48,6 +48,7 @@ ROLE_POLICIES = frozenset({"legacy", "terra_os"})
 # artifact value: selecting it requires verified local owner-decision context,
 # which the public routing facade does not yet receive.
 OWNER_AUTHORIZED_LARGE_PROJECT_ROUTE = "owner_authorized_large_project"
+_ROUTE_ADVICE_TRUST_TOKEN = object()
 
 
 def _workflow_error(code: str, message: str) -> BaseException:
@@ -632,6 +633,7 @@ class OptimizationAdviceResult:
     applied: bool
     roles: tuple[str, ...]
     effective_roles: tuple[str, ...]
+    _provenance: object = field(default=None, repr=False, compare=False)
 
     def to_dict(self) -> dict[str, object]:
         return self.decision.to_dict()
@@ -648,6 +650,11 @@ class OptimizationAdviceResult:
             "task_sha256": self.decision.task_sha256,
             "request_sha256": self.decision.request_sha256,
         }
+
+
+def _trusted_advice_result(**values: object) -> OptimizationAdviceResult:
+    values["_provenance"] = _ROUTE_ADVICE_TRUST_TOKEN
+    return OptimizationAdviceResult(**values)
 
 
 def resolve_optimization_policy(config: object) -> OptimizationPolicy:
@@ -769,7 +776,7 @@ def _evaluate_with_optimization_inputs(
             decision, suggested, bound_task, bound_request
         ):
             suggested = actual_route
-        return OptimizationAdviceResult(
+        return _trusted_advice_result(
             decision=decision,
             actual_route=actual_route,
             recommended_route=suggested,
@@ -787,7 +794,7 @@ def _evaluate_with_optimization_inputs(
     if computed_gate != "ALLOW_ENFORCED" or not _recommendation_is_safe(
         decision, suggested, bound_task, bound_request
     ):
-        return OptimizationAdviceResult(
+        return _trusted_advice_result(
             decision=decision,
             actual_route=actual_route,
             recommended_route=suggested,
@@ -798,7 +805,7 @@ def _evaluate_with_optimization_inputs(
             effective_roles=original_roles,
         )
     if not isinstance(bound_task, Mapping) or not isinstance(bound_request, Mapping):
-        return OptimizationAdviceResult(
+        return _trusted_advice_result(
             decision=decision,
             actual_route=actual_route,
             recommended_route=suggested,
@@ -818,7 +825,7 @@ def _evaluate_with_optimization_inputs(
             construction_step_id=construction_step_id,
         )
     except Exception:
-        return OptimizationAdviceResult(
+        return _trusted_advice_result(
             decision=decision,
             actual_route=actual_route,
             recommended_route=suggested,
@@ -828,7 +835,7 @@ def _evaluate_with_optimization_inputs(
             roles=original_roles,
             effective_roles=original_roles,
         )
-    return OptimizationAdviceResult(
+    return _trusted_advice_result(
         decision=decision,
         actual_route=actual_route,
         recommended_route=suggested,
@@ -988,6 +995,11 @@ def record_route_advice(
         _fail("INVALID_TASK_ID", "task_id must be a non-empty string")
     document = _advice_document(advice)
     validate_route_advice(document)
+    if not isinstance(advice, OptimizationAdviceResult) or advice._provenance is not _ROUTE_ADVICE_TRUST_TOKEN:
+        _fail(
+            "ROUTE_ADVICE_UNTRUSTED",
+            "route advice must come from the controller-owned evaluation path",
+        )
     if document["task_id"] != task_id:
         _fail("ROUTE_ADVICE_CONFLICT", "route advice task_id does not match persistence target")
     if request_sha256 is not None and request_sha256 != document["request_sha256"]:
