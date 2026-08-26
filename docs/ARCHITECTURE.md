@@ -40,7 +40,7 @@ Codex Team 是一个本地、可恢复、可审计的半自动编排层。它把
 
 中间工程小节不再单独派发对抗式审查，但施工 owner 仍必须执行冻结信封内的目标测试、负向检查、范围核对和运行时证据门。这里的自检不能被写成“独立验收”。
 
-`ACCEPTANCE` task 的 Terra xhigh reviewer 是显式本地审查的兼容入口，不代表全工程终验。正常计划调度在全部工程小节 receipt 完成后生成唯一 whole-project `ACCEPTANCE` child。final candidate 可以不同于 FrozenPlan 初始 candidate，但必须是当前 clean HEAD、初始 candidate 的 git 祖先后代，且 diff 落在授权 write union 内；parent ledger 用 `acceptance_task_sha256` 绑定完整 child，child 的 `scheduler-parent.json` 反向定向绑定唯一 parent task、plan、final event 和 candidate，分类时不扫描无关任务。`schedule-final` 通过现有 adversarial-acceptance-1 API 只签发一次 Sol-medium `REVIEW_1`，open 后 assignment 失败可续签。standalone `ACCEPTANCE` 兼容入口不变。
+`ACCEPTANCE` task 的 Terra xhigh reviewer 是显式本地审查入口，不代表全工程终验。正常计划调度在全部工程小节 receipt 完成后生成唯一 whole-project `ACCEPTANCE` child。final candidate 可以不同于 FrozenPlan 初始 candidate，但必须是当前 clean HEAD、初始 candidate 的 git 祖先后代，且 diff 落在授权 write union 内；parent ledger 用 `acceptance_task_sha256` 绑定完整 child，child 的 `scheduler-parent.json` 反向定向绑定唯一 parent task、plan、final event 和 candidate，分类时不扫描无关任务。`schedule-final` 通过现有 adversarial-acceptance-1 API 只签发一次 Sol-medium `REVIEW_1`，open 后 assignment 失败可续签。standalone `ACCEPTANCE` 入口保持不变。
 
 生产 CLI 的零模型调度控制面是 `schedule-batch` → `schedule-result` → `schedule-receipt` → `schedule-final`。`schedule-result` 接收既有执行边界产出的 `ai-result-1`，由 controller 补齐并核对 `dispatch_id/task_id/step_id/attempt`，输出位置不能由调用方指定：controller 从已重放 dispatch 唯一确定 `<state_root>/<task_id>/scheduler-results/<dispatch_id>.json` 并原子冻结，再按该文件 bytes 生成 receipt。结果读取按已打开的目录 fd 定位，拒绝目录换绑、symlink、hardlink 和超限文件。`schedule-final` 先创建 child；同时提供已记录 runtime evidence 对应的 `--owner-receipt` 与 Sol-medium `--acceptor` 时签发 `REVIEW_1`。后续 repair ladder 到达 terminal 授权点后使用 `decide <child_id> authorize_final_xhigh`。
 
@@ -125,7 +125,3 @@ tests/                           # 默认假 runner、负向注入和发布一�
 - 项目是 public preview，重点是自用和实验，不提供生产 SLA；
 - 真实计费数据、模型服务可用性和 live rollout 仍必须由实际环境单独验证；
 - Windows 原生生命周期不在当前验证范围内。
-
-## 9. 权威与历史材料
-
-当前运行时真值依次来自根目录 `config/` 与 `scripts/`、严格 Schema、分发测试以及本架构说明/README。`docs/superpowers/` 下的早期实验设计和实施计划保留为审计材料；它们不会被重写，且与当前运行时冲突时不参与路由或角色判定。

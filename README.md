@@ -4,7 +4,7 @@
 
 | 项目状态 | 当前值 |
 |---|---|
-| Plugin 版本 | `0.2.0` |
+| Plugin 版本 | `0.3.0` |
 | 发布形态 | Public preview；自用优先，不承诺生产 SLA |
 | 默认 Luna 执行面 | 原生 `NATIVE_SUBAGENT`：`gpt-5.6-luna / max` |
 | 默认施工 OS | Terra xhigh |
@@ -100,7 +100,7 @@ Codex Team 只有四种受限 disposition：
 
 中间工程小节采用 `section_self_check_only`：施工 owner 必须完成信封内的测试、负向检查、范围核对和运行时证据门，但不再逐小节派发独立对抗式审查。自检不等于验收。
 
-通用 `ACCEPTANCE` task 保留 Terra xhigh reviewer，供显式的本地/兼容性审查使用；它不是全工程 final acceptance。正常计划执行不会为每个中间小节创建这类 task。scheduler 在全部小节 receipt 完成后创建唯一 `ACCEPTANCE` child：final candidate 必须是当前 clean HEAD，且是 FrozenPlan 初始 candidate 的后代，diff 不得越出 step/parent write union；`FINAL_ACCEPTANCE_OPENED` 绑定 child task hash，child 的 `scheduler-parent.json` 定向绑定唯一 parent/plan/event/candidate。`schedule-final` 只签发一次 Sol-medium `REVIEW_1`；不为中间小节调 reviewer，也不自动跑模型。
+通用 `ACCEPTANCE` task 保留 Terra xhigh reviewer，供显式的本地审查使用；它不是全工程 final acceptance。正常计划执行不会为每个中间小节创建这类 task。scheduler 在全部小节 receipt 完成后创建唯一 `ACCEPTANCE` child：final candidate 必须是当前 clean HEAD，且是 FrozenPlan 初始 candidate 的后代，diff 不得越出 step/parent write union；`FINAL_ACCEPTANCE_OPENED` 绑定 child task hash，child 的 `scheduler-parent.json` 定向绑定唯一 parent/plan/event/candidate。`schedule-final` 只签发一次 Sol-medium `REVIEW_1`；不为中间小节调 reviewer，也不自动跑模型。
 
 ### 3. 验收后返工
 
@@ -181,5 +181,3 @@ sh scripts/verify_all.sh
 - [架构说明](docs/ARCHITECTURE.md)
 - [开发与验证指南](CONTRIBUTING.md)
 - [变更记录](CHANGELOG.md)
-
-运行时权威顺序为 `config/` 与 `scripts/`、严格 Schema、分发测试、README/架构说明。`docs/superpowers/` 下的早期实验设计和实施计划保留作审计证据；若与当前运行时冲突，不作为模型分工或路由真值，也不会为对齐现状而改写历史内容。

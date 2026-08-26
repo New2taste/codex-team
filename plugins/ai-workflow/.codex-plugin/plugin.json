@@ -1,6 +1,6 @@
 {
   "name": "ai-workflow",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Codex Team: deterministic multi-model routing, evidence, and review workflow.",
   "author": {
     "name": "Codex Team maintainers"

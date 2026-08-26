@@ -1,10 +1,31 @@
 # Changelog
 
-## 2026-08-26 — Upgrade synchronization
+## 0.3.0 — 2026-08-26
 
-- 对外项目名称统一为 **Codex Team**，GitHub 仓库地址同步为 `New2taste/codex-team`；
-- 公开说明收束到当前工作流契约，README 与架构/Skill 入口的最近更新时间同步为 2026-08-26；
-- 本次为项目升级记录与发布同步，不改变已验收的运行时路由和角色配置。
+调度与效率升级，公开项目名称统一为 **Codex Team**。
+
+### Added
+
+- 零模型 scheduler control plane：批次调度、结果收据、集中终验 child、resume 和 abort；
+- optimization shadow route advice、成本门禁和双钥匙 compact prompt 投影，默认不改变 effective route；
+- 固定 root-to-Plugin 同步器与 `scripts/verify_all.sh` 零模型完整验证入口；
+- scheduler、resume/abort、optimization、全工程终验和分发同步测试。
+
+### Changed
+
+- README、架构说明和 Skill 入口收束为当前运行时契约；
+- Plugin 版本升级为 `0.3.0`，GitHub 仓库地址统一为 `New2taste/codex-team`；
+- 中间工程小节继续只做施工自检，集中终验仍由 Sol medium 执行。
+
+### Verification snapshot
+
+- `sh scripts/verify_all.sh`：529 tests passed，8 个既有 repair-ledger-v1 intentional skips；
+- root/Plugin parity、Plugin verifier、Skill validator、compileall、shell syntax 和 `git diff --check` 均通过。
+
+### Known limitations
+
+- public preview，不提供生产 SLA；
+- 真实 live rollout、模型服务可用性和计费数据需要在实际 Codex 环境中单独验证。
 
 ## 0.2.0 — 2026-08-24
 
