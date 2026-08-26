@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.4.0 — 2026-08-26
+
+运行时与常驻路由研究升级，公开项目名称继续统一为 **Codex Team**。
+
+### Added
+
+- live runtime 合同修复：完整 rollout 解析、受限身份归一化和安全诊断输出；
+- provider-strict dispatch schema 投影，保持 `ai-result-1` canonical contract 不变；
+- 独立、shadow-only 的 Luna/Sol/Terra 常驻路由探针，支持 dry-run、fake、live 双钥匙、配对分析和报告；
+- Git 控制面只读快照比较，以及 router-probe manifest / cost evidence 契约。
+
+### Changed
+
+- 默认常驻入口分类建议记录为 Luna max；这只是项目说明，不改变确定性生产路由；
+- README、架构说明、配置和 Plugin runtime/config 镜像同步到当前升级；
+- Plugin 版本升级为 `0.4.0`。
+
+### Verification snapshot
+
+- `sh scripts/verify_all.sh`：583 tests passed，8 个既有 repair-ledger-v1 intentional skips；
+- root/Plugin parity、runtime inspector、router probe、scheduler、repair 和分发测试纳入同一验证入口。
+
+### Known limitations
+
+- 常驻路由研究仍为 shadow-only；未完成实测前不宣称真实成本赢家；
+- live rollout、模型服务可用性和计费数据需要在实际 Codex 环境中单独验证。
+
 ## 0.3.0 — 2026-08-26
 
 调度与效率升级，公开项目名称统一为 **Codex Team**。

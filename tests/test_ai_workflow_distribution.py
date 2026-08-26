@@ -272,7 +272,7 @@ class DistributionContractTest(unittest.TestCase):
         manifest = json.loads((PLUGIN / ".codex-plugin" / "plugin.json").read_text())
         marketplace = json.loads((ROOT / ".agents" / "plugins" / "marketplace.json").read_text())
         self.assertEqual("ai-workflow", manifest["name"])
-        self.assertEqual("0.3.0", manifest["version"])
+        self.assertEqual("0.4.0", manifest["version"])
         self.assertEqual("./skills/", manifest["skills"])
         self.assertEqual("ai-workflow", marketplace["name"])
         self.assertEqual(

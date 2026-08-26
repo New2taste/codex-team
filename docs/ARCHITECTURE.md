@@ -110,7 +110,8 @@ write-once。分析只有在 measured、六臂完整、至少 32 个 paired case
 `CACHE_MECHANISM_CANDIDATE_*`。它只比较热前缀的 uncached-input 机制，不冒充
 真实成本赢家；缺少费率快照和下游反事实成本时 cost winner 明确 unavailable。
 `effective_route=UNCHANGED`；缺证据返回 `OBSERVATION_ONLY`，无缓存收益返回
-`KEEP_DETERMINISTIC_BASELINE`。
+`KEEP_DETERMINISTIC_BASELINE`。项目说明建议常驻入口分类优先用 Luna max；
+这只是文档建议，生产生效路由仍由确定性规则决定，live 探针与模型选择由使用者显式指定。
 
 ### 恢复与终止
 

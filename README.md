@@ -4,9 +4,10 @@
 
 | 项目状态 | 当前值 |
 |---|---|
-| Plugin 版本 | `0.3.0` |
+| Plugin 版本 | `0.4.0` |
 | 发布形态 | Public preview；自用优先，不承诺生产 SLA |
 | 默认 Luna 执行面 | 原生 `NATIVE_SUBAGENT`：`gpt-5.6-luna / max` |
+| 常驻路由建议 | Luna max；仅项目说明建议，生效路由仍由确定性规则与使用者自行选择 |
 | 默认施工 OS | Terra xhigh |
 | 最终验收 | Sol medium 集中、只读、对抗式验收 |
 | 最近更新 | 2026-08-26 |
@@ -159,7 +160,7 @@ CLI 命令：`new`、`validate`、`team-call`、`run`、`route`、`schedule-batc
 
 `[optimization]` 默认 `mode=shadow`，由 `evaluate_and_apply_route_advice` 读取，与 `route --mode` 的 routing 模式分开。`actual_route`/`recommended_route` 只进入 runtime advice 与 `ai-route-advice-1` sidecar，永不改 `ai-route-decision-1` 九字段或生效 roles。`mode=enforced` 仅当内部计算的四门全过且推荐是闭集成本降级时才应用；否则固定链回退。缺 miss 报告或缺省 period/origin 不能开门。Scheduler 在 shadow 下不执行推荐。
 
-`scripts/ai_workflow_router_probe.py` 是独立的常驻路由研究工具，不接入生产路由，也不写 task store。这里的“常驻”仅指固定模型、冻结 prompt 前缀、每次新会话和时间聚簇；不复用跨任务长线程。候选闭集只有 Luna、Sol、Terra，并为每个模型保留冷前缀对照。默认 `dry-run` 为零模型；fake 示例：
+`scripts/ai_workflow_router_probe.py` 是独立的常驻路由研究工具，不接入生产路由，也不写 task store。这里的“常驻”仅指固定模型、冻结 prompt 前缀、每次新会话和时间聚簇；不复用跨任务长线程。候选闭集只有 Luna、Sol、Terra，并为每个模型保留冷前缀对照。项目说明建议：若要常驻一个模型做入口分类，优先选 Luna max（高频短沟通、单价更低）；这不是实测成本赢家，也不改生产 `effective_route`，实际仍以使用者选择为准。默认 `dry-run` 为零模型；fake 示例：
 
 ```sh
 python3.11 scripts/ai_workflow_router_probe.py \
