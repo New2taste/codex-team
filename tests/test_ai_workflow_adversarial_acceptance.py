@@ -267,6 +267,19 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
 
+    @staticmethod
+    def _controller_codex_lookup():
+        """Provide only the fixed Codex path exercised by mocked controller runs."""
+
+        real_which = repairs.shutil.which
+
+        def resolve(executable, *, path=None):
+            if executable == "codex":
+                return "/test-controller-bin/codex"
+            return real_which(executable, path=path)
+
+        return mock.patch.object(repairs.shutil, "which", side_effect=resolve)
+
     # ------------------------------------------------------------------
     # Deterministic local fixtures
     # ------------------------------------------------------------------
@@ -327,9 +340,9 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
             )
         runtime = runtime_instance_id or source_id
         effective_attempt_id = attempt_id or f"{label}-attempt-{attempt_number}"
-        if role in {"luna", "terra_xhigh"}:
-            model = "gpt-5.6-luna" if role == "luna" else "gpt-5.6-terra"
-            effort = "max" if role == "luna" else "xhigh"
+        if role in {"luna", "luna_construction", "terra_xhigh"}:
+            model = "gpt-5.6-luna" if role.startswith("luna") else "gpt-5.6-terra"
+            effort = "max" if role.startswith("luna") else "xhigh"
             sandbox = "workspace-write"
             permission = "workspace-write"
         elif role == "sol_xhigh":
@@ -1386,8 +1399,11 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
                 )
             return real_run(command, *args, **kwargs)
 
-        with mock.patch.object(
-            workflow.subprocess, "run", side_effect=controller_process
+        with (
+            mock.patch.object(
+                workflow.subprocess, "run", side_effect=controller_process
+            ),
+            self._controller_codex_lookup(),
         ):
             repairs.run_assignment(self.store, self.TASK_ID, review, sessions)
         replay = repairs.replay_acceptance_ledger(self.store, self.TASK_ID)
@@ -1482,8 +1498,11 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
                 )
             return real_run(command, *args, **kwargs)
 
-        with mock.patch.object(
-            workflow.subprocess, "run", side_effect=controller_process
+        with (
+            mock.patch.object(
+                workflow.subprocess, "run", side_effect=controller_process
+            ),
+            self._controller_codex_lookup(),
         ):
             repairs.run_assignment(
                 self.store, self.TASK_ID, owner_repair, sessions
@@ -1592,8 +1611,11 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
                 stderr="",
             )
 
-        with mock.patch.object(
-            workflow.subprocess, "run", side_effect=controller_process
+        with (
+            mock.patch.object(
+                workflow.subprocess, "run", side_effect=controller_process
+            ),
+            self._controller_codex_lookup(),
         ):
             repairs.run_assignment(self.store, self.TASK_ID, fixer, sessions)
             peer = self._issue(
@@ -1888,8 +1910,13 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
                 )
             return real_run(command, *args, **kwargs)
 
-        with mock.patch.object(
-            workflow.subprocess, "run", side_effect=terminal_controller_process
+        with (
+            mock.patch.object(
+                workflow.subprocess,
+                "run",
+                side_effect=terminal_controller_process,
+            ),
+            self._controller_codex_lookup(),
         ):
             repairs.run_assignment(self.store, self.TASK_ID, terminal, sessions)
         events = self._assert_chain()

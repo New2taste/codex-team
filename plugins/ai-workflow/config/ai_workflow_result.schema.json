@@ -10,6 +10,22 @@
       "type": "string",
       "enum": ["luna", "luna_construction", "terra", "sol_planner", "sol_reviewer", "sol_xhigh", "sol_medium_supervisor", "terra_xhigh", "terra_xhigh_planner", "terra_xhigh_reviewer", "sol_medium_reviewer", "sol_xhigh_planner"]
     },
+    "dispatch_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "task_id": {
+      "type": "string",
+      "pattern": "^.+$"
+    },
+    "step_id": {
+      "type": "string",
+      "pattern": "^.+$"
+    },
+    "attempt": {
+      "type": "integer",
+      "minimum": 1
+    },
     "status": {
       "type": "string",
       "enum": [

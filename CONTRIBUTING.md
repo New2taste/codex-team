@@ -22,12 +22,10 @@ Codex Team 当前以个人自用和公开预览为主。贡献应保持契约优
 ## 本地验证
 
 ```sh
-python3.11 -m unittest discover -s tests
-python3.11 -m compileall -q config scripts tests plugins/ai-workflow/runtime plugins/ai-workflow/scripts
-sh plugins/ai-workflow/scripts/verify.sh
-for script in plugins/ai-workflow/scripts/*.sh; do sh -n "$script"; done
-git diff --check
+sh scripts/verify_all.sh
 ```
+
+修改根目录 `config/` 或镜像清单内的 `scripts/` 后，先运行 `python3.11 scripts/sync_plugin.py --check` 查看漂移；确认需要覆盖 Plugin 时才运行 `--write`。同步器只处理代码内固定 manifest，不接受任意源/目标路径。
 
 如果本机安装了 Codex skill-creator，再运行：
 

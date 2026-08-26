@@ -1,0 +1,102 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "ai-route-advice-1"
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "actual_route": {
+      "type": "string",
+      "enum": ["direct", "sol_only", "delegated", "blocked"]
+    },
+    "recommended_route": {
+      "type": "string",
+      "enum": ["direct", "sol_only", "delegated", "blocked"]
+    },
+    "optimization_mode": {
+      "type": "string",
+      "enum": ["shadow", "enforced"]
+    },
+    "gate_result": {
+      "type": "string",
+      "enum": ["KEEP_SHADOW", "ALLOW_ENFORCED", "FALLBACK_FIXED"]
+    },
+    "applied": {
+      "type": "boolean"
+    },
+    "task_sha256": {
+      "type": "string",
+      "minLength": 1
+    },
+    "request_sha256": {
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "required": [
+    "schema_version",
+    "task_id",
+    "actual_route",
+    "recommended_route",
+    "optimization_mode",
+    "gate_result",
+    "applied",
+    "task_sha256",
+    "request_sha256"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {"optimization_mode": {"const": "shadow"}},
+        "required": ["optimization_mode"]
+      },
+      "then": {
+        "properties": {
+          "gate_result": {"const": "KEEP_SHADOW"},
+          "applied": {"const": false}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"gate_result": {"const": "KEEP_SHADOW"}},
+        "required": ["gate_result"]
+      },
+      "then": {
+        "properties": {
+          "optimization_mode": {"const": "shadow"},
+          "applied": {"const": false}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"gate_result": {"const": "ALLOW_ENFORCED"}},
+        "required": ["gate_result"]
+      },
+      "then": {
+        "properties": {
+          "optimization_mode": {"const": "enforced"},
+          "applied": {"const": true}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"gate_result": {"const": "FALLBACK_FIXED"}},
+        "required": ["gate_result"]
+      },
+      "then": {
+        "properties": {
+          "optimization_mode": {"const": "enforced"},
+          "applied": {"const": false}
+        }
+      }
+    }
+  ]
+}

@@ -24,14 +24,26 @@ class NewArtifactSchemaTest(unittest.TestCase):
     EXPECTED = {
         "ai_workflow_route_request.schema.json": "ai-route-request-1",
         "ai_workflow_route_decision.schema.json": "ai-route-decision-1",
+        "ai_workflow_route_advice.schema.json": "ai-route-advice-1",
         "ai_workflow_plan.schema.json": "ai-plan-1",
         "ai_workflow_runtime_evidence.schema.json": "runtime-evidence-1",
         "ai_workflow_cost_evidence.schema.json": "cost-evidence-1",
+        "ai_workflow_scheduler.schema.json": "plan-scheduler-1",
     }
 
     def test_every_new_schema_is_strict_and_versioned(self):
         for filename, version in self.EXPECTED.items():
             schema = json.loads((ROOT / "config" / filename).read_text())
+            if filename == "ai_workflow_scheduler.schema.json":
+                receipt = schema["$defs"]["receipt"]
+                self.assertFalse(receipt["additionalProperties"])
+                self.assertEqual("construction-receipt-1", receipt["properties"]["schema_version"]["const"])
+                self.assertTrue(schema["oneOf"])
+                for variant in schema["oneOf"]:
+                    self.assertFalse(variant["additionalProperties"])
+                    self.assertEqual(set(variant["properties"]), set(variant["required"]))
+                    self.assertEqual(version, variant["properties"]["schema_version"]["const"])
+                continue
             self.assertFalse(schema["additionalProperties"])
             self.assertEqual(version, schema["properties"]["schema_version"]["const"])
             self.assertEqual(set(schema["properties"]), set(schema["required"]))

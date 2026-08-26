@@ -98,12 +98,44 @@ class TerraOSConfigTest(unittest.TestCase):
             {"mode": "enforced", "role_policy": "terra_os"},
             self.config["routing"],
         )
-        self.assertEqual(2, self.config["policy"]["max_implementation_reworks"])
+        self.assertEqual(1, self.config["policy"]["max_implementation_reworks"])
         self.assertFalse(self.config["policy"]["automatic_xhigh"])
         self.assertFalse(self.config["policy"]["automatic_sol_high"])
         self.assertFalse(self.config["policy"]["automatic_merge"])
         self.assertFalse(self.config["policy"]["automatic_push"])
         self.assertNotIn("repair", self.config)
+
+    def test_automation_and_optimization_defaults_are_bounded(self):
+        self.assertEqual(
+            {
+                "max_parallel_read_only": 2,
+                "max_active_writers": 1,
+                "allow_decide_resume": True,
+            },
+            self.config["automation"],
+        )
+        self.assertEqual(
+            {
+                "mode": "shadow",
+                "minimum_paired_cases": 8,
+                "compact_prompts": False,
+            },
+            self.config["optimization"],
+        )
+
+    def test_every_sol_medium_and_xhigh_prompt_prohibits_over_design(self):
+        sol_roles = {
+            name: role
+            for name, role in self.config["roles"].items()
+            if role["model"] == "gpt-5.6-sol"
+            and role["reasoning_effort"] in {"medium", "xhigh"}
+        }
+        self.assertTrue(sol_roles)
+        for name, role in sol_roles.items():
+            with self.subTest(role=name):
+                instructions = role["instructions"]
+                self.assertIn("Do not over-design", instructions)
+                self.assertIn("smallest change", instructions)
 
     def test_final_sol_medium_rework_is_the_global_default(self):
         self.assertEqual(
