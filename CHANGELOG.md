@@ -19,7 +19,7 @@
 
 ### Verification snapshot
 
-- `sh scripts/verify_all.sh`：529 tests passed，8 个既有 repair-ledger-v1 intentional skips；
+- `sh scripts/verify_all.sh`：532 tests passed，8 个既有 repair-ledger-v1 intentional skips；
 - root/Plugin parity、Plugin verifier、Skill validator、compileall、shell syntax 和 `git diff --check` 均通过。
 
 ### Known limitations
