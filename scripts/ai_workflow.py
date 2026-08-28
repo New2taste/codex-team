@@ -15,6 +15,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from collections.abc import Mapping
@@ -76,6 +77,7 @@ HUMAN_GATES = frozenset(
     }
 )
 TASK_ID_PATTERN = re.compile(r"^AWF-[0-9]{8}-[0-9]{3,}$")
+LEDGER_NAME_PATTERN = re.compile(r"^[a-z0-9-]+\.jsonl$")
 ATTEMPT_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
 ROLE_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "ai_workflow.toml"
 RESULT_REQUIRED_FIELDS = frozenset(
@@ -149,13 +151,6 @@ _LONG_HIGH_ENTROPY = re.compile(r"(?<![A-Za-z0-9_])[A-Za-z0-9+/=_-]{48,}(?![A-Za
 METRICS_SCHEMA_VERSION = "ai-metrics-1"
 
 
-class WorkflowError(RuntimeError):
-    def __init__(self, code: str, message: str):
-        self.code = str(code)
-        self.message = str(message)
-        super().__init__(f"{self.code}: {self.message}")
-
-
 try:
     from .ai_workflow_artifacts import (
         ArtifactError,
@@ -165,14 +160,22 @@ try:
         RouteDecision,
         RouteRequest,
         RuntimeEvidence,
+        WorkflowError,
+        _directory_identity_matches,
+        _open_parent_directory,
+        _validate_regular_descriptor,
+        append_jsonl,
         artifact_sha256,
+        canonical_json,
         load_artifact,
+        read_jsonl,
         validate_cost_evidence,
         validate_plan_shape,
         validate_route_advice,
         validate_route_decision,
         validate_route_request,
         validate_runtime_evidence,
+        write_json_once,
     )
 except ImportError:  # direct script execution
     from ai_workflow_artifacts import (
@@ -183,15 +186,25 @@ except ImportError:  # direct script execution
         RouteDecision,
         RouteRequest,
         RuntimeEvidence,
+        WorkflowError,
+        _directory_identity_matches,
+        _open_parent_directory,
+        _validate_regular_descriptor,
+        append_jsonl,
         artifact_sha256,
+        canonical_json,
         load_artifact,
+        read_jsonl,
         validate_cost_evidence,
         validate_plan_shape,
         validate_route_advice,
         validate_route_decision,
         validate_route_request,
         validate_runtime_evidence,
+        write_json_once,
     )
+
+_canonical_json = canonical_json
 
 try:
     from .ai_workflow_runtime import (
@@ -2132,13 +2145,6 @@ def next_state(current: str, target: str, *, owner_authorized: bool) -> str:
     return target
 
 
-def _canonical_json(value: object) -> str:
-    try:
-        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    except (TypeError, ValueError) as exc:
-        raise WorkflowError("INVALID_RECORD", f"record is not JSON serializable: {exc}") from exc
-
-
 def atomic_write_json(path: Path, value: object) -> None:
     """Write JSON through a same-directory fsynced temporary file and replace."""
 
@@ -2169,56 +2175,6 @@ def atomic_write_json(path: Path, value: object) -> None:
                 temporary.unlink()
             except FileNotFoundError:
                 pass
-
-
-def _directory_identity_matches(path: Path, descriptor: int) -> bool:
-    """Return whether a path still names the directory pinned by ``descriptor``."""
-
-    try:
-        current = os.stat(path, follow_symlinks=False)
-        opened = os.fstat(descriptor)
-    except OSError:
-        return False
-    return (
-        stat.S_ISDIR(current.st_mode)
-        and stat.S_ISDIR(opened.st_mode)
-        and current.st_dev == opened.st_dev
-        and current.st_ino == opened.st_ino
-    )
-
-
-def _open_parent_directory(path: Path, *, error_code: str) -> int:
-    """Open a target parent without following a replacement directory symlink."""
-
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-    try:
-        descriptor = os.open(path, flags)
-    except OSError as exc:
-        raise WorkflowError(error_code, f"cannot open parent directory for {path.name}") from exc
-    try:
-        metadata = os.fstat(descriptor)
-    except OSError as exc:
-        os.close(descriptor)
-        raise WorkflowError(error_code, f"cannot inspect parent directory for {path.name}") from exc
-    if not stat.S_ISDIR(metadata.st_mode):
-        os.close(descriptor)
-        raise WorkflowError(error_code, f"parent directory for {path.name} is not a directory")
-    return descriptor
-
-
-def _validate_regular_descriptor(
-    descriptor: int,
-    *,
-    error_code: str,
-    label: str,
-    max_bytes: int | None = None,
-) -> os.stat_result:
-    metadata = os.fstat(descriptor)
-    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-        raise WorkflowError(error_code, f"{label} must be a private regular file")
-    if max_bytes is not None and metadata.st_size > max_bytes:
-        raise WorkflowError(error_code, f"{label} is too large")
-    return metadata
 
 
 def _read_regular_file(
@@ -2267,164 +2223,52 @@ def _read_regular_file(
             os.close(parent_descriptor)
 
 
-def write_json_once(path: Path, value: object, *, conflict_code: str) -> str:
-    """Atomically publish one frozen JSON artifact without replacing an existing one."""
-
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    payload = (_canonical_json(value) + "\n").encode("utf-8")
-    digest = hashlib.sha256(payload).hexdigest()
-    temporary: Path | None = None
-    parent_descriptor = -1
-    published = False
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="wb",
-            dir=target.parent,
-            prefix=f".{target.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as handle:
-            temporary = Path(handle.name)
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        parent_descriptor = os.open(
-            target.parent,
-            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
-        )
-        fcntl.flock(parent_descriptor, fcntl.LOCK_EX)
-        if not _directory_identity_matches(target.parent, parent_descriptor):
-            raise WorkflowError(
-                "ATOMIC_WRITE_FAILED",
-                f"parent directory changed before publishing {target.name}",
-            )
-        try:
-            existing = os.stat(target.name, dir_fd=parent_descriptor, follow_symlinks=False)
-        except FileNotFoundError:
-            existing = None
-        if existing is not None:
-            _fail(conflict_code, f"{target.name} is already frozen")
-        temporary_name = Path(temporary.name).name
-        temp_descriptor = -1
-        try:
-            temp_descriptor = os.open(
-                temporary_name,
-                os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
-                dir_fd=parent_descriptor,
-            )
-            _validate_regular_descriptor(
-                temp_descriptor,
-                error_code="ATOMIC_WRITE_FAILED",
-                label=temporary_name,
-            )
-            try:
-                # A same-directory hard-link is the portable POSIX no-replace
-                # primitive: it succeeds only when the destination is absent.
-                os.link(
-                    temporary_name,
-                    target.name,
-                    src_dir_fd=parent_descriptor,
-                    dst_dir_fd=parent_descriptor,
-                    follow_symlinks=False,
-                )
-            except FileExistsError as exc:
-                _fail(conflict_code, f"{target.name} is already frozen")
-                raise AssertionError("unreachable") from exc
-            published = True
-            os.unlink(temporary_name, dir_fd=parent_descriptor)
-            temporary = None
-        finally:
-            if temp_descriptor >= 0:
-                os.close(temp_descriptor)
-        if not _directory_identity_matches(target.parent, parent_descriptor):
-            raise WorkflowError(
-                "ATOMIC_WRITE_PUBLISHED_UNSYNCED",
-                f"parent directory changed while publishing {target.name}",
-            )
-        os.fsync(parent_descriptor)
-        if not _directory_identity_matches(target.parent, parent_descriptor):
-            raise WorkflowError(
-                "ATOMIC_WRITE_PUBLISHED_UNSYNCED",
-                f"parent directory changed after publishing {target.name}",
-            )
-        return digest
-    except WorkflowError:
-        raise
-    except OSError as exc:
-        code = (
-            "ATOMIC_WRITE_PUBLISHED_UNSYNCED"
-            if published
-            else "ATOMIC_WRITE_FAILED"
-        )
-        raise WorkflowError(code, f"cannot write {target.name}") from exc
-    finally:
-        if temporary is not None:
-            try:
-                if parent_descriptor >= 0:
-                    os.unlink(Path(temporary.name).name, dir_fd=parent_descriptor)
-                else:
-                    temporary.unlink()
-            except FileNotFoundError:
-                pass
-        if parent_descriptor >= 0:
-            os.close(parent_descriptor)
-
-
-def append_jsonl(path: Path, record: Mapping[str, object]) -> None:
-    """Append one compact, fsynced JSON object without rewrite/delete support."""
-
-    if not isinstance(record, Mapping):
-        raise WorkflowError("INVALID_RECORD", "JSONL record must be an object")
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    line = _canonical_json(dict(record)) + "\n"
-    parent_descriptor = -1
-    descriptor = -1
-    try:
-        parent_descriptor = _open_parent_directory(target.parent, error_code="APPEND_UNSAFE")
-        descriptor = os.open(
-            target.name,
-            os.O_WRONLY
-            | os.O_APPEND
-            | os.O_CREAT
-            | os.O_NOFOLLOW
-            | getattr(os, "O_CLOEXEC", 0),
-            0o600,
-            dir_fd=parent_descriptor,
-        )
-        _validate_regular_descriptor(
-            descriptor,
-            error_code="APPEND_UNSAFE",
-            label=target.name,
-        )
-        payload = line.encode("utf-8")
-        written = 0
-        while written < len(payload):
-            written += os.write(descriptor, payload[written:])
-        os.fsync(descriptor)
-        if not _directory_identity_matches(target.parent, parent_descriptor):
-            raise WorkflowError(
-                "APPEND_UNSAFE",
-                f"parent directory changed while appending {target.name}",
-            )
-    except WorkflowError:
-        raise
-    except OSError as exc:
-        code = "APPEND_UNSAFE" if exc.errno in {errno.ELOOP, errno.ENOTDIR} else "APPEND_FAILED"
-        raise WorkflowError(code, f"cannot append {target.name}") from exc
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-        if parent_descriptor >= 0:
-            os.close(parent_descriptor)
-
-
 class WorkflowStore:
     """Filesystem-backed task store with append-only event and decision ledgers."""
 
     def __init__(self, root: Path):
         self.root = Path(root)
+        self._held_locks = threading.local()
+
+    def _held_task_ids(self) -> set[str]:
+        held = getattr(self._held_locks, "task_ids", None)
+        if held is None:
+            held = set()
+            self._held_locks.task_ids = held
+        return held
+
+    def _assert_lock_held(self, task_id: str) -> None:
+        held = getattr(self._held_locks, "task_ids", None)
+        if not held or task_id not in held:
+            raise WorkflowError("LOCK_REQUIRED", f"task lock is required for {task_id}")
+
+    def _ledger_path(self, task_id: str, name: str) -> Path:
+        if not isinstance(name, str) or not LEDGER_NAME_PATTERN.fullmatch(name):
+            raise WorkflowError("INVALID_RECORD", f"ledger name is invalid: {name}")
+        return self._require_task(task_id) / name
+
+    def write_task_artifact_once(
+        self,
+        task_id: str,
+        name: str,
+        value: Mapping[str, object],
+        *,
+        conflict_code: str,
+    ) -> Path:
+        task_dir = self._require_task(task_id)
+        path = task_dir / name
+        write_json_once(path, value, conflict_code=conflict_code)
+        return path
+
+    def append_task_ledger(
+        self, task_id: str, name: str, record: Mapping[str, object]
+    ) -> None:
+        append_jsonl(self._ledger_path(task_id, name), record)
+
+    def read_task_ledger(self, task_id: str, name: str) -> tuple[dict[str, object], ...]:
+        path = self._ledger_path(task_id, name)
+        code = name[: -len(".jsonl")].replace("-", "_").upper()
+        return read_jsonl(path, code=code)
 
     @staticmethod
     def _validate_task_id(task_id: str) -> None:
@@ -2558,9 +2402,12 @@ class WorkflowStore:
                 if exc.errno in (errno.EACCES, errno.EAGAIN):
                     raise WorkflowError("TASK_ALREADY_RUNNING", f"task {task_id} is already running") from exc
                 raise WorkflowError("LOCK_FAILED", f"cannot lock task {task_id}") from exc
+            held = self._held_task_ids()
+            held.add(task_id)
             try:
                 yield
             finally:
+                held.discard(task_id)
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         finally:
             handle.close()

@@ -27,6 +27,7 @@ try:
         validate_route_advice,
         validate_route_decision,
         validate_route_request,
+        write_json_once,
     )
     from .ai_workflow_costs import evaluate_optimization_gate
 except ImportError:  # direct script execution
@@ -39,6 +40,7 @@ except ImportError:  # direct script execution
         validate_route_advice,
         validate_route_decision,
         validate_route_request,
+        write_json_once,
     )
     from ai_workflow_costs import evaluate_optimization_gate
 
@@ -446,21 +448,6 @@ def _atomic_write_json(path: Path, value: Mapping[str, object]) -> None:
                 pass
 
 
-def _write_json_once(
-    path: Path,
-    value: Mapping[str, object],
-    *,
-    conflict_code: str = "ROUTE_ALREADY_FROZEN",
-) -> str:
-    """Delegate immutable authority publication to the shared atomic writer."""
-
-    try:
-        from .ai_workflow import write_json_once
-    except (ImportError, ModuleNotFoundError):
-        from ai_workflow import write_json_once
-    return write_json_once(path, value, conflict_code=conflict_code)
-
-
 def _stored_task_sha256(task_dir: Path) -> str:
     try:
         value = json.loads((Path(task_dir) / "task.json").read_text(encoding="utf-8"))
@@ -492,7 +479,7 @@ def record_route_decision(
         if _stored_task_sha256(task_dir) != decision.task_sha256:
             _fail("ROUTE_TASK_MISMATCH", "route decision task hash does not match stored task")
         path = Path(task_dir) / "route-decision.json"
-        _write_json_once(path, wire)
+        write_json_once(path, wire, conflict_code="ROUTE_ALREADY_FROZEN")
         store.append_event(task_id, _route_decision_event(decision))
     return path
 
@@ -1054,7 +1041,7 @@ def record_route_advice(
             if not has_matching_event:
                 store.append_event(task_id, _advice_event_payload(document))
             return path
-        _write_json_once(
+        write_json_once(
             path,
             document,
             conflict_code="ROUTE_ADVICE_CONFLICT",

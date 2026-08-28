@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest import mock
 
 from scripts import ai_workflow as workflow
+from scripts import ai_workflow_artifacts as artifacts
 from scripts import ai_workflow_planning as planning
 from scripts import ai_workflow_repairs as repairs
 from scripts import ai_workflow_scheduler as scheduler
@@ -750,7 +751,7 @@ class SchedulerDispatchTest(SchedulerHarness):
         target = parent / "artifact.json"
         outside = Path(self.temporary_directory.name) / "artifact-outside"
         backup = Path(self.temporary_directory.name) / "artifact-parent-original"
-        real_open = workflow.os.open
+        real_open = artifacts.os.open
         swapped = False
 
         def swap_parent_after_open(path, flags, *args, **kwargs):
@@ -765,7 +766,7 @@ class SchedulerDispatchTest(SchedulerHarness):
                 parent.symlink_to(outside, target_is_directory=True)
             return descriptor
 
-        with mock.patch.object(workflow.os, "open", side_effect=swap_parent_after_open):
+        with mock.patch.object(artifacts.os, "open", side_effect=swap_parent_after_open):
             with self.assertRaisesRegex(workflow.WorkflowError, "ATOMIC_WRITE_FAILED"):
                 workflow.write_json_once(target, {"safe": True}, conflict_code="CONFLICT")
         self.assertFalse((outside / target.name).exists())
@@ -776,7 +777,7 @@ class SchedulerDispatchTest(SchedulerHarness):
         parent.mkdir()
         target = parent / "artifact.json"
         attacker_bytes = b'{"attacker":true}\n'
-        real_link = workflow.os.link
+        real_link = artifacts.os.link
         injected = False
 
         def create_target_then_link(source, destination, *args, **kwargs):
@@ -786,7 +787,7 @@ class SchedulerDispatchTest(SchedulerHarness):
                 target.write_bytes(attacker_bytes)
             return real_link(source, destination, *args, **kwargs)
 
-        with mock.patch.object(workflow.os, "link", side_effect=create_target_then_link):
+        with mock.patch.object(artifacts.os, "link", side_effect=create_target_then_link):
             with self.assertRaisesRegex(workflow.WorkflowError, "CONFLICT"):
                 workflow.write_json_once(target, {"safe": True}, conflict_code="CONFLICT")
         self.assertEqual(attacker_bytes, target.read_bytes())
@@ -797,7 +798,7 @@ class SchedulerDispatchTest(SchedulerHarness):
         target = parent / "artifact.json"
         outside = Path(self.temporary_directory.name) / "post-publish-outside"
         backup = Path(self.temporary_directory.name) / "post-publish-original"
-        real_fsync = workflow.os.fsync
+        real_fsync = artifacts.os.fsync
         fsync_calls = 0
 
         def swap_on_parent_fsync(descriptor):
@@ -809,7 +810,7 @@ class SchedulerDispatchTest(SchedulerHarness):
                 parent.symlink_to(outside, target_is_directory=True)
             return real_fsync(descriptor)
 
-        with mock.patch.object(workflow.os, "fsync", side_effect=swap_on_parent_fsync):
+        with mock.patch.object(artifacts.os, "fsync", side_effect=swap_on_parent_fsync):
             with self.assertRaisesRegex(
                 workflow.WorkflowError, "ATOMIC_WRITE_PUBLISHED_UNSYNCED"
             ):

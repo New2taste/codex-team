@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 from scripts import ai_workflow as workflow
+from scripts import ai_workflow_artifacts as artifacts
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -46,7 +47,7 @@ class WriteJsonOnceAtomicityTest(unittest.TestCase):
                     return self.handle.__exit__(exc_type, exc, traceback)
 
             with mock.patch.object(
-                workflow.tempfile,
+                artifacts.tempfile,
                 "NamedTemporaryFile",
                 side_effect=FailingTemporary,
             ):

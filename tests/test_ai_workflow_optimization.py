@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 from scripts import ai_workflow as workflow
+from scripts import ai_workflow_artifacts as artifacts
 from scripts import ai_workflow_routing as routing_mod
 
 
@@ -659,18 +660,18 @@ class RoutingAtomicPersistenceTest(unittest.TestCase):
                     return self.handle.__exit__(exc_type, exc, traceback)
 
             return mock.patch.object(
-                workflow.tempfile,
+                artifacts.tempfile,
                 "NamedTemporaryFile",
                 side_effect=FailingTemporary,
             )
         if stage == "file_fsync":
             return mock.patch.object(
-                workflow.os,
+                artifacts.os,
                 "fsync",
                 side_effect=OSError("injected file fsync failure"),
             )
         return mock.patch.object(
-            workflow.os,
+            artifacts.os,
             "link",
             side_effect=OSError("injected no-replace publish failure"),
         )
@@ -742,7 +743,7 @@ class RoutingAtomicPersistenceTest(unittest.TestCase):
                 store, task, request, decision, advice = self._case(root)
                 if artifact == "advice":
                     workflow.record_route_decision(store, task["task_id"], decision)
-                real_fsync = workflow.os.fsync
+                real_fsync = artifacts.os.fsync
                 calls = 0
 
                 def fail_directory_fsync(descriptor):
@@ -753,7 +754,7 @@ class RoutingAtomicPersistenceTest(unittest.TestCase):
                     return real_fsync(descriptor)
 
                 with mock.patch.object(
-                    workflow.os, "fsync", side_effect=fail_directory_fsync
+                    artifacts.os, "fsync", side_effect=fail_directory_fsync
                 ):
                     with self.assertRaisesRegex(
                         workflow.WorkflowError,
