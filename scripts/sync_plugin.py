@@ -35,6 +35,7 @@ RUNTIME_FILES = (
     "ai_workflow_candidate_state.py",
     "ai_workflow_verdicts.py",
     "ai_workflow_ownership.py",
+    "ai_workflow_side_effects.py",
     "ai_workflow_planning.py",
     "ai_workflow_runtime.py",
     "ai_workflow_costs.py",

@@ -27,6 +27,21 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .ai_workflow import WorkflowStore
 
+try:
+    from .ai_workflow_side_effects import (
+        capture_fs_snapshot,
+        observation_exclusions,
+        observe_execution_side_effects,
+        record_unobserved_side_effect,
+    )
+except ImportError:  # direct script execution
+    from ai_workflow_side_effects import (
+        capture_fs_snapshot,
+        observation_exclusions,
+        observe_execution_side_effects,
+        record_unobserved_side_effect,
+    )
+
 
 _SHA_PATTERN = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 _ASSIGNMENT_ID_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -2818,6 +2833,7 @@ def run_assignment(
     caller_boundary = isinstance(runtime_sessions_dir, ControllerAssignmentBoundary)
     workflow = _workflow()
     started = False
+    before_fs = None
     with store.lock(task_id):
         replay = replay_acceptance_ledger(store, task_id)
         if replay is None:
@@ -2841,6 +2857,9 @@ def run_assignment(
         if not isinstance(runtime_sessions_dir, (str, os.PathLike)):
             _fail("REPAIR_ADAPTER_REQUIRED", "fixed executor requires controller runtime sessions")
         repository, before = _v2_controller_snapshot(stored_task, replay)
+        before_fs = capture_fs_snapshot(
+            repository, exclusions=observation_exclusions(repository)
+        )
         task_dir = store._require_task(task_id)
         output_path = task_dir / "attempts" / f"{assignment.attempt_id}-assignment-result.json"
         if output_path.exists():
@@ -2923,6 +2942,13 @@ def run_assignment(
                 env=workflow.sanitized_environment(os.environ),
             )
         except (OSError, subprocess.TimeoutExpired):
+            record_unobserved_side_effect(
+                store,
+                task_id,
+                role=assignment.expected_actor.role,
+                permit_id=None,
+                reason="unobserved-assignment",
+            )
             _fail("REPAIR_ADAPTER_REQUIRED", "controller assignment process could not complete")
         if completed.returncode != 0:
             _fail("REPAIR_ADAPTER_REQUIRED", "controller assignment process failed")
@@ -2940,6 +2966,18 @@ def run_assignment(
             after = workflow.capture_repo(repository)
         except RuntimeError:
             _fail("REPAIR_ADAPTER_REQUIRED", "controller cannot snapshot the post-launch repository")
+        if before_fs is not None:
+            observe_execution_side_effects(
+                store,
+                task_id,
+                role=assignment.expected_actor.role,
+                permit_id=None,
+                before=before_fs,
+                after=capture_fs_snapshot(
+                    repository, exclusions=observation_exclusions(repository)
+                ),
+                rollout_events=tuple(events),
+            )
         if after.status:
             _fail("REPAIR_ADAPTER_REQUIRED", "controller rejects uncommitted assignment writes")
         if assignment.phase in _REVIEW_PHASES and after != before:

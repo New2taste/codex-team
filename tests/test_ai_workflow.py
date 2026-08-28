@@ -3209,5 +3209,245 @@ class FinalSafetyRegressionTest(unittest.TestCase):
         self.assertEqual(runner.calls, ["terra"])
 
 
+class CodexSideEffectObservationTest(unittest.TestCase):
+    def valid_task(self):
+        return CodexRunnerTest().valid_task()
+
+    def valid_result(self, role="luna", status="SUPPORTED"):
+        return CodexRunnerTest().valid_result(role=role, status=status)
+
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.repo = Path(self.temporary_directory.name) / "repository"
+        self.repo.mkdir()
+        self._git("init", "-b", "main")
+        self._git("config", "user.email", "observe@example.test")
+        self._git("config", "user.name", "Observe Test")
+        self._git("config", "commit.gpgsign", "false")
+        (self.repo / "tracked.txt").write_text("initial\n", encoding="utf-8")
+        self._git("add", "tracked.txt")
+        self._git("commit", "-m", "initial")
+        self.state_root = Path(self.temporary_directory.name) / "state"
+        self.store = workflow.WorkflowStore(self.state_root)
+
+    def tearDown(self):
+        self.temporary_directory.cleanup()
+
+    def _git(self, *args):
+        completed = subprocess.run(
+            ["git", "-C", str(self.repo), *args],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        return completed.stdout.strip()
+
+    def _task(self):
+        task = self.valid_task()
+        task["repository_root"] = str(self.repo)
+        return task
+
+    def _paths(self, task):
+        return workflow.RunPaths(
+            repo=self.repo,
+            output_path=Path(self.temporary_directory.name) / "luna-result.json",
+            schema_path=ROOT / "config/ai_workflow_result.schema.json",
+            logs_dir=Path(self.temporary_directory.name) / "logs",
+            state_root=self.state_root,
+        )
+
+    def _patch_codex(self, handler):
+        real_run = subprocess.run
+
+        def launch(command, *args, **kwargs):
+            if command[0] == "git":
+                return real_run(command, *args, **kwargs)
+            return handler(command, *args, **kwargs)
+
+        return mock.patch("scripts.ai_workflow.subprocess.run", side_effect=launch)
+
+    def test_live_runner_records_new_worktree_file_kind(self):
+        from scripts import ai_workflow_ownership as ownership
+
+        task = self._task()
+        self.store.create_task(task)
+        result = self.valid_result()
+
+        def write_new_file(command, *args, **kwargs):
+            (self.repo / "observed.txt").write_text("from runner\n", encoding="utf-8")
+            return write_codex_result(command, result)
+
+        with self._patch_codex(write_new_file):
+            with self.assertRaisesRegex(workflow.WorkflowError, "READ_ONLY_ROLE_MODIFIED_REPO"):
+                workflow.run_codex("luna", task, "task contract", self._paths(task))
+        kinds = {
+            row["effect_kind"] for row in ownership.load_side_effects(self.store, task["task_id"])
+        }
+        self.assertTrue(kinds & {"OWNED_WRITE", "UNTRACKED_WRITE"})
+        paths = {
+            row["path"] for row in ownership.load_side_effects(self.store, task["task_id"])
+        }
+        self.assertIn("observed.txt", paths)
+
+    def test_read_only_role_with_no_tree_change_has_no_locking_ledger_rows(self):
+        from scripts import ai_workflow_ownership as ownership
+
+        task = self._task()
+        self.store.create_task(task)
+        result = self.valid_result()
+        with self._patch_codex(lambda command, *args, **kwargs: write_codex_result(command, result)):
+            workflow.run_codex("luna", task, "task contract", self._paths(task))
+        rows = ownership.load_side_effects(self.store, task["task_id"])
+        self.assertFalse(any(row["effect_kind"] in ownership.LOCKING_EFFECT_KINDS for row in rows))
+        self.assertFalse(ownership.has_ownership_locking_side_effect(self.store, task["task_id"]))
+
+    def test_timeout_and_crash_record_unobserved_locking_effect(self):
+        from scripts import ai_workflow_ownership as ownership
+
+        task = self._task()
+        self.store.create_task(task)
+        with self._patch_codex(
+            lambda command, *args, **kwargs: (_ for _ in ()).throw(
+                subprocess.TimeoutExpired("codex", 30)
+            )
+        ):
+            with self.assertRaisesRegex(workflow.WorkflowError, "CODEX_TIMEOUT"):
+                workflow.run_codex("luna", task, "task contract", self._paths(task))
+        self.assertTrue(ownership.has_ownership_locking_side_effect(self.store, task["task_id"]))
+        kinds = {
+            row["effect_kind"] for row in ownership.load_side_effects(self.store, task["task_id"])
+        }
+        self.assertIn("UNOBSERVED_ASSUMED_PRESENT", kinds)
+
+        other_task = self._task()
+        other_task["task_id"] = "AWF-20260803-099"
+        self.store.create_task(other_task)
+        with self._patch_codex(
+            lambda command, *args, **kwargs: (_ for _ in ()).throw(OSError("codex crashed"))
+        ):
+            with self.assertRaises(OSError):
+                workflow.run_codex("luna", other_task, "task contract", self._paths(other_task))
+        self.assertTrue(
+            ownership.has_ownership_locking_side_effect(self.store, other_task["task_id"])
+        )
+
+    def test_host_observation_does_not_call_record_side_effect_from_this_test(self):
+        from scripts import ai_workflow_ownership as ownership
+
+        task = self._task()
+        self.store.create_task(task)
+        result = self.valid_result()
+
+        def write_new_file(command, *args, **kwargs):
+            (self.repo / "host-observed.txt").write_text("host\n", encoding="utf-8")
+            return write_codex_result(command, result)
+
+        with self._patch_codex(write_new_file):
+            with self.assertRaisesRegex(workflow.WorkflowError, "READ_ONLY_ROLE_MODIFIED_REPO"):
+                workflow.run_codex("luna", task, "task contract", self._paths(task))
+        rows = ownership.load_side_effects(self.store, task["task_id"])
+        self.assertTrue(rows)
+        self.assertIn("host-observed.txt", {row["path"] for row in rows})
+
+    def test_construction_run_codex_records_frozen_step_producer(self):
+        from tests.test_ai_workflow_construction_execution import (
+            construction_plan,
+            remediation_task,
+        )
+        from scripts import ai_workflow_ownership as ownership
+
+        rollout_events_with_commands = (
+            {
+                "type": "thread.started",
+                "thread_id": "019fc73c-4d40-7c20-a82a-c5a9ae078bcf",
+            },
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "command_execution",
+                    "command": "python -m unittest tests.test_parser",
+                    "cwd": "/work",
+                    "exit_code": 0,
+                    "aggregated_output": "ok",
+                },
+            },
+            {"type": "turn.completed"},
+        )
+
+        task = remediation_task()
+        task_id = task["task_id"]
+        worktree = self.repo / ".codex-worktrees" / task_id.lower()
+        self._git("worktree", "add", str(worktree), "HEAD")
+        task["repository_root"] = str(self.repo)
+        task["source_worktree"] = str(worktree)
+        task["base_commit"] = self._git("rev-parse", "HEAD")
+        frozen = workflow.validate_plan(construction_plan(task=task), task)
+        context = workflow.ConstructionExecutionContext(
+            plan=frozen,
+            step=frozen.tasks[0],
+            dispatch_id="d" * 64,
+            task_sha256=frozen.task_sha256,
+            request_sha256="e" * 64,
+            role="luna_construction",
+        )
+        self.store.create_task(task)
+        prompt = workflow.build_construction_role_prompt(task, context)
+        result = {
+            "schema_version": "ai-result-1",
+            "role": "luna_construction",
+            "status": "BLOCKED",
+            "summary": "bounded construction stopped.",
+            "claims": [],
+            "evidence": [],
+            "counter_checks": [],
+            "changed_files": [],
+            "blind_spots": [],
+            "unresolved_questions": [],
+            "recommended_next_state": "BLOCKED",
+        }
+        stdout = "\n".join(json.dumps(event) for event in rollout_events_with_commands) + "\n"
+
+        def write_construction(command, *args, **kwargs):
+            written = write_codex_result(command, result)
+            return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr=written.stderr)
+
+        paths = workflow.RunPaths(
+            repo=worktree,
+            output_path=Path(self.temporary_directory.name) / "luna-construction.json",
+            schema_path=ROOT / "config/ai_workflow_result.schema.json",
+            logs_dir=Path(self.temporary_directory.name) / "construction-logs",
+            state_root=self.state_root,
+        )
+        with (
+            mock.patch.object(workflow, "_assert_terra_worktree_authorized"),
+            self._patch_codex(write_construction),
+        ):
+            try:
+                workflow.run_codex(
+                    "luna_construction",
+                    task,
+                    prompt,
+                    paths,
+                    construction_plan=construction_plan(task=task),
+                    construction_step_id="construction-601",
+                    construction_context=context,
+                )
+            except workflow.WorkflowError:
+                pass
+        generated = [
+            row
+            for row in ownership.load_side_effects(self.store, task_id)
+            if row["effect_kind"] == "COMMAND_GENERATED"
+        ]
+        self.assertEqual(1, len(generated))
+        self.assertEqual("CONSTRUCTION_FROZEN_STEP", generated[0]["producer"])
+        self.assertEqual(
+            f"{frozen.plan_sha256}:{frozen.tasks[0].id}",
+            generated[0]["producer_ref"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

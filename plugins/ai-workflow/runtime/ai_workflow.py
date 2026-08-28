@@ -248,6 +248,21 @@ except ImportError:  # direct script execution
     )
 
 try:
+    from .ai_workflow_side_effects import (
+        capture_fs_snapshot,
+        observation_exclusions,
+        observe_execution_side_effects,
+        record_unobserved_side_effect,
+    )
+except ImportError:  # direct script execution
+    from ai_workflow_side_effects import (
+        capture_fs_snapshot,
+        observation_exclusions,
+        observe_execution_side_effects,
+        record_unobserved_side_effect,
+    )
+
+try:
     from .ai_workflow_costs import (
         aggregate_paired_cases,
         evaluate_cost_claim,
@@ -1753,6 +1768,12 @@ def run_codex(
         )
     before_run = capture_repo(repo)
     before_changes = working_tree_paths(repo)
+    before_fs = (
+        capture_fs_snapshot(repo, exclusions=observation_exclusions(repo))
+        if paths.state_root is not None
+        else None
+    )
+    spawned = False
     attempt_id = accounting_context.attempt_id
     attempt_output = Path(paths.output_path).parent / "attempts" / f"{attempt_id}.json"
     attempt_events = Path(paths.logs_dir) / f"{attempt_id}.jsonl"
@@ -1795,6 +1816,7 @@ def run_codex(
         )
         command = build_codex_command(role, repo, attempt_output, dispatch_schema_path)
         try:
+            spawned = True
             completed = subprocess.run(
                 command,
                 check=False,
@@ -1838,6 +1860,37 @@ def run_codex(
             try:
                 after_run = capture_repo(repo)
                 after_changes = working_tree_paths(repo)
+                if paths.state_root is not None and spawned:
+                    store = WorkflowStore(paths.state_root)
+                    if completed is None:
+                        record_unobserved_side_effect(
+                            store,
+                            task["task_id"],
+                            role=role,
+                            permit_id=None,
+                            reason="unobserved-executor",
+                        )
+                    elif before_fs is not None:
+                        construction_step = (
+                            {
+                                "plan_sha256": construction_context.plan.plan_sha256,
+                                "subtask_id": construction_context.step.id,
+                            }
+                            if construction_context is not None
+                            else None
+                        )
+                        observe_execution_side_effects(
+                            store,
+                            task["task_id"],
+                            role=role,
+                            permit_id=None,
+                            before=before_fs,
+                            after=capture_fs_snapshot(
+                                repo, exclusions=observation_exclusions(repo)
+                            ),
+                            rollout_events=tuple(parse_codex_jsonl(completed.stdout)),
+                            construction_step=construction_step,
+                        )
                 if before_run.head != after_run.head:
                     _fail("HEAD_DRIFT", "repository HEAD changed during the role run")
                 if role in READ_ONLY_ROLES and before_run != after_run:
