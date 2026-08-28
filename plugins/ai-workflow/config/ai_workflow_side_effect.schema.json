@@ -1,0 +1,59 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "ai-side-effect-1"
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "role": {
+      "type": "string",
+      "minLength": 1
+    },
+    "path": {
+      "type": "string",
+      "minLength": 1
+    },
+    "effect_kind": {
+      "type": "string",
+      "enum": [
+        "CONTROL_PLANE_ARTIFACT",
+        "OWNED_WRITE",
+        "UNTRACKED_WRITE",
+        "COMMAND_GENERATED",
+        "EXTERNAL",
+        "UNOBSERVED_ASSUMED_PRESENT"
+      ]
+    },
+    "permit_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "producer": {
+      "type": "string",
+      "minLength": 1
+    },
+    "producer_ref": {
+      "type": "string",
+      "minLength": 1
+    },
+    "command_sha256s": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  },
+  "required": [
+    "schema_version",
+    "task_id",
+    "role",
+    "path",
+    "effect_kind"
+  ]
+}

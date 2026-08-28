@@ -1,0 +1,36 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "ai-ownership-registry-1"
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "envelope_hash": {
+      "type": "string",
+      "minLength": 1
+    },
+    "path_owners": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "registered_at_utc": {
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "required": [
+    "schema_version",
+    "task_id",
+    "envelope_hash",
+    "path_owners",
+    "registered_at_utc"
+  ]
+}
