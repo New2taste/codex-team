@@ -1,0 +1,2948 @@
+{
+  "schema_version": "ai-test-baseline-1",
+  "base_commit": "ce24e14ec39107a97a4c675ea763e784caff8c60",
+  "captured_with": "/Users/lee/.local/bin/python3.11 scripts/collect_test_baseline.py --output tests/baseline_manifest.json",
+  "captured_at_utc": "2026-08-28T16:43:41.385040Z",
+  "tests": [
+    {
+      "id": "test_ai_workflow.CodexCommandTest.test_luna_command_is_pinned_and_read_only",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.CodexRunnerTest.test_attempt_context_rejects_task_and_role_mismatches_before_launch",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.CodexRunnerTest.test_business_secrets_are_not_forwarded",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.CodexRunnerTest.test_codex_non_runtime_usage_is_unavailable_without_verified_runtime_identity",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.CodexRunnerTest.test_codex_nonzero_exit_surfaces_bounded_redacted_stderr_tail",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.CodexRunnerTest.test_codex_stderr_tail_redacts_secret_straddling_the_truncation_cut",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.CodexRunnerTest.test_codex_usage_is_unavailable_when_runtime_identity_validation_fails",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.CodexRunnerTest.test_distinct_attempt_contexts_can_launch_independent_failures",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.CodexRunnerTest.test_live_bound_validation_rejects_model_supplied_scheduler_identity",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.CodexRunnerTest.test_non_runtime_invalid_result_has_exactly_one_failed_attempt",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.CodexRunnerTest.test_non_runtime_repo_guard_failure_has_exactly_one_failed_attempt",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.CodexRunnerTest.test_prompt_is_limited_to_task_contract_and_named_evidence",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.CodexRunnerTest.test_read_only_role_rejects_real_diff_even_when_result_declares_none",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.CodexRunnerTest.test_result_all_null_identity_quartet_normalizes_to_absent",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.CodexRunnerTest.test_result_changed_files_must_match_real_diff",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.CodexRunnerTest.test_result_exact_bound_task_id_echo_normalizes_to_absent",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.CodexRunnerTest.test_result_forged_identity_values_are_still_rejected",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.CodexRunnerTest.test_result_fully_bound_identity_is_still_accepted",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.CodexRunnerTest.test_result_partially_null_identity_is_rejected",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.CodexRunnerTest.test_result_rejects_incomplete_nested_schema_record",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.CodexRunnerTest.test_result_task_id_echo_rejects_non_null_reserved_identity",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.CodexRunnerTest.test_result_task_id_echo_requires_exact_controller_binding",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.CodexRunnerTest.test_reused_failed_attempt_context_is_rejected_before_a_second_launch",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.CodexRunnerTest.test_reused_successful_attempt_context_is_rejected_before_a_second_launch",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.CodexRunnerTest.test_role_status_cross_checks_reject_invalid_statuses",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.CodexRunnerTest.test_run_codex_enforces_luna_l1_evidence_package",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.CodexRunnerTest.test_run_codex_keeps_task_id_echo_in_raw_attempt_but_returns_normalized_result",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.CodexRunnerTest.test_run_codex_passes_sanitized_stdin_and_accepts_valid_output",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.CodexRunnerTest.test_run_codex_redacts_secret_assignments_and_long_tokens_from_events",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.CodexRunnerTest.test_run_codex_rejects_timeout_exit_and_invalid_json",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.ContractFilesTest.test_codex_response_schema_avoids_unsupported_keywords",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.ContractFilesTest.test_codex_response_schema_declares_type_for_const",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.ContractFilesTest.test_contract_versions_and_closed_sets_are_pinned",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.ContractFilesTest.test_role_models_and_efforts_are_pinned",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.DispatchSchemaDerivationTest.test_derivation_is_write_once_per_attempt",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.DispatchSchemaDerivationTest.test_derivation_rejects_identity_field_shape_drift",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.DispatchSchemaDerivationTest.test_derivation_rejects_unknown_canonical_property",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.DispatchSchemaDerivationTest.test_derived_variant_is_provider_strict_and_otherwise_identical",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.FakeRunnerTest.test_luna_fake_result_never_claims_acceptance",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.FinalSafetyRegressionTest.test_acceptance_rechecks_the_candidate_after_the_model_run",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.FinalSafetyRegressionTest.test_acceptance_rejects_a_head_other_than_the_resolved_candidate_before_model_run",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.FinalSafetyRegressionTest.test_each_role_attempt_uses_a_new_output_and_log_path",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.FinalSafetyRegressionTest.test_luna_blocked_stops_the_pipeline_without_running_the_next_role",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.FinalSafetyRegressionTest.test_read_only_role_rejects_a_preexisting_dirty_repository_before_model_run",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.FinalSafetyRegressionTest.test_role_runner_creates_the_attempt_output_directory_before_codex",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.FinalSafetyRegressionTest.test_stale_canonical_output_is_not_accepted_when_this_attempt_creates_no_output",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.FinalSafetyRegressionTest.test_terra_actual_forbidden_file_is_blocked_even_when_the_model_declares_no_changes",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.GatedPipelineTest.test_abort_command_preserves_task_evidence",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.GatedPipelineTest.test_abort_is_available_from_every_nonterminal_runtime_state",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.GatedPipelineTest.test_authorized_escalation_runs_sol_xhigh_once_and_returns_to_a_gate",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.GatedPipelineTest.test_authorized_live_remediation_uses_the_existing_safe_worktree_creator",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.GatedPipelineTest.test_decide_command_records_only_a_complete_closed_set_owner_decision",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.GatedPipelineTest.test_decide_resume_disabled_does_not_write_owner_decision",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.GatedPipelineTest.test_decide_resume_is_one_explicit_fake_command",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.GatedPipelineTest.test_decide_resume_rejects_live_before_recording_the_decision",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.GatedPipelineTest.test_owner_authorization_edges_cannot_be_crossed_by_state_table_alone",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.GatedPipelineTest.test_owner_decision_uses_closed_set_and_records_complete_audit_fields",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.GatedPipelineTest.test_resume_command_continues_an_authorized_task_idempotently",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.GatedPipelineTest.test_reviewer_escalation_stops_at_owner_gate_without_calling_sol_xhigh",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.GatedPipelineTest.test_second_terra_failure_after_owner_authorized_rework_does_not_run_terra_third_time",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.GatedPipelineTest.test_two_malformed_results_use_only_one_technical_retry_then_block",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.GitSafetyTest.test_assert_allowed_changes_rejects_a_path_outside_the_allowed_prefix",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.GitSafetyTest.test_assert_pinned_rejects_a_repository_head_that_moved",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.GitSafetyTest.test_changed_paths_reports_the_files_between_two_commits",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.GitSafetyTest.test_create_worktree_rejects_an_unauthorized_owner_before_running_git",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.GitSafetyTest.test_create_worktree_requires_an_execution_approval_record",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.GitSafetyTest.test_create_worktree_uses_the_approved_branch_and_directory",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.GitSafetyTest.test_git_uses_a_list_command_without_a_shell",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.GitSafetyTest.test_read_only_luna_and_sol_runs_reject_real_repository_mutations",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.LiveLunaCliTest.test_authorized_live_luna_uses_only_task_evidence_and_task_directory",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.LiveLunaCliTest.test_live_runner_rejects_non_luna_roles",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.LiveLunaCliTest.test_live_runner_requires_explicit_authorization",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.MetricsReportTest.test_aggregate_metrics_excludes_synthetic_fixture_records_but_keeps_production",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.MetricsReportTest.test_aggregate_metrics_reports_calls_gates_prompt_and_cache_efficiency",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.MetricsReportTest.test_aggregate_metrics_separates_luna_value_and_review_cost",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.MetricsReportTest.test_controller_appends_native_cost_attempts_for_failures_and_retries",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.MetricsReportTest.test_invalid_role_result_is_recorded_as_failed_cost_attempt",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.MetricsReportTest.test_live_codex_dispatch_passes_derived_strict_schema_to_codex",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.MetricsReportTest.test_live_codex_retry_records_inner_attempts_with_outer_retry_kinds",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.MetricsReportTest.test_live_codex_successful_attempt_is_recorded_once",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.MetricsReportTest.test_live_codex_unrecovered_failure_is_recorded_once",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.MetricsReportTest.test_live_guard_failure_is_recorded_as_failed_cost_attempt",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.MetricsReportTest.test_native_runner_stale_runtime_usage_is_not_cost_evidence",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.MetricsReportTest.test_record_metrics_never_estimates_missing_or_invalid_token_usage",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.MetricsReportTest.test_record_metrics_strips_model_supplied_cost_evidence",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.MetricsReportTest.test_report_command_fails_closed_on_invalid_optimization_policy",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.MetricsReportTest.test_report_command_pins_claim_threshold_from_optimization_policy",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.MetricsReportTest.test_report_command_writes_one_markdown_file_and_prints_its_path",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.MetricsReportTest.test_report_redacts_json_style_secret_fields",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.MetricsReportTest.test_report_redacts_secrets_and_high_entropy_event_values",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.MetricsReportTest.test_unpaired_cost_attempt_is_reported_unavailable_and_not_aggregated",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.RetryBudgetTest.test_each_budget_is_limited_to_one_consumption",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.RetryBudgetTest.test_retry_budget_consumes_explicit_configured_limits",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.RoutingTest.test_acceptance_route",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.RoutingTest.test_high_risk_remediation_plans_first",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.RoutingTest.test_plain_remediation_route",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.RoutingTest.test_plan_route",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.StateMachineTest.test_closed_is_owner_only",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.StateMachineTest.test_normal_evidence_transition",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.StateMachineTest.test_owner_gate_cannot_be_crossed_automatically",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.TaskValidationTest.test_acceptance_requires_both_commits",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.TaskValidationTest.test_optional_paired_case_id_is_stored_and_legacy_tasks_remain_valid",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.TaskValidationTest.test_optional_paired_case_id_rejects_blank_or_non_string_values",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.TaskValidationTest.test_unknown_field_is_rejected",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.TaskValidationTest.test_valid_task_passes",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.TeamCallCliTest.test_team_call_cli_replays_a_failed_call_as_blocked_with_exit_two",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.TeamCallCliTest.test_team_call_cli_reports_missing_repository_with_exit_two",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.TeamCallCliTest.test_team_call_default_state_root_stays_outside_a_fresh_repository",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.TeamCallCliTest.test_team_call_fake_cli_emits_a_canonical_l0_receipt",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.TeamCallCliTest.test_team_call_live_l1_runs_when_live_is_explicitly_authorized",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.TeamCallCliTest.test_team_call_live_runner_requires_explicit_model_authorization",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.WorkflowStoreTest.test_create_task_writes_canonical_json",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.WorkflowStoreTest.test_decisions_are_appended_not_rewritten",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.WorkflowStoreTest.test_lock_is_exclusive",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow.WriteJsonOnceAtomicityTest.test_content_write_failure_leaves_no_frozen_target_and_retry_succeeds",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_adversarial_acceptance.AcceptanceContractMutationTest.test_assignment_prompt_reserves_controller_identity_fields",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_adversarial_acceptance.AcceptanceContractMutationTest.test_attempt_lifecycle_contract_kills_success_after_failed_same_attempt",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_adversarial_acceptance.AcceptanceContractMutationTest.test_common_event_binding_kills_field_presence_only_validator",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_adversarial_acceptance.AcceptanceContractMutationTest.test_controller_result_accepts_all_null_identity_wire_shape",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_adversarial_acceptance.AcceptanceContractMutationTest.test_controller_result_accepts_exact_bound_task_id_echo",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_adversarial_acceptance.AcceptanceContractMutationTest.test_controller_result_rejects_model_supplied_scheduler_identity",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_adversarial_acceptance.AcceptanceContractMutationTest.test_controller_result_rejects_partially_null_identity",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_adversarial_acceptance.AcceptanceContractMutationTest.test_controller_result_rejects_unbound_or_wrong_task_id_echo",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_adversarial_acceptance.AcceptanceContractMutationTest.test_receipt_identity_contract_kills_assignment_attempt_only_verifier",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_adversarial_acceptance.AcceptanceLedgerV2ContractTest.test_actual_git_diff_is_authoritative_over_reported_changed_paths",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_adversarial_acceptance.AcceptanceLedgerV2ContractTest.test_actual_git_diff_rejects_symlink_scope_escape",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_adversarial_acceptance.AcceptanceLedgerV2ContractTest.test_actual_git_diff_rejects_traversal_and_prefix_scope_escape",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_adversarial_acceptance.AcceptanceLedgerV2ContractTest.test_canonical_replay_rejects_one_mutated_ledger_identity",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_adversarial_acceptance.AcceptanceLedgerV2ContractTest.test_capability_and_evidence_tamper_fail_completion_review_and_replay",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_adversarial_acceptance.AcceptanceLedgerV2ContractTest.test_controller_evidence_rejects_metacharacters_and_non_targets_before_launch",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_adversarial_acceptance.AcceptanceLedgerV2ContractTest.test_controller_evidence_rejects_safe_argv_that_mutates_the_repository",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_adversarial_acceptance.AcceptanceLedgerV2ContractTest.test_controller_evidence_rejects_shell_command_before_it_runs",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_adversarial_acceptance.AcceptanceLedgerV2ContractTest.test_controller_evidence_rejects_transcript_over_the_cap",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_adversarial_acceptance.AcceptanceLedgerV2ContractTest.test_controller_fixed_executor_binds_sol_medium_repair_write_contract",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_adversarial_acceptance.AcceptanceLedgerV2ContractTest.test_controller_fixed_executor_commits_only_the_issued_repair_scope",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_adversarial_acceptance.AcceptanceLedgerV2ContractTest.test_controller_fixed_executor_resumes_issued_runtime_and_accepts",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_adversarial_acceptance.AcceptanceLedgerV2ContractTest.test_direct_review_cannot_complete_an_orphaned_started_attempt",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_adversarial_acceptance.AcceptanceLedgerV2ContractTest.test_finding_binding_and_actual_diff_scope_are_immutable",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_adversarial_acceptance.AcceptanceLedgerV2ContractTest.test_identity_reuse_self_review_and_skipped_transition_fail_closed",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_adversarial_acceptance.AcceptanceLedgerV2ContractTest.test_luna_owner_review_one_accepts_to_terminal",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_adversarial_acceptance.AcceptanceLedgerV2ContractTest.test_luna_owner_rework_then_distinct_terra_review_two_accepts",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_adversarial_acceptance.AcceptanceLedgerV2ContractTest.test_orphaned_started_attempt_is_interrupted_once_before_retry",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_adversarial_acceptance.AcceptanceLedgerV2ContractTest.test_owner_repair_requires_the_issued_owner_runtime_receipt",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_adversarial_acceptance.AcceptanceLedgerV2ContractTest.test_public_runtime_records_and_arbitrary_boundary_cannot_authorize_accept",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_adversarial_acceptance.AcceptanceLedgerV2ContractTest.test_replay_rejects_duplicate_repair_completion",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_adversarial_acceptance.AcceptanceLedgerV2ContractTest.test_replay_rejects_missing_common_reordered_broken_and_duplicate_records",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_adversarial_acceptance.AcceptanceLedgerV2ContractTest.test_replay_rejects_rechained_identity_binding_and_evidence_mutations",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_adversarial_acceptance.AcceptanceLedgerV2ContractTest.test_review_rejects_model_claimed_evidence_not_executed_by_controller",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_adversarial_acceptance.AcceptanceLedgerV2ContractTest.test_sol_fixer_cannot_be_its_own_peer_and_v1_history_is_not_v2",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_adversarial_acceptance.AcceptanceLedgerV2ContractTest.test_sol_peer_rework_creates_one_sol_xhigh_terminal_repair",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_adversarial_acceptance.AcceptanceLedgerV2ContractTest.test_task_candidate_and_cross_task_bindings_reject_stale_capabilities",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_adversarial_acceptance.AcceptanceLedgerV2ContractTest.test_terra_owner_rework_then_sol_peer_accepts",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_adversarial_acceptance.AcceptanceLedgerV2ContractTest.test_terra_xhigh_runtime_cannot_launch_or_complete_sol_medium_repair",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_adversarial_acceptance.AcceptanceLedgerV2ContractTest.test_v2_terminal_ledger_claims_task_from_generic_runner",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_adversarial_acceptance.AcceptanceLedgerV2ContractTest.test_v2_types_are_frozen_and_public_without_legacy_fallback",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_artifacts.ArtifactValidatorTest.test_artifact_hash_is_canonical",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_artifacts.ArtifactValidatorTest.test_cost_evidence_requires_execution_surface",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_artifacts.ArtifactValidatorTest.test_cost_execution_surface_is_a_closed_set",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_artifacts.ArtifactValidatorTest.test_load_artifact_requires_json_object",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_artifacts.ArtifactValidatorTest.test_measured_cost_requires_token_evidence",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_artifacts.ArtifactValidatorTest.test_native_runtime_schema_requires_null_agent_type",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_artifacts.ArtifactValidatorTest.test_new_and_legacy_model_roles_validate_in_every_frozen_artifact",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_artifacts.ArtifactValidatorTest.test_reason_codes_reject_unknown_values",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_artifacts.ArtifactValidatorTest.test_route_decision_has_no_unvalidated_runtime_extensions",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_artifacts.ArtifactValidatorTest.test_route_request_must_match_task_risk_flags",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_artifacts.ArtifactValidatorTest.test_runtime_schema_freezes_observed_agent_type_conditions",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_artifacts.ArtifactValidatorTest.test_unknown_artifact_field_is_rejected",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_artifacts.NewArtifactSchemaTest.test_every_new_schema_is_strict_and_versioned",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_baseline_manifest.BaselineManifestTest.test_manifest_ids_all_present",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_baseline_manifest.BaselineManifestTest.test_manifest_shape",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_baseline_manifest.BaselineManifestTest.test_skip_semantics_unchanged",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_construction_adversarial.ControllerEvidenceExecutionTest.test_nonexistent_l0_artifact_cannot_be_attested_by_fake_runner",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_construction_adversarial.ControllerEvidenceExecutionTest.test_shell_noop_and_unbound_commands_are_rejected_by_plan_validation",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_construction_adversarial.FrozenConstructionAuthorityTest.test_first_freeze_event_binds_complete_owner_decision",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_construction_adversarial.FrozenConstructionAuthorityTest.test_rewriting_both_supplied_and_persisted_plan_after_gate_is_rejected",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_construction_adversarial.FrozenConstructionAuthorityTest.test_route_decision_is_write_once",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_construction_adversarial.LunaScopeAndOwnerTest.test_casefolded_control_scope_and_wide_control_parent_are_rejected",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_construction_adversarial.LunaScopeAndOwnerTest.test_enforced_construction_rejects_every_non_construction_owner",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_construction_adversarial.LunaScopeAndOwnerTest.test_symlink_scope_is_rejected_before_freeze",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_construction_adversarial.LunaScopeAndOwnerTest.test_uncertain_authorization_language_is_not_luna_eligible",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_construction_adversarial.TerraOSDefaultExecutionTest.test_plan_and_acceptance_generic_execution_fail_closed",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_construction_execution.EnforcedConstructionExecutionTest.test_cli_construction_path_uses_the_same_enforced_executor",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_construction_execution.EnforcedConstructionExecutionTest.test_decide_resume_advances_attempt_before_rework_dispatch",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_construction_execution.EnforcedConstructionExecutionTest.test_duplicate_rework_dispatch_does_not_leave_running_state",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_construction_execution.EnforcedConstructionExecutionTest.test_enforced_state_machine_launches_the_hash_bound_luna_owner",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_construction_execution.EnforcedConstructionExecutionTest.test_generic_terra_os_state_machine_and_cli_fail_closed_without_context",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_construction_execution.EnforcedConstructionExecutionTest.test_non_luna_frozen_step_runs_terra_xhigh_without_any_sol_role",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_construction_execution.EnforcedConstructionExecutionTest.test_orphan_dispatch_after_append_is_resumed_on_the_same_identity",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_construction_execution.EnforcedConstructionExecutionTest.test_orphan_dispatch_identity_drift_is_rejected_before_running",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_construction_execution.EnforcedConstructionExecutionTest.test_owner_approval_cannot_switch_to_a_different_plan_after_freeze",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_construction_execution.EnforcedConstructionExecutionTest.test_resume_reuses_the_frozen_construction_context_without_redispatch",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_construction_execution.EnforcedConstructionExecutionTest.test_rework_attempt_two_orphan_resumes_without_incrementing_to_three",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_construction_execution.EnforcedConstructionExecutionTest.test_separate_second_rework_decision_advances_attempt_two_to_three",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_construction_execution.LunaConstructionEnvelopeRegressionTest.test_disguised_operator_control_semantics_are_not_luna_eligible",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_construction_execution.LunaConstructionEnvelopeRegressionTest.test_luna_prompt_cannot_replace_the_frozen_construction_contract",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_construction_execution.LunaConstructionEnvelopeRegressionTest.test_luna_result_requires_bound_l0_l1_l2_and_negative_evidence",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_construction_execution.LunaConstructionEnvelopeRegressionTest.test_luna_scope_rejects_git_metadata_even_when_the_parent_allows_it",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_construction_execution.LunaConstructionEnvelopeRegressionTest.test_luna_scope_rejects_workflow_state_log_and_control_plane_paths",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_construction_execution.LunaConstructionEnvelopeRegressionTest.test_placeholder_and_noop_envelope_values_are_rejected",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_construction_execution.LunaConstructionEnvelopeRegressionTest.test_unflagged_authorization_semantics_are_not_luna_eligible",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_costs.CostNormalizationTest.test_explicit_duration_is_measured_even_when_token_usage_is_missing",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_costs.CostNormalizationTest.test_explicit_unavailable_with_duration_stays_unavailable",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_costs.CostNormalizationTest.test_invalid_numbers_are_rejected",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_costs.CostNormalizationTest.test_missing_tokens_remain_unavailable",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_costs.CostNormalizationTest.test_projection_requires_rate_snapshot_and_keeps_price_separate",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_costs.CostNormalizationTest.test_unavailable_rejects_projected_price_values",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_costs.CostReportTest.test_report_claim_gate_uses_pinned_minimum_cases",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_costs.CostReportTest.test_report_keeps_measured_projection_and_unavailable_separate",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_costs.CostReportTest.test_report_optimization_gate_treats_synthetic_records_as_fallback",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_costs.CostReportTest.test_report_prints_optimization_gate_line",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_costs.CostReportTest.test_report_shows_signed_deltas_and_projection_amounts_without_mixing_classes",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_costs.PairingAndClaimGateTest.test_claim_gate_requires_cases_quality_and_measured_delta",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_costs.PairingAndClaimGateTest.test_every_accepted_price_field_requires_projection_and_rate_snapshot",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_costs.PairingAndClaimGateTest.test_failed_and_retry_attempts_count_in_the_same_pair",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_costs.PairingAndClaimGateTest.test_measured_usage_cannot_carry_projected_price",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_costs.PairingAndClaimGateTest.test_paired_fixture_is_stable_stratified_and_has_both_surfaces",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_costs.PairingAndClaimGateTest.test_signed_cost_and_quality_deltas_survive_pairing_and_claim_gate",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_costs.PairingAndClaimGateTest.test_synthetic_fixture_flows_through_aggregation_and_stays_out_of_metrics",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_distribution.CleanupOnlyLifecycleTest.test_backup_restore_preserves_replacement_racing_the_rename",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_distribution.CleanupOnlyLifecycleTest.test_cleanup_preserves_state_replacement_racing_retirement",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_distribution.CleanupOnlyLifecycleTest.test_final_discard_never_unlinks_target_state_or_backup_replacement",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_distribution.CleanupOnlyLifecycleTest.test_identity_change_before_cleanup_fails_closed",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_distribution.CleanupOnlyLifecycleTest.test_tampered_mixed_and_symlink_inputs_fail_closed",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_distribution.CleanupOnlyLifecycleTest.test_unmanaged_cleanup_preserves_replacement_racing_the_retirement",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_distribution.CleanupOnlyLifecycleTest.test_verified_canonical_cleanup_removes_owned_files",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_distribution.CleanupOnlyLifecycleTest.test_verified_canonical_cleanup_restores_user_backup",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_distribution.CleanupOnlyLifecycleTest.test_verified_legacy_cleanup_removes_known_historical_file",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_distribution.DistributionContractTest.test_cleanup_only_never_creates_files_for_an_empty_user_directory",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_distribution.DistributionContractTest.test_known_legacy_fixture_matches_the_registered_digest",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_distribution.DistributionContractTest.test_legacy_migration_payload_digest_is_pinned",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_distribution.DistributionContractTest.test_legacy_migration_payload_matches_the_historical_contract",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_distribution.DistributionContractTest.test_native_luna_is_default_and_custom_templates_are_not_active",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_distribution.DistributionContractTest.test_orchestration_metadata_has_no_legacy_agent_identifier",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_distribution.DistributionContractTest.test_plugin_manifest_and_marketplace_are_versioned",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_distribution.DistributionContractTest.test_plugin_verifier_rejects_a_dangling_plugin_legacy_template",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_distribution.DistributionContractTest.test_plugin_verifier_rejects_a_dangling_root_legacy_template",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_distribution.DistributionContractTest.test_plugin_verifier_rejects_a_legacy_agent_template_in_a_copied_release",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_distribution.DistributionContractTest.test_plugin_verifier_rejects_a_tampered_mirrored_runtime_copy",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_distribution.DistributionContractTest.test_plugin_verifier_rejects_tampered_team_call_runtime_copy",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_distribution.DistributionContractTest.test_project_and_release_agent_templates_are_absent",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_distribution.DistributionContractTest.test_published_default_defers_adversarial_review_until_final_acceptance",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_distribution.DistributionContractTest.test_published_role_and_lifecycle_language_has_no_legacy_allocation",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_distribution.DistributionContractTest.test_release_runtime_and_schema_copies_are_byte_exact",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_distribution.DistributionContractTest.test_sol_xhigh_terminal_repair_is_narrow_exception_to_construction_ban",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_distribution.DistributionContractTest.test_team_call_runtime_copy_and_published_contract_are_exact",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_distribution.FullVerificationEntrypointTest.test_untracked_files_are_included_in_whitespace_checks",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_distribution.LifecycleVerifierTest.test_verifier_rejects_invalid_cleanup_lifecycle_syntax",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_distribution.LifecycleVerifierTest.test_verifier_rejects_missing_python_syntax_tool",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_distribution.LifecycleVerifierTest.test_verifier_requires_all_cleanup_lifecycle_scripts",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_final_fix.FinalFixEvidenceContractTest.test_authorized_artifact_bound_test_executes_normally",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_final_fix.FinalFixEvidenceContractTest.test_executor_revalidates_a_forged_cross_scope_check_before_launch",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_final_fix.FinalFixEvidenceContractTest.test_plan_rejects_a_cross_scope_evidence_operand",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_final_fix.FinalFixEvidenceContractTest.test_plan_rejects_an_artifact_argv_mismatch",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_final_fix.FinalFixEvidenceContractTest.test_plan_rejects_an_external_same_name_executable",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_final_fix.FinalFixReadOnlyRouteTest.test_persisted_read_only_route_reaches_owner_gate_through_its_runner",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_final_fix.FinalFixReadOnlyRouteTest.test_plan_and_acceptance_routes_select_task_typed_read_only_terra_roles",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.AdviceCombinationAndRecoveryTest.test_illegal_mode_gate_applied_combinations_are_rejected",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.AdviceCombinationAndRecoveryTest.test_record_rejects_actual_route_not_bound_to_stored_effective_route",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.AdviceCombinationAndRecoveryTest.test_sidecar_retries_restore_missing_event_without_duplicating",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.BoundInputAndDowngradeTest.test_hash_mismatch_between_decision_and_inputs_is_rejected",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.BoundInputAndDowngradeTest.test_route_escalation_is_not_applied",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.CompactConstructionPromptTest.test_compact_requires_controller_armed_builder_result",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.CompactConstructionPromptTest.test_construction_and_terra_prompts_use_the_same_renderer",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.CompactConstructionPromptTest.test_frozen_legal_prompt_ignores_later_aggregate_metrics",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.CompactConstructionPromptTest.test_illegal_construction_prompt_with_result_mismatches",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.CompactConstructionPromptTest.test_unrelated_luna_full_or_missing_plan_hash_mismatches_even_with_result",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.CompactPromptDecisionTest.test_builder_rejects_caller_asserted_compact_or_gate",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.CompactPromptDecisionTest.test_dual_key_requires_flag_enforced_mode_and_allow_enforced_gate",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.CompactPromptMetricsTest.test_aggregate_metrics_counts_compact_applied_without_touching_cost_summary",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.CompactPromptMetricsTest.test_compact_applied_metric_does_not_change_the_gate",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.CompactPromptPluginMirrorTest.test_plugin_runtime_mirrors_compact_prompt_entry",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.CompactPromptProjectionTest.test_armed_compact_is_a_projection_not_a_summary",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.CompactPromptProjectionTest.test_default_and_unarmed_paths_keep_full_prompt",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.CompactPromptProjectionTest.test_role_identity_and_overdesign_ban_survive_compact",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.CompactPromptProjectionTest.test_unknown_contract_field_is_kept_or_disables_compact",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.CompactPromptReviewFixTest.test_compact_keeps_full_evidence_authorization_sentences",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.CompactPromptReviewFixTest.test_construction_does_not_reaggregate_a_frozen_prompt_result",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.CompactPromptReviewFixTest.test_fidelity_is_structural_and_rejects_substring_soup",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.CompactPromptReviewFixTest.test_forged_compact_result_is_not_recorded",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.CompactPromptReviewFixTest.test_oversized_compact_falls_back_to_full",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.CompactPromptReviewFixTest.test_production_builders_reject_config_and_metrics_kwargs",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.CompactPromptReviewFixTest.test_repair_assignment_prompt_stays_full_and_is_not_a_compact_surface",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.ConfiguredRolePolicyAdviceTest.test_evaluate_and_apply_uses_routing_role_policy_from_config",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.ConfiguredRolePolicyAdviceTest.test_missing_routing_role_policy_fails_closed",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.ForgedGateAndControlledEntryTest.test_caller_supplied_allow_enforced_does_not_apply",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.ForgedGateAndControlledEntryTest.test_controller_state_loader_can_open_enforced_gate",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.ForgedGateAndControlledEntryTest.test_evaluate_and_apply_enforced_uses_internal_gate_not_routing_mode",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.ForgedGateAndControlledEntryTest.test_public_advice_entry_rejects_caller_config_metrics_and_requires_state_root",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.ForgedGateAndControlledEntryTest.test_public_facade_has_no_forgeable_gate_result",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.GateCoveredCostSummaryTest.test_undeclared_cost_pairs_cannot_open_the_gate_even_with_valid_misses",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.GateEvidenceFailClosedTest.test_defaulted_period_or_origin_cannot_open_the_gate",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.GateEvidenceFailClosedTest.test_missing_p0_or_p1_on_a_covered_run_is_none",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.GateEvidenceFailClosedTest.test_no_records_leave_p0_and_p1_none",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.OptimizationGateTest.test_eight_pairs_with_support_zero_miss_and_no_first_delivery_drop_allow",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.OptimizationGateTest.test_evaluate_cost_claim_default_minimum_stays_thirty",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.OptimizationGateTest.test_insufficient_pairs_missing_net_non_negative_miss_and_first_delivery_fallback",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.OptimizationGateTest.test_synthetic_fixture_cannot_open_the_gate",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.OptimizationMetricsTest.test_aggregate_metrics_counts_misses_and_cohort_first_delivery",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.OptimizationMetricsTest.test_invalid_miss_counts_fail_closed",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.OptimizationMetricsTest.test_synthetic_fixture_records_cannot_open_aggregated_gate",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.OptimizationPolicyTest.test_unknown_config_fails_closed",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.RouteAdvicePersistenceTest.test_existing_route_advice_rejects_symlink_and_hardlink",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.RouteAdvicePersistenceTest.test_schema_valid_enforced_advice_cannot_be_recorded_without_controller_evaluation",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.RouteAdvicePersistenceTest.test_sidecar_binds_hashes_and_rejects_a_second_different_advice",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.RouteAdvicePersistenceTest.test_sidecar_rejects_hash_drift",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.RouteAdviceSchemaTest.test_schema_is_strict_ai_route_advice_1",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.RouteAdviceSchemaTest.test_unknown_and_missing_fields_are_rejected",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.RouteCliShadowAdviceTest.test_route_cli_reads_optimization_policy_not_routing_mode",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.RouteCliShadowAdviceTest.test_route_cli_recovers_advice_after_partial_write",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.RouteCliShadowAdviceTest.test_route_cli_rejects_retry_with_different_mode",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.RouteCliShadowAdviceTest.test_route_cli_rejects_retry_with_different_request",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.RouteCliShadowAdviceTest.test_route_cli_writes_sidecar_but_prints_unchanged_decision_wire",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.RouteCliShadowAdviceTest.test_route_decision_retry_restores_exactly_one_missing_matching_event",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.RoutingAtomicPersistenceTest.test_directory_fsync_failure_reports_published_and_retry_recovers_events",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.RoutingAtomicPersistenceTest.test_route_advice_prepublication_failures_leave_no_frozen_file",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.RoutingAtomicPersistenceTest.test_route_decision_prepublication_failures_leave_no_frozen_file",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.ShadowAndEnforcedAdviceTest.test_blocked_and_high_risk_direct_recommendations_are_not_applied",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.ShadowAndEnforcedAdviceTest.test_enforced_applies_only_when_all_four_gates_pass_and_recommendation_is_legal",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.ShadowAndEnforcedAdviceTest.test_enforced_below_eight_pairs_keeps_the_fixed_chain",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.ShadowAndEnforcedAdviceTest.test_illegal_optimization_mode_raises",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.ShadowAndEnforcedAdviceTest.test_illegal_recommendation_falls_back_without_raising",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.ShadowAndEnforcedAdviceTest.test_shadow_can_recommend_a_different_route_without_changing_roles_or_wire",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_optimization.ShadowAndEnforcedAdviceTest.test_shadow_does_not_record_an_unsafe_direct_recommendation",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_planning.DispatchIdentityTest.test_dispatch_candidate_must_match_the_frozen_parent_task",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_planning.DispatchIdentityTest.test_dispatch_id_hashes_exactly_the_five_canonical_fields",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_planning.DispatchIdentityTest.test_dispatch_requires_a_nonempty_frozen_candidate_commit",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_planning.DispatchIdentityTest.test_invalid_historical_dispatch_id_blocks_append_without_rewriting_ledger",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_planning.DispatchIdentityTest.test_record_dispatch_binds_frozen_plan_owner_scope_and_candidate",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_planning.DispatchIdentityTest.test_same_dispatch_identity_is_not_launched_twice",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_planning.PlanGraphValidationTest.test_cycle_is_rejected",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_planning.PlanGraphValidationTest.test_dependency_must_be_in_an_earlier_stage",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_planning.PlanGraphValidationTest.test_stages_must_cover_each_declared_task_once",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_planning.PlanScopeValidationTest.test_all_scope_kinds_reject_absolute_traversal_glob_and_empty_paths",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_planning.PlanScopeValidationTest.test_each_new_terra_os_role_is_a_valid_frozen_plan_owner",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_planning.PlanScopeValidationTest.test_luna_construction_owner_rejects_missing_mutation_evidence",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_planning.PlanScopeValidationTest.test_luna_construction_owner_requires_a_complete_local_envelope",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_planning.PlanScopeValidationTest.test_luna_execution_context_revalidates_the_exact_envelope_step",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_planning.PlanScopeValidationTest.test_parent_child_write_scopes_overlap",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_planning.PlanScopeValidationTest.test_same_exact_scope_cannot_have_two_subtask_owners",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_planning.PlanScopeValidationTest.test_subtask_cannot_write_its_own_do_not_touch_scope",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_planning.PlanScopeValidationTest.test_valid_plan_freezes_scope_ownership_by_subtask_id",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_planning.PlanScopeValidationTest.test_write_scope_must_stay_within_parent_allowed_paths",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_planning.ReadyBatchTest.test_capacity_limits_sorted_current_stage_tasks",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_planning.ReadyBatchTest.test_future_stage_waits_for_completed_prior_stage_dependencies",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_planning.ReadyBatchTest.test_zero_capacity_returns_empty_and_invalid_capacity_fails_closed",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_repairs.RepairProtocolTest.test_active_repair_fails_closed_without_identity_aware_execution_handoff",
+      "outcome": "skip",
+      "skip_reason": "repair-ledger-1 mutation is terminally disabled"
+    },
+    {
+      "id": "test_ai_workflow_repairs.RepairProtocolTest.test_assignments_are_immutable_and_cap_terra_at_two_rounds",
+      "outcome": "skip",
+      "skip_reason": "repair-ledger-1 assignment creation is terminally disabled"
+    },
+    {
+      "id": "test_ai_workflow_repairs.RepairProtocolTest.test_closed_actor_set_and_peer_separation_fail_closed",
+      "outcome": "skip",
+      "skip_reason": "repair-ledger-1 mutation is terminally disabled"
+    },
+    {
+      "id": "test_ai_workflow_repairs.RepairProtocolTest.test_direct_assignment_construction_retains_no_mutable_finding_input",
+      "outcome": "skip",
+      "skip_reason": "repair-ledger-1 assignment creation is terminally disabled"
+    },
+    {
+      "id": "test_ai_workflow_repairs.RepairProtocolTest.test_legacy_remediation_without_repair_events_never_requires_repair_commits",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_repairs.RepairProtocolTest.test_persisted_rounds_require_completed_rejections_and_replay_after_restart",
+      "outcome": "skip",
+      "skip_reason": "repair-ledger-1 mutation is terminally disabled"
+    },
+    {
+      "id": "test_ai_workflow_repairs.RepairProtocolTest.test_protocol_rejects_actor_scope_finding_commit_and_replay_drift",
+      "outcome": "skip",
+      "skip_reason": "repair-ledger-1 mutation is terminally disabled"
+    },
+    {
+      "id": "test_ai_workflow_repairs.RepairProtocolTest.test_repair_finding_scope_must_stay_within_the_parent_task_write_scope",
+      "outcome": "skip",
+      "skip_reason": "repair-ledger-1 mutation is terminally disabled"
+    },
+    {
+      "id": "test_ai_workflow_repairs.RepairProtocolTest.test_repair_protocol_owns_execution_until_an_acceptance_verdict_closes_it",
+      "outcome": "skip",
+      "skip_reason": "repair-ledger-1 mutation is terminally disabled"
+    },
+    {
+      "id": "test_ai_workflow_repairs.RepairProtocolTest.test_v1_repair_mutation_api_is_disabled",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_repairs.RepairProtocolTest.test_v2_absence_preserves_plan_acceptance_and_legacy_generic_routing",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_repairs.RepairProtocolTest.test_v2_adapter_requires_controller_boundary_and_records_one_failure",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_repairs.RepairProtocolTest.test_workflow_reexports_the_frozen_repair_protocol",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_router_probe.RouterProbeAnalysisTest.test_analysis_binds_rows_to_the_frozen_source_manifest",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_router_probe.RouterProbeAnalysisTest.test_analysis_fails_closed_on_insufficient_synthetic_or_incomplete_evidence",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_router_probe.RouterProbeAnalysisTest.test_measured_complete_matrix_reports_cache_curve_and_luna_candidate",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_router_probe.RouterProbeAnalysisTest.test_p0_eliminates_one_arm_and_no_cache_lift_keeps_baseline",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_router_probe.RouterProbeContractTest.test_manifest_schema_closes_models_arms_conditions_and_properties",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_router_probe.RouterProbeContractTest.test_probe_schema_is_in_plugin_distribution_manifest",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_router_probe.RouterProbeContractTest.test_router_probe_config_is_disabled_and_has_exact_three_family_matrix",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_router_probe.RouterProbeContractTest.test_router_probe_is_cost_only_and_not_a_production_role",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_router_probe.RouterProbeRunnerTest.test_atomic_publish_oserror_is_bounded",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_router_probe.RouterProbeRunnerTest.test_executor_origin_cannot_be_promoted_by_manifest_claim",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_router_probe.RouterProbeRunnerTest.test_fake_batch_writes_atomic_manifest_and_normalized_cost_rows",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_router_probe.RouterProbeRunnerTest.test_live_cli_requires_enabled_probe_config",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_router_probe.RouterProbeRunnerTest.test_live_cli_requires_explicit_model_authorization",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_router_probe.RouterProbeRunnerTest.test_live_executor_is_read_only_and_extracts_usage",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_router_probe.RouterProbeRunnerTest.test_live_executor_rejects_model_effort_pair_drift",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_router_probe.RouterProbeRunnerTest.test_manifest_validator_rejects_unknown_mismatched_and_extra_values",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_router_probe.RouterProbeRunnerTest.test_output_root_must_be_absolute_non_symlink_and_outside_dot_git",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_router_probe.RouterProbeRunnerTest.test_probe_module_has_no_workflow_store_dependency",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_router_probe.RouterProbeRunnerTest.test_resident_prefix_is_stable_and_cold_control_prefix_is_case_bound",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_routing_v2.ClosedSetRoutingTest.test_non_decomposable_bounded_work_is_blocked",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_routing_v2.ClosedSetRoutingTest.test_planning_only_routes_read_only_terra_xhigh_without_sol_medium",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_routing_v2.ClosedSetRoutingTest.test_security_write_can_never_route_direct",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_routing_v2.ClosedSetRoutingTest.test_simple_low_risk_work_routes_direct",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_routing_v2.ClosedSetRoutingTest.test_undecidable_request_fails_closed",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_routing_v2.ClosedSetRoutingTest.test_unknown_mode_is_rejected",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_routing_v2.RouteDecisionPersistenceTest.test_record_route_decision_writes_strict_document_and_hash_event",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_routing_v2.RouteDecisionPersistenceTest.test_route_cli_never_starts_a_model_and_prints_canonical_wire_json",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_routing_v2.ShadowRoutingCompatibilityTest.test_legacy_mode_keeps_existing_role_chain",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_routing_v2.ShadowRoutingCompatibilityTest.test_route_decision_binds_both_input_hashes",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_routing_v2.ShadowRoutingCompatibilityTest.test_shadow_records_decision_without_changing_legacy_roles",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_routing_v2.ShadowRoutingCompatibilityTest.test_wire_decision_excludes_runtime_compatibility_fields",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_runtime.RuntimeIdentityTest.test_broadened_exception_is_limited_to_read_only_reviewer_with_real_snapshots",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_runtime.RuntimeIdentityTest.test_broadened_reviewer_needs_opt_in_prompt_guard_and_unchanged_snapshots",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_runtime.RuntimeIdentityTest.test_conflicting_canonical_and_observed_aliases_fail_closed",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_runtime.RuntimeIdentityTest.test_conflicting_public_and_rollout_values_fail_closed",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_runtime.RuntimeIdentityTest.test_each_pinned_terra_os_role_has_a_verifiable_runtime_identity",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_runtime.RuntimeIdentityTest.test_every_native_identity_field_is_required",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_runtime.RuntimeIdentityTest.test_exec_evidence_has_null_agent_type_and_never_claims_native_luna",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_runtime.RuntimeIdentityTest.test_exec_rejects_a_nonnull_observed_agent_type_alias",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_runtime.RuntimeIdentityTest.test_exec_surface_must_not_claim_a_custom_agent_type",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_runtime.RuntimeIdentityTest.test_exec_uuid_fields_are_null_and_mutually_exclusive_with_native",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_runtime.RuntimeIdentityTest.test_model_effort_and_cwd_are_exact_identity_matches",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_runtime.RuntimeIdentityTest.test_native_agent_type_must_be_null_on_both_sides",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_runtime.RuntimeIdentityTest.test_native_contract_is_controller_owned_and_rejects_self_consistent_wrong_model",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_runtime.RuntimeIdentityTest.test_native_contract_rejects_non_luna_role_even_when_request_and_observation_agree",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_runtime.RuntimeIdentityTest.test_native_custom_agent_name_is_rejected",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_runtime.RuntimeIdentityTest.test_native_luna_identity_uses_model_and_effort_without_custom_agent_name",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_runtime.RuntimeIdentityTest.test_native_metadata_and_rollout_can_complete_one_consistent_identity",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_runtime.RuntimeIdentityTest.test_native_metadata_without_rollout_thread_uuid_cannot_verify",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_runtime.RuntimeIdentityTest.test_native_requires_controller_agent_and_thread_uuids",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_runtime.RuntimeIdentityTest.test_permissions_can_only_narrow_from_the_requested_contract",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_runtime.RuntimeInspectorTest.test_allowlisted_inspection_never_leaks_sensitive_fixture_values",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_runtime.RuntimeInspectorTest.test_inspector_allows_null_agent_type_for_an_exec_role_contract",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_runtime.RuntimeInspectorTest.test_inspector_parses_redacted_real_codex_0150_jsonl",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_runtime.RuntimeInspectorTest.test_inspector_rejects_a_same_suffix_symlink_without_leaking_its_content",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_runtime.RuntimeInspectorTest.test_inspector_rejects_malformed_real_jsonl_without_reflection",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_runtime.RuntimeInspectorTest.test_inspector_rejects_missing_multiple_and_conflicting_rollouts_without_secrets",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_runtime.RuntimeInspectorTest.test_inspector_rejects_relative_roots_and_invalid_thread_ids",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_runtime.RuntimeInspectorTest.test_native_inspector_binds_controller_agent_uuid_to_rollout",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_runtime.RuntimeInspectorTest.test_real_jsonl_shape_mutations_fail_closed_without_leaking",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_runtime.RuntimeLiveIntegrationTest.test_live_execution_requires_fresh_thread_evidence_before_canonical_output",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_runtime.RuntimeLiveIntegrationTest.test_live_invalidates_a_prior_canonical_result_when_runtime_evidence_is_missing",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_runtime.RuntimeLiveIntegrationTest.test_live_rejects_independent_rollout_identity_conflict_before_promotion",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_runtime.RuntimeLiveIntegrationTest.test_missing_thread_evidence_cannot_promote_a_fresh_result",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_runtime.RuntimeLiveIntegrationTest.test_runtime_sessions_directory_preflight_blocks_codex_launch",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_runtime.RuntimeUsageTest.test_missing_or_non_turn_usage_stays_null",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_runtime.RuntimeUsageTest.test_turn_completed_usage_is_recorded_without_estimation",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_runtime.RuntimeUsageTest.test_write_runtime_evidence_is_append_only_and_rejects_attempt_replay",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_runtime.RuntimeUsageTest.test_write_runtime_evidence_rejects_a_native_source_for_exec",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.FinalAcceptanceCaseTest.test_child_fields_are_the_deterministic_projection",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.FinalAcceptanceCaseTest.test_create_does_not_issue_review_or_call_runners",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.FinalAcceptanceCaseTest.test_descendant_final_candidate_with_allowed_changes_succeeds",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.FinalAcceptanceCaseTest.test_dirty_repository_rejects_without_child_or_event",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.FinalAcceptanceCaseTest.test_dispatch_is_rejected_after_final_acceptance_child_is_bound",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.FinalAcceptanceCaseTest.test_event_append_failure_after_child_create_is_recoverable",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.FinalAcceptanceCaseTest.test_existing_unequal_child_without_final_event_fails_closed",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.FinalAcceptanceCaseTest.test_final_event_schema_requires_child_hash",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.FinalAcceptanceCaseTest.test_head_drift_between_create_and_append_is_rejected_and_recoverable",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.FinalAcceptanceCaseTest.test_head_mismatch_rejects_without_child_or_event",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.FinalAcceptanceCaseTest.test_identical_retry_is_idempotent_and_divergent_values_are_rejected",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.FinalAcceptanceCaseTest.test_incomplete_receipts_do_not_create_child_or_final_event",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.FinalAcceptanceCaseTest.test_inflight_step_does_not_create_child_or_final_event",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.FinalAcceptanceCaseTest.test_issue_assignment_append_failure_is_retryable",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.FinalAcceptanceCaseTest.test_issue_requires_recorded_owner_evidence_then_emits_one_sol_review",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.FinalAcceptanceCaseTest.test_legacy_open_api_cannot_create_a_ghost_binding",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.FinalAcceptanceCaseTest.test_non_ancestor_and_out_of_scope_commits_are_rejected",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.FinalAcceptanceCaseTest.test_replay_rejects_missing_or_symlinked_bound_child_task",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.FinalAcceptanceCaseTest.test_scheduler_cli_drives_batch_results_receipts_and_first_final_review",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.FinalAcceptanceCaseTest.test_source_worktree_is_projected_to_the_bound_checkout",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.FinalAcceptanceCaseTest.test_tampered_event_child_hash_fails_replay_and_tampered_child_fails_issue",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.FinalAcceptanceCaseTest.test_wrong_actor_does_not_open_acceptance",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.SchedulerContractTest.test_frozen_plan_and_ready_batch_signatures_are_unchanged",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.SchedulerContractTest.test_plugin_scheduler_mirrors_are_byte_identical",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.SchedulerContractTest.test_schema_is_strict_plan_scheduler_1",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.SchedulerDispatchTest.test_corrupt_scheduler_history_fails_closed_without_rewrite",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.SchedulerDispatchTest.test_direct_dispatch_rejects_step_outside_current_ready_batch",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.SchedulerDispatchTest.test_dispatch_replays_ledger_then_calls_ready_batch",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.SchedulerDispatchTest.test_duplicate_dispatch_identity_rejects_and_leaves_scheduler_ledger_bytes_unchanged",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.SchedulerDispatchTest.test_each_step_gets_an_isolated_worktree_path_inside_the_repository",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.SchedulerDispatchTest.test_event_ids_are_canonical_hashes_and_dispatch_reuses_planning_identity",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.SchedulerDispatchTest.test_final_acceptance_opens_only_after_every_implemented_receipt_and_at_most_once",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.SchedulerDispatchTest.test_receipt_is_required_to_complete_and_hash_drift_is_rejected",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.SchedulerDispatchTest.test_receipt_rejects_result_role_or_status_identity_mismatch",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.SchedulerDispatchTest.test_receipt_requires_controller_locatable_regular_result_with_exact_hash_and_identity",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.SchedulerDispatchTest.test_result_directory_swap_during_open_is_rejected",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.SchedulerDispatchTest.test_result_document_rejects_cross_step_identity_swap",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.SchedulerDispatchTest.test_result_rejects_hardlinks_and_oversized_files",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.SchedulerDispatchTest.test_same_stage_slots_are_two_read_only_and_one_writer",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.SchedulerDispatchTest.test_schedule_result_hashes_published_bytes_without_path_reread",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.SchedulerDispatchTest.test_schedule_result_rejects_all_null_identity_instead_of_augmenting",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.SchedulerDispatchTest.test_schedule_result_rejects_bound_task_id_echo_before_generic_normalization",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.SchedulerDispatchTest.test_schedule_result_remains_write_once_for_same_and_conflicting_results",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.SchedulerDispatchTest.test_scheduler_and_dispatch_ledgers_reject_linked_append_targets",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.SchedulerDispatchTest.test_scheduler_does_not_call_runners_or_per_step_reviewers",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.SchedulerDispatchTest.test_scheduler_ledger_rejects_symlink_and_hardlink_replay",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.SchedulerDispatchTest.test_stage_barrier_never_advances_while_prior_stage_is_open",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.SchedulerDispatchTest.test_write_json_once_does_not_replace_target_created_after_check",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.SchedulerDispatchTest.test_write_json_once_rejects_parent_directory_swap_before_publish",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.SchedulerDispatchTest.test_write_json_once_reports_publish_when_parent_swaps_after_link",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.SchedulerPreReviewFixTest.test_dispatch_rejected_while_in_flight_completed_or_final_opened",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.SchedulerPreReviewFixTest.test_duplicate_receipt_is_rejected_and_leaves_ledger_bytes_unchanged",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.SchedulerPreReviewFixTest.test_failed_receipt_releases_attempt_and_retry_uses_new_dispatch_id",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.SchedulerPreReviewFixTest.test_final_acceptance_requires_explicit_candidate_commit",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.SchedulerPreReviewFixTest.test_forbidden_section_roles_produce_no_proposal",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.SchedulerPreReviewFixTest.test_foreign_event_fields_are_rejected_by_replay",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.SchedulerPreReviewFixTest.test_mismatched_orphan_dispatch_is_not_swallowed",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.SchedulerPreReviewFixTest.test_orphan_dispatch_is_recovered_on_the_same_identity",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.SchedulerPreReviewFixTest.test_second_attempt_ledger_replays",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_scheduler.SchedulerPreReviewFixTest.test_worktree_path_rejects_case_and_injection",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallContractTest.test_call_id_binds_raw_request_hash_and_normalized_intake",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallContractTest.test_callback_base_exceptions_record_terminal_blocked_routes",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallContractTest.test_callback_error_records_terminal_blocked_route_before_reraising",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallContractTest.test_duplicate_json_member_names_are_rejected_before_shape_validation",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallContractTest.test_empty_and_malformed_leading_directives_have_stable_errors",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallContractTest.test_every_shell_metacharacter_is_rejected_before_routing",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallContractTest.test_exact_l0_allowlist_never_accepts_user_shell",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallContractTest.test_execute_once_rejects_a_manually_forged_non_directive_call",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallContractTest.test_full_verification_is_a_fixed_zero_model_action",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallContractTest.test_identity_drift_for_existing_call_id_is_rejected",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallContractTest.test_interleaved_received_and_routed_histories_are_rejected",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallContractTest.test_invalid_utf8_ledger_is_a_stable_ledger_error",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallContractTest.test_l1_requires_exact_safe_relative_file_grammar",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallContractTest.test_only_a_leading_team_call_directive_is_recognized",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallContractTest.test_same_call_claim_is_idempotent_but_tampered_ledger_blocks",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallContractTest.test_two_processes_contending_for_the_same_global_lock_start_one_executor",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallContractTest.test_valid_partial_history_blocks_every_call_from_starting",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallControllerTest.test_authorized_production_l1_uses_an_immutable_evidence_snapshot",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallControllerTest.test_direct_l1_rejects_a_subclass_forged_controller_capability",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallControllerTest.test_direct_l1_rejects_an_exact_instance_method_shadow_before_execution",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallControllerTest.test_explicit_l1_file_is_luna_only_and_cannot_write",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallControllerTest.test_failed_l0_replay_is_a_blocked_receipt_without_second_execution",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallControllerTest.test_failed_l1_replay_is_a_blocked_receipt_without_second_execution",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallControllerTest.test_l0_runs_fixed_git_status_once_and_returns_its_receipt",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallControllerTest.test_l1_actual_working_tree_diff_records_blocked_route",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallControllerTest.test_l1_allocates_the_next_daily_task_id_while_the_registry_is_held",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallControllerTest.test_l1_committed_write_records_blocked_route_even_when_tree_is_clean",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallControllerTest.test_l1_controller_cannot_change_the_persisted_task_identity",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallControllerTest.test_l1_controller_cannot_widen_the_read_only_write_scope",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallControllerTest.test_l1_evidence_swap_after_initial_validation_prevents_controller_execution",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallControllerTest.test_l1_existing_git_control_file_content_change_is_blocked",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallControllerTest.test_l1_git_control_plane_write_records_blocked_route",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallControllerTest.test_l1_ignored_in_repository_write_records_blocked_route",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallControllerTest.test_l1_intermediate_symlink_evidence_is_rejected_before_luna_execution",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallControllerTest.test_l1_linked_worktree_gitdir_and_common_gitdir_writes_are_blocked",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallControllerTest.test_l1_metadata_only_change_records_blocked_route",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallControllerTest.test_l1_nonempty_changed_files_claim_records_blocked_route",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallControllerTest.test_l1_post_revalidation_swap_cannot_change_consumed_evidence",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallControllerTest.test_l1_read_only_git_status_does_not_fail_on_transient_lock_metadata",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallControllerTest.test_l1_rejects_an_untrusted_controller_even_when_it_claims_not_live",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallControllerTest.test_l1_rejects_an_untrusted_controller_result_for_a_different_task",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallControllerTest.test_l1_rejects_same_value_rewrite_of_the_exact_stored_task_bytes",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallControllerTest.test_l1_role_mismatch_records_blocked_route",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallControllerTest.test_l1_symlink_evidence_is_rejected_before_luna_execution",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallControllerTest.test_l1_untracked_in_repository_write_records_blocked_route",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallControllerTest.test_missing_repository_fails_before_controller_execution",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallControllerTest.test_production_l0_uses_the_fixed_argv_without_a_shell",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallControllerTest.test_simultaneous_duplicate_calls_start_exactly_one_execution",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_team_call.TeamCallControllerTest.test_write_or_ambiguous_request_creates_no_dispatch_and_requires_plan",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_terra_os.TerraOSConfigTest.test_automation_and_optimization_defaults_are_bounded",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_terra_os.TerraOSConfigTest.test_every_sol_medium_and_xhigh_prompt_prohibits_over_design",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_terra_os.TerraOSConfigTest.test_final_sol_medium_rework_is_the_global_default",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_terra_os.TerraOSConfigTest.test_role_policy_resolution_is_closed_and_honors_explicit_override",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_terra_os.TerraOSConfigTest.test_terra_os_is_the_enforced_default_with_final_rework_policy",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_terra_os.TerraOSConfigTest.test_terra_os_roles_pin_luna_construction_and_terra_xhigh",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_terra_os.TerraOSExecutionGuardTest.test_luna_construction_cannot_bypass_the_verified_plan_step_at_launch",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_terra_os.TerraOSExecutionGuardTest.test_luna_construction_role_closes_plan_result_runtime_and_cost_validation",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_terra_os.TerraOSExecutionGuardTest.test_new_role_names_are_accepted_by_pinned_role_configuration",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_terra_os.TerraOSRolePolicyTest.test_authorized_large_project_chain_is_pure_policy_only",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_terra_os.TerraOSRolePolicyTest.test_bounded_and_multi_stage_nonwrite_work_are_sol_only",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_terra_os.TerraOSRolePolicyTest.test_bounded_and_multi_stage_writes_use_terra_without_an_envelope",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_terra_os.TerraOSRolePolicyTest.test_direct_and_blocked_routes_never_start_a_model",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_terra_os.TerraOSRolePolicyTest.test_legacy_policy_keeps_the_frozen_luna_first_chain",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_terra_os.TerraOSRolePolicyTest.test_missing_or_invalid_luna_envelope_fails_closed_to_terra",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_terra_os.TerraOSRolePolicyTest.test_non_decomposable_bounded_and_multi_stage_work_is_blocked",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_terra_os.TerraOSRolePolicyTest.test_normal_writes_default_to_the_terra_xhigh_construction_owner",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_terra_os.TerraOSRolePolicyTest.test_only_a_verified_luna_construction_envelope_can_select_luna",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_terra_os.TerraOSRolePolicyTest.test_public_facade_never_guesses_large_project_authorization",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_terra_os.TerraOSRolePolicyTest.test_route_cli_default_comes_from_the_loaded_config",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_terra_os.TerraOSRolePolicyTest.test_security_and_open_ended_work_cannot_gain_luna_from_an_envelope",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_terra_os.TerraOSRolePolicyTest.test_shadow_preserves_legacy_effective_roles_without_leaking_policy_to_wire",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_terra_os.TerraOSRolePolicyTest.test_sol_only_policy_uses_read_only_terra_xhigh_not_ordinary_sol_medium",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_terra_os.TerraOSRolePolicyTest.test_unselectable_terra_medium_and_sol_high_owner_roles_are_rejected",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_whole_project_final.WholeProjectFinalAcceptanceTest.test_authorize_before_peer_rework_is_rejected",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_whole_project_final.WholeProjectFinalAcceptanceTest.test_authorize_binds_candidate_and_acceptance_event",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_whole_project_final.WholeProjectFinalAcceptanceTest.test_authorize_final_xhigh_rejects_empty_actor",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_whole_project_final.WholeProjectFinalAcceptanceTest.test_blocked_and_reject_are_not_accept",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_whole_project_final.WholeProjectFinalAcceptanceTest.test_decide_authorize_final_xhigh_records_without_resume_or_generic_state",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_whole_project_final.WholeProjectFinalAcceptanceTest.test_fixer_cannot_reuse_acceptor_identity",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_whole_project_final.WholeProjectFinalAcceptanceTest.test_forged_xhigh_ticket_missing_fields_or_wrong_hash_leaves_ledger",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_whole_project_final.WholeProjectFinalAcceptanceTest.test_later_unrelated_owner_decision_does_not_hide_valid_xhigh_ticket",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_whole_project_final.WholeProjectFinalAcceptanceTest.test_ordinary_decide_still_uses_closed_owner_decisions",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_whole_project_final.WholeProjectFinalAcceptanceTest.test_ordinary_remediation_ladder_still_uses_owner_repair",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_whole_project_final.WholeProjectFinalAcceptanceTest.test_ordinary_remediation_still_rejects_luna_construction_owner",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_whole_project_final.WholeProjectFinalAcceptanceTest.test_owner_authorized_xhigh_may_issue_once",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_whole_project_final.WholeProjectFinalAcceptanceTest.test_peer_rework_without_owner_xhigh_authorization_leaves_ledger_bytes",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_whole_project_final.WholeProjectFinalAcceptanceTest.test_recheck_cannot_match_acceptor_or_fixer",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_whole_project_final.WholeProjectFinalAcceptanceTest.test_review_one_rejects_terra_acceptor",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_whole_project_final.WholeProjectFinalAcceptanceTest.test_review_one_rework_skips_owner_repair_and_review_two",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_whole_project_final.WholeProjectFinalAcceptanceTest.test_review_one_uses_sol_medium_acceptor",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_whole_project_final.WholeProjectFinalAcceptanceTest.test_skipping_review_one_is_rejected",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_whole_project_final.WholeProjectFinalAcceptanceTest.test_stale_ticket_bindings_reject_when_replay_position_differs",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_whole_project_final.WholeProjectFinalAcceptanceTest.test_standalone_acceptance_terra_route_is_unchanged",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_whole_project_final.WholeProjectFinalAcceptanceTest.test_tampered_final_acceptance_rework_policy_fails_before_assignment",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_whole_project_final.WholeProjectFinalAcceptanceTest.test_unrelated_corrupt_scheduler_artifacts_do_not_affect_bound_child",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_whole_project_final.WholeProjectFinalAcceptanceTest.test_v2_open_still_blocks_generic_runner",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_whole_project_final.WholeProjectFinalClassificationTest.test_forged_scheduler_child_hash_does_not_classify_as_whole_project",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_ai_workflow_whole_project_final.WholeProjectFinalClassificationTest.test_standalone_final_acceptance_is_not_whole_project_final",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_sync_plugin.SyncPluginTest.test_check_reports_drift_without_writing",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_sync_plugin.SyncPluginTest.test_verify_all_is_one_deterministic_zero_model_entrypoint",
+      "outcome": "pass",
+      "skip_reason": ""
+    },
+    {
+      "id": "test_sync_plugin.SyncPluginTest.test_write_copies_only_the_fixed_manifest_then_check_passes",
+      "outcome": "pass",
+      "skip_reason": ""
+    }
+  ]
+}
