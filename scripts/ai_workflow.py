@@ -2387,6 +2387,8 @@ class WorkflowStore:
 
     @contextlib.contextmanager
     def lock(self, task_id: str):
+        if task_id in self._held_task_ids():
+            raise WorkflowError("TASK_ALREADY_RUNNING", f"task {task_id} is already running")
         task_dir = self._require_task(task_id)
         lock_path = task_dir / ".lock"
         try:

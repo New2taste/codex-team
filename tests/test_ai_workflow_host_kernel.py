@@ -6,6 +6,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from scripts import ai_workflow as workflow
 from scripts import ai_workflow_artifacts as artifacts
@@ -249,6 +250,16 @@ class WorkflowStoreKernelTest(unittest.TestCase):
             ):
                 with self.store.lock(self.task_id):
                     pass
+
+    def test_nested_lock_rejected_by_held_set_even_if_flock_succeeds(self):
+        with mock.patch.object(workflow.fcntl, "flock"):
+            with self.store.lock(self.task_id):
+                with self.assertRaisesRegex(
+                    workflow.WorkflowError, "TASK_ALREADY_RUNNING"
+                ):
+                    with self.store.lock(self.task_id):
+                        pass
+                self.store._assert_lock_held(self.task_id)
 
 
 if __name__ == "__main__":
