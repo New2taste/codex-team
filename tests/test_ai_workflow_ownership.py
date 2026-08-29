@@ -717,6 +717,49 @@ class ResolvePathOwnerTest(_OwnershipGateMixin, unittest.TestCase):
             ownership.resolve_path_owner(other, TASK_ID, "src/alias.py"),
         )
 
+    def test_symlink_escaping_worktree_is_rejected(self) -> None:
+        repo = Path(self.temporary.name) / "repo"
+        outside = Path(self.temporary.name) / "outside"
+        (repo / "src").mkdir(parents=True)
+        outside.mkdir()
+        (repo / "src" / "owned.py").write_text("owned\n", encoding="utf-8")
+        (outside / "secret.py").write_text("escaped\n", encoding="utf-8")
+        (repo / "src" / "escape.py").symlink_to(outside / "secret.py")
+        other = workflow.WorkflowStore(Path(self.temporary.name) / "store-escape")
+        task = _parent_task()
+        task["repository_root"] = str(repo)
+        task["source_worktree"] = str(repo)
+        other.create_task(task)
+        envelope = artifacts.artifact_sha256(task)
+        registry = ownership.OwnershipRegistry(
+            schema_version=ownership.OWNERSHIP_REGISTRY_SCHEMA_VERSION,
+            task_id=TASK_ID,
+            envelope_hash=envelope,
+            path_owners={"src": "terra", "src/escape.py": "terra"},
+            registered_at_utc="2026-08-28T00:00:00Z",
+        )
+        with other.lock(TASK_ID):
+            ownership.record_ownership_registry(other, TASK_ID, registry)
+        with self.assertRaisesRegex(artifacts.WorkflowError, "PLAN_INVALID"):
+            ownership.resolve_path_owner(other, TASK_ID, "src/escape.py")
+        with self.assertRaisesRegex(artifacts.WorkflowError, "PLAN_INVALID"):
+            ownership.verify_actual_write_paths(
+                other,
+                TASK_ID,
+                "terra",
+                permit_id="permit-escape",
+                actual_paths=("src/escape.py",),
+            )
+        with self.assertRaisesRegex(artifacts.WorkflowError, "PLAN_INVALID"):
+            with other.lock(TASK_ID):
+                ownership.require_write_ownership_locked(
+                    other,
+                    TASK_ID,
+                    "terra",
+                    permit_id="permit-escape",
+                    paths=("src/escape.py",),
+                )
+
 
 class WriteOwnershipGateTest(_OwnershipGateMixin, unittest.TestCase):
     def test_precheck_closed_set_and_does_not_consume(self) -> None:
@@ -932,6 +975,43 @@ class ActualPathVerificationTest(_OwnershipGateMixin, unittest.TestCase):
         self.assertEqual(inspect.Parameter.KEYWORD_ONLY, parameter.kind)
         self.assertIs(inspect.Parameter.empty, parameter.default)
         self.assertNotIn("skip", signature.parameters)
+
+    def test_verify_nested_registry_uses_longest_prefix_not_parent_key(self) -> None:
+        self._record_registry({"src": "terra", "src/pkg": "luna"})
+        self.assertEqual(
+            "luna",
+            ownership.resolve_path_owner(self.store, TASK_ID, "src/pkg/mod.py"),
+        )
+        with self.assertRaisesRegex(
+            artifacts.WorkflowError, "OWNERSHIP_TRANSFER_BLOCKED"
+        ):
+            self._require(
+                "terra",
+                permit_id="permit-terra",
+                paths=("src/pkg/mod.py",),
+            )
+        with self.assertRaisesRegex(artifacts.WorkflowError, "OWNERSHIP_VIOLATION"):
+            ownership.verify_actual_write_paths(
+                self.store,
+                TASK_ID,
+                "terra",
+                permit_id="permit-terra",
+                actual_paths=("src/pkg/mod.py",),
+            )
+        ownership.verify_actual_write_paths(
+            self.store,
+            TASK_ID,
+            "luna",
+            permit_id="permit-luna",
+            actual_paths=("src/pkg/mod.py",),
+        )
+        ownership.verify_actual_write_paths(
+            self.store,
+            TASK_ID,
+            "terra",
+            permit_id="permit-terra-owned",
+            actual_paths=("src/a.py",),
+        )
 
     def test_unknown_actual_paths_are_a_caller_reject(self) -> None:
         self._record_registry()

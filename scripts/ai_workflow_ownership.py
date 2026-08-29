@@ -366,7 +366,8 @@ def _normalize_write_path(store: TaskStoreProtocol, task_id: str, path: str) -> 
         resolved = (root / lexical).resolve()
         relative = resolved.relative_to(root.resolve())
     except (OSError, ValueError):
-        return lexical
+        _fail("PLAN_INVALID", "scope must not escape the repository root")
+        raise AssertionError("unreachable")
     return _lexical_repo_path(relative.as_posix())
 
 
@@ -510,19 +511,24 @@ def verify_actual_write_paths(
     if registry is None:
         _fail("OWNERSHIP_REGISTRY_MISSING", "ownership registry is not recorded")
         raise AssertionError("unreachable")
-    allowed = {
-        path for path, owner in registry.path_owners.items() if owner == role_text
-    }
+    lease_roots: set[str] = set()
     for row in leases_for_permit(store, task_id, permit):
         for item in row.get("allowed_paths") or ():
-            allowed.add(_lexical_repo_path(str(item)))
+            lease_roots.add(_lexical_repo_path(str(item)))
     out_of_bounds: list[str] = []
     for path in actual_paths:
         if not isinstance(path, str):
             _fail("INVALID_TYPE", "actual_paths items must be strings")
         normalized = _normalize_write_path(store, task_id, path)
-        if not _path_covered(normalized, allowed):
-            out_of_bounds.append(normalized)
+        owned = False
+        try:
+            owned = resolve_path_owner(store, task_id, normalized) == role_text
+        except WorkflowError as exc:
+            if exc.code != "OWNERSHIP_UNKNOWN":
+                raise
+        if owned or _path_covered(normalized, lease_roots):
+            continue
+        out_of_bounds.append(normalized)
     if not out_of_bounds:
         return
     event: dict[str, object] = {
