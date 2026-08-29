@@ -50,6 +50,7 @@ RUNTIME_FILES = (
     "ai_workflow_team_call.py",
     "ai_workflow_scheduler.py",
     "ai_workflow_preflight.py",
+    "ai_workflow_dispatch_policy.py",
 )
 RUNTIME_MANIFEST_FILENAME = "ai_workflow_runtime_files.json"
 RUNTIME_MANIFEST_SCHEMA_VERSION = "ai-runtime-files-1"

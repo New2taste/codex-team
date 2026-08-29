@@ -309,6 +309,16 @@ class ImportGraphTest(unittest.TestCase):
             self.scanned["ai_workflow_preflight"]["edges"] & FORBIDDEN_HOST_TARGETS
         )
 
+    def test_dispatch_policy_module_exists_within_allowed_edges(self):
+        self.assertIn("ai_workflow_dispatch_policy", self.scanned)
+        self.assertEqual(
+            IMPORT_GRAPH_ALLOWED["ai_workflow_dispatch_policy"],
+            self.scanned["ai_workflow_dispatch_policy"]["edges"],
+        )
+        self.assertFalse(
+            self.scanned["ai_workflow_dispatch_policy"]["edges"] & FORBIDDEN_HOST_TARGETS
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

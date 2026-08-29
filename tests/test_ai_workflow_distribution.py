@@ -1044,7 +1044,7 @@ class PreflightDistributionManifestTest(unittest.TestCase):
         )
         self.assertIn("ai_workflow_runtime_files.json", sync_plugin.CONFIG_FILES)
         self.assertIn("ai_workflow_preflight.py", sync_plugin.RUNTIME_FILES)
-
+        self.assertIn("ai_workflow_dispatch_policy.py", sync_plugin.RUNTIME_FILES)
 
 
 if __name__ == "__main__":
