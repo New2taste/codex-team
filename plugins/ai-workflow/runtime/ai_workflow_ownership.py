@@ -397,7 +397,7 @@ def ensure_ownership_registry_for_paths_locked(
     for raw_path, raw_owner in path_owners.items():
         if not isinstance(raw_path, str):
             _fail("INVALID_TYPE", "path_owners keys must be strings")
-        path = normalize_scope(raw_path).as_posix()
+        path = _lexical_repo_path(raw_path)
         owner = _string(raw_owner, "path_owners")
         prior = normalized_owners.get(path)
         if prior is not None and prior != owner:
