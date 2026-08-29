@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import inspect
 import json
 import subprocess
@@ -27,7 +28,6 @@ from tests import test_ai_workflow as _workflow_tests
 from tests import test_ai_workflow_router_probe as _probe_tests
 from tests.test_ai_workflow import (
     _RecordingPopen,
-    _compat_popen,
     _install_declaration,
 )
 from tests.test_ai_workflow_construction_execution import (
@@ -148,7 +148,10 @@ FROZEN_ACCEPTANCE_COMMON_FIELDS = frozenset(
         "candidate_commit",
     }
 )
-FROZEN_ACCEPTANCE_REQUIRED_EXTRAS = {
+# Closed extras the writer may merge onto `_v2_common` for each event type
+# (required keys plus conditional terminal/attestation keys). Drift in
+# `_v2_append` call-site dicts turns the golden red.
+FROZEN_ACCEPTANCE_WRITER_EXTRAS = {
     "ACCEPTANCE_OPENED": frozenset(
         {
             "owner_actor",
@@ -170,7 +173,14 @@ FROZEN_ACCEPTANCE_REQUIRED_EXTRAS = {
         }
     ),
     "ASSIGNMENT_ATTEMPT_STARTED": frozenset(
-        {"assignment_id", "attempt_id", "actor_receipt", "receipt_sha256"}
+        {
+            "assignment_id",
+            "attempt_id",
+            "actor_receipt",
+            "receipt_sha256",
+            "controller_attestation",
+            "controller_attestation_sha256",
+        }
     ),
     "ASSIGNMENT_ATTEMPT_FAILED": frozenset(
         {"assignment_id", "attempt_id", "failure_code", "failure_message"}
@@ -183,6 +193,9 @@ FROZEN_ACCEPTANCE_REQUIRED_EXTRAS = {
             "changed_paths",
             "actual_changed_paths",
             "output_candidate_commit",
+            "terminal_state",
+            "terminal_reason",
+            "whole_project_acceptance_required",
         }
     ),
     "REVIEW_COMPLETED": frozenset(
@@ -194,25 +207,6 @@ FROZEN_ACCEPTANCE_REQUIRED_EXTRAS = {
             "findings",
             "evidence",
             "evidence_sha256",
-        }
-    ),
-}
-FROZEN_ACCEPTANCE_OPTIONAL_EXTRAS = {
-    "ACCEPTANCE_OPENED": frozenset(),
-    "ASSIGNMENT_ISSUED": frozenset(),
-    "ASSIGNMENT_ATTEMPT_STARTED": frozenset(
-        {"controller_attestation", "controller_attestation_sha256"}
-    ),
-    "ASSIGNMENT_ATTEMPT_FAILED": frozenset(),
-    "REPAIR_COMPLETED": frozenset(
-        {
-            "terminal_state",
-            "terminal_reason",
-            "whole_project_acceptance_required",
-        }
-    ),
-    "REVIEW_COMPLETED": frozenset(
-        {
             "terminal_state",
             "terminal_reason",
             "whole_project_acceptance_required",
@@ -264,6 +258,287 @@ def _git_show(spec: str) -> bytes:
     return completed.stdout
 
 
+def _repairs_tree() -> ast.Module:
+    return ast.parse((ROOT / "scripts" / "ai_workflow_repairs.py").read_text(encoding="utf-8"))
+
+
+def _dict_literal_keys(node: ast.AST | None) -> frozenset[str] | None:
+    if not isinstance(node, ast.Dict):
+        return None
+    keys: list[str] = []
+    for key in node.keys:
+        if not isinstance(key, ast.Constant) or not isinstance(key.value, str):
+            raise AssertionError("writer dict keys must be string constants")
+        keys.append(key.value)
+    return frozenset(keys)
+
+
+def _function_named(tree: ast.Module, name: str) -> ast.FunctionDef:
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    raise AssertionError(f"missing function {name}")
+
+
+def _return_dict_keys(function: ast.FunctionDef) -> frozenset[str]:
+    for node in function.body:
+        if isinstance(node, ast.Return):
+            keys = _dict_literal_keys(node.value)
+            if keys is not None:
+                return keys
+    raise AssertionError(f"{function.name} does not return a dict literal")
+
+
+def _event_field_reads(node: ast.AST) -> frozenset[str]:
+    keys: set[str] = set()
+    for child in ast.walk(node):
+        if (
+            isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Attribute)
+            and child.func.attr == "get"
+            and isinstance(child.func.value, ast.Name)
+            and child.func.value.id == "event"
+            and child.args
+            and isinstance(child.args[0], ast.Constant)
+            and isinstance(child.args[0].value, str)
+        ):
+            keys.add(child.args[0].value)
+        if (
+            isinstance(child, ast.Subscript)
+            and isinstance(child.value, ast.Name)
+            and child.value.id == "event"
+        ):
+            slice_node = child.slice
+            if isinstance(slice_node, ast.Constant) and isinstance(slice_node.value, str):
+                keys.add(slice_node.value)
+        if (
+            isinstance(child, ast.Compare)
+            and child.ops
+            and isinstance(child.ops[0], ast.In)
+            and child.comparators
+            and isinstance(child.comparators[0], ast.Name)
+            and child.comparators[0].id == "event"
+            and isinstance(child.left, ast.Constant)
+            and isinstance(child.left.value, str)
+        ):
+            keys.add(child.left.value)
+    return frozenset(keys)
+
+
+def _v2_append_event_and_fields(call: ast.Call) -> tuple[str, ast.AST] | None:
+    if not (isinstance(call.func, ast.Name) and call.func.id == "_v2_append"):
+        return None
+    if len(call.args) < 7 or not isinstance(call.args[4], ast.Constant):
+        raise AssertionError("_v2_append must pass event_type and fields positionally")
+    event_type = call.args[4].value
+    if not isinstance(event_type, str):
+        raise AssertionError("_v2_append event_type is not a string")
+    return event_type, call.args[6]
+
+
+def _walk_writer_field_sets(
+    stmts: list[ast.stmt],
+    payload_keys: frozenset[str],
+    collected: dict[str, frozenset[str]],
+) -> None:
+    assigns: list[tuple[int, frozenset[str]]] = []
+    updates: list[tuple[int, frozenset[str]]] = []
+
+    def visit(stmt: ast.stmt) -> None:
+        assign_value: ast.AST | None = None
+        assign_target: str | None = None
+        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+            target = stmt.targets[0]
+            if isinstance(target, ast.Name):
+                assign_target = target.id
+                assign_value = stmt.value
+        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+            assign_target = stmt.target.id
+            assign_value = stmt.value
+        if assign_target == "fields" and assign_value is not None:
+            keys = _dict_literal_keys(assign_value)
+            if keys is None:
+                raise AssertionError("named fields must be a dict literal")
+            assigns.append((stmt.lineno, keys))
+        calls: list[ast.Call] = []
+        if assign_value is not None and isinstance(assign_value, ast.Call):
+            calls.append(assign_value)
+        if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+            calls.append(stmt.value)
+        if isinstance(stmt, ast.Return) and isinstance(stmt.value, ast.Call):
+            calls.append(stmt.value)
+        for call in calls:
+            if (
+                isinstance(call.func, ast.Attribute)
+                and call.func.attr == "update"
+                and isinstance(call.func.value, ast.Name)
+                and call.func.value.id == "fields"
+                and call.args
+            ):
+                extra = _dict_literal_keys(call.args[0])
+                if extra is None:
+                    raise AssertionError("fields.update must pass a dict literal")
+                updates.append((call.lineno, extra))
+            extracted = _v2_append_event_and_fields(call)
+            if extracted is not None:
+                event_type, fields_node = extracted
+                collected[event_type] = _resolve_writer_fields(
+                    fields_node, call.lineno, assigns, updates, payload_keys
+                )
+        if isinstance(stmt, ast.If):
+            for child in (*stmt.body, *stmt.orelse):
+                visit(child)
+        elif isinstance(stmt, ast.With):
+            for child in stmt.body:
+                visit(child)
+        elif isinstance(stmt, ast.Try):
+            for child in (*stmt.body, *stmt.orelse, *stmt.finalbody):
+                visit(child)
+            for handler in stmt.handlers:
+                for child in handler.body:
+                    visit(child)
+        elif isinstance(stmt, (ast.For, ast.While)):
+            for child in (*stmt.body, *stmt.orelse):
+                visit(child)
+
+    for stmt in stmts:
+        visit(stmt)
+
+
+def _resolve_writer_fields(
+    fields_node: ast.AST,
+    append_lineno: int,
+    assigns: list[tuple[int, frozenset[str]]],
+    updates: list[tuple[int, frozenset[str]]],
+    payload_keys: frozenset[str],
+) -> frozenset[str]:
+    if isinstance(fields_node, ast.Name) and fields_node.id == "fields":
+        prior = [item for item in assigns if item[0] < append_lineno]
+        if not prior:
+            raise AssertionError("named fields used before assignment")
+        assigned = prior[-1]
+        extra = frozenset().union(
+            *(
+                keys
+                for lineno, keys in updates
+                if assigned[0] < lineno < append_lineno
+            )
+        )
+        return assigned[1] | extra
+    literal = _dict_literal_keys(fields_node)
+    if literal is not None:
+        return literal
+    if (
+        isinstance(fields_node, ast.Call)
+        and isinstance(fields_node.func, ast.Name)
+        and fields_node.func.id == "_v2_assignment_payload_for_event"
+    ):
+        return payload_keys
+    raise AssertionError("unsupported _v2_append fields argument")
+
+
+def _acceptance_writer_extras() -> dict[str, frozenset[str]]:
+    tree = _repairs_tree()
+    payload_keys = _return_dict_keys(
+        _function_named(tree, "_v2_assignment_payload_for_event")
+    )
+    collected: dict[str, frozenset[str]] = {}
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and any(
+            isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Name)
+            and child.func.id == "_v2_append"
+            for child in ast.walk(node)
+        ):
+            _walk_writer_field_sets(node.body, payload_keys, collected)
+    return collected
+
+
+def _acceptance_replay_extra_keys() -> dict[str, frozenset[str]]:
+    tree = _repairs_tree()
+    replay = _function_named(tree, "replay_acceptance_ledger")
+    by_type: dict[str, set[str]] = {name: set() for name in FROZEN_ACCEPTANCE_EVENT_TYPES}
+    by_type["ASSIGNMENT_ISSUED"] |= set(
+        _event_field_reads(_function_named(tree, "_v2_assignment_from_event"))
+    )
+
+    def field_reads(stmts: list[ast.stmt]) -> frozenset[str]:
+        return _event_field_reads(ast.Module(body=list(stmts), type_ignores=[]))
+
+    def visit(stmt: ast.stmt) -> None:
+        if isinstance(stmt, ast.If):
+            event_type = _event_type_equality(stmt.test)
+            if event_type is not None:
+                by_type[event_type].update(field_reads(stmt.body))
+                for child in stmt.orelse:
+                    visit(child)
+                return
+            if _is_first_event_branch(stmt.test):
+                by_type["ACCEPTANCE_OPENED"].update(field_reads(stmt.body))
+                for child in stmt.orelse:
+                    visit(child)
+                return
+            for child in (*stmt.body, *stmt.orelse):
+                visit(child)
+            return
+        if isinstance(stmt, ast.Try):
+            for child in (*stmt.body, *stmt.orelse, *stmt.finalbody):
+                visit(child)
+            for handler in stmt.handlers:
+                for child in handler.body:
+                    visit(child)
+            return
+        if isinstance(stmt, (ast.For, ast.While, ast.With)):
+            for child in stmt.body:
+                visit(child)
+
+    for stmt in replay.body:
+        visit(stmt)
+    return {event_type: frozenset(keys) for event_type, keys in by_type.items()}
+
+
+def _event_type_equality(test: ast.AST) -> str | None:
+    if (
+        not isinstance(test, ast.Compare)
+        or not test.ops
+        or not isinstance(test.ops[0], ast.Eq)
+        or not test.comparators
+    ):
+        return None
+    comparator = test.comparators[0]
+    if not isinstance(comparator, ast.Constant) or not isinstance(comparator.value, str):
+        return None
+    if comparator.value not in FROZEN_ACCEPTANCE_EVENT_TYPES:
+        return None
+    return comparator.value
+
+
+def _is_first_event_branch(test: ast.AST) -> bool:
+    return (
+        isinstance(test, ast.Compare)
+        and test.ops
+        and isinstance(test.ops[0], ast.Eq)
+        and isinstance(test.left, ast.Name)
+        and test.left.id == "index"
+        and test.comparators
+        and isinstance(test.comparators[0], ast.Constant)
+        and test.comparators[0].value == 0
+    )
+
+
+def _assignment_popen_command(call: mock._Call) -> list[object]:
+    args, kwargs = call
+    command = args[0] if args else kwargs.get("args")
+    if command is None:
+        return []
+    return list(command)
+
+
+def _is_assignment_spawn(call: mock._Call) -> bool:
+    command = _assignment_popen_command(call)
+    return bool(command) and command[0] != "git" and "-o" in command and "resume" in command
+
+
 class FrozenWireGoldenTest(unittest.TestCase):
     def test_ai_task_1_field_set_matches_schema_and_constant(self):
         self.assertEqual(FROZEN_TASK_FIELDS, workflow.TASK_FIELDS)
@@ -298,26 +573,26 @@ class FrozenWireGoldenTest(unittest.TestCase):
         self.assertEqual(FROZEN_ACCEPTANCE_EVENT_TYPES, repairs._ACCEPTANCE_EVENT_TYPES)
         self.assertEqual(6, len(repairs._ACCEPTANCE_EVENT_TYPES))
         self.assertEqual(FROZEN_ACCEPTANCE_COMMON_FIELDS, repairs._V2_COMMON_FIELDS)
-        self.assertEqual(
-            FROZEN_ACCEPTANCE_EVENT_TYPES,
-            set(FROZEN_ACCEPTANCE_REQUIRED_EXTRAS),
+        common_without_id = _return_dict_keys(
+            _function_named(_repairs_tree(), "_v2_common")
         )
-        for event_type, required in FROZEN_ACCEPTANCE_REQUIRED_EXTRAS.items():
-            allowed = (
-                FROZEN_ACCEPTANCE_COMMON_FIELDS
-                | required
-                | FROZEN_ACCEPTANCE_OPTIONAL_EXTRAS[event_type]
-            )
-            self.assertTrue(required.isdisjoint(FROZEN_ACCEPTANCE_COMMON_FIELDS), event_type)
-            self.assertTrue(
-                FROZEN_ACCEPTANCE_OPTIONAL_EXTRAS[event_type].isdisjoint(required),
+        self.assertEqual(common_without_id | {"event_id"}, repairs._V2_COMMON_FIELDS)
+        writer_extras = _acceptance_writer_extras()
+        replay_keys = _acceptance_replay_extra_keys()
+        self.assertEqual(FROZEN_ACCEPTANCE_EVENT_TYPES, set(writer_extras))
+        self.assertEqual(FROZEN_ACCEPTANCE_EVENT_TYPES, set(FROZEN_ACCEPTANCE_WRITER_EXTRAS))
+        for event_type in repairs._ACCEPTANCE_EVENT_TYPES:
+            extras = writer_extras[event_type]
+            self.assertEqual(FROZEN_ACCEPTANCE_WRITER_EXTRAS[event_type], extras, event_type)
+            self.assertTrue(extras.isdisjoint(repairs._V2_COMMON_FIELDS), event_type)
+            self.assertEqual(
+                FROZEN_ACCEPTANCE_COMMON_FIELDS | FROZEN_ACCEPTANCE_WRITER_EXTRAS[event_type],
+                repairs._V2_COMMON_FIELDS | extras,
                 event_type,
             )
-            self.assertEqual(
-                allowed,
-                FROZEN_ACCEPTANCE_COMMON_FIELDS
-                | required
-                | FROZEN_ACCEPTANCE_OPTIONAL_EXTRAS[event_type],
+            self.assertTrue(
+                (replay_keys[event_type] - repairs._V2_COMMON_FIELDS) <= extras,
+                (event_type, replay_keys[event_type] - repairs._V2_COMMON_FIELDS - extras),
             )
 
     def test_owner_decisions_closed_set(self):
@@ -690,42 +965,16 @@ class FourDirectPathMissingDeclarationTest(unittest.TestCase):
                 encoding="utf-8",
             )
             (fx.store._require_task(fx.TASK_ID) / "route-declaration.json").unlink()
-            _RecordingPopen.reset()
-            result = {
-                "schema_version": "ai-result-1",
-                "dispatch_id": None,
-                "task_id": None,
-                "step_id": None,
-                "attempt": None,
-                "role": "terra_xhigh_reviewer",
-                "status": "ACCEPTANCE_RECOMMENDED",
-                "summary": "ok",
-                "claims": [],
-                "evidence": [],
-                "counter_checks": [],
-                "changed_files": [],
-                "blind_spots": [],
-                "unresolved_questions": [],
-                "recommended_next_state": "AWAITING_OWNER_DECISION",
-            }
-
-            def controller_process(command, *args, **kwargs):
-                output_path = Path(command[command.index("-o") + 1])
-                output_path.write_text(json.dumps(result), encoding="utf-8")
-                events = "\n".join(
-                    (
-                        json.dumps({"type": "thread.started", "thread_id": reviewer_thread}),
-                        json.dumps({"type": "turn.completed"}),
-                    )
-                )
-                return subprocess.CompletedProcess(command, 0, stdout=events + "\n", stderr="")
-
+            self.assertRegex(
+                inspect.getsource(fx._original_run_assignment),
+                r"\bsubprocess\.Popen\(",
+            )
             with (
                 mock.patch.object(
                     repairs.subprocess,
                     "Popen",
-                    _compat_popen(controller_process),
-                ),
+                    wraps=repairs.subprocess.Popen,
+                ) as spawn,
                 fx._controller_codex_lookup(),
             ):
                 with self.assertRaisesRegex(
@@ -733,7 +982,11 @@ class FourDirectPathMissingDeclarationTest(unittest.TestCase):
                     "ROUTE_DECLARATION_MISSING|ROUTE_DECLARATION_CORRUPT",
                 ):
                     repairs.run_assignment(fx.store, fx.TASK_ID, review, sessions)
-            self.assertEqual([], _RecordingPopen.calls)
+            assignment_spawns = [
+                call for call in spawn.call_args_list if _is_assignment_spawn(call)
+            ]
+            self.assertEqual([], assignment_spawns)
+            self.assertEqual(0, len(assignment_spawns))
         finally:
             fx.tearDown()
 
