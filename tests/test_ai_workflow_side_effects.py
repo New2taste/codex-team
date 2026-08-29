@@ -329,7 +329,7 @@ class CommandProducerTest(unittest.TestCase):
             plan = planning.validate_plan(_plan_document(), _parent_task())
             registry = ownership.build_ownership_registry(
                 task_id=TASK_ID,
-                envelope_hash="a" * 64,
+                envelope_hash=artifacts.artifact_sha256(_parent_task()),
                 plan=plan,
                 registered_at_utc="2026-08-28T00:00:00Z",
             )

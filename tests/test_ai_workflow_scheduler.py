@@ -15,6 +15,7 @@ from unittest import mock
 from scripts import ai_workflow as workflow
 from scripts import ai_workflow_artifacts as artifacts
 from scripts import ai_workflow_declarations as declarations
+from scripts import ai_workflow_ownership as ownership
 from scripts import ai_workflow_planning as planning
 from scripts import ai_workflow_preflight as preflight
 from scripts import ai_workflow_repairs as repairs
@@ -1553,6 +1554,27 @@ class FinalAcceptanceCaseTest(unittest.TestCase):
             )
         replay_after = repairs.replay_acceptance_ledger(self.store, child["task_id"])
         self.assertEqual(1, len(replay_after.assignments))
+
+    def test_open_final_acceptance_materializes_child_ownership_registry(self):
+        self._complete_all()
+        child = self._create()
+        owner = self._record_owner_evidence()
+        with mock.patch.object(repairs, "run_assignment", create=True):
+            scheduler.issue_final_acceptance(
+                self.store, self.frozen, child["task_id"], owner, self._acceptor()
+            )
+
+        registry = ownership.load_ownership_registry(self.store, child["task_id"])
+        self.assertIsNotNone(registry)
+        assert registry is not None
+        self.assertEqual(
+            artifacts.artifact_sha256(child),
+            registry.envelope_hash,
+        )
+        self.assertEqual(
+            {path: "luna_construction" for path in child["allowed_write_paths"]},
+            registry.path_owners,
+        )
 
     def test_wrong_actor_does_not_open_acceptance(self):
         self._complete_all()

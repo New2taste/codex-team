@@ -46,6 +46,7 @@ try:
     )
     from .ai_workflow_ownership import (
         claimed_write_paths,
+        ensure_ownership_registry_for_paths_locked,
         require_write_ownership_locked,
         verify_actual_write_paths,
     )
@@ -69,6 +70,7 @@ except ImportError:  # direct script execution
     )
     from ai_workflow_ownership import (
         claimed_write_paths,
+        ensure_ownership_registry_for_paths_locked,
         require_write_ownership_locked,
         verify_actual_write_paths,
     )
@@ -1931,6 +1933,15 @@ def open_task_acceptance(
             allowed_owners = {"luna", "terra_xhigh", "luna_construction"}
         if owner_receipt.requested_role not in allowed_owners:
             _fail("ACCEPTANCE_RECEIPT_MISMATCH", "only Luna or Terra xhigh may own acceptance")
+        if _is_whole_project_final(stored, store=store):
+            ensure_ownership_registry_for_paths_locked(
+                store,
+                task_id,
+                path_owners={
+                    path: owner_receipt.requested_role
+                    for path in stored["allowed_write_paths"]
+                },
+            )
         owner_actor = owner_receipt.actor_identity
         event = _v2_append(
             store,
@@ -3046,6 +3057,15 @@ def run_assignment(
             if replay is None:
                 _fail("REPAIR_ADAPTER_REQUIRED", "v2 acceptance ledger is not open")
             context = _v2_context(store, task_id)
+            if replay.whole_project_final:
+                ensure_ownership_registry_for_paths_locked(
+                    store,
+                    task_id,
+                    path_owners={
+                        path: replay.owner_actor.role
+                        for path in stored_task["allowed_write_paths"]
+                    },
+                )
             replay = _v2_start_attempt(
                 store,
                 task_id,

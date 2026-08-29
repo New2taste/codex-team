@@ -240,6 +240,34 @@ class OwnershipRegistryStoreTest(unittest.TestCase):
     def test_load_returns_none_when_missing(self) -> None:
         self.assertIsNone(ownership.load_ownership_registry(self.store, TASK_ID))
 
+    def test_record_rejects_registry_bound_to_a_different_task_envelope(self) -> None:
+        mismatched = ownership.OwnershipRegistry(
+            schema_version=self.registry.schema_version,
+            task_id=self.registry.task_id,
+            envelope_hash="0" * 64,
+            path_owners=dict(self.registry.path_owners),
+            registered_at_utc=self.registry.registered_at_utc,
+        )
+        with self.store.lock(TASK_ID):
+            with self.assertRaisesRegex(
+                artifacts.WorkflowError, "OWNERSHIP_REGISTRY_MISMATCH"
+            ):
+                ownership.record_ownership_registry(
+                    self.store, TASK_ID, mismatched
+                )
+
+    def test_load_rejects_registry_when_stored_task_identity_drifted(self) -> None:
+        with self.store.lock(TASK_ID):
+            ownership.record_ownership_registry(self.store, TASK_ID, self.registry)
+        path = self.store._require_task(TASK_ID) / REGISTRY_FILENAME
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["envelope_hash"] = "0" * 64
+        path.write_text(artifacts.canonical_json(payload) + "\n", encoding="utf-8")
+        with self.assertRaisesRegex(
+            artifacts.WorkflowError, "OWNERSHIP_REGISTRY_MISMATCH"
+        ):
+            ownership.load_ownership_registry(self.store, TASK_ID)
+
 
 class SideEffectLedgerTest(unittest.TestCase):
     def setUp(self) -> None:

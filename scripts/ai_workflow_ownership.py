@@ -205,6 +205,11 @@ def record_ownership_registry(
     validate_ownership_registry(payload)
     if registry.task_id != task_id:
         _fail("OWNERSHIP_REGISTRY_MISMATCH", "registry task_id does not match task")
+    if registry.envelope_hash != _task_envelope_hash(store, task_id):
+        _fail(
+            "OWNERSHIP_REGISTRY_MISMATCH",
+            "registry envelope_hash does not match the stored task",
+        )
     return store.write_task_artifact_once(
         task_id,
         OWNERSHIP_REGISTRY_FILENAME,
@@ -232,7 +237,13 @@ def load_ownership_registry(
         ) from exc
     if not isinstance(value, Mapping):
         _fail("OWNERSHIP_REGISTRY_CORRUPT", "ownership registry must be an object")
-    return _registry_from_mapping(value)
+    registry = _registry_from_mapping(value)
+    if registry.envelope_hash != _task_envelope_hash(store, task_id):
+        _fail(
+            "OWNERSHIP_REGISTRY_MISMATCH",
+            "registry envelope_hash does not match the stored task",
+        )
+    return registry
 
 
 def record_side_effect_locked(
@@ -355,28 +366,11 @@ def ensure_ownership_registry_locked(
     store._assert_lock_held(task_id)
     if not isinstance(plan, FrozenPlan):
         _fail("PLAN_INVALID", "ownership registry requires a frozen plan")
-    envelope_hash = _task_envelope_hash(store, task_id)
-    existing = load_ownership_registry(store, task_id)
-    expected = build_ownership_registry(
-        task_id=task_id,
-        envelope_hash=envelope_hash,
-        plan=plan,
-        registered_at_utc=_utc_now(),
+    return ensure_ownership_registry_for_paths_locked(
+        store,
+        task_id,
+        path_owners=scope_owner_map(plan),
     )
-    if existing is not None:
-        if (
-            existing.schema_version != expected.schema_version
-            or existing.task_id != expected.task_id
-            or existing.envelope_hash != expected.envelope_hash
-            or existing.path_owners != expected.path_owners
-        ):
-            _fail(
-                "OWNERSHIP_REGISTRY_CONFLICT",
-                "ownership registry does not match the authoritative task or plan",
-            )
-        return existing
-    record_ownership_registry(store, task_id, expected)
-    return expected
 
 
 def _lexical_repo_path(path: str) -> str:
@@ -386,6 +380,52 @@ def _lexical_repo_path(path: str) -> str:
     if collapsed in {"", ".", ".."} or collapsed.startswith("../") or collapsed.startswith("/"):
         _fail("PLAN_INVALID", "scope must be a literal repository-relative path")
     return normalize_scope(collapsed).as_posix()
+
+
+def ensure_ownership_registry_for_paths_locked(
+    store: TaskStoreProtocol,
+    task_id: str,
+    *,
+    path_owners: Mapping[str, str],
+) -> OwnershipRegistry:
+    """Materialize a role-owned registry for a task without a FrozenPlan."""
+
+    store._assert_lock_held(task_id)
+    if not isinstance(path_owners, Mapping):
+        _fail("INVALID_TYPE", "path_owners must be an object")
+    normalized_owners: dict[str, str] = {}
+    for raw_path, raw_owner in path_owners.items():
+        if not isinstance(raw_path, str):
+            _fail("INVALID_TYPE", "path_owners keys must be strings")
+        path = _lexical_repo_path(raw_path)
+        owner = _string(raw_owner, "path_owners")
+        prior = normalized_owners.get(path)
+        if prior is not None and prior != owner:
+            _fail("OWNERSHIP_REGISTRY_CONFLICT", "path owners conflict after normalization")
+        normalized_owners[path] = owner
+    expected = OwnershipRegistry(
+        schema_version=OWNERSHIP_REGISTRY_SCHEMA_VERSION,
+        task_id=_string(task_id, "task_id"),
+        envelope_hash=_task_envelope_hash(store, task_id),
+        path_owners=normalized_owners,
+        registered_at_utc=_utc_now(),
+    )
+    validate_ownership_registry(expected.to_dict())
+    existing = load_ownership_registry(store, task_id)
+    if existing is not None:
+        if (
+            existing.schema_version != expected.schema_version
+            or existing.task_id != expected.task_id
+            or existing.envelope_hash != expected.envelope_hash
+            or existing.path_owners != expected.path_owners
+        ):
+            _fail(
+                "OWNERSHIP_REGISTRY_CONFLICT",
+                "ownership registry does not match the authoritative task or path owners",
+            )
+        return existing
+    record_ownership_registry(store, task_id, expected)
+    return expected
 
 
 def _normalize_write_path(store: TaskStoreProtocol, task_id: str, path: str) -> str:
