@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import ast
 import inspect
 import json
+import subprocess
 import tempfile
 import unittest
 from dataclasses import replace
@@ -11,6 +13,7 @@ from pathlib import Path
 
 from scripts import ai_workflow as workflow
 from scripts import ai_workflow_artifacts as artifacts
+from scripts import ai_workflow_authorizations as authorizations
 from scripts import ai_workflow_candidate_state as candidate_state
 from scripts import ai_workflow_repairs as repairs
 from scripts import ai_workflow_verdicts as verdicts
@@ -546,6 +549,304 @@ class VerdictLedgerReplayTest(_VerdictStoreMixin, unittest.TestCase):
         )
 
 
+def _first_call_name(function) -> str | None:
+    tree = ast.parse(inspect.getsource(function))
+    func = tree.body[0]
+    assert isinstance(func, ast.FunctionDef)
+    for node in func.body:
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
+            continue
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+            call = node.value
+        elif isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
+            call = node.value
+        else:
+            return None
+        if isinstance(call.func, ast.Attribute):
+            return call.func.attr
+        if isinstance(call.func, ast.Name):
+            return call.func.id
+        return None
+    return None
+
+
+def _git(repo: Path, *args: str) -> str:
+    completed = subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return completed.stdout.strip()
+
+
+class ReleaseGateTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        root = Path(self.temporary.name)
+        self.repo = root / "repo"
+        self.repo.mkdir()
+        _git(self.repo, "init", "-b", "main")
+        _git(self.repo, "config", "user.email", "gate@example.test")
+        _git(self.repo, "config", "user.name", "Release Gate")
+        _git(self.repo, "config", "commit.gpgsign", "false")
+        (self.repo / "README.md").write_text("base\n", encoding="utf-8")
+        _git(self.repo, "add", "README.md")
+        _git(self.repo, "commit", "-m", "A")
+        self.commit_a = _git(self.repo, "rev-parse", "HEAD")
+        (self.repo / "src").mkdir()
+        (self.repo / "src" / "app.py").write_text("v1\n", encoding="utf-8")
+        _git(self.repo, "add", "src/app.py")
+        _git(self.repo, "commit", "-m", "B")
+        self.commit_b = _git(self.repo, "rev-parse", "HEAD")
+        self.store = workflow.WorkflowStore(root / "state")
+        self.store.create_task(
+            {
+                "schema_version": "ai-task-1",
+                "task_id": TASK_ID,
+                "task_type": "PLAN",
+                "objective": "Gate release on a fresh ACCEPT verdict",
+                "repository_root": str(self.repo),
+                "source_worktree": None,
+                "base_commit": None,
+                "candidate_commit": None,
+                "authoritative_files": ["README.md"],
+                "allowed_write_paths": [],
+                "forbidden_actions": ["merge", "push", "change_constitution"],
+                "risk_flags": [],
+                "acceptance_commands": [],
+                "verification_level": "L1",
+                "human_gates": ["PLAN_APPROVAL"],
+            }
+        )
+        self.evidence = _issuer_evidence(observed_cwd=str(self.repo))
+        self.issuer_id = _evidence_id(self.evidence)
+        self.store.append_task_ledger(TASK_ID, "runtime-evidence.jsonl", self.evidence)
+        self.store.append_event(
+            TASK_ID,
+            {
+                "event_type": "RUNTIME_EVIDENCE_RECORDED",
+                "attempt_id": self.evidence["attempt_id"],
+                "requested_role": self.evidence["requested_role"],
+                "runtime_evidence_sha256": self.issuer_id,
+            },
+        )
+        self.actor = "owner"
+        self.decision = {
+            "event_type": "OWNER_DECISION",
+            "decision": "defer",
+            "actor": self.actor,
+            "timestamp_utc": "2026-08-28T00:00:00Z",
+            "previous_state": "AWAITING_OWNER_DECISION",
+            "new_state": "DEFERRED",
+            "task_sha256": artifacts.artifact_sha256(
+                artifacts.load_artifact(self.store._require_task(TASK_ID) / "task.json")
+            ),
+        }
+        self.store.record_decision(TASK_ID, self.decision)
+        self.owner_evidence_id = artifacts.artifact_sha256(self.decision)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def _evidence_ids(self) -> tuple[str, ...]:
+        ids: list[str] = []
+        for event in self.store.read_task_ledger(TASK_ID, "events.jsonl"):
+            if event.get("event_type") != "RUNTIME_EVIDENCE_RECORDED":
+                continue
+            digest = event.get("runtime_evidence_sha256")
+            if isinstance(digest, str) and digest:
+                ids.append(digest)
+        return tuple(ids)
+
+    def _capture(self, *, baseline: str) -> candidate_state.CandidateState:
+        return candidate_state.capture_candidate_state(
+            self.store,
+            TASK_ID,
+            baseline_commit=baseline,
+            runtime_evidence_ids=self._evidence_ids(),
+        )
+
+    def _record(
+        self,
+        *,
+        verdict: str,
+        state: candidate_state.CandidateState | None = None,
+        recorded_at: str = "2026-08-28T12:00:00Z",
+    ) -> candidate_state.CandidateState:
+        captured = state or self._capture(baseline=self.commit_b)
+        with self.store.lock(TASK_ID):
+            verdicts.record_final_verdict(
+                self.store,
+                TASK_ID,
+                verdict=verdict,
+                candidate_state=captured,
+                issuer_evidence_id=self.issuer_id,
+                recorded_at=recorded_at,
+            )
+        return captured
+
+    def _require(self, **kwargs: object) -> None:
+        with self.store.lock(TASK_ID):
+            verdicts.require_verdict_fresh_locked(self.store, TASK_ID, **kwargs)
+
+    def _issue_override(self, digest: str) -> authorizations.OwnerAuthorization:
+        return authorizations.issue_owner_authorization(
+            self.store,
+            TASK_ID,
+            authorization_type="VERDICT_STALE_OVERRIDE",
+            actor=self.actor,
+            owner_evidence_id=self.owner_evidence_id,
+            issued_at_utc="2026-08-28T13:00:00Z",
+            candidate_state_digest=digest,
+        )
+
+    def _consumptions(self) -> list[dict[str, object]]:
+        return [
+            row
+            for row in authorizations.replay_authorizations(self.store, TASK_ID)
+            if row.get("record_kind") == "consumption"
+        ]
+
+    def test_signatures_have_no_current_or_baseline_commit(self) -> None:
+        for function in (
+            verdicts.require_verdict_fresh_locked,
+            verdicts.require_verdict_fresh,
+        ):
+            parameters = inspect.signature(function).parameters
+            self.assertNotIn("current", parameters)
+            self.assertNotIn("baseline_commit", parameters)
+            self.assertEqual(
+                ("override_authorization_id",),
+                tuple(
+                    name
+                    for name, param in parameters.items()
+                    if param.kind is inspect.Parameter.KEYWORD_ONLY
+                ),
+            )
+
+    def test_locked_variant_asserts_lock_first_and_wrapper_only_delegates(self) -> None:
+        self.assertEqual(
+            "_assert_lock_held",
+            _first_call_name(verdicts.require_verdict_fresh_locked),
+        )
+        tree = ast.parse(inspect.getsource(verdicts.require_verdict_fresh))
+        func = tree.body[0]
+        stmts = [
+            node
+            for node in func.body
+            if not (
+                isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)
+            )
+        ]
+        self.assertEqual(1, len(stmts))
+        self.assertIsInstance(stmts[0], ast.With)
+
+    def test_empty_history_is_verdict_missing_without_baseline(self) -> None:
+        with self.assertRaisesRegex(artifacts.WorkflowError, "VERDICT_MISSING"):
+            self._require()
+
+    def test_locked_variant_requires_held_lock(self) -> None:
+        with self.assertRaisesRegex(artifacts.WorkflowError, "LOCK_REQUIRED"):
+            verdicts.require_verdict_fresh_locked(self.store, TASK_ID)
+
+    def test_fresh_reject_never_releases(self) -> None:
+        self._record(verdict="REJECT")
+        with self.assertRaisesRegex(artifacts.WorkflowError, "VERDICT_REJECTED"):
+            self._require()
+
+    def test_stale_reject_never_consumes_override(self) -> None:
+        self._record(verdict="REJECT")
+        (self.repo / "src" / "app.py").write_text("drift\n", encoding="utf-8")
+        current = self._capture(baseline=self.commit_b)
+        issued = self._issue_override(current.state_digest())
+        with self.assertRaisesRegex(artifacts.WorkflowError, "VERDICT_REJECTED"):
+            self._require(override_authorization_id=issued.authorization_id)
+        self.assertEqual([], self._consumptions())
+
+    def test_stale_accept_without_override_is_blocked(self) -> None:
+        self._record(verdict="ACCEPT")
+        (self.repo / "src" / "app.py").write_text("drift\n", encoding="utf-8")
+        with self.assertRaisesRegex(artifacts.WorkflowError, "VERDICT_STALE"):
+            self._require()
+
+    def test_fresh_accept_releases(self) -> None:
+        self._record(verdict="ACCEPT")
+        self._require()
+
+    def test_rerecorded_accept_releases_after_stale(self) -> None:
+        self._record(verdict="ACCEPT", recorded_at="2026-08-28T12:00:00Z")
+        (self.repo / "src" / "app.py").write_text("drift\n", encoding="utf-8")
+        with self.assertRaisesRegex(artifacts.WorkflowError, "VERDICT_STALE"):
+            self._require()
+        self._record(verdict="ACCEPT", recorded_at="2026-08-28T14:00:00Z")
+        self._require()
+
+    def test_stale_override_releases_once_then_consumed(self) -> None:
+        self._record(verdict="ACCEPT")
+        (self.repo / "src" / "app.py").write_text("drift\n", encoding="utf-8")
+        current = self._capture(baseline=self.commit_b)
+        issued = self._issue_override(current.state_digest())
+        self._require(override_authorization_id=issued.authorization_id)
+        consumptions = self._consumptions()
+        self.assertEqual(1, len(consumptions))
+        self.assertEqual(
+            {"candidate_state_digest": current.state_digest()},
+            consumptions[0]["binding"],
+        )
+        with self.assertRaisesRegex(artifacts.WorkflowError, "AUTHORIZATION_CONSUMED"):
+            self._require(override_authorization_id=issued.authorization_id)
+
+    def test_override_digest_mismatch_is_scope_error(self) -> None:
+        self._record(verdict="ACCEPT")
+        (self.repo / "src" / "app.py").write_text("drift\n", encoding="utf-8")
+        issued = self._issue_override("f" * 64)
+        with self.assertRaisesRegex(
+            artifacts.WorkflowError, "AUTHORIZATION_SCOPE_MISMATCH"
+        ):
+            self._require(override_authorization_id=issued.authorization_id)
+        self.assertEqual([], self._consumptions())
+
+    def test_override_release_then_mutation_is_stale_again(self) -> None:
+        self._record(verdict="ACCEPT")
+        (self.repo / "src" / "app.py").write_text("drift-1\n", encoding="utf-8")
+        current = self._capture(baseline=self.commit_b)
+        issued = self._issue_override(current.state_digest())
+        self._require(override_authorization_id=issued.authorization_id)
+        (self.repo / "src" / "app.py").write_text("drift-2\n", encoding="utf-8")
+        with self.assertRaisesRegex(artifacts.WorkflowError, "VERDICT_STALE"):
+            self._require()
+
+    def test_in_gate_baseline_comes_from_ledger_not_caller(self) -> None:
+        captured_a = self._capture(baseline=self.commit_a)
+        mixed = replace(captured_a, baseline_commit=self.commit_b)
+        self._record(verdict="ACCEPT", state=mixed)
+        with self.assertRaisesRegex(artifacts.WorkflowError, "VERDICT_STALE"):
+            self._require()
+        fresh_under_a = verdicts.evaluate_verdict_freshness(
+            self.store,
+            TASK_ID,
+            current=replace(captured_a, baseline_commit=self.commit_b),
+        )
+        self.assertEqual("FRESH", fresh_under_a)
+
+    def test_tampered_ledger_baseline_is_corrupt(self) -> None:
+        self._record(verdict="ACCEPT")
+        path = self.store._require_task(TASK_ID) / verdicts.FINAL_VERDICT_LEDGER
+        record = json.loads(path.read_text(encoding="utf-8").splitlines()[-1])
+        record["candidate_state"]["baseline_commit"] = self.commit_a
+        path.write_text(artifacts.canonical_json(record) + "\n", encoding="utf-8")
+        with self.assertRaisesRegex(artifacts.WorkflowError, "VERDICT_LEDGER_CORRUPT"):
+            self._require()
+
+    def test_release_completion_phases_constant(self) -> None:
+        self.assertEqual(
+            frozenset({"SOL_XHIGH_TERMINAL_REPAIR"}),
+            verdicts.RELEASE_COMPLETION_PHASES,
+        )
+
+
 class OldAcceptanceLedgerUnchangedTest(unittest.TestCase):
     def setUp(self) -> None:
         self.harness = adversarial_acceptance.AcceptanceLedgerV2ContractTest()
@@ -588,6 +889,24 @@ class OldAcceptanceLedgerUnchangedTest(unittest.TestCase):
         self.assertEqual(1, len(opened))
         self.assertEqual(FROZEN_V2_APPEND_OPENED_FIELDS, set(opened[0]))
         self.assertEqual("adversarial-acceptance-1", opened[0]["ledger_version"])
+        self.assertEqual("adversarial-acceptance-1", repairs._ACCEPTANCE_LEDGER_VERSION)
+
+    def test_acceptance_events_do_not_carry_override_fields(self) -> None:
+        self.harness._open_with_owner("owner")
+        _, first, receipt = self.harness._issue_with_receipt(
+            "REVIEW_1", "terra-review-one", "terra_xhigh_reviewer"
+        )
+        self.harness._review(first, receipt, "ACCEPT")
+        forbidden = {
+            "override_authorization_id",
+            "authorization_id",
+            "verdict_id",
+            "freshness",
+            "candidate_state_digest",
+        }
+        for event in self.harness._events():
+            self.assertEqual("adversarial-acceptance-1", event["ledger_version"])
+            self.assertFalse(forbidden & set(event))
 
 
 if __name__ == "__main__":

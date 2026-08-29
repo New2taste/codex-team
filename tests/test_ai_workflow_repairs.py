@@ -1,5 +1,6 @@
 import json
 import hashlib
+import inspect
 import subprocess
 import tempfile
 import unittest
@@ -909,6 +910,88 @@ class AssignmentSideEffectObservationTest(unittest.TestCase):
         )
         actual = set(completed["actual_changed_paths"])
         self.assertEqual(actual, observed_paths)
+
+
+class VerdictReleaseGateRepairTest(unittest.TestCase):
+    def setUp(self) -> None:
+        from tests.test_ai_workflow_adversarial_acceptance import (
+            AcceptanceLedgerV2ContractTest,
+        )
+
+        self.fx = AcceptanceLedgerV2ContractTest()
+        self.fx.setUp()
+
+    def tearDown(self) -> None:
+        self.fx.tearDown()
+
+    def test_review_one_completion_does_not_require_final_verdict(self) -> None:
+        self.fx._open_with_owner("luna-owner", "luna")
+        _, first, receipt = self.fx._issue_with_receipt(
+            "REVIEW_1", "terra-review-one", "terra_xhigh_reviewer"
+        )
+        self.fx._review(first, receipt, "ACCEPT")
+        completed = [
+            event
+            for event in self.fx._events()
+            if event.get("event_type") == "REVIEW_COMPLETED"
+        ]
+        self.assertEqual(1, len(completed))
+
+    def test_terminal_repair_completed_without_verdict_is_missing(self) -> None:
+        self.fx.task["source_worktree"] = str(self.fx.repository_root)
+        owner_actor, _ = self.fx._open_with_owner("luna-owner", "luna")
+        _, first, reviewer_one_receipt = self.fx._issue_with_receipt(
+            "REVIEW_1", "terra-review-one", "terra_xhigh_reviewer"
+        )
+        self.fx._review(first, reviewer_one_receipt, "REWORK", self.fx.findings)
+        _, owner_repair, owner_receipt = self.fx._issue_with_receipt(
+            "OWNER_REPAIR", "luna-owner-repair", "luna", expected_actor=owner_actor
+        )
+        owner_candidate = self.fx._commit_file("src/alpha.py", "OWNER_ALPHA = 1\n")
+        self.fx._complete(
+            owner_repair, owner_receipt, owner_candidate, ("src/alpha.py",)
+        )
+        _, second, reviewer_two_receipt = self.fx._issue_with_receipt(
+            "REVIEW_2", "terra-review-two", "terra_xhigh_reviewer"
+        )
+        self.fx._review(second, reviewer_two_receipt, "REWORK", self.fx.findings)
+        _, sol_repair, sol_receipt = self.fx._issue_with_receipt(
+            "SOL_MEDIUM_REPAIR", "sol-fixer", "sol_medium_reviewer"
+        )
+        sol_candidate = self.fx._commit_file("src/alpha.py", "SOL_MEDIUM_ALPHA = 1\n")
+        self.fx._complete(sol_repair, sol_receipt, sol_candidate, ("src/alpha.py",))
+        _, peer_review, peer_receipt = self.fx._issue_with_receipt(
+            "SOL_MEDIUM_PEER_REVIEW", "sol-peer", "sol_medium_reviewer"
+        )
+        self.fx._review(peer_review, peer_receipt, "REWORK", self.fx.findings)
+        _, terminal, receipt = self.fx._issue_with_receipt(
+            "SOL_XHIGH_TERMINAL_REPAIR", "sol-xhigh", "sol_xhigh"
+        )
+        candidate = self.fx._commit_file("src/alpha.py", "TERMINAL_ALPHA = 1\n")
+        with self.assertRaisesRegex(workflow.WorkflowError, "VERDICT_MISSING"):
+            self.fx._complete(terminal, receipt, candidate, ("src/alpha.py",))
+        self.assertFalse(
+            any(
+                event.get("event_type") == "REPAIR_COMPLETED"
+                and event.get("terminal_reason") == "SOL_XHIGH_TERMINAL_REPAIR_COMPLETED"
+                for event in self.fx._events()
+            )
+        )
+
+    def test_v2_append_and_authorize_call_locked_gate(self) -> None:
+        append_source = inspect.getsource(repairs._v2_append)
+        authorize_source = inspect.getsource(repairs.authorize_final_xhigh)
+        self.assertIn("require_verdict_fresh_locked", append_source)
+        self.assertIn("require_verdict_fresh_locked", authorize_source)
+        self.assertIn("Generic pipeline", append_source)
+        self.assertNotIn(
+            "require_verdict_fresh(",
+            append_source.replace("require_verdict_fresh_locked", ""),
+        )
+        self.assertNotIn(
+            "require_verdict_fresh(",
+            authorize_source.replace("require_verdict_fresh_locked", ""),
+        )
 
 
 if __name__ == "__main__":

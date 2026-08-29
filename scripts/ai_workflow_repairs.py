@@ -34,12 +34,20 @@ try:
         observe_execution_side_effects,
         record_unobserved_side_effect,
     )
+    from .ai_workflow_verdicts import (
+        RELEASE_COMPLETION_PHASES,
+        require_verdict_fresh_locked,
+    )
 except ImportError:  # direct script execution
     from ai_workflow_side_effects import (
         capture_fs_snapshot,
         observation_exclusions,
         observe_execution_side_effects,
         record_unobserved_side_effect,
+    )
+    from ai_workflow_verdicts import (
+        RELEASE_COMPLETION_PHASES,
+        require_verdict_fresh_locked,
     )
 
 
@@ -1305,14 +1313,65 @@ def _v2_append(
     event_type: str,
     candidate_commit: str,
     fields: Mapping[str, object],
+    *,
+    override_authorization_id: str | None = None,
 ) -> dict[str, object]:
+    """Append one adversarial-acceptance-1 event.
+
+    Generic pipeline owner decisions (CLI ``decide``) are not gated here.
+    This freshness gate only constrains adversarial-acceptance-1 ledger
+    tasks at terminal REPAIR_COMPLETED / REVIEW_COMPLETED. Whole-project
+    final children created by issue_final_acceptance still complete
+    through this append exit. authorize_final_xhigh is a separate exit.
+    """
+
     if event_type not in _ACCEPTANCE_EVENT_TYPES:
         _fail("ACCEPTANCE_LEDGER_INVALID", "event type is not part of the v2 ledger")
+    if _is_release_completion(store, task_id, event_type, fields, replay):
+        require_verdict_fresh_locked(
+            store, task_id, override_authorization_id=override_authorization_id
+        )
     event = _v2_common(replay, context, task_id, event_type, candidate_commit)
     event.update(fields)
     event["event_id"] = _v2_event_id(event)
     store.append_event(task_id, event)
     return event
+
+
+def _assignment_phase(
+    replay: _AcceptanceReplay | None, fields: Mapping[str, object]
+) -> str | None:
+    if replay is None:
+        return None
+    assignment_id = fields.get("assignment_id")
+    if not isinstance(assignment_id, str):
+        return None
+    stored = replay.assignments.get(assignment_id)
+    if stored is None:
+        return None
+    return stored.phase
+
+
+def _is_release_completion(
+    store: WorkflowStore,
+    task_id: str,
+    event_type: str,
+    fields: Mapping[str, object],
+    replay: _AcceptanceReplay | None,
+) -> bool:
+    if event_type not in {"REPAIR_COMPLETED", "REVIEW_COMPLETED"}:
+        return False
+    phase = _assignment_phase(replay, fields)
+    if phase in RELEASE_COMPLETION_PHASES:
+        return True
+    stored = _workflow().load_task(store._require_task(task_id) / "task.json")
+    if not _is_whole_project_final(stored, store=store):
+        return False
+    return (
+        event_type == "REVIEW_COMPLETED"
+        and fields.get("verdict") == "ACCEPT"
+        and phase != "REVIEW_1"
+    )
 
 
 def _v2_validate_observed_receipt(
@@ -2311,7 +2370,13 @@ def _require_one_final_xhigh_ticket(
     return tickets[0]
 
 
-def authorize_final_xhigh(store: WorkflowStore, task_id: str, actor: str) -> None:
+def authorize_final_xhigh(
+    store: WorkflowStore,
+    task_id: str,
+    actor: str,
+    *,
+    override_authorization_id: str | None = None,
+) -> None:
     """Record one owner-authorized Sol xhigh for whole-project final acceptance."""
 
     if not isinstance(actor, str) or not actor.strip():
@@ -2334,6 +2399,9 @@ def authorize_final_xhigh(store: WorkflowStore, task_id: str, actor: str) -> Non
         _assert_automatic_xhigh_disabled()
         if _final_xhigh_decision_records(store, task_id):
             _fail("ACCEPTANCE_SEQUENCE_INVALID", "whole-project xhigh is already authorized")
+        require_verdict_fresh_locked(
+            store, task_id, override_authorization_id=override_authorization_id
+        )
         store.record_decision(
             task_id,
             {

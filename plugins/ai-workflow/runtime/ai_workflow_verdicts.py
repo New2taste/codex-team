@@ -17,7 +17,12 @@ try:
         sorted_strs,
         verify_content_id,
     )
-    from .ai_workflow_candidate_state import CandidateState, validate_candidate_state
+    from .ai_workflow_authorizations import consume_owner_authorization_locked
+    from .ai_workflow_candidate_state import (
+        CandidateState,
+        capture_candidate_state,
+        validate_candidate_state,
+    )
 except ImportError:  # direct script execution
     from ai_workflow_artifacts import (
         TaskStoreProtocol,
@@ -28,7 +33,12 @@ except ImportError:  # direct script execution
         sorted_strs,
         verify_content_id,
     )
-    from ai_workflow_candidate_state import CandidateState, validate_candidate_state
+    from ai_workflow_authorizations import consume_owner_authorization_locked
+    from ai_workflow_candidate_state import (
+        CandidateState,
+        capture_candidate_state,
+        validate_candidate_state,
+    )
 
 
 FINAL_VERDICT_SCHEMA_VERSION = "ai-final-verdict-1"
@@ -52,6 +62,7 @@ ISSUER_ROLE_CONTRACTS: Mapping[str, tuple[str, str, str, str]] = {
     "sol_medium_reviewer": ("gpt-5.6-sol", "medium", "read-only", "read-only"),
 }
 FRESHNESS_VALUES = frozenset({"FRESH", "STALE", "MISSING"})
+RELEASE_COMPLETION_PHASES = frozenset({"SOL_XHIGH_TERMINAL_REPAIR"})
 VERDICT_ID_EXCLUDE = frozenset({"verdict_id"})
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -368,3 +379,62 @@ def evaluate_verdict_freshness(
     if _freshness_key(latest.candidate_state) != _freshness_key(current):
         return "STALE"
     return "FRESH"
+
+
+def _runtime_evidence_ids_from_events(
+    store: TaskStoreProtocol, task_id: str
+) -> tuple[str, ...]:
+    ids: list[str] = []
+    for event in store.read_task_ledger(task_id, "events.jsonl"):
+        if event.get("event_type") != "RUNTIME_EVIDENCE_RECORDED":
+            continue
+        digest = event.get("runtime_evidence_sha256")
+        if isinstance(digest, str) and digest:
+            ids.append(digest)
+    return tuple(ids)
+
+
+def require_verdict_fresh_locked(
+    store: TaskStoreProtocol,
+    task_id: str,
+    *,
+    override_authorization_id: str | None = None,
+) -> None:
+    store._assert_lock_held(task_id)
+    history = load_verdict_history(store, task_id)
+    if not history:
+        _fail("VERDICT_MISSING", "final verdict is missing")
+    latest = history[-1]
+    if latest.verdict == "REJECT":
+        _fail("VERDICT_REJECTED", "latest final verdict is REJECT")
+    current = capture_candidate_state(
+        store,
+        task_id,
+        baseline_commit=latest.candidate_state.baseline_commit,
+        runtime_evidence_ids=_runtime_evidence_ids_from_events(store, task_id),
+    )
+    freshness = evaluate_verdict_freshness(store, task_id, current=current)
+    if freshness == "FRESH":
+        return
+    if freshness != "STALE":
+        _fail("VERDICT_MISSING", "final verdict is missing")
+    if not override_authorization_id:
+        _fail("VERDICT_STALE", "latest ACCEPT verdict is stale")
+    consume_owner_authorization_locked(
+        store,
+        task_id,
+        override_authorization_id,
+        binding={"candidate_state_digest": current.state_digest()},
+    )
+
+
+def require_verdict_fresh(
+    store: TaskStoreProtocol,
+    task_id: str,
+    *,
+    override_authorization_id: str | None = None,
+) -> None:
+    with store.lock(task_id):
+        require_verdict_fresh_locked(
+            store, task_id, override_authorization_id=override_authorization_id
+        )

@@ -6,6 +6,7 @@ do not change ordinary REMEDIATION ladder semantics.
 
 from __future__ import annotations
 
+import inspect
 import json
 import hashlib
 import unittest
@@ -127,6 +128,9 @@ class WholeProjectFinalAcceptanceTest(unittest.TestCase):
             original_create(document)
 
         self.fx._create_task = create_bound_task
+
+    def _record_fresh_verdict(self, *, verdict: str = "ACCEPT") -> object:
+        return self.fx._record_fresh_verdict(verdict=verdict)
 
     def tearDown(self) -> None:
         self.fx.tearDown()
@@ -267,6 +271,7 @@ class WholeProjectFinalAcceptanceTest(unittest.TestCase):
         self._advance_to_peer_rework()
         authorize = getattr(repairs, "authorize_final_xhigh", None)
         self.assertIsNotNone(authorize, "explicit owner xhigh authorization API is required")
+        self._record_fresh_verdict()
         authorize(self.fx.store, self.fx.TASK_ID, "owner")
         with self.assertRaises(workflow.WorkflowError):
             authorize(self.fx.store, self.fx.TASK_ID, "owner")
@@ -275,6 +280,7 @@ class WholeProjectFinalAcceptanceTest(unittest.TestCase):
         )
         self.assertEqual("sol_xhigh", terminal.expected_actor.role)
         candidate = self.fx._commit_file("src/alpha.py", "SOL_XHIGH_ALPHA = 1\n")
+        self._record_fresh_verdict()
         self.fx._complete(terminal, receipt, candidate, ("src/alpha.py",))
         with self.assertRaises(workflow.WorkflowError):
             self.fx._issue(
@@ -333,6 +339,7 @@ class WholeProjectFinalAcceptanceTest(unittest.TestCase):
     def test_authorize_binds_candidate_and_acceptance_event(self):
         self._advance_to_peer_rework()
         replay = repairs.replay_acceptance_ledger(self.fx.store, self.fx.TASK_ID)
+        self._record_fresh_verdict()
         repairs.authorize_final_xhigh(self.fx.store, self.fx.TASK_ID, "owner")
         record = json.loads(self._decisions_path().read_text(encoding="utf-8").splitlines()[-1])
         self.assertEqual(replay.current_candidate_commit, record["candidate_commit"])
@@ -341,6 +348,7 @@ class WholeProjectFinalAcceptanceTest(unittest.TestCase):
 
     def test_later_unrelated_owner_decision_does_not_hide_valid_xhigh_ticket(self):
         self._advance_to_peer_rework()
+        self._record_fresh_verdict()
         repairs.authorize_final_xhigh(self.fx.store, self.fx.TASK_ID, "owner")
         self._append_owner_decision(
             {
@@ -560,6 +568,7 @@ class WholeProjectFinalAcceptanceTest(unittest.TestCase):
 
     def test_decide_authorize_final_xhigh_records_without_resume_or_generic_state(self):
         self._advance_to_peer_rework()
+        self._record_fresh_verdict()
         previous_state = workflow._current_state(self.fx.store, self.fx.TASK_ID)
         output = StringIO()
         with redirect_stdout(output):
@@ -601,6 +610,8 @@ class WholeProjectFinalAcceptanceTest(unittest.TestCase):
 
     def test_ordinary_decide_still_uses_closed_owner_decisions(self):
         self.assertNotIn("authorize_final_xhigh", workflow.OWNER_DECISIONS)
+        source = inspect.getsource(workflow._apply_owner_decision)
+        self.assertNotIn("require_verdict_fresh", source)
         fx = _acceptance_harness()
         fx.setUp()
         try:
@@ -615,6 +626,65 @@ class WholeProjectFinalAcceptanceTest(unittest.TestCase):
             self.assertFalse((fx.state_root / fx.TASK_ID / "human-decisions.jsonl").exists())
         finally:
             fx.tearDown()
+
+    def test_missing_verdict_blocks_authorize_final_xhigh(self):
+        self._advance_to_peer_rework()
+        with self.assertRaisesRegex(workflow.WorkflowError, "VERDICT_MISSING"):
+            repairs.authorize_final_xhigh(self.fx.store, self.fx.TASK_ID, "owner")
+        self.assertEqual([], self._final_xhigh_tickets())
+
+    def test_reject_verdict_blocks_authorize_final_xhigh(self):
+        self._advance_to_peer_rework()
+        self._record_fresh_verdict(verdict="REJECT")
+        with self.assertRaisesRegex(workflow.WorkflowError, "VERDICT_REJECTED"):
+            repairs.authorize_final_xhigh(self.fx.store, self.fx.TASK_ID, "owner")
+        self.assertEqual([], self._final_xhigh_tickets())
+
+    def test_stale_accept_blocks_authorize_final_xhigh(self):
+        self._advance_to_peer_rework()
+        self._record_fresh_verdict()
+        self.fx._commit_file("src/alpha.py", "STALE_FOR_AUTHORIZE = 1\n")
+        with self.assertRaisesRegex(workflow.WorkflowError, "VERDICT_STALE"):
+            repairs.authorize_final_xhigh(self.fx.store, self.fx.TASK_ID, "owner")
+        self.assertEqual([], self._final_xhigh_tickets())
+
+    def test_peer_accept_without_verdict_is_blocked(self):
+        (
+            _,
+            _,
+            _,
+            fixer_actor,
+            repair,
+            fixer_receipt,
+        ) = self._advance_to_fixer()
+        candidate = self.fx._commit_file("src/alpha.py", "SOL_FIXER_ALPHA = 1\n")
+        self.fx._complete(repair, fixer_receipt, candidate, ("src/alpha.py",))
+        _, peer, recheck_receipt = self.fx._issue_with_receipt(
+            "SOL_MEDIUM_PEER_REVIEW", "sol-recheck", "sol_medium_reviewer"
+        )
+        with self.assertRaisesRegex(workflow.WorkflowError, "VERDICT_MISSING"):
+            self.fx._review(peer, recheck_receipt, "ACCEPT")
+        self.assertFalse(
+            any(
+                event.get("event_type") == "REVIEW_COMPLETED"
+                and event.get("verdict") == "ACCEPT"
+                for event in self.fx._events()
+            )
+        )
+
+    def test_issue_final_acceptance_child_completion_uses_v2_append_gate(self):
+        source = inspect.getsource(scheduler.issue_final_acceptance)
+        self.assertNotIn("require_verdict_fresh", source)
+        self.assertIn("issue_acceptance_assignment", source)
+
+    def test_authorize_final_xhigh_uses_locked_gate_not_wrapper(self):
+        self._advance_to_peer_rework()
+        self._record_fresh_verdict()
+        source = inspect.getsource(repairs.authorize_final_xhigh)
+        self.assertIn("require_verdict_fresh_locked", source)
+        self.assertNotIn("require_verdict_fresh(", source.replace("require_verdict_fresh_locked", ""))
+        repairs.authorize_final_xhigh(self.fx.store, self.fx.TASK_ID, "owner")
+        self.assertEqual(1, len(self._final_xhigh_tickets()))
 
     def _final_xhigh_tickets(self):
         path = self._decisions_path()
