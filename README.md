@@ -1,6 +1,6 @@
 # Codex Team
 
-[English](README.en.md)
+[English overview below](#english-overview) · [Full English documentation](README.en.md)
 
 Codex Team 是一个面向 Codex 的本地、可恢复、可审计的半自动多模型协作工作流。它把“谁来做、能改什么、何时停下、谁来验收”从模型自由发挥，收束为任务信封、确定性路由、运行时身份、证据链和人工闸门。
 
@@ -67,6 +67,57 @@ flowchart TD
 ```
 
 路由的关键取舍是：Luna 负责高频、低成本且可机械验证的工作；Terra xhigh 承担需要上下文和调试能力的施工；Sol medium 只在全部工程小节完成后介入，集中寻找遗漏；Sol xhigh 仅在 owner 明确授权后处理终局例外。`optimization` 默认是 shadow 建议，不会偷偷改变这条确定性生产链。
+
+## English overview
+
+Codex Team is a local, resumable, auditable, semi-automated multi-model workflow for Codex. It turns “who acts, what they may change, when they must stop, and who accepts the result” into explicit task envelopes, deterministic routing, runtime identity, evidence chains, and human gates.
+
+It is designed for personal development, experiments, and local workflows that combine different model capabilities without losing an audit trail. It is not a background service, does not make product decisions for the user, and never implicitly merges, pushes, or deletes a workspace.
+
+### Default role split
+
+| Role | Default model / effort | Primary responsibility | Explicit boundary |
+|---|---|---|---|
+| Luna Max | `gpt-5.6-luna / max` | Mechanical coding inside a frozen envelope, deterministic checks, evidence extraction, and distribution sync | Never planning, reviewing, approving, or final acceptance |
+| Terra xhigh | `gpt-5.6-terra / xhigh` | Complex construction, debugging, integration, and open-ended problem decomposition | Never merge, push, or self-accept |
+| Sol medium | `gpt-5.6-sol / medium` | Supervise overall-plan execution, perform concentrated final acceptance, and run bounded rework | Not resident construction; acceptance stays read-only and adversarial |
+| Sol xhigh | `gpt-5.6-sol / xhigh` | Owner-authorized overall planning or terminal escalation after the rework ladder | Never starts automatically or bypasses the owner gate |
+
+### Routing at a glance
+
+The production path starts with deterministic triage, then enters a frozen envelope. Intermediate engineering sections perform construction self-checks only; Sol medium performs the concentrated final acceptance after all sections complete.
+
+```mermaid
+flowchart TD
+    A[User objective] --> B{Deterministic intake}
+    B -->|Fixed safe command| C[DIRECT_L0<br/>Controller only<br/>No model]
+    B -->|Read-only file fact| D[DIRECT_L1<br/>Luna Max<br/>NATIVE_SUBAGENT]
+    B -->|Planning or construction| E[PLAN_REQUIRED]
+    B -->|Invalid input, lock, or evidence| X[BLOCKED<br/>Append blocking receipt]
+
+    E --> F{Plan and owner gate}
+    F -->|No executable plan| G[Sol xhigh<br/>Owner-authorized planning]
+    F -->|Frozen envelope| H{Task complexity}
+    G --> H
+    H -->|Mechanical, low risk, bounded| I[Luna Max<br/>Low-cost tool process]
+    H -->|Complex construction, debug, integration| J[Terra xhigh<br/>Resident construction OS]
+    I --> K[Section self-check<br/>+ runtime evidence]
+    J --> K
+    K -->|Sections remain| H
+    K -->|All sections complete| L[Pin clean candidate<br/>Check scope and evidence]
+    L --> M[Sol medium<br/>Concentrated, read-only,<br/>adversarial final acceptance]
+    M -->|ACCEPT| N[Owner decision<br/>Close task]
+    M -->|REWORK| O[Different Sol medium<br/>Bounded repair]
+    O --> P[Another different Sol medium<br/>Read-only recheck]
+    P -->|ACCEPT| N
+    P -->|REWORK again| Q[Owner authorization]
+    Q --> R[Sol xhigh<br/>One-time terminal repair]
+    R --> N
+```
+
+Luna handles frequent, low-cost, mechanically verifiable work; Terra xhigh handles context-heavy construction and debugging; Sol medium looks for omissions only after the engineering sections are complete; Sol xhigh handles the terminal exception only after explicit owner authorization. `optimization` is shadow advice by default and never silently changes the deterministic production route.
+
+For installation, CLI usage, lifecycle details, identity/evidence requirements, security boundaries, and limitations, see the [full English documentation](README.en.md).
 
 ## 快速开始
 
