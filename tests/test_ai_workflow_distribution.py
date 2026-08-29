@@ -1070,5 +1070,18 @@ class IdentityProbeDistributionTest(unittest.TestCase):
         )
 
 
+class EvidenceChainDistributionTest(unittest.TestCase):
+    def test_evidence_chain_is_excluded_from_runtime(self):
+        from scripts import sync_plugin
+
+        self.assertNotIn(
+            "ai_workflow_evidence_chain.py",
+            sync_plugin.RUNTIME_FILES,
+        )
+        self.assertFalse(
+            (PLUGIN / "runtime" / "ai_workflow_evidence_chain.py").exists()
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
