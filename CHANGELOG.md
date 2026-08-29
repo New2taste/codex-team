@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased — 2026-08-29
+
+本轮更新补强了 Sol medium 集中终验与返工链路的所有权控制面，并保持 Terra xhigh 常驻施工、Luna max 廉价工具进程的既定分工。
+
+### Changed
+
+- FrozenPlan 冻结时自动物化 task-hash-bound ownership registry，缺失或身份漂移时 fail closed；
+- 唯一 final-acceptance child 在创建时即生成独立、不可变的所有权登记，明确 Sol medium 返工路径，避免返工启动后才发现登记缺失并留下孤儿 attempt；
+- ownership registry 的写入和读取均重新绑定已存储 task 信封哈希，防止调用方伪造任务身份；
+- root runtime、Plugin 镜像、配置清单和导入图登记保持同步。
+
+### Verification snapshot
+
+- `sh scripts/verify_all.sh`：1221 tests passed，8 个既有 repair-ledger-v1 intentional skips；
+- root/Plugin parity、Plugin verifier、compileall、shell syntax、导入图和 `git diff --check` 均通过。
+
 ## 0.4.0 — 2026-08-26
 
 运行时与常驻路由研究升级，公开项目名称继续统一为 **Codex Team**。
