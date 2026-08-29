@@ -664,29 +664,7 @@ def compute_arm_cost_minor(
         return int(minor)
 
 
-def _arm_without_amounts(
-    arm_id: str, arm_usage: Mapping[str, object]
-) -> dict[str, object]:
-    evidence_ids = _billing_evidence_ids(arm_usage)
-    if evidence_ids is not None:
-        usage = _wire_tokens(arm_usage.get("usage"), label="usage")
-        _check_input_identity(arm_usage, usage)
-        return {
-            "type": "COST_ESTIMATE_UNDER_SNAPSHOT",
-            "arm_id": arm_id,
-            "usage": usage,
-            "usage_source": "BILLING_USAGE",
-            "usage_evidence_ids": list(evidence_ids),
-            "quality": _quality(arm_usage),
-        }
-    if arm_usage.get("usage_source") == "TEXT_TOKEN_ESTIMATE":
-        tokens = _wire_tokens(arm_usage.get("tokens"), label="tokens")
-        return {
-            "type": "TEXT_TOKEN_ESTIMATE",
-            "arm_id": arm_id,
-            "tokens": tokens,
-            "usage_source": "TEXT_TOKEN_ESTIMATE",
-        }
+def _unavailable_arm(arm_id: str, arm_usage: Mapping[str, object]) -> dict[str, object]:
     reason = arm_usage.get("reason")
     if not isinstance(reason, str) or not reason.strip():
         reason = "usage authority unavailable"
@@ -697,21 +675,54 @@ def _arm_without_amounts(
     }
 
 
+def _billing_identity(
+    arm_id: str, arm_usage: Mapping[str, object]
+) -> dict[str, object] | None:
+    evidence_ids = _billing_evidence_ids(arm_usage)
+    if evidence_ids is None:
+        return None
+    usage = _wire_tokens(arm_usage.get("usage"), label="usage")
+    _check_input_identity(arm_usage, usage)
+    return {
+        "arm_id": arm_id,
+        "usage": usage,
+        "usage_source": "BILLING_USAGE",
+        "usage_evidence_ids": list(evidence_ids),
+        "quality": _quality(arm_usage),
+    }
+
+
+def _arm_without_amounts(
+    arm_id: str, arm_usage: Mapping[str, object]
+) -> dict[str, object]:
+    if _billing_identity(arm_id, arm_usage) is not None:
+        return _unavailable_arm(arm_id, arm_usage)
+    if arm_usage.get("usage_source") == "TEXT_TOKEN_ESTIMATE":
+        tokens = _wire_tokens(arm_usage.get("tokens"), label="tokens")
+        return {
+            "type": "TEXT_TOKEN_ESTIMATE",
+            "arm_id": arm_id,
+            "tokens": tokens,
+            "usage_source": "TEXT_TOKEN_ESTIMATE",
+        }
+    return _unavailable_arm(arm_id, arm_usage)
+
+
 def build_arm_cost_result(
     arm_id: str,
     arm_usage: Mapping[str, object],
     *,
     snapshot: Mapping[str, object],
 ) -> Mapping[str, object]:
-    classified = _arm_without_amounts(arm_id, arm_usage)
-    if classified["type"] != "COST_ESTIMATE_UNDER_SNAPSHOT":
-        return classified
+    identity = _billing_identity(arm_id, arm_usage)
+    if identity is None:
+        return _arm_without_amounts(arm_id, arm_usage)
     sku = _sku_record(snapshot, arm_usage.get("sku"))
     unit = sku.get("unit")
     currency = sku.get("currency")
     if not isinstance(unit, str) or not isinstance(currency, str):
         _cost_input_invalid("sku unit and currency must be strings")
-    usage = classified["usage"]
+    usage = identity["usage"]
     estimated = 0
     for field, price_field in _SKU_PRICE_FIELDS.items():
         estimated += compute_arm_cost_minor(
@@ -721,7 +732,8 @@ def build_arm_cost_result(
             currency=currency,
         )
     return {
-        **classified,
+        "type": "COST_ESTIMATE_UNDER_SNAPSHOT",
+        **identity,
         "sku": sku["sku"],
         "currency": currency,
         "unit": unit,
@@ -1092,12 +1104,11 @@ def aggregate_probe_results(
     strata_complete = all(count >= 8 for count in strata_counts.values())
     if snapshot is not None and now_utc is None:
         _fail("now_utc is required with a rate snapshot")
-    resolved_usage = arm_usage
-    if resolved_usage is None:
-        resolved_usage = {
-            arm_id: {"reason": "usage authority unavailable"}
-            for arm_id in ARM_CONTRACTS
-        }
+    resolved_usage = dict(arm_usage) if arm_usage is not None else {}
+    for arm_id in ARM_CONTRACTS:
+        resolved_usage.setdefault(
+            arm_id, {"reason": "usage authority unavailable"}
+        )
     cost_estimate = build_cost_estimate(
         resolved_usage,
         snapshot=snapshot,

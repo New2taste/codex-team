@@ -1615,6 +1615,109 @@ class RouterProbeCostLayersTest(unittest.TestCase):
             synthetic["cost_estimate"]["arms"][0]["usage_evidence_ids"],
         )
 
+    def test_aggregate_pads_missing_matrix_arms_so_subset_is_partial(self):
+        rows, cost_rows, source = RouterProbeAnalysisTest.measured_matrix()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            digest = self._write_archive(root)
+            summary = probe.aggregate_probe_results(
+                rows,
+                cost_rows,
+                source_manifest=source,
+                snapshot=self._valid_snapshot(digest),
+                now_utc=self.NOW_UTC,
+                root=root,
+                arm_usage={
+                    "luna_resident": self._billing_usage(
+                        uncached_input=20,
+                        cached_input=80,
+                        output=10,
+                        sku="gpt-5.6-luna",
+                    )
+                },
+            )
+        estimate = summary["cost_estimate"]
+        arm_ids = [arm["arm_id"] for arm in estimate["arms"]]
+        self.assertEqual(list(probe.ARM_CONTRACTS), arm_ids)
+        luna = self._arm_by_id(estimate, "luna_resident")
+        self.assertEqual("COST_ESTIMATE_UNDER_SNAPSHOT", luna["type"])
+        for field in ("sku", "currency", "unit", "estimated_cost_minor"):
+            self.assertIn(field, luna)
+        for arm in estimate["arms"]:
+            if arm["arm_id"] == "luna_resident":
+                continue
+            self.assertEqual("USAGE_AUTHORITY_UNAVAILABLE", arm["type"])
+        total = estimate["total"]
+        self.assertEqual("COST_TOTAL_UNAVAILABLE", total["type"])
+        self.assertEqual("PARTIAL_AUTHORITY", total["reason"])
+        for field in self.AMOUNT_FIELDS:
+            self.assertNotIn(field, total)
+        report = probe.render_probe_report(summary)
+        self.assertIn("PARTIAL_AUTHORITY", report)
+        self.assertNotRegex(report, r"cost_estimate=\S+ snapshot=\S+ total=\d+")
+
+    def test_degraded_pricing_does_not_emit_amountless_cost_estimate_type(self):
+        billing = {
+            "luna_resident": self._billing_usage(
+                uncached_input=20,
+                cached_input=80,
+                output=10,
+                sku="gpt-5.6-luna",
+            )
+        }
+        amount_fields = ("sku", "currency", "unit", "estimated_cost_minor")
+
+        def assert_no_amountless_estimate(result):
+            for arm in result["arms"]:
+                if arm["type"] == "COST_ESTIMATE_UNDER_SNAPSHOT":
+                    for field in amount_fields:
+                        self.assertIn(field, arm)
+                        self.assertIsNotNone(arm[field])
+                else:
+                    self.assertNotEqual(
+                        "COST_ESTIMATE_UNDER_SNAPSHOT", arm["type"]
+                    )
+
+        omitted = probe.build_cost_estimate(
+            billing, snapshot=None, now_utc=self.NOW_UTC
+        )
+        self.assertEqual("UNAVAILABLE_WITHOUT_RATE_SNAPSHOT", omitted["type"])
+        self.assertNotEqual(
+            "COST_ESTIMATE_UNDER_SNAPSHOT",
+            self._arm_by_id(omitted, "luna_resident")["type"],
+        )
+        assert_no_amountless_estimate(omitted)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            digest = self._write_archive(root)
+            stale = probe.build_cost_estimate(
+                billing,
+                snapshot=self._valid_snapshot(digest),
+                now_utc="2026-08-29T00:00:01Z",
+                root=root,
+            )
+            unknown = self._valid_snapshot(digest)
+            del unknown["skus"][0]["price_output"]
+            unknown_result = probe.build_cost_estimate(
+                billing,
+                snapshot=unknown,
+                now_utc=self.NOW_UTC,
+                root=root,
+            )
+        self.assertEqual("PRICE_STALE", stale["type"])
+        self.assertEqual("PRICE_UNKNOWN", unknown_result["type"])
+        self.assertNotEqual(
+            "COST_ESTIMATE_UNDER_SNAPSHOT",
+            self._arm_by_id(stale, "luna_resident")["type"],
+        )
+        self.assertNotEqual(
+            "COST_ESTIMATE_UNDER_SNAPSHOT",
+            self._arm_by_id(unknown_result, "luna_resident")["type"],
+        )
+        assert_no_amountless_estimate(stale)
+        assert_no_amountless_estimate(unknown_result)
+
 
 if __name__ == "__main__":
     unittest.main()
