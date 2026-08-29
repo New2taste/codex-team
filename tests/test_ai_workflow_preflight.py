@@ -21,7 +21,11 @@ from scripts import ai_workflow_dispatch_policy as policy
 from scripts import ai_workflow_preflight as preflight
 from scripts import sync_plugin
 from scripts.ai_workflow_routing import RuntimeRouteDecision
-from tests.test_ai_workflow import ScriptedRunner, _compat_popen
+from tests.test_ai_workflow import (
+    ScriptedRunner,
+    _compat_popen,
+    spy_orchestration_call_order,
+)
 from tests.test_ai_workflow_runtime import THREAD_ID, blocked_luna_result
 
 
@@ -760,7 +764,8 @@ class PreflightProductionWiringTest(unittest.TestCase):
         self.assertNotIn("run_role_preflight_locked", source)
 
     def test_until_gate_preflights_active_roles_before_first_reserved(self) -> None:
-        state = self._run_until_gate(workflow.FakeRunner())
+        with spy_orchestration_call_order() as order:
+            state = self._run_until_gate(workflow.FakeRunner())
         self.assertEqual("AWAITING_OWNER_DECISION", state)
         declaration = declarations.load_route_declaration(self.store, TASK_ID)
         self.assertIsNotNone(declaration)
@@ -780,9 +785,12 @@ class PreflightProductionWiringTest(unittest.TestCase):
         for role in declaration.active_roles:
             self.assertIn(role, first_by_role)
             self.assertEqual("RESERVED", first_by_role[role]["state"])
+            names = [name for name, called_role in order if called_role == role]
+            self.assertIn("run_role_preflight", names)
+            self.assertIn("require_dispatch_permit_locked", names)
             self.assertLess(
-                preflighted.index(role),
-                len(preflighted),
+                names.index("run_role_preflight"),
+                names.index("require_dispatch_permit_locked"),
             )
 
     def test_until_gate_deleted_preflight_rejects_without_permit_growth(self) -> None:

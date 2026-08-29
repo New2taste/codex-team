@@ -1173,6 +1173,51 @@ class ScriptedRunner:
         return result
 
 
+def _orchestration_role(name: str, args, kwargs) -> str:
+    if name == "activate_role":
+        return str(kwargs["to_role"])
+    return str(kwargs["role"] if "role" in kwargs else args[2])
+
+
+@contextmanager
+def spy_orchestration_call_order():
+    """Record (name, role) for activate / preflight / permit lookups on the host."""
+
+    order: list[tuple[str, str]] = []
+
+    def wrap(name, original):
+        def wrapper(*args, **kwargs):
+            order.append((name, _orchestration_role(name, args, kwargs)))
+            return original(*args, **kwargs)
+
+        return wrapper
+
+    with (
+        mock.patch.object(
+            workflow, "activate_role", wrap("activate_role", workflow.activate_role)
+        ),
+        mock.patch.object(
+            workflow,
+            "run_role_preflight",
+            wrap("run_role_preflight", workflow.run_role_preflight),
+        ),
+        mock.patch.object(
+            policy,
+            "run_role_preflight",
+            wrap("run_role_preflight", policy.run_role_preflight),
+        ),
+        mock.patch.object(
+            workflow,
+            "require_dispatch_permit_locked",
+            wrap(
+                "require_dispatch_permit_locked",
+                workflow.require_dispatch_permit_locked,
+            ),
+        ),
+    ):
+        yield order
+
+
 class GatedPipelineTest(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
@@ -1326,41 +1371,49 @@ class GatedPipelineTest(unittest.TestCase):
         escalation_runner = ScriptedRunner(
             [self._result("sol_xhigh", "OPTION_A", "ESCALATION_PROPOSED")]
         )
-        with mock.patch.object(workflow, "WORKFLOW_STATE_ROOT", self.state_root):
-            self.assertEqual(
-                workflow.run_until_gate(task_id, runner=first_runner, allow_live_model=False),
-                "AWAITING_OWNER_DECISION",
-            )
-            self.assertEqual(
-                workflow.apply_owner_decision(task_id, "authorize_escalation", "owner"),
-                "ESCALATION_AUTHORIZED",
-            )
-            self.assertEqual(
-                workflow.run_until_gate(task_id, runner=escalation_runner, allow_live_model=False),
-                "AWAITING_OWNER_DECISION",
-            )
+        with spy_orchestration_call_order() as order:
+            with mock.patch.object(workflow, "WORKFLOW_STATE_ROOT", self.state_root):
+                self.assertEqual(
+                    workflow.run_until_gate(task_id, runner=first_runner, allow_live_model=False),
+                    "AWAITING_OWNER_DECISION",
+                )
+                self.assertEqual(
+                    workflow.apply_owner_decision(task_id, "authorize_escalation", "owner"),
+                    "ESCALATION_AUTHORIZED",
+                )
+                self.assertEqual(
+                    workflow.run_until_gate(task_id, runner=escalation_runner, allow_live_model=False),
+                    "AWAITING_OWNER_DECISION",
+                )
         self.assertEqual(escalation_runner.calls, ["sol_xhigh"])
+        xhigh = [name for name, role in order if role == "sol_xhigh"]
+        self.assertGreaterEqual(len(xhigh), 3)
+        self.assertEqual(
+            (
+                "activate_role",
+                "run_role_preflight",
+                "require_dispatch_permit_locked",
+            ),
+            tuple(xhigh[:3]),
+        )
         events = self._task_jsonl(task_id, "events.jsonl")
-        activated_at = next(
-            index
-            for index, event in enumerate(events)
-            if event.get("event_type") == "ROLE_ACTIVATED"
-            and event.get("to_role") == "sol_xhigh"
+        self.assertTrue(
+            any(
+                event.get("event_type") == "ROLE_ACTIVATED"
+                and event.get("to_role") == "sol_xhigh"
+                for event in events
+            )
         )
-        preflight_roles = [
-            row["role"]
-            for row in self._task_jsonl(task_id, preflight.PREFLIGHT_LEDGER)
-        ]
-        self.assertIn("sol_xhigh", preflight_roles)
-        xhigh_preflight_index = preflight_roles.index("sol_xhigh")
-        permits = self._task_jsonl(task_id, policy.DISPATCH_PERMIT_LEDGER)
-        xhigh_reserved = next(
-            row for row in permits if row.get("role") == "sol_xhigh" and row.get("state") == "RESERVED"
+        self.assertIn(
+            "sol_xhigh",
+            [row["role"] for row in self._task_jsonl(task_id, preflight.PREFLIGHT_LEDGER)],
         )
-        self.assertEqual("RESERVED", xhigh_reserved["state"])
-        self.assertGreaterEqual(xhigh_preflight_index, 0)
-        self.assertIn("ROLE_ACTIVATED", [event.get("event_type") for event in events])
-        self.assertLess(activated_at, len(events))
+        self.assertTrue(
+            any(
+                row.get("role") == "sol_xhigh" and row.get("state") == "RESERVED"
+                for row in self._task_jsonl(task_id, policy.DISPATCH_PERMIT_LEDGER)
+            )
+        )
 
     def test_skip_upgrade_preflight_rejects_without_new_role_permit(self):
         task_id = self._create_task(self._task("ACCEPTANCE"))
