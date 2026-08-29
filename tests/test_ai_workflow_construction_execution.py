@@ -9,7 +9,9 @@ from unittest import mock
 
 from scripts import ai_workflow as workflow
 from scripts import ai_workflow_artifacts as artifacts
+from scripts import ai_workflow_declarations as declarations
 from scripts import ai_workflow_ownership as ownership
+from scripts import ai_workflow_preflight as preflight
 from tests.test_ai_workflow import _install_declaration
 
 
@@ -927,6 +929,152 @@ class ConstructionDispatchGateTest(unittest.TestCase):
                 "TASK_VALIDATED",
                 "APPROVED_FOR_EXECUTION",
             },
+        )
+
+    def _install_construction_declaration(
+        self,
+        *,
+        allowed_roles: tuple[str, ...] = ("luna_construction", "luna"),
+        active_roles: tuple[str, ...] | None = None,
+        max_dispatches: int = 8,
+        run_preflight: bool = True,
+    ) -> declarations.RouteDeclaration:
+        decision = workflow.decide_route(
+            self.task,
+            self.request,
+            "enforced",
+            construction_plan=self.plan,
+            construction_step_id="construction-601",
+        )
+        workflow.record_route_decision(self.store, self.task["task_id"], decision)
+        declaration = declarations.build_route_declaration(
+            decision=decision,
+            route_config_hash=declarations.compute_route_config_hash(
+                workflow._load_workflow_config()
+            ),
+            allowed_roles=allowed_roles,
+            active_roles=active_roles if active_roles is not None else allowed_roles,
+            rule_ids=(decision.rule_id,),
+            reason_codes=("PLAN_IS_DELIVERABLE",),
+            max_dispatches=max_dispatches,
+            allowed_transitions=(),
+        )
+        with self.store.lock(self.task["task_id"]):
+            recorded = declarations.ensure_route_declaration(
+                self.store, self.task["task_id"], declaration
+            )
+            if run_preflight:
+                for role in recorded.active_roles:
+                    preflight.run_role_preflight_locked(
+                        self.store, self.task["task_id"], role
+                    )
+        return recorded
+
+    def _construction_kwargs(self, runner: BoundConstructionRunner) -> dict[str, object]:
+        return {
+            "task_id": self.task["task_id"],
+            "construction_plan": self.plan,
+            "request": self.request,
+            "step_id": "construction-601",
+            "attempt": 1,
+            "runner": runner,
+            "allow_live_model": False,
+            "state_root": self.root,
+        }
+
+    def _assert_construction_rejects_before_runner(
+        self,
+        code: str,
+        *,
+        allowed_roles: tuple[str, ...],
+        active_roles: tuple[str, ...],
+        max_dispatches: int = 8,
+        run_preflight: bool = True,
+        resume: bool = False,
+    ) -> None:
+        self._install_construction_declaration(
+            allowed_roles=allowed_roles,
+            active_roles=active_roles,
+            max_dispatches=max_dispatches,
+            run_preflight=run_preflight,
+        )
+        runner = BoundConstructionRunner()
+        kwargs = self._construction_kwargs(runner)
+        waiting = workflow.run_enforced_construction(**kwargs)
+        self.assertEqual("AWAITING_OWNER_DECISION", waiting)
+        self.assertEqual([], runner.calls)
+        workflow._apply_owner_decision(
+            self.store, self.task["task_id"], "approve_execution", "owner"
+        )
+        if resume:
+            state = workflow._resume_stored_task(
+                self.store,
+                self.task["task_id"],
+                runner,
+                (self.plan, self.request, "construction-601", 1),
+            )
+        else:
+            state = workflow.run_enforced_construction(**kwargs)
+        self.assertEqual([], runner.calls)
+        self.assertEqual("BLOCKED", state)
+        events = [
+            json.loads(line)
+            for line in (
+                self.root / self.task["task_id"] / "events.jsonl"
+            ).read_text(encoding="utf-8").splitlines()
+            if line
+        ]
+        failures = [event for event in events if event.get("event_type") == "ROLE_FAILURE"]
+        self.assertTrue(failures)
+        self.assertEqual(code, failures[0]["error_code"])
+
+    def test_enforced_construction_role_not_allowed_does_not_run(self) -> None:
+        self._assert_construction_rejects_before_runner(
+            "ROLE_NOT_ALLOWED",
+            allowed_roles=("luna",),
+            active_roles=("luna",),
+        )
+
+    def test_enforced_construction_role_not_preflighted_does_not_run(self) -> None:
+        self._assert_construction_rejects_before_runner(
+            "ROLE_NOT_PREFLIGHTED",
+            allowed_roles=("luna_construction", "luna"),
+            active_roles=("luna_construction", "luna"),
+            run_preflight=False,
+        )
+
+    def test_enforced_construction_budget_exceeded_does_not_run(self) -> None:
+        self._assert_construction_rejects_before_runner(
+            "ROUTE_BUDGET_EXCEEDED",
+            allowed_roles=("luna_construction", "luna"),
+            active_roles=("luna_construction", "luna"),
+            max_dispatches=0,
+        )
+
+    def test_resume_construction_role_not_allowed_does_not_run(self) -> None:
+        self._assert_construction_rejects_before_runner(
+            "ROLE_NOT_ALLOWED",
+            allowed_roles=("luna",),
+            active_roles=("luna",),
+            resume=True,
+        )
+
+    def test_resume_construction_role_not_preflighted_does_not_run(self) -> None:
+        self._assert_construction_rejects_before_runner(
+            "ROLE_NOT_PREFLIGHTED",
+            allowed_roles=("luna_construction", "luna"),
+            active_roles=("luna_construction", "luna"),
+            run_preflight=False,
+            resume=True,
+        )
+
+    def test_resume_construction_budget_exceeded_does_not_run(self) -> None:
+        self._assert_construction_rejects_before_runner(
+            "ROUTE_BUDGET_EXCEEDED",
+            allowed_roles=("luna_construction", "luna"),
+            active_roles=("luna_construction", "luna"),
+            max_dispatches=0,
+            resume=True,
         )
 
 

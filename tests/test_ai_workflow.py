@@ -4460,6 +4460,94 @@ class DispatchGateHubTest(unittest.TestCase):
                 workflow._resume_stored_task(self.store, self.task_id, runner, None)
         self.assertEqual([], runner.calls)
 
+    def _assert_until_gate_rejects_before_runner(
+        self,
+        code: str,
+        *,
+        allowed_roles: tuple[str, ...],
+        active_roles: tuple[str, ...],
+        max_dispatches: int = 8,
+        run_preflight: bool = True,
+        resume: bool = False,
+    ) -> None:
+        _install_declaration(
+            self.store,
+            self.task,
+            allowed_roles=allowed_roles,
+            active_roles=active_roles,
+            max_dispatches=max_dispatches,
+            run_preflight=run_preflight,
+        )
+        runner = ScriptedRunner([CodexRunnerTest().valid_result()])
+        with mock.patch.object(workflow, "WORKFLOW_STATE_ROOT", self.state_root):
+            if resume:
+                state = workflow._resume_stored_task(self.store, self.task_id, runner, None)
+            else:
+                state = workflow.run_until_gate(
+                    self.task_id,
+                    runner=runner,
+                    allow_live_model=False,
+                    state_root=self.state_root,
+                )
+        self.assertEqual([], runner.calls)
+        self.assertEqual("BLOCKED", state)
+        failures = [
+            event
+            for event in self._events()
+            if event.get("event_type") == "ROLE_FAILURE"
+        ]
+        self.assertTrue(failures)
+        self.assertEqual(code, failures[0]["error_code"])
+
+    def test_until_gate_role_not_allowed_does_not_run(self) -> None:
+        self._assert_until_gate_rejects_before_runner(
+            "ROLE_NOT_ALLOWED",
+            allowed_roles=("sol_planner",),
+            active_roles=("sol_planner",),
+        )
+
+    def test_until_gate_role_not_preflighted_does_not_run(self) -> None:
+        self._assert_until_gate_rejects_before_runner(
+            "ROLE_NOT_PREFLIGHTED",
+            allowed_roles=("luna", "sol_planner"),
+            active_roles=("luna", "sol_planner"),
+            run_preflight=False,
+        )
+
+    def test_until_gate_budget_exceeded_does_not_run(self) -> None:
+        self._assert_until_gate_rejects_before_runner(
+            "ROUTE_BUDGET_EXCEEDED",
+            allowed_roles=("luna", "sol_planner"),
+            active_roles=("luna", "sol_planner"),
+            max_dispatches=0,
+        )
+
+    def test_resume_until_gate_role_not_allowed_does_not_run(self) -> None:
+        self._assert_until_gate_rejects_before_runner(
+            "ROLE_NOT_ALLOWED",
+            allowed_roles=("sol_planner",),
+            active_roles=("sol_planner",),
+            resume=True,
+        )
+
+    def test_resume_until_gate_role_not_preflighted_does_not_run(self) -> None:
+        self._assert_until_gate_rejects_before_runner(
+            "ROLE_NOT_PREFLIGHTED",
+            allowed_roles=("luna", "sol_planner"),
+            active_roles=("luna", "sol_planner"),
+            run_preflight=False,
+            resume=True,
+        )
+
+    def test_resume_until_gate_budget_exceeded_does_not_run(self) -> None:
+        self._assert_until_gate_rejects_before_runner(
+            "ROUTE_BUDGET_EXCEEDED",
+            allowed_roles=("luna", "sol_planner"),
+            active_roles=("luna", "sol_planner"),
+            max_dispatches=0,
+            resume=True,
+        )
+
     def test_resume_until_gate_crash_window_recovers_declared_then_continues(self) -> None:
         declaration = _install_declaration(
             self.store, self.task, allowed_roles=("luna", "sol_planner"), active_roles=("luna", "sol_planner")
@@ -4560,6 +4648,112 @@ class DispatchGateHubTest(unittest.TestCase):
             with self.assertRaisesRegex(workflow.WorkflowError, "ROUTE_DECLARATION_MISSING"):
                 workflow._run_live_luna(self.task, args)
         run_codex.assert_not_called()
+
+    def _live_luna_args(self) -> argparse.Namespace:
+        return argparse.Namespace(
+            allow_live_model=True,
+            role="luna",
+            root=self.state_root,
+            runtime_sessions_dir=self.repo / ".codex" / "sessions",
+        )
+
+    def _assert_live_luna_rejects_before_popen(
+        self,
+        code: str,
+        *,
+        allowed_roles: tuple[str, ...],
+        active_roles: tuple[str, ...],
+        max_dispatches: int = 8,
+        run_preflight: bool = True,
+    ) -> None:
+        _install_declaration(
+            self.store,
+            self.task,
+            allowed_roles=allowed_roles,
+            active_roles=active_roles,
+            max_dispatches=max_dispatches,
+            run_preflight=run_preflight,
+        )
+        popen = self._popen(CodexRunnerTest().valid_result())
+        with (
+            mock.patch.object(workflow, "capture_repo", return_value=workflow.RepoSnapshot("h" * 40, ())),
+            mock.patch.object(workflow, "working_tree_paths", return_value=set()),
+            mock.patch.object(workflow.subprocess, "Popen", popen),
+        ):
+            with self.assertRaisesRegex(workflow.WorkflowError, code):
+                workflow._run_live_luna(self.task, self._live_luna_args())
+        self.assertEqual([], popen.calls)
+
+    def test_live_luna_role_not_allowed_does_not_spawn(self) -> None:
+        self._assert_live_luna_rejects_before_popen(
+            "ROLE_NOT_ALLOWED",
+            allowed_roles=("sol_planner",),
+            active_roles=("sol_planner",),
+        )
+
+    def test_live_luna_role_not_preflighted_does_not_spawn(self) -> None:
+        self._assert_live_luna_rejects_before_popen(
+            "ROLE_NOT_PREFLIGHTED",
+            allowed_roles=("luna", "sol_planner"),
+            active_roles=("luna", "sol_planner"),
+            run_preflight=False,
+        )
+
+    def test_live_luna_budget_exceeded_does_not_spawn(self) -> None:
+        self._assert_live_luna_rejects_before_popen(
+            "ROUTE_BUDGET_EXCEEDED",
+            allowed_roles=("luna", "sol_planner"),
+            active_roles=("luna", "sol_planner"),
+            max_dispatches=0,
+        )
+
+    def test_live_write_role_forwards_authorization_id_and_records_lease(self) -> None:
+        self._prepare_terra_task()
+        _install_declaration(self.store, self.task, allowed_roles=("terra",), active_roles=("terra",))
+        self._record_registry({"src": "luna"})
+        self._record_owner_evidence()
+        issued = self._issue_transfer()
+        popen = self._popen(self._terra_result())
+        captured: dict[str, object] = {}
+
+        class LiveForwardingRunner:
+            is_live_model = True
+
+            def run(self, role, task, *, authorization_id=None, attempt_context=None):
+                captured["authorization_id"] = authorization_id
+                kwargs: dict[str, object] = {}
+                if attempt_context is not None:
+                    kwargs["attempt_context"] = attempt_context
+                return workflow.run_codex(
+                    role,
+                    task,
+                    "task contract",
+                    self_paths,
+                    authorization_id=authorization_id,
+                    **kwargs,
+                )
+
+        self_paths = self._paths()
+        runner = LiveForwardingRunner()
+        with self._terra_run_patches(popen):
+            workflow._run_role_with_technical_retry(
+                self.store,
+                self.task_id,
+                self.task,
+                "IMPLEMENTATION_RUNNING",
+                "terra",
+                runner,
+                workflow.RetryBudget(),
+                state_root=self.state_root,
+                authorization_id=issued.authorization_id,
+            )
+        self.assertEqual(issued.authorization_id, captured.get("authorization_id"))
+        self.assertEqual(1, len(popen.calls))
+        permit_id = self._permit_records()[0]["permit_id"]
+        leases = authorizations.leases_for_permit(self.store, self.task_id, permit_id)
+        self.assertEqual(1, len(leases))
+        self.assertEqual(permit_id, leases[0]["permit_id"])
+        self.assertEqual(["src"], leases[0]["allowed_paths"])
 
 
 if __name__ == "__main__":

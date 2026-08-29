@@ -4653,6 +4653,7 @@ class CodexConstructionRunner:
         context: ConstructionExecutionContext,
         *,
         attempt_context: AttemptAccountingContext | None = None,
+        authorization_id: str | None = None,
     ) -> Mapping[str, object]:
         if not isinstance(context, ConstructionExecutionContext) or context.role != role:
             _fail("CONSTRUCTION_CONTEXT_INVALID", "live construction context does not match role")
@@ -4682,6 +4683,7 @@ class CodexConstructionRunner:
             construction_step_id=context.step.id,
             construction_context=context,
             prompt_result=prompt_result,
+            authorization_id=authorization_id,
         )
 
 
@@ -5146,6 +5148,11 @@ def _run_role_with_technical_retry(
                                 reason="fake-runner-before-start",
                             )
                         raise
+                extra: dict[str, object] = {}
+                if attempt_context is not None:
+                    extra["attempt_context"] = attempt_context
+                if getattr(runner, "is_live_model", False) and authorization_id is not None:
+                    extra["authorization_id"] = authorization_id
                 if construction_context is not None:
                     run_construction = getattr(runner, "run_construction", None)
                     if not callable(run_construction):
@@ -5153,19 +5160,11 @@ def _run_role_with_technical_retry(
                             "CONSTRUCTION_CONTEXT_INVALID",
                             "construction runner must accept the frozen contract",
                         )
-                    if attempt_context is None:
-                        result = run_construction(role, task, construction_context)
-                    else:
-                        result = run_construction(
-                            role,
-                            task,
-                            construction_context,
-                            attempt_context=attempt_context,
-                        )
-                elif attempt_context is None:
-                    result = runner.run(role, task)
+                    result = run_construction(role, task, construction_context, **extra)
+                elif extra:
+                    result = runner.run(role, task, **extra)
                 else:
-                    result = runner.run(role, task, attempt_context=attempt_context)
+                    result = runner.run(role, task)
                 if construction_context is not None:
                     result = _bind_controller_construction_evidence(
                         result, task, construction_context
@@ -5406,6 +5405,7 @@ def _run_pipeline_role(
     budget: RetryBudget,
     *,
     state_root: Path | None = None,
+    authorization_id: str | None = None,
 ) -> str:
     result, state_after_retry = _run_role_with_technical_retry(
         store,
@@ -5416,6 +5416,7 @@ def _run_pipeline_role(
         runner,
         budget,
         state_root=state_root,
+        authorization_id=authorization_id,
     )
     if result is None:
         return state_after_retry
@@ -5818,6 +5819,7 @@ def run_enforced_construction(
     runner: Runner,
     allow_live_model: bool,
     state_root: Path | None = None,
+    authorization_id: str | None = None,
 ) -> str:
     """Run exactly one approved construction step; never infer it from route wire data."""
 
@@ -5966,6 +5968,7 @@ def run_enforced_construction(
         budget,
         construction_context=context,
         state_root=store.root,
+        authorization_id=authorization_id,
     )
     with store.lock(task_id):
         if result is None:
@@ -5985,6 +5988,7 @@ def run_until_gate(
     construction_step_id: object = None,
     construction_attempt: int | None = None,
     state_root: Path | None = None,
+    authorization_id: str | None = None,
 ) -> str:
     """Advance one bounded pipeline only until its next owner-controlled gate."""
 
@@ -6015,6 +6019,7 @@ def run_until_gate(
             runner=runner,
             allow_live_model=allow_live_model,
             state_root=state_root,
+            authorization_id=authorization_id,
         )
     if not isinstance(allow_live_model, bool):
         _fail("INVALID_LIVE_MODEL_FLAG", "allow_live_model must be a boolean")
@@ -6182,6 +6187,7 @@ def run_until_gate(
                 runner,
                 budget,
                 state_root=store.root,
+                authorization_id=authorization_id,
             )
 
 
@@ -6393,6 +6399,8 @@ def _resume_stored_task(
     task_id: str,
     runner: Runner,
     context: tuple[object, Mapping[str, object], str, int] | None,
+    *,
+    authorization_id: str | None = None,
 ) -> str:
     if context is not None:
         plan, request, step_id, attempt = context
@@ -6405,12 +6413,14 @@ def _resume_stored_task(
             runner=runner,
             allow_live_model=getattr(runner, "is_live_model", False),
             state_root=store.root,
+            authorization_id=authorization_id,
         )
     return run_until_gate(
         task_id,
         runner=runner,
         allow_live_model=False,
         state_root=store.root,
+        authorization_id=authorization_id,
     )
 
 
