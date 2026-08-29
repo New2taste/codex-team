@@ -639,6 +639,24 @@ class RateSnapshotTest(unittest.TestCase):
         with self.assertRaisesRegex(workflow.WorkflowError, "INVALID_TYPE"):
             costs.validate_rate_snapshot(snapshot)
 
+    def test_calendar_invalid_utc_timestamps_fail_closed(self):
+        for field, value in (
+            ("effective_at", "2026-02-31T00:00:00Z"),
+            ("retrieved_at", "2026-13-01T00:00:00Z"),
+            ("effective_at", "2026-08-28T24:00:00Z"),
+        ):
+            snapshot = self._valid_snapshot()
+            snapshot[field] = value
+            with self.subTest(field=field, value=value):
+                try:
+                    costs.validate_rate_snapshot(snapshot)
+                except workflow.WorkflowError as exc:
+                    self.assertIn("INVALID_TYPE", str(exc))
+                except ValueError:
+                    self.fail("calendar-invalid timestamp leaked ValueError")
+                else:
+                    self.fail("expected WorkflowError for calendar-invalid timestamp")
+
     def test_missing_archive_or_approval_is_rejected(self):
         for field in ("archive", "approved_by", "approval_evidence_id"):
             snapshot = self._valid_snapshot()
@@ -721,6 +739,23 @@ class RateSnapshotTest(unittest.TestCase):
                 root=root,
             )
         self.assertEqual("PRICE_UNKNOWN", status)
+
+    def test_omitted_archive_root_is_price_unknown(self):
+        snapshot = self._valid_snapshot()
+        omitted = costs.snapshot_pricing_status(
+            snapshot,
+            now_utc=self.NOW_UTC,
+            max_age_seconds=86400,
+        )
+        explicit_none = costs.snapshot_pricing_status(
+            snapshot,
+            now_utc=self.NOW_UTC,
+            max_age_seconds=86400,
+            root=None,
+        )
+        self.assertEqual("PRICE_UNKNOWN", omitted)
+        self.assertEqual("PRICE_UNKNOWN", explicit_none)
+        self.assertNotEqual("CURRENT", omitted)
 
     def test_second_write_of_same_snapshot_id_is_rejected(self):
         snapshot = self._valid_snapshot()

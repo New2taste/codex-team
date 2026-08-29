@@ -240,7 +240,10 @@ def _utc_timestamp(value: object, field: str) -> datetime:
     text = _snapshot_string(value, field)
     if _UTC_TIMESTAMP.fullmatch(text) is None:
         _fail("INVALID_TYPE", f"{field} must be a UTC timestamp")
-    parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        _fail("INVALID_TYPE", f"{field} must be a UTC timestamp")
     if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
         _fail("INVALID_TYPE", f"{field} must be a UTC timestamp")
     return parsed.astimezone(timezone.utc)
@@ -399,13 +402,14 @@ def snapshot_pricing_status(
     if not isinstance(snapshot, Mapping) or not _sku_prices_present(snapshot):
         return "PRICE_UNKNOWN"
     validate_rate_snapshot(snapshot)
-    if root is not None:
-        try:
-            resolve_snapshot_archive(snapshot, root=root)
-        except Exception as exc:
-            if _error_code(exc) == "RATE_ARCHIVE_UNRESOLVABLE":
-                return "PRICE_UNKNOWN"
-            raise
+    if root is None:
+        return "PRICE_UNKNOWN"
+    try:
+        resolve_snapshot_archive(snapshot, root=root)
+    except Exception as exc:
+        if _error_code(exc) == "RATE_ARCHIVE_UNRESOLVABLE":
+            return "PRICE_UNKNOWN"
+        raise
     retrieved = _utc_timestamp(snapshot["retrieved_at"], "retrieved_at")
     age = (now - retrieved).total_seconds()
     if age > max_age_seconds:
