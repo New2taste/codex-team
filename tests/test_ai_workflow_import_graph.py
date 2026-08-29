@@ -299,6 +299,16 @@ class ImportGraphTest(unittest.TestCase):
             IMPORT_GRAPH_ALLOWED["ai_workflow_repairs"],
         )
 
+    def test_preflight_module_exists_within_allowed_edges(self):
+        self.assertIn("ai_workflow_preflight", self.scanned)
+        self.assertEqual(
+            IMPORT_GRAPH_ALLOWED["ai_workflow_preflight"],
+            self.scanned["ai_workflow_preflight"]["edges"],
+        )
+        self.assertFalse(
+            self.scanned["ai_workflow_preflight"]["edges"] & FORBIDDEN_HOST_TARGETS
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

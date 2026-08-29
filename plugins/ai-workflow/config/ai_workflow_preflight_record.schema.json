@@ -1,0 +1,59 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "ai-preflight-record-1"
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "role": {
+      "type": "string",
+      "minLength": 1
+    },
+    "cache_key": {
+      "type": "string",
+      "minLength": 1
+    },
+    "status": {
+      "type": "string",
+      "enum": ["PASS", "FAIL"]
+    },
+    "route_config_hash": {
+      "type": "string",
+      "minLength": 1
+    },
+    "runtime_profile_hash": {
+      "type": "string"
+    },
+    "install_version": {
+      "type": "string"
+    },
+    "launcher_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "cwd": {
+      "type": "string",
+      "minLength": 1
+    },
+    "worktree_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "process_generation": {
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "required": [
+    "schema_version",
+    "task_id",
+    "role",
+    "cache_key",
+    "status"
+  ]
+}

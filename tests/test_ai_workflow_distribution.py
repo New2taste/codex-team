@@ -1032,6 +1032,20 @@ class LifecycleVerifierTest(unittest.TestCase):
             )
 
 
+class PreflightDistributionManifestTest(unittest.TestCase):
+    def test_sync_manifest_keeps_rate_snapshot_and_adds_preflight(self):
+        from scripts import sync_plugin
+
+        self.assertIn(
+            "ai_workflow_rate_snapshot.schema.json", sync_plugin.CONFIG_FILES
+        )
+        self.assertIn(
+            "ai_workflow_preflight_record.schema.json", sync_plugin.CONFIG_FILES
+        )
+        self.assertIn("ai_workflow_runtime_files.json", sync_plugin.CONFIG_FILES)
+        self.assertIn("ai_workflow_preflight.py", sync_plugin.RUNTIME_FILES)
+
+
 
 if __name__ == "__main__":
     unittest.main()
