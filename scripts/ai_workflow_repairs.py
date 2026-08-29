@@ -49,6 +49,7 @@ try:
         require_write_ownership_locked,
         verify_actual_write_paths,
     )
+    from .ai_workflow_evidence import append_runtime_evidence_v2, record_launch_intent
 except ImportError:  # direct script execution
     from ai_workflow_side_effects import (
         capture_fs_snapshot,
@@ -71,6 +72,7 @@ except ImportError:  # direct script execution
         require_write_ownership_locked,
         verify_actual_write_paths,
     )
+    from ai_workflow_evidence import append_runtime_evidence_v2, record_launch_intent
 
 
 _SHA_PATTERN = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
@@ -2775,6 +2777,15 @@ def _v2_controller_runtime_receipt(
             "runtime_evidence_sha256": evidence_sha256,
         },
     )
+    events_path = store._require_task(task_id) / "events.jsonl"
+    event_index = len(workflow.read_jsonl(events_path, code="EVENTS")) - 1
+    append_runtime_evidence_v2(
+        store,
+        task_id,
+        event_index=event_index,
+        observed=observed,
+        recorded_at_utc=str(evidence["observed_at_utc"]),
+    )
     return VerifiedActorReceipt(
         assignment_id=assignment.assignment_id,
         execution_surface=execution_surface,
@@ -3097,6 +3108,14 @@ def run_assignment(
                 receipt.runtime_instance_id,
                 "-",
             ]
+            record_launch_intent(
+                store,
+                task_id,
+                permit=permit,
+                role=assignment.expected_actor.role,
+                argv=tuple(command),
+                tool_mapping={},
+            )
             launched_ns = time.time_ns()
             proc = subprocess.Popen(
                 command,

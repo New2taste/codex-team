@@ -1035,6 +1035,14 @@ class AssignmentDispatchGateTest(unittest.TestCase):
             ):
                 repairs.run_assignment(self.fx.store, self.fx.TASK_ID, review, sessions)
         self.assertEqual([], _RecordingPopen.calls)
+        intents = [
+            json.loads(line)
+            for line in (
+                self.fx.store._require_task(self.fx.TASK_ID) / "events.jsonl"
+            ).read_text(encoding="utf-8").splitlines()
+            if line and json.loads(line).get("event_type") == "LAUNCH_INTENT_RECORDED"
+        ]
+        self.assertEqual([], intents)
 
     def test_role_not_allowed_rejects_assignment_before_spawn(self) -> None:
         self.fx._declaration_kwargs = {
@@ -1149,6 +1157,64 @@ class AssignmentDispatchGateTest(unittest.TestCase):
         assert registry is not None
         self.assertEqual("luna", registry.path_owners["src"])
         self.assertNotEqual("terra_xhigh_reviewer", registry.path_owners["src"])
+        sidecar = self.fx.store._require_task(self.fx.TASK_ID) / "runtime-evidence-v2.jsonl"
+        self.assertTrue(sidecar.is_file())
+
+    def test_legal_assignment_records_launch_intent_before_popen(self) -> None:
+        review, sessions, thread_id = self._issue_review()
+        order: list[str] = []
+        real_append = workflow.WorkflowStore.append_event
+        real_ledger = workflow.WorkflowStore.append_task_ledger
+
+        def tracking_append(store, task_id, event):
+            order.append(str(event.get("event_type")))
+            return real_append(store, task_id, event)
+
+        def tracking_ledger(store, task_id, name, record):
+            if name == "dispatch-permits.jsonl":
+                order.append(f"PERMIT:{record.get('state')}")
+            return real_ledger(store, task_id, name, record)
+
+        inner = _compat_popen(self._controller_handler(thread_id, self._review_result()))
+
+        class Popen(inner):
+            def __init__(self, command, *args, **kwargs):
+                super().__init__(command, *args, **kwargs)
+                if getattr(self, "_delegate", None) is None:
+                    order.append("POPEN")
+
+        with (
+            mock.patch.object(workflow.WorkflowStore, "append_event", tracking_append),
+            mock.patch.object(workflow.WorkflowStore, "append_task_ledger", tracking_ledger),
+            mock.patch.object(repairs.subprocess, "Popen", Popen),
+            self.fx._controller_codex_lookup(),
+        ):
+            repairs.run_assignment(self.fx.store, self.fx.TASK_ID, review, sessions)
+        self.assertLess(order.index("PERMIT:RESERVED"), order.index("LAUNCH_INTENT_RECORDED"))
+        self.assertLess(order.index("LAUNCH_INTENT_RECORDED"), order.index("POPEN"))
+        events = [
+            json.loads(line)
+            for line in (
+                self.fx.store._require_task(self.fx.TASK_ID) / "events.jsonl"
+            ).read_text(encoding="utf-8").splitlines()
+            if line
+        ]
+        intents = [event for event in events if event.get("event_type") == "LAUNCH_INTENT_RECORDED"]
+        self.assertEqual(1, len(intents))
+        self.assertEqual(artifacts.artifact_sha256(self.fx.task), intents[0]["envelope_hash"])
+        recorded = [event for event in events if event.get("event_type") == "RUNTIME_EVIDENCE_RECORDED"]
+        self.assertTrue(recorded)
+        self.assertEqual(
+            {
+                "event_type",
+                "attempt_id",
+                "requested_role",
+                "thread_id",
+                "execution_surface",
+                "runtime_evidence_sha256",
+            },
+            set(recorded[-1]),
+        )
 
 
 class VerdictReleaseGateRepairTest(unittest.TestCase):

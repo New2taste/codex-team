@@ -3958,6 +3958,63 @@ class DispatchGateHubTest(unittest.TestCase):
             stack.enter_context(mock.patch.object(workflow.subprocess, "Popen", popen))
             yield
 
+    def test_legal_path_records_launch_intent_after_reserved_before_popen(self) -> None:
+        _install_declaration(self.store, self.task, allowed_roles=("luna",), active_roles=("luna",))
+        order: list[str] = []
+        real_append = workflow.WorkflowStore.append_event
+        real_ledger = workflow.WorkflowStore.append_task_ledger
+
+        def tracking_append(store, task_id, event):
+            order.append(str(event.get("event_type")))
+            return real_append(store, task_id, event)
+
+        def tracking_ledger(store, task_id, name, record):
+            if name == policy.DISPATCH_PERMIT_LEDGER:
+                order.append(f"PERMIT:{record.get('state')}")
+            return real_ledger(store, task_id, name, record)
+
+        class Popen(_RecordingPopen):
+            _result = CodexRunnerTest().valid_result()
+
+            def __init__(self, command, *args, **kwargs):
+                super().__init__(command, *args, **kwargs)
+                if self._delegate is None:
+                    order.append("POPEN")
+
+        with (
+            mock.patch.object(workflow, "capture_repo", return_value=workflow.RepoSnapshot("h" * 40, ())),
+            mock.patch.object(workflow, "working_tree_paths", return_value=set()),
+            mock.patch.object(workflow.WorkflowStore, "append_event", tracking_append),
+            mock.patch.object(workflow.WorkflowStore, "append_task_ledger", tracking_ledger),
+            mock.patch.object(workflow.subprocess, "Popen", Popen),
+        ):
+            workflow.run_codex("luna", self.task, "task contract", self._paths())
+        self.assertLess(order.index("PERMIT:RESERVED"), order.index("LAUNCH_INTENT_RECORDED"))
+        self.assertLess(order.index("LAUNCH_INTENT_RECORDED"), order.index("POPEN"))
+        intents = [
+            event for event in self._events() if event.get("event_type") == "LAUNCH_INTENT_RECORDED"
+        ]
+        self.assertEqual(1, len(intents))
+        self.assertEqual(
+            {
+                "event_type",
+                "event_id",
+                "task_id",
+                "envelope_hash",
+                "permit_id",
+                "role",
+                "command_sha256",
+                "tool_mapping_sha256",
+                "route_config_hash",
+                "launcher_version",
+                "install_version",
+                "timestamp_utc",
+            },
+            set(intents[0]),
+        )
+        self.assertEqual(self._permit_records()[0]["permit_id"], intents[0]["permit_id"])
+        self.assertEqual(artifacts.artifact_sha256(self.task), intents[0]["envelope_hash"])
+
     def test_missing_declaration_rejects_run_codex_without_spawn(self) -> None:
         popen = self._popen(CodexRunnerTest().valid_result())
         with (
@@ -3970,6 +4027,10 @@ class DispatchGateHubTest(unittest.TestCase):
         self.assertEqual([], popen.calls)
         self.assertEqual([], self._permit_records())
         self.assertEqual([], self._dispatch_records())
+        self.assertEqual(
+            [],
+            [event for event in self._events() if event.get("event_type") == "LAUNCH_INTENT_RECORDED"],
+        )
 
     def test_state_root_none_is_declaration_missing(self) -> None:
         paths = workflow.RunPaths(

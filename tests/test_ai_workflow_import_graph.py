@@ -21,6 +21,7 @@ NEW_BUSINESS_MODULES = frozenset(
         "ai_workflow_side_effects",
         "ai_workflow_preflight",
         "ai_workflow_dispatch_policy",
+        "ai_workflow_evidence",
     }
 )
 FORBIDDEN_HOST_TARGETS = frozenset(
@@ -60,6 +61,7 @@ IMPORT_GRAPH_ALLOWED: Mapping[str, frozenset[str]] = {
             "ai_workflow_authorizations",
             "ai_workflow_side_effects",
             "ai_workflow_ownership",
+            "ai_workflow_evidence",
         }
     ),
     "ai_workflow_router_probe": frozenset({"ai_workflow_costs"}),
@@ -78,6 +80,7 @@ IMPORT_GRAPH_ALLOWED: Mapping[str, frozenset[str]] = {
             "ai_workflow_ownership",
             "ai_workflow_preflight",
             "ai_workflow_declarations",
+            "ai_workflow_evidence",
         }
     ),
     "ai_workflow_declarations": frozenset(
@@ -118,6 +121,13 @@ IMPORT_GRAPH_ALLOWED: Mapping[str, frozenset[str]] = {
             "ai_workflow_routing",
             "ai_workflow_ownership",
             "ai_workflow_side_effects",
+            "ai_workflow_artifacts",
+        }
+    ),
+    "ai_workflow_evidence": frozenset(
+        {
+            "ai_workflow_declarations",
+            "ai_workflow_preflight",
             "ai_workflow_artifacts",
         }
     ),
@@ -321,6 +331,16 @@ class ImportGraphTest(unittest.TestCase):
         )
         self.assertFalse(
             self.scanned["ai_workflow_dispatch_policy"]["edges"] & FORBIDDEN_HOST_TARGETS
+        )
+
+    def test_evidence_module_exists_within_allowed_edges(self):
+        self.assertIn("ai_workflow_evidence", self.scanned)
+        self.assertEqual(
+            IMPORT_GRAPH_ALLOWED["ai_workflow_evidence"],
+            self.scanned["ai_workflow_evidence"]["edges"],
+        )
+        self.assertFalse(
+            self.scanned["ai_workflow_evidence"]["edges"] & FORBIDDEN_HOST_TARGETS
         )
 
 

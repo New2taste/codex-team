@@ -272,6 +272,7 @@ try:
     )
     from .ai_workflow_preflight import run_role_preflight_locked
     from .ai_workflow_declarations import load_route_declaration_locked
+    from .ai_workflow_evidence import append_runtime_evidence_v2, record_launch_intent
 except ImportError:  # direct script execution
     from ai_workflow_side_effects import (
         capture_fs_snapshot,
@@ -297,6 +298,7 @@ except ImportError:  # direct script execution
     )
     from ai_workflow_preflight import run_role_preflight_locked
     from ai_workflow_declarations import load_route_declaration_locked
+    from ai_workflow_evidence import append_runtime_evidence_v2, record_launch_intent
 
 try:
     from .ai_workflow_costs import (
@@ -1889,6 +1891,14 @@ def run_codex(
                     paths.schema_path, attempt_output.parent, attempt_id
                 )
                 command = build_codex_command(role, repo, attempt_output, dispatch_schema_path)
+                record_launch_intent(
+                    store,
+                    task["task_id"],
+                    permit=permit,
+                    role=role,
+                    argv=tuple(command),
+                    tool_mapping={},
+                )
                 proc = subprocess.Popen(
                     command,
                     stdin=subprocess.PIPE,
@@ -2120,6 +2130,13 @@ def run_codex(
                         _canonical_json(result).encode("utf-8")
                     ).hexdigest(),
                 },
+            )
+            append_runtime_evidence_v2(
+                runtime_store,
+                task["task_id"],
+                event_index=len(_load_event_records(runtime_store, task["task_id"])) - 1,
+                observed=rollout_observation,
+                recorded_at_utc=_utc_timestamp(),
             )
         result = dict(
             validate_role_result(
@@ -5137,6 +5154,14 @@ def _run_role_with_technical_retry(
                                     authorization_id=authorization_id,
                                 )
                             # Task 18: LAUNCH_INTENT_RECORDED is inserted in this critical section before spawn.
+                            record_launch_intent(
+                                store,
+                                task_id,
+                                permit=permit,
+                                role=role,
+                                argv=("fake-runner", role),
+                                tool_mapping={},
+                            )
                             claim_permit_start_locked(store, task_id, permit)
                             claimed = True
                     except BaseException:

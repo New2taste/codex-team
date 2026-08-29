@@ -25,6 +25,7 @@ CONFIG_FILES = (
     "ai_workflow_owner_authorization.schema.json",
     "ai_workflow_rate_snapshot.schema.json",
     "ai_workflow_preflight_record.schema.json",
+    "ai_workflow_runtime_evidence_v2.schema.json",
     "ai_workflow_runtime_files.json",
     "ai_workflow_route_advice.schema.json",
     "ai_workflow_plan.schema.json",
@@ -51,6 +52,7 @@ RUNTIME_FILES = (
     "ai_workflow_scheduler.py",
     "ai_workflow_preflight.py",
     "ai_workflow_dispatch_policy.py",
+    "ai_workflow_evidence.py",
 )
 RUNTIME_MANIFEST_FILENAME = "ai_workflow_runtime_files.json"
 RUNTIME_MANIFEST_SCHEMA_VERSION = "ai-runtime-files-1"
