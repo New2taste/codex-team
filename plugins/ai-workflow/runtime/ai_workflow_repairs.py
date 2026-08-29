@@ -1938,7 +1938,7 @@ def open_task_acceptance(
                 store,
                 task_id,
                 path_owners={
-                    path: owner_receipt.requested_role
+                    path: _SOL_MEDIUM_REVIEWER
                     for path in stored["allowed_write_paths"]
                 },
             )
@@ -3062,7 +3062,7 @@ def run_assignment(
                     store,
                     task_id,
                     path_owners={
-                        path: replay.owner_actor.role
+                        path: _SOL_MEDIUM_REVIEWER
                         for path in stored_task["allowed_write_paths"]
                     },
                 )

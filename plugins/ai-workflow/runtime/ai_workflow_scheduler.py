@@ -18,6 +18,7 @@ from pathlib import Path
 
 try:
     from .ai_workflow_artifacts import artifact_sha256
+    from .ai_workflow_ownership import ensure_ownership_registry_for_paths_locked
     from .ai_workflow_planning import (
         FrozenPlan,
         FrozenSubtask,
@@ -30,6 +31,7 @@ try:
     from .ai_workflow_declarations import load_route_declaration_locked
 except ImportError:  # direct script execution
     from ai_workflow_artifacts import artifact_sha256
+    from ai_workflow_ownership import ensure_ownership_registry_for_paths_locked
     from ai_workflow_planning import (
         FrozenPlan,
         FrozenSubtask,
@@ -1257,6 +1259,15 @@ def create_final_acceptance_case(
         _assert_final_candidate_binding(stored_task, plan, pinned)
         if child_bytes is None:
             store.create_task(dict(projection))
+        with lock(identifier):
+            ensure_ownership_registry_for_paths_locked(
+                store,
+                identifier,
+                path_owners={
+                    path: "sol_medium_reviewer"
+                    for path in projection["allowed_write_paths"]
+                },
+            )
         _assert_final_candidate_binding(stored_task, plan, pinned)
         _ensure_opened(store, plan, replay)
         final_event = _append_event(

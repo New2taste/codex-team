@@ -1558,6 +1558,13 @@ class FinalAcceptanceCaseTest(unittest.TestCase):
     def test_open_final_acceptance_materializes_child_ownership_registry(self):
         self._complete_all()
         child = self._create()
+        registry_at_create = ownership.load_ownership_registry(self.store, child["task_id"])
+        self.assertIsNotNone(registry_at_create)
+        assert registry_at_create is not None
+        self.assertEqual(
+            {path: "sol_medium_reviewer" for path in child["allowed_write_paths"]},
+            registry_at_create.path_owners,
+        )
         owner = self._record_owner_evidence()
         with mock.patch.object(repairs, "run_assignment", create=True):
             scheduler.issue_final_acceptance(
@@ -1572,7 +1579,7 @@ class FinalAcceptanceCaseTest(unittest.TestCase):
             registry.envelope_hash,
         )
         self.assertEqual(
-            {path: "luna_construction" for path in child["allowed_write_paths"]},
+            {path: "sol_medium_reviewer" for path in child["allowed_write_paths"]},
             registry.path_owners,
         )
 
