@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest import mock
 
 from scripts import ai_workflow as workflow
+from tests.test_ai_workflow import _compat_popen, _install_declaration
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -408,6 +409,7 @@ class RuntimeUsageTest(unittest.TestCase):
             store = workflow.WorkflowStore(Path(temporary) / "state")
             task = valid_task()
             store.create_task(task)
+            _install_declaration(store, task, allowed_roles=("luna",), active_roles=("luna",))
             evidence = workflow.verify_runtime_identity(
                 runtime_expected(), runtime_observation()
             )
@@ -422,6 +424,7 @@ class RuntimeUsageTest(unittest.TestCase):
             store = workflow.WorkflowStore(Path(temporary) / "state")
             task = valid_task()
             store.create_task(task)
+            _install_declaration(store, task, allowed_roles=("luna",), active_roles=("luna",))
             evidence = workflow.verify_runtime_identity(
                 runtime_expected(surface="CODEX_EXEC_ROLE_CONTRACT"),
                 runtime_observation(surface="CODEX_EXEC_ROLE_CONTRACT"),
@@ -658,6 +661,7 @@ class RuntimeLiveIntegrationTest(unittest.TestCase):
             store = workflow.WorkflowStore(state_root)
             task = valid_task()
             store.create_task(task)
+            _install_declaration(store, task, allowed_roles=("luna",), active_roles=("luna",))
             sessions = Path(temporary) / "sessions"
             write_exec_rollout(sessions, model="gpt-5.6-sol")
             paths = self._run_paths(temporary, state_root, sessions)
@@ -667,9 +671,10 @@ class RuntimeLiveIntegrationTest(unittest.TestCase):
                     return_value=workflow.RepoSnapshot("pinned", ()),
                 ),
                 mock.patch("scripts.ai_workflow.working_tree_paths", return_value=set()),
-                mock.patch(
-                    "scripts.ai_workflow.subprocess.run",
-                    side_effect=self._write_codex_result,
+                mock.patch.object(
+                    workflow.subprocess,
+                    "Popen",
+                    _compat_popen(self._write_codex_result),
                 ),
                 self.assertRaisesRegex(workflow.WorkflowError, "RUNTIME_IDENTITY_CONFLICT"),
             ):
@@ -684,6 +689,7 @@ class RuntimeLiveIntegrationTest(unittest.TestCase):
             store = workflow.WorkflowStore(state_root)
             task = valid_task()
             store.create_task(task)
+            _install_declaration(store, task, allowed_roles=("luna",), active_roles=("luna",))
             not_a_directory = Path(temporary) / "not-a-directory"
             not_a_directory.write_text("not a sessions directory", encoding="utf-8")
             cases = (
@@ -703,11 +709,18 @@ class RuntimeLiveIntegrationTest(unittest.TestCase):
                         mock.patch(
                             "scripts.ai_workflow.working_tree_paths", return_value=set()
                         ),
-                        mock.patch("scripts.ai_workflow.subprocess.run") as model_launch,
+                        mock.patch.object(
+                            workflow.subprocess,
+                            "Popen",
+                            _compat_popen(
+                                lambda command, *args, **kwargs: (_ for _ in ()).throw(
+                                    AssertionError("codex launched")
+                                )
+                            ),
+                        ),
                         self.assertRaisesRegex(workflow.WorkflowError, code),
                     ):
                         workflow.run_codex("luna", task, "Read only.", paths)
-                    model_launch.assert_not_called()
 
     def test_live_invalidates_a_prior_canonical_result_when_runtime_evidence_is_missing(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -715,6 +728,7 @@ class RuntimeLiveIntegrationTest(unittest.TestCase):
             store = workflow.WorkflowStore(state_root)
             task = valid_task()
             store.create_task(task)
+            _install_declaration(store, task, allowed_roles=("luna",), active_roles=("luna",))
             sessions = Path(temporary) / "sessions"
             sessions.mkdir()
             paths = self._run_paths(temporary, state_root, sessions)
@@ -725,9 +739,10 @@ class RuntimeLiveIntegrationTest(unittest.TestCase):
                     return_value=workflow.RepoSnapshot("pinned", ()),
                 ),
                 mock.patch("scripts.ai_workflow.working_tree_paths", return_value=set()),
-                mock.patch(
-                    "scripts.ai_workflow.subprocess.run",
-                    side_effect=self._write_codex_result,
+                mock.patch.object(
+                    workflow.subprocess,
+                    "Popen",
+                    _compat_popen(self._write_codex_result),
                 ),
                 self.assertRaisesRegex(workflow.WorkflowError, "RUNTIME_EVIDENCE_MISSING"),
             ):
@@ -740,6 +755,7 @@ class RuntimeLiveIntegrationTest(unittest.TestCase):
             store = workflow.WorkflowStore(state_root)
             task = valid_task()
             store.create_task(task)
+            _install_declaration(store, task, allowed_roles=("luna",), active_roles=("luna",))
             sessions = Path(temporary) / "sessions"
             write_exec_rollout(sessions)
             output_path = Path(temporary) / "luna-result.json"
@@ -779,7 +795,9 @@ class RuntimeLiveIntegrationTest(unittest.TestCase):
                     return_value=workflow.RepoSnapshot("pinned", ()),
                 ),
                 mock.patch("scripts.ai_workflow.working_tree_paths", return_value=set()),
-                mock.patch("scripts.ai_workflow.subprocess.run", side_effect=write_result),
+                mock.patch.object(
+                    workflow.subprocess, "Popen", _compat_popen(write_result)
+                ),
             ):
                 self.assertEqual(
                     blocked_luna_result(),
@@ -800,6 +818,7 @@ class RuntimeLiveIntegrationTest(unittest.TestCase):
             store = workflow.WorkflowStore(state_root)
             task = valid_task()
             store.create_task(task)
+            _install_declaration(store, task, allowed_roles=("luna",), active_roles=("luna",))
             output_path = Path(temporary) / "luna-result.json"
             paths = workflow.RunPaths(
                 repo=ROOT,
@@ -821,9 +840,10 @@ class RuntimeLiveIntegrationTest(unittest.TestCase):
                     return_value=workflow.RepoSnapshot("pinned", ()),
                 ),
                 mock.patch("scripts.ai_workflow.working_tree_paths", return_value=set()),
-                mock.patch(
-                    "scripts.ai_workflow.subprocess.run",
-                    side_effect=write_result_without_thread,
+                mock.patch.object(
+                    workflow.subprocess,
+                    "Popen",
+                    _compat_popen(write_result_without_thread),
                 ),
                 self.assertRaisesRegex(workflow.WorkflowError, "RUNTIME_EVIDENCE_MISSING"),
             ):

@@ -25,8 +25,10 @@ from unittest import mock
 from scripts import ai_workflow as workflow
 from scripts import ai_workflow_artifacts as artifacts
 from scripts import ai_workflow_candidate_state as candidate_state
+from scripts import ai_workflow_ownership as ownership
 from scripts import ai_workflow_repairs as repairs
 from scripts import ai_workflow_verdicts as verdicts
+from tests.test_ai_workflow import _compat_popen, _install_declaration
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -350,7 +352,7 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
             "task_type": "REMEDIATION",
             "objective": "Repair the bounded candidate under adversarial acceptance",
             "repository_root": str(self.repository_root),
-            "source_worktree": None,
+            "source_worktree": str(self.repository_root),
             "base_commit": self.base_commit,
             "candidate_commit": self.input_candidate,
             "authoritative_files": ["README.md"],
@@ -366,6 +368,29 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
             repairs.RepairFinding("finding-002", ("src/beta.py",)),
         )
         self._recorded_runtime_attempts: set[str] = set()
+        self._original_run_assignment = repairs.run_assignment
+
+        def gated_run(store, task_id, assignment, *args, **kwargs):
+            if ownership.load_ownership_registry(store, task_id) is None:
+                role = assignment.expected_actor.role
+                scopes = tuple(getattr(assignment, "allowed_paths", ()) or ("src",))
+                path_owners = {
+                    str(path).rstrip("/") or "src": role for path in scopes
+                } or {"src": role}
+                registry = ownership.OwnershipRegistry(
+                    schema_version=ownership.OWNERSHIP_REGISTRY_SCHEMA_VERSION,
+                    task_id=task_id,
+                    envelope_hash=artifacts.artifact_sha256(
+                        workflow.load_task(store.root / task_id / "task.json")
+                    ),
+                    path_owners=path_owners,
+                    registered_at_utc="2026-08-28T00:00:00Z",
+                )
+                with store.lock(task_id):
+                    ownership.record_ownership_registry(store, task_id, registry)
+            return self._original_run_assignment(store, task_id, assignment, *args, **kwargs)
+
+        repairs.run_assignment = gated_run
 
     def _git(self, *args: str) -> str:
         env = os.environ.copy()
@@ -405,6 +430,7 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
         return self._git("rev-parse", "HEAD")
 
     def tearDown(self) -> None:
+        repairs.run_assignment = self._original_run_assignment
         self.temporary_directory.cleanup()
 
     @staticmethod
@@ -596,7 +622,25 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
         return api["execute_adversarial_evidence"](self.store, self.TASK_ID)
 
     def _create_task(self, task: dict[str, object] | None = None) -> None:
-        self.store.create_task(dict(task or self.task))
+        document = dict(task or self.task)
+        self.store.create_task(document)
+        _install_declaration(
+            self.store,
+            document,
+            allowed_roles=(
+                "luna",
+                "terra",
+                "terra_xhigh",
+                "terra_xhigh_reviewer",
+                "sol_medium_reviewer",
+                "sol_xhigh",
+                "luna_construction",
+                "sol_reviewer",
+                "sol_planner",
+            ),
+            active_roles=("luna", "terra_xhigh_reviewer", "sol_medium_reviewer", "sol_xhigh"),
+            max_dispatches=64,
+        )
 
     def _record_runtime_evidence(self, receipt: object) -> None:
         self.assertIsInstance(receipt, repairs.VerifiedActorReceipt)
@@ -1544,13 +1588,14 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
                 raise AssertionError("caller-authored evidence reached Codex execution")
             return real_run(command, *args, **kwargs)
 
+        handler = mock.Mock(side_effect=no_codex_launch)
         with mock.patch.object(
-            workflow.subprocess, "run", side_effect=no_codex_launch
-        ) as launched:
+            repairs.subprocess, "Popen", _compat_popen(handler)
+        ):
             with self.assertRaises(workflow.WorkflowError):
                 repairs.run_assignment(self.store, self.TASK_ID, review, sessions)
         self.assertFalse(
-            any(Path(call.args[0][0]).name == "codex" for call in launched.call_args_list)
+            any(Path(call.args[0][0]).name == "codex" for call in handler.call_args_list)
         )
         with self.assertRaisesRegex(workflow.WorkflowError, "REPAIR_ADAPTER_REQUIRED"):
             repairs.record_adversarial_review(
@@ -1650,7 +1695,7 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
 
         with (
             mock.patch.object(
-                workflow.subprocess, "run", side_effect=controller_process
+                repairs.subprocess, "Popen", _compat_popen(controller_process)
             ),
             self._controller_codex_lookup(),
         ):
@@ -1753,7 +1798,7 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
 
         with (
             mock.patch.object(
-                workflow.subprocess, "run", side_effect=controller_process
+                repairs.subprocess, "Popen", _compat_popen(controller_process)
             ),
             self._controller_codex_lookup(),
         ):
@@ -1874,7 +1919,7 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
 
         with (
             mock.patch.object(
-                workflow.subprocess, "run", side_effect=controller_process
+                repairs.subprocess, "Popen", _compat_popen(controller_process)
             ),
             self._controller_codex_lookup(),
         ):
@@ -1944,7 +1989,7 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
             return real_run(command, *args, **kwargs)
 
         with mock.patch.object(
-            workflow.subprocess, "run", side_effect=reject_codex_launch
+            repairs.subprocess, "Popen", _compat_popen(reject_codex_launch)
         ):
             with self.assertRaisesRegex(
                 workflow.WorkflowError, "ACCEPTANCE_RECEIPT_MISMATCH"
@@ -2179,9 +2224,9 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
 
         with (
             mock.patch.object(
-                workflow.subprocess,
-                "run",
-                side_effect=terminal_controller_process,
+                repairs.subprocess,
+                "Popen",
+                _compat_popen(terminal_controller_process),
             ),
             self._controller_codex_lookup(),
         ):

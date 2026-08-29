@@ -59,6 +59,7 @@ IMPORT_GRAPH_ALLOWED: Mapping[str, frozenset[str]] = {
             "ai_workflow_candidate_state",
             "ai_workflow_authorizations",
             "ai_workflow_side_effects",
+            "ai_workflow_ownership",
         }
     ),
     "ai_workflow_router_probe": frozenset({"ai_workflow_costs"}),
@@ -74,6 +75,9 @@ IMPORT_GRAPH_ALLOWED: Mapping[str, frozenset[str]] = {
             "ai_workflow_team_call",
             "ai_workflow_dispatch_policy",
             "ai_workflow_side_effects",
+            "ai_workflow_ownership",
+            "ai_workflow_preflight",
+            "ai_workflow_declarations",
         }
     ),
     "ai_workflow_declarations": frozenset(

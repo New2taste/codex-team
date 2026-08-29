@@ -27,6 +27,7 @@ try:
         record_dispatch,
         validate_plan,
     )
+    from .ai_workflow_declarations import load_route_declaration_locked
 except ImportError:  # direct script execution
     from ai_workflow_artifacts import artifact_sha256
     from ai_workflow_planning import (
@@ -38,6 +39,7 @@ except ImportError:  # direct script execution
         record_dispatch,
         validate_plan,
     )
+    from ai_workflow_declarations import load_route_declaration_locked
 
 
 SCHEMA_VERSION = "plan-scheduler-1"
@@ -795,6 +797,12 @@ def _dispatch_step_locked(
     if selected is None:
         _fail("PLAN_INVALID", "dispatch references an unknown subtask")
     owner_role = _require_role(selected.owner_role)
+    declaration = load_route_declaration_locked(store, plan.task_id)
+    if declaration is None:
+        _fail("ROUTE_DECLARATION_MISSING", "route declaration is missing")
+        raise AssertionError("unreachable")
+    if owner_role not in declaration.allowed_roles:
+        _fail("ROLE_NOT_ALLOWED", f"role {owner_role} is not allowed")
     worktree = isolated_worktree_path(str(stored_task["repository_root"]), plan.task_id, subtask_id)
     for other_id, other_path in replay.worktree_paths.items():
         if other_path == str(worktree) and other_id != subtask_id:
@@ -879,6 +887,14 @@ def dispatch_ready_batch(
         selected = _select_ready(plan, ready, replay.in_flight, max_read_only, max_writers)
         if not selected:
             return ()
+        declaration = load_route_declaration_locked(store, plan.task_id)
+        if declaration is None:
+            _fail("ROUTE_DECLARATION_MISSING", "route declaration is missing")
+            raise AssertionError("unreachable")
+        for subtask_id in selected:
+            subtask = next(task for task in plan.tasks if task.id == subtask_id)
+            if subtask.owner_role not in declaration.allowed_roles:
+                _fail("ROLE_NOT_ALLOWED", f"role {subtask.owner_role} is not allowed")
         _ensure_opened(store, plan, replay)
         proposals: list[dict[str, object]] = []
         for subtask_id in selected:

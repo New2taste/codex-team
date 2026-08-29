@@ -18,6 +18,7 @@ from unittest import mock
 from scripts import ai_workflow as workflow
 from scripts import ai_workflow_repairs as repairs
 from scripts import ai_workflow_scheduler as scheduler
+from tests.test_ai_workflow import _install_declaration
 
 _FROZEN_FINAL_ACCEPTANCE_REWORK = {
     "fixer_role": "sol_medium_reviewer",
@@ -53,6 +54,21 @@ class WholeProjectFinalAcceptanceTest(unittest.TestCase):
             "allowed_write_paths": ["src/alpha.py", "src/beta.py"],
         }
         self.fx.store.create_task(parent)
+        _install_declaration(
+            self.fx.store,
+            parent,
+            allowed_roles=(
+                "luna",
+                "terra",
+                "terra_xhigh",
+                "luna_construction",
+                "sol_reviewer",
+                "sol_medium_reviewer",
+                "sol_xhigh",
+            ),
+            active_roles=("terra", "luna_construction"),
+            max_dispatches=32,
+        )
         plan = {
             "schema_version": "ai-plan-1",
             "plan_id": "plan-20260809-final",

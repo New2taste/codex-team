@@ -15,6 +15,9 @@ from scripts import ai_workflow as workflow
 from scripts import ai_workflow_team_call as team
 
 
+ROOT = Path(__file__).resolve().parents[1]
+
+
 def _concurrent_claim(state_root: str, started, results) -> None:
     call = team.parse_team_call("team call 检查当前工作区状态")
     intent = team.classify_team_call(call)
@@ -1154,6 +1157,53 @@ class TeamCallControllerTest(unittest.TestCase):
             shell=False,
             cwd=self.repo,
         )
+
+    def test_direct_l0_never_reaches_run_codex_or_creates_a_task(self) -> None:
+        with mock.patch.object(workflow, "run_codex") as run_codex:
+            receipt = workflow.run_team_call(
+                "team call 检查当前工作区状态",
+                repository_root=self.repo,
+                state_root=self.root,
+                controller=self.controller,
+            )
+        self.assertEqual("DIRECT_L0", receipt.disposition)
+        self.assertIsNone(receipt.task_id)
+        run_codex.assert_not_called()
+        self.assertFalse(any(path.is_dir() and path.name.startswith("AWF-") for path in self.root.iterdir()))
+
+    def test_direct_l1_creates_declaration_and_rejects_after_deletion(self) -> None:
+        (self.repo / ".codex" / "sessions").mkdir(parents=True, exist_ok=True)
+        receipt = workflow.run_team_call(
+            "team call 核对文件 README.md",
+            repository_root=self.repo,
+            state_root=self.root,
+            controller=self.controller,
+        )
+        self.assertEqual("DIRECT_L1", receipt.disposition)
+        task_id = receipt.task_id
+        self.assertIsNotNone(task_id)
+        declaration = self.root / str(task_id) / "route-declaration.json"
+        self.assertTrue(declaration.is_file())
+        declaration.unlink()
+        store = workflow.WorkflowStore(self.root)
+        task = workflow.load_task(self.root / str(task_id) / "task.json")
+        paths = workflow.RunPaths(
+            repo=self.repo,
+            output_path=self.root / str(task_id) / "luna-result.json",
+            schema_path=ROOT / "config/ai_workflow_result.schema.json",
+            logs_dir=self.root / str(task_id) / "logs",
+            state_root=self.root,
+        )
+        with (
+            mock.patch.object(workflow, "working_tree_paths", return_value=set()),
+            mock.patch.object(workflow, "capture_repo", return_value=workflow.RepoSnapshot("h" * 40, ())),
+            mock.patch.object(workflow.subprocess, "Popen") as popen,
+        ):
+            with self.assertRaisesRegex(
+                workflow.WorkflowError, "ROUTE_DECLARATION_MISSING|ROUTE_DECLARATION_CORRUPT"
+            ):
+                workflow.run_codex("luna", task, "task contract", paths)
+        popen.assert_not_called()
 
 
 if __name__ == "__main__":

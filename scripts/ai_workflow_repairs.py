@@ -38,6 +38,17 @@ try:
         RELEASE_COMPLETION_PHASES,
         require_verdict_fresh_locked,
     )
+    from .ai_workflow_dispatch_policy import (
+        claim_permit_start_locked,
+        derive_assignment_dispatch_identity,
+        release_permit_if_never_spawned,
+        require_dispatch_permit_locked,
+    )
+    from .ai_workflow_ownership import (
+        claimed_write_paths,
+        require_write_ownership_locked,
+        verify_actual_write_paths,
+    )
 except ImportError:  # direct script execution
     from ai_workflow_side_effects import (
         capture_fs_snapshot,
@@ -48,6 +59,17 @@ except ImportError:  # direct script execution
     from ai_workflow_verdicts import (
         RELEASE_COMPLETION_PHASES,
         require_verdict_fresh_locked,
+    )
+    from ai_workflow_dispatch_policy import (
+        claim_permit_start_locked,
+        derive_assignment_dispatch_identity,
+        release_permit_if_never_spawned,
+        require_dispatch_permit_locked,
+    )
+    from ai_workflow_ownership import (
+        claimed_write_paths,
+        require_write_ownership_locked,
+        verify_actual_write_paths,
     )
 
 
@@ -2890,7 +2912,8 @@ def _observe_assignment_execution_side_effects(
     repository: Path,
     before_fs: object,
     completed: subprocess.CompletedProcess | None,
-) -> None:
+    permit_id: str | None = None,
+) -> tuple[object, ...] | None:
     """Record spawn-armed assignment effects; unknown results are fail-closed."""
 
     if completed is None:
@@ -2898,12 +2921,12 @@ def _observe_assignment_execution_side_effects(
             store,
             task_id,
             role=role,
-            permit_id=None,
+            permit_id=permit_id,
             reason="unobserved-assignment",
         )
-        return
+        return None
     if before_fs is None:
-        return
+        return ()
     try:
         after_fs = capture_fs_snapshot(
             repository, exclusions=observation_exclusions(repository)
@@ -2913,16 +2936,16 @@ def _observe_assignment_execution_side_effects(
             store,
             task_id,
             role=role,
-            permit_id=None,
+            permit_id=permit_id,
             reason="unobserved-assignment",
         )
-        return
+        return None
     workflow = _workflow()
-    observe_execution_side_effects(
+    return observe_execution_side_effects(
         store,
         task_id,
         role=role,
-        permit_id=None,
+        permit_id=permit_id,
         before=before_fs,
         after=after_fs,
         rollout_events=tuple(workflow.parse_codex_jsonl(completed.stdout)),
@@ -2995,70 +3018,112 @@ def run_assignment(
         candidate_commit=assignment.input_candidate_commit,
         actor_receipt=receipt,
     )
-    with store.lock(task_id):
-        replay = replay_acceptance_ledger(store, task_id)
-        if replay is None:
-            _fail("REPAIR_ADAPTER_REQUIRED", "v2 acceptance ledger is not open")
-        context = _v2_context(store, task_id)
-        replay = _v2_start_attempt(
-            store,
-            task_id,
-            replay,
-            context,
-            assignment,
-            receipt,
-            stored_task,
-            attestation,
-        )
-        started = True
+    permit = None
+    proc = None
     try:
-        role_config = workflow._load_role_config(assignment.expected_actor.role)
-        model = role_config.get("model")
-        effort = role_config.get("reasoning_effort")
-        if not isinstance(model, str) or not isinstance(effort, str):
-            _fail("REPAIR_ADAPTER_REQUIRED", "issued role runtime configuration is incomplete")
-        codex = shutil.which("codex", path=os.environ.get("PATH", os.defpath))
-        if not isinstance(codex, str):
-            _fail("REPAIR_ADAPTER_REQUIRED", "controller Codex executable is unavailable")
-        dispatch_schema_path = workflow.materialize_dispatch_result_schema(
-            repository / "config" / "ai_workflow_result.schema.json",
-            output_path.parent,
-            f"{assignment.attempt_id}-assignment",
-        )
-        command = [
-            codex,
-            "exec",
-            "resume",
-            "-m",
-            model,
-            "-c",
-            f'model_reasoning_effort="{effort}"',
-            "-c",
-            f'sandbox_mode="{receipt.observed_sandbox_policy}"',
-            "--json",
-            "--output-schema",
-            str(dispatch_schema_path),
-            "-o",
-            str(output_path),
-            receipt.runtime_instance_id,
-            "-",
-        ]
-        launched_ns = time.time_ns()
-        completed = None
-        spawned = False
-        try:
-            spawned = True
+        with store.lock(task_id):
+            replay = replay_acceptance_ledger(store, task_id)
+            if replay is None:
+                _fail("REPAIR_ADAPTER_REQUIRED", "v2 acceptance ledger is not open")
+            context = _v2_context(store, task_id)
+            replay = _v2_start_attempt(
+                store,
+                task_id,
+                replay,
+                context,
+                assignment,
+                receipt,
+                stored_task,
+                attestation,
+            )
+            started = True
+            permit = require_dispatch_permit_locked(
+                store,
+                task_id,
+                assignment.expected_actor.role,
+                dispatch_identity=derive_assignment_dispatch_identity(
+                    task_sha256=assignment.capability.task_sha256,
+                    assignment_id=assignment.assignment_id,
+                    attempt_id=assignment.attempt_id,
+                ),
+                config=workflow._load_workflow_config(),
+            )
+            require_write_ownership_locked(
+                store,
+                task_id,
+                assignment.expected_actor.role,
+                permit_id=permit.permit_id,
+                paths=claimed_write_paths(tuple(assignment.allowed_paths)),
+            )
+            # Task 18: LAUNCH_INTENT_RECORDED is inserted in this critical section before spawn.
+            role_config = workflow._load_role_config(assignment.expected_actor.role)
+            model = role_config.get("model")
+            effort = role_config.get("reasoning_effort")
+            if not isinstance(model, str) or not isinstance(effort, str):
+                _fail("REPAIR_ADAPTER_REQUIRED", "issued role runtime configuration is incomplete")
+            codex = shutil.which("codex", path=os.environ.get("PATH", os.defpath))
+            if not isinstance(codex, str):
+                _fail("REPAIR_ADAPTER_REQUIRED", "controller Codex executable is unavailable")
+            dispatch_schema_path = workflow.materialize_dispatch_result_schema(
+                repository / "config" / "ai_workflow_result.schema.json",
+                output_path.parent,
+                f"{assignment.attempt_id}-assignment",
+            )
+            command = [
+                codex,
+                "exec",
+                "resume",
+                "-m",
+                model,
+                "-c",
+                f'model_reasoning_effort="{effort}"',
+                "-c",
+                f'sandbox_mode="{receipt.observed_sandbox_policy}"',
+                "--json",
+                "--output-schema",
+                str(dispatch_schema_path),
+                "-o",
+                str(output_path),
+                receipt.runtime_instance_id,
+                "-",
+            ]
+            launched_ns = time.time_ns()
+            proc = subprocess.Popen(
+                command,
+                cwd=repository,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                shell=False,
+                env=workflow.sanitized_environment(os.environ),
+            )
+            claim_permit_start_locked(store, task_id, permit)
+    except BaseException:
+        if permit is not None:
+            release_permit_if_never_spawned(
+                store,
+                permit,
+                spawned=proc is not None,
+                reason="assignment-lock-before-communicate",
+            )
+        if proc is not None:
             try:
-                completed = subprocess.run(
-                    command,
-                    cwd=repository,
+                proc.kill()
+            except OSError:
+                pass
+        raise
+    try:
+        completed = None
+        spawned = proc is not None
+        try:
+            try:
+                stdout, stderr = proc.communicate(
                     input=_v2_assignment_prompt(stored_task, assignment),
-                    check=False,
-                    capture_output=True,
-                    text=True,
                     timeout=120,
-                    shell=False,
-                    env=workflow.sanitized_environment(os.environ),
+                )
+                completed = subprocess.CompletedProcess(
+                    proc.args, proc.returncode, stdout, stderr
                 )
             except (OSError, subprocess.TimeoutExpired):
                 _fail("REPAIR_ADAPTER_REQUIRED", "controller assignment process could not complete")
@@ -3078,16 +3143,39 @@ def run_assignment(
                 after = workflow.capture_repo(repository)
             except RuntimeError:
                 _fail("REPAIR_ADAPTER_REQUIRED", "controller cannot snapshot the post-launch repository")
+        except BaseException:
+            if permit is not None:
+                release_permit_if_never_spawned(
+                    store,
+                    permit,
+                    spawned=proc is not None,
+                    reason="assignment-before-or-after-spawn",
+                )
+            if proc is not None:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+            raise
         finally:
             if spawned:
-                _observe_assignment_execution_side_effects(
+                observed = _observe_assignment_execution_side_effects(
                     store,
                     task_id,
                     role=assignment.expected_actor.role,
                     repository=repository,
                     before_fs=before_fs,
                     completed=completed,
+                    permit_id=permit.permit_id if permit is not None else None,
                 )
+                if permit is not None and completed is not None and observed is not None:
+                    verify_actual_write_paths(
+                        store,
+                        task_id,
+                        assignment.expected_actor.role,
+                        permit_id=permit.permit_id,
+                        actual_paths=tuple(change.path for change in observed),
+                    )
         if after.status:
             _fail("REPAIR_ADAPTER_REQUIRED", "controller rejects uncommitted assignment writes")
         if assignment.phase in _REVIEW_PHASES and after != before:

@@ -8,6 +8,8 @@ from pathlib import Path
 from unittest import mock
 
 from scripts import ai_workflow as workflow
+from scripts import ai_workflow_artifacts as artifacts
+from scripts import ai_workflow_ownership as ownership
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,7 +22,7 @@ def remediation_task(*, objective="implement one isolated parser behavior", path
         "task_type": "REMEDIATION",
         "objective": objective,
         "repository_root": str(ROOT),
-        "source_worktree": None,
+        "source_worktree": str(ROOT),
         "base_commit": "b" * 40,
         "candidate_commit": "c" * 40,
         "authoritative_files": ["README.md"],
@@ -168,6 +170,17 @@ class EnforcedConstructionExecutionTest(unittest.TestCase):
             construction_step_id="construction-601",
         )
         workflow.record_route_decision(self.store, self.task["task_id"], decision)
+        frozen = workflow.validate_plan(self.plan, self.task)
+        registry = ownership.build_ownership_registry(
+            task_id=self.task["task_id"],
+            envelope_hash=artifacts.artifact_sha256(self.task),
+            plan=frozen,
+            registered_at_utc="2026-08-28T00:00:00Z",
+        )
+        with self.store.lock(self.task["task_id"]):
+            ownership.record_ownership_registry(
+                self.store, self.task["task_id"], registry
+            )
 
     def tearDown(self):
         self.temporary_directory.cleanup()
@@ -232,6 +245,15 @@ class EnforcedConstructionExecutionTest(unittest.TestCase):
             construction_step_id="construction-601",
         )
         workflow.record_route_decision(store, task["task_id"], decision)
+        frozen = workflow.validate_plan(plan, task)
+        registry = ownership.build_ownership_registry(
+            task_id=task["task_id"],
+            envelope_hash=artifacts.artifact_sha256(task),
+            plan=frozen,
+            registered_at_utc="2026-08-28T00:00:00Z",
+        )
+        with store.lock(task["task_id"]):
+            ownership.record_ownership_registry(store, task["task_id"], registry)
         runner = BoundConstructionRunner()
 
         self.assertEqual(
@@ -797,6 +819,50 @@ class LunaConstructionEnvelopeRegressionTest(unittest.TestCase):
                     workflow.validate_plan(
                         construction_plan(task=task, scope=scope), task
                     )
+
+
+class ConstructionDispatchGateTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary_directory.name) / "state"
+        self.store = workflow.WorkflowStore(self.root)
+        self.task = remediation_task()
+        self.plan = construction_plan(task=self.task)
+        self.request = route_request(self.task)
+        self.store.create_task(self.task)
+        (Path(self.task["repository_root"]) / ".codex" / "sessions").mkdir(
+            parents=True, exist_ok=True
+        )
+
+    def tearDown(self):
+        self.temporary_directory.cleanup()
+
+    def test_missing_declaration_rejects_enforced_construction(self) -> None:
+        events = self.store._require_task(self.task["task_id"]) / "events.jsonl"
+        events.write_text(
+            json.dumps(
+                {
+                    "event_type": "STATE_TRANSITION",
+                    "previous_state": "DRAFT",
+                    "new_state": "TASK_VALIDATED",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        runner = BoundConstructionRunner()
+        with self.assertRaisesRegex(workflow.WorkflowError, "ROUTE_DECLARATION_MISSING"):
+            workflow.run_enforced_construction(
+                self.task["task_id"],
+                construction_plan=self.plan,
+                request=self.request,
+                step_id="construction-601",
+                attempt=1,
+                runner=runner,
+                allow_live_model=False,
+                state_root=self.root,
+            )
+        self.assertEqual([], runner.calls)
 
 
 if __name__ == "__main__":

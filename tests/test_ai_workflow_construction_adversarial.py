@@ -149,11 +149,11 @@ class TerraOSDefaultExecutionTest(unittest.TestCase):
                     task["human_gates"] = ["FINAL_ACCEPTANCE"]
                 store = workflow.WorkflowStore(Path(temporary) / "state")
                 store.create_task(task)
-                with self.assertRaisesRegex(workflow.WorkflowError, "TERRA_OS_DECISION_REQUIRED"):
-                    workflow.run_until_gate(
-                        task["task_id"], runner=workflow.FakeRunner(),
-                        allow_live_model=False, state_root=store.root,
-                    )
+                state = workflow.run_until_gate(
+                    task["task_id"], runner=workflow.FakeRunner(),
+                    allow_live_model=False, state_root=store.root,
+                )
+                self.assertEqual("AWAITING_OWNER_DECISION", state)
 
 
 class LunaScopeAndOwnerTest(unittest.TestCase):

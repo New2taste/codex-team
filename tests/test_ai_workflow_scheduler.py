@@ -14,6 +14,7 @@ from unittest import mock
 
 from scripts import ai_workflow as workflow
 from scripts import ai_workflow_artifacts as artifacts
+from scripts import ai_workflow_declarations as declarations
 from scripts import ai_workflow_planning as planning
 from scripts import ai_workflow_repairs as repairs
 from scripts import ai_workflow_scheduler as scheduler
@@ -133,12 +134,44 @@ def canonical_event_id(event):
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def _install_scheduler_declaration(store, task, *, allowed_roles=None):
+    request = {
+        "schema_version": "ai-route-request-1",
+        "task_id": task["task_id"],
+        "work_class": "BOUNDED",
+        "execution_need": "WRITE",
+        "decomposable": True,
+        "risk_flags": [],
+        "reason_codes": ["PLAN_IS_DELIVERABLE"],
+    }
+    decision = workflow.persist_or_reuse_route_decision(
+        store,
+        task["task_id"],
+        workflow.decide_route(task, request, "legacy"),
+    )
+    roles = allowed_roles or ("luna", "terra", "terra_xhigh", "luna_construction")
+    declaration = declarations.build_route_declaration(
+        decision=decision,
+        route_config_hash=declarations.compute_route_config_hash({"policy": {}}),
+        allowed_roles=roles,
+        active_roles=roles,
+        rule_ids=(decision.rule_id,),
+        reason_codes=("PLAN_IS_DELIVERABLE",),
+        max_dispatches=32,
+        allowed_transitions=(),
+    )
+    with store.lock(task["task_id"]):
+        declarations.ensure_route_declaration(store, task["task_id"], declaration)
+    return declaration
+
+
 class SchedulerHarness(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.store = workflow.WorkflowStore(Path(self.temporary_directory.name) / "state")
         self.task = remediation_task()
         self.store.create_task(self.task)
+        _install_scheduler_declaration(self.store, self.task)
         self.frozen = workflow.validate_plan(mixed_plan_document(), self.task)
 
     def tearDown(self):
@@ -649,6 +682,7 @@ class SchedulerDispatchTest(SchedulerHarness):
         starvation_task = remediation_task(task_id="AWF-20260803-002")
         starvation_store = workflow.WorkflowStore(Path(self.temporary_directory.name) / "starvation")
         starvation_store.create_task(starvation_task)
+        _install_scheduler_declaration(starvation_store, starvation_task)
         starvation_frozen = workflow.validate_plan(
             slot_starvation_plan_document(task_id=starvation_task["task_id"]),
             starvation_task,
@@ -1163,6 +1197,7 @@ class FinalAcceptanceCaseTest(unittest.TestCase):
             "human_gates": ["EXECUTION_APPROVAL"],
         }
         self.store.create_task(self.task)
+        _install_scheduler_declaration(self.store, self.task)
         self.frozen = workflow.validate_plan(
             valid_plan(
                 tasks=[
@@ -1710,6 +1745,7 @@ class FinalAcceptanceCaseTest(unittest.TestCase):
         self.task["source_worktree"] = str(other)
         drifted = workflow.WorkflowStore(Path(self.temporary_directory.name) / "state-source")
         drifted.create_task(self.task)
+        _install_scheduler_declaration(drifted, self.task)
         frozen = workflow.validate_plan(
             valid_plan(
                 tasks=[
@@ -1909,6 +1945,49 @@ class FinalAcceptanceCaseTest(unittest.TestCase):
             )
         self.assertEqual(0, issue_exit, issue_output.getvalue())
         self.assertEqual("REVIEW_1", json.loads(issue_output.getvalue())["phase"])
+
+
+class SchedulerDeclarationGateTest(SchedulerHarness):
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.store = workflow.WorkflowStore(Path(self.temporary_directory.name) / "state")
+        self.task = remediation_task()
+        self.store.create_task(self.task)
+        self.frozen = workflow.validate_plan(mixed_plan_document(), self.task)
+    def test_missing_declaration_refuses_to_record_proposals(self) -> None:
+        original = ledger_bytes(self.store, self.frozen.task_id)
+        with self.assertRaisesRegex(workflow.WorkflowError, "ROUTE_DECLARATION_MISSING"):
+            scheduler.dispatch_ready_batch(self.store, self.frozen)
+        self.assertEqual(original, ledger_bytes(self.store, self.frozen.task_id))
+
+    def test_plan_role_outside_allowed_roles_is_rejected(self) -> None:
+        request = {
+            "schema_version": "ai-route-request-1",
+            "task_id": self.task["task_id"],
+            "work_class": "BOUNDED",
+            "execution_need": "WRITE",
+            "decomposable": True,
+            "risk_flags": [],
+            "reason_codes": ["PLAN_IS_DELIVERABLE"],
+        }
+        decision = workflow.decide_route(self.task, request, "legacy")
+        workflow.persist_or_reuse_route_decision(self.store, self.task["task_id"], decision)
+        declaration = declarations.build_route_declaration(
+            decision=decision,
+            route_config_hash=declarations.compute_route_config_hash({"policy": {}}),
+            allowed_roles=("luna",),
+            active_roles=("luna",),
+            rule_ids=(decision.rule_id,),
+            reason_codes=("PLAN_IS_DELIVERABLE",),
+            max_dispatches=4,
+            allowed_transitions=(),
+        )
+        with self.store.lock(self.task["task_id"]):
+            declarations.record_route_declaration(self.store, self.task["task_id"], declaration)
+        original = ledger_bytes(self.store, self.frozen.task_id)
+        with self.assertRaisesRegex(workflow.WorkflowError, "ROLE_NOT_ALLOWED"):
+            scheduler.dispatch_ready_batch(self.store, self.frozen)
+        self.assertEqual(original, ledger_bytes(self.store, self.frozen.task_id))
 
 
 if __name__ == "__main__":

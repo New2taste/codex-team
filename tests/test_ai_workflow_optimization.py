@@ -1056,7 +1056,7 @@ class RouteCliShadowAdviceTest(unittest.TestCase):
             (self.state_root / self.task["task_id"] / "route-advice.json").exists()
         )
         self.assertEqual(
-            ["ROUTE_DECIDED"],
+            ["ROUTE_DECIDED", "ROUTE_DECLARED"],
             [event["event_type"] for event in self._task_events()],
         )
 
@@ -1075,7 +1075,7 @@ class RouteCliShadowAdviceTest(unittest.TestCase):
         self.assertEqual(stored["task_sha256"], sidecar["task_sha256"])
         self.assertEqual(stored["request_sha256"], sidecar["request_sha256"])
         self.assertEqual(
-            ["ROUTE_DECIDED", "ROUTE_ADVICE_RECORDED"],
+            ["ROUTE_DECIDED", "ROUTE_DECLARED", "ROUTE_ADVICE_RECORDED"],
             [event["event_type"] for event in self._task_events()],
         )
         run_codex.assert_not_called()

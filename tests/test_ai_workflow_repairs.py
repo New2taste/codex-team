@@ -9,7 +9,10 @@ from pathlib import Path
 from unittest import mock
 
 from scripts import ai_workflow as workflow
+from scripts import ai_workflow_artifacts as artifacts
+from scripts import ai_workflow_ownership as ownership
 from scripts import ai_workflow_repairs as repairs
+from tests.test_ai_workflow import _compat_popen, _install_declaration
 
 
 class RepairProtocolTest(unittest.TestCase):
@@ -37,6 +40,9 @@ class RepairProtocolTest(unittest.TestCase):
                 "human_gates": ["PLAN_APPROVAL", "EXECUTION_APPROVAL"],
             }
         )
+        repo = Path(self.temporary_directory.name)
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True, capture_output=True)
+        (repo / ".codex" / "sessions").mkdir(parents=True, exist_ok=True)
         self.original_reviewer = repairs.ActorIdentity(
             identity="sol-reviewer-original", role="sol_medium_reviewer"
         )
@@ -281,10 +287,11 @@ class RepairProtocolTest(unittest.TestCase):
                 task.update({"base_commit": None, "candidate_commit": None})
             if task_type == "REMEDIATION":
                 task["allowed_write_paths"] = ["scripts/"]
+                task["source_worktree"] = task["repository_root"]
             else:
                 task["human_gates"] = ["FINAL_ACCEPTANCE"]
             self.store.create_task(task)
-            tasks.append((task_id, "AWAITING_OWNER_DECISION" if task_type == "REMEDIATION" else "BLOCKED"))
+            tasks.append((task_id, "AWAITING_OWNER_DECISION"))
 
         legacy_config = workflow._load_workflow_config()
         legacy_config["routing"] = {"mode": "legacy", "role_policy": "legacy"}
@@ -543,8 +550,48 @@ class AssignmentSideEffectObservationTest(unittest.TestCase):
 
         self.fx = AcceptanceLedgerV2ContractTest()
         self.fx.setUp()
+        self.fx.task["source_worktree"] = str(self.fx.repository_root)
+        (self.fx.repository_root / ".codex" / "sessions").mkdir(parents=True, exist_ok=True)
+        original_open = self.fx._open_with_owner
+
+        def gated_open(*args, **kwargs):
+            result = original_open(*args, **kwargs)
+            _install_declaration(
+                self.fx.store,
+                self.fx.task,
+                allowed_roles=(
+                    "luna",
+                    "terra",
+                    "terra_xhigh_reviewer",
+                    "sol_medium_reviewer",
+                ),
+                active_roles=("luna", "terra_xhigh_reviewer"),
+                max_dispatches=32,
+            )
+            return result
+
+        self.fx._open_with_owner = gated_open
+        original_run = repairs.run_assignment
+
+        def gated_run(store, task_id, assignment, *args, **kwargs):
+            if ownership.load_ownership_registry(store, task_id) is None:
+                role = assignment.expected_actor.role
+                registry = ownership.OwnershipRegistry(
+                    schema_version=ownership.OWNERSHIP_REGISTRY_SCHEMA_VERSION,
+                    task_id=task_id,
+                    envelope_hash=artifacts.artifact_sha256(self.fx.task),
+                    path_owners={"src": role},
+                    registered_at_utc="2026-08-28T00:00:00Z",
+                )
+                with store.lock(task_id):
+                    ownership.record_ownership_registry(store, task_id, registry)
+            return original_run(store, task_id, assignment, *args, **kwargs)
+
+        repairs.run_assignment = gated_run
+        self._original_run_assignment = original_run
 
     def tearDown(self) -> None:
+        repairs.run_assignment = self._original_run_assignment
         self.fx.tearDown()
 
     def _write_rollout(self, sessions: Path, thread_id: str, *, sandbox: str, model: str, effort: str, permission: str) -> None:
@@ -565,14 +612,7 @@ class AssignmentSideEffectObservationTest(unittest.TestCase):
         )
 
     def _patch_codex(self, handler):
-        real_run = subprocess.run
-
-        def launch(command, *args, **kwargs):
-            if Path(command[0]).name == "codex":
-                return handler(command, *args, **kwargs)
-            return real_run(command, *args, **kwargs)
-
-        return mock.patch.object(workflow.subprocess, "run", side_effect=launch)
+        return mock.patch.object(repairs.subprocess, "Popen", _compat_popen(handler))
 
     def test_v2_controller_captures_before_and_after_snapshots(self) -> None:
         from scripts import ai_workflow_side_effects as side_effects
@@ -709,7 +749,7 @@ class AssignmentSideEffectObservationTest(unittest.TestCase):
         )
 
         def fail_and_mutate(command, *args, **kwargs):
-            (self.fx.repository_root / "spawn-failed.txt").write_text(
+            (self.fx.repository_root / "src" / "spawn-failed.txt").write_text(
                 "mutated after spawn\n", encoding="utf-8"
             )
             return subprocess.CompletedProcess(command, 23, stdout="", stderr="failed")
@@ -724,7 +764,7 @@ class AssignmentSideEffectObservationTest(unittest.TestCase):
         kinds = {row["effect_kind"] for row in rows}
         self.assertTrue(ownership.has_ownership_locking_side_effect(self.fx.store, self.fx.TASK_ID))
         self.assertTrue(kinds & {"OWNED_WRITE", "UNTRACKED_WRITE", "COMMAND_GENERATED"})
-        self.assertIn("spawn-failed.txt", {row["path"] for row in rows})
+        self.assertIn("src/spawn-failed.txt", {row["path"] for row in rows})
         self.assertNotIn("UNOBSERVED_ASSUMED_PRESENT", kinds)
 
     def test_post_spawn_snapshot_failure_records_unobserved(self) -> None:
@@ -992,6 +1032,12 @@ class VerdictReleaseGateRepairTest(unittest.TestCase):
             "require_verdict_fresh(",
             authorize_source.replace("require_verdict_fresh_locked", ""),
         )
+
+    def test_run_assignment_requires_locked_dispatch_permit(self) -> None:
+        source = inspect.getsource(self.fx._original_run_assignment)
+        self.assertIn("require_dispatch_permit_locked(", source)
+        self.assertIn("claim_permit_start_locked(", source)
+        self.assertIn("release_permit_if_never_spawned(", source)
 
 
 if __name__ == "__main__":

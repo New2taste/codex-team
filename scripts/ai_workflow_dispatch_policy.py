@@ -239,7 +239,6 @@ def _build_declaration_from_decision(
         raw_retries = policy_cfg.get("max_technical_retries", 0)
         if isinstance(raw_retries, int) and not isinstance(raw_retries, bool) and raw_retries >= 0:
             retries = raw_retries
-    max_dispatches = len(roles) * (1 + retries)
     reason_codes_raw = payload.get("reason_codes", ())
     if isinstance(reason_codes_raw, (list, tuple)):
         reason_codes = tuple(str(item) for item in reason_codes_raw)
@@ -251,6 +250,16 @@ def _build_declaration_from_decision(
         for item in transitions_raw:
             if isinstance(item, Mapping):
                 transitions.append(dict(item))
+    extra_roles: list[str] = []
+    if "sol_reviewer" in roles and "sol_xhigh" not in roles:
+        extra_roles.append("sol_xhigh")
+        transitions.append({"from_role": "sol_reviewer", "to_role": "sol_xhigh"})
+    if "sol_planner" in roles and "sol_xhigh_planner" not in roles:
+        extra_roles.append("sol_xhigh_planner")
+        transitions.append({"from_role": "sol_planner", "to_role": "sol_xhigh_planner"})
+    if extra_roles:
+        roles = tuple(dict.fromkeys((*roles, *extra_roles)))
+    max_dispatches = len(roles) * (1 + retries)
     return build_route_declaration(
         decision=decision,
         route_config_hash=compute_route_config_hash(payload),
