@@ -107,9 +107,27 @@ class ControllerEvidenceExecutionTest(unittest.TestCase):
     def test_nonexistent_l0_artifact_cannot_be_attested_by_fake_runner(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "state"
+            repository = Path(temporary) / "repository"
+            artifact = repository / "tests" / "fixtures" / "paired-cases.json"
+            artifact.parent.mkdir(parents=True)
+            artifact.write_text("case-01\n", encoding="utf-8")
+            workflow.git(repository, "init", "--quiet")
+            workflow.git(repository, "config", "user.email", "tests@example.invalid")
+            workflow.git(repository, "config", "user.name", "Workflow Tests")
+            workflow.git(repository, "add", ".")
+            workflow.git(repository, "commit", "--quiet", "-m", "fixture")
+            commit = workflow.git(repository, "rev-parse", "HEAD")
             task = remediation_task()
-            task["repository_root"] = temporary
-            plan = construction_plan(task=task)
+            task["repository_root"] = str(repository)
+            task["source_worktree"] = str(repository)
+            task["base_commit"] = commit
+            task["candidate_commit"] = commit
+            scope = "tests/fixtures/paired-cases.json"
+            envelope = valid_envelope(scope)
+            envelope["evidence"]["L0"]["sha256"] = hashlib.sha256(
+                artifact.read_bytes()
+            ).hexdigest()
+            plan = construction_plan(task=task, envelope=envelope)
             request = route_request(task)
             store = workflow.WorkflowStore(root)
             store.create_task(task)
@@ -125,6 +143,7 @@ class ControllerEvidenceExecutionTest(unittest.TestCase):
                 construction_step_id="construction-601", construction_attempt=1,
                 state_root=root,
             )
+            artifact.unlink()
             workflow._apply_owner_decision(store, task["task_id"], "approve_execution", "owner")
             self.assertEqual(
                 "BLOCKED",
