@@ -8,13 +8,14 @@ import tempfile
 import tomllib
 import argparse
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest import mock
 
 from scripts import ai_workflow as workflow
 from scripts import ai_workflow_artifacts as artifacts
+from scripts import ai_workflow_authorizations as authorizations
 from scripts import ai_workflow_declarations as declarations
 from scripts import ai_workflow_dispatch_policy as policy
 from scripts import ai_workflow_ownership as ownership
@@ -108,6 +109,7 @@ def _install_declaration(
     active_roles: tuple[str, ...] | None = None,
     max_dispatches: int = 8,
     mode: str = "legacy",
+    run_preflight: bool = True,
 ) -> declarations.RouteDeclaration:
     _seed_sessions(task)
     task_id = str(task["task_id"])
@@ -129,8 +131,9 @@ def _install_declaration(
     )
     with store.lock(task_id):
         recorded = declarations.ensure_route_declaration(store, task_id, declaration)
-        for role in recorded.active_roles:
-            preflight.run_role_preflight_locked(store, task_id, role)
+        if run_preflight:
+            for role in recorded.active_roles:
+                preflight.run_role_preflight_locked(store, task_id, role)
     return recorded
 
 
@@ -3861,6 +3864,100 @@ class DispatchGateHubTest(unittest.TestCase):
             return []
         return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
 
+    def _events(self) -> list[dict[str, object]]:
+        path = self.store._require_task(self.task_id) / "events.jsonl"
+        if not path.is_file():
+            return []
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+
+    def _store_task(self) -> None:
+        task_dir = self.store._require_task(self.task_id)
+        (task_dir / "task.json").write_text(
+            workflow._canonical_json(self.task) + "\n", encoding="utf-8"
+        )
+
+    def _prepare_terra_task(self, *, allowed_write_paths: tuple[str, ...] = ("src",)) -> None:
+        self.task["task_type"] = "REMEDIATION"
+        self.task["allowed_write_paths"] = list(allowed_write_paths)
+        self.task["source_worktree"] = str(self.repo)
+        self._store_task()
+
+    def _record_registry(self, path_owners: dict[str, str]) -> None:
+        registry = ownership.OwnershipRegistry(
+            schema_version=ownership.OWNERSHIP_REGISTRY_SCHEMA_VERSION,
+            task_id=self.task_id,
+            envelope_hash=artifacts.artifact_sha256(self.task),
+            path_owners=dict(path_owners),
+            registered_at_utc="2026-08-28T00:00:00Z",
+        )
+        with self.store.lock(self.task_id):
+            ownership.record_ownership_registry(self.store, self.task_id, registry)
+
+    def _record_owner_evidence(self) -> None:
+        self.actor = "owner"
+        self.evidence = {
+            "event_type": "OWNER_DECISION",
+            "decision": "defer",
+            "actor": self.actor,
+            "timestamp_utc": "2026-08-28T00:00:00Z",
+            "previous_state": "AWAITING_OWNER_DECISION",
+            "new_state": "DEFERRED",
+            "task_sha256": artifacts.artifact_sha256(self.task),
+        }
+        self.store.record_decision(self.task_id, self.evidence)
+        self.owner_evidence_id = artifacts.artifact_sha256(self.evidence)
+
+    def _issue_transfer(self, **overrides: object) -> authorizations.OwnerAuthorization:
+        kwargs: dict[str, object] = {
+            "authorization_type": "OWNERSHIP_TRANSFER",
+            "actor": self.actor,
+            "owner_evidence_id": self.owner_evidence_id,
+            "issued_at_utc": "2026-08-28T12:00:00Z",
+            "path": "src",
+            "from_role": "luna",
+            "to_role": "terra",
+            "allowed_paths": ("src",),
+            "max_dispatches": 4,
+        }
+        kwargs.update(overrides)
+        return authorizations.issue_owner_authorization(self.store, self.task_id, **kwargs)
+
+    def _popen_writing(self, result: dict[str, object], *relative_paths: str):
+        repo = self.repo
+
+        class Popen(_RecordingPopen):
+            _result = result
+
+            def __init__(self, command, *args, **kwargs):
+                super().__init__(command, *args, **kwargs)
+                if self._delegate is not None:
+                    return
+                for relative in relative_paths:
+                    path = repo / relative
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text("hub-write\n", encoding="utf-8")
+
+        return Popen
+
+    def _terra_result(self) -> dict[str, object]:
+        result = CodexRunnerTest().valid_result("terra", "IMPLEMENTED_CANDIDATE")
+        result["recommended_next_state"] = "PRECHECK_RUNNING"
+        return result
+
+    @contextmanager
+    def _terra_run_patches(self, popen):
+        with ExitStack() as stack:
+            stack.enter_context(
+                mock.patch.object(
+                    workflow, "capture_repo", return_value=workflow.RepoSnapshot("h" * 40, ())
+                )
+            )
+            stack.enter_context(mock.patch.object(workflow, "working_tree_paths", return_value=set()))
+            stack.enter_context(mock.patch.object(workflow, "_assert_terra_worktree_authorized"))
+            stack.enter_context(mock.patch.object(workflow, "_reject_dirty_input"))
+            stack.enter_context(mock.patch.object(workflow.subprocess, "Popen", popen))
+            yield
+
     def test_missing_declaration_rejects_run_codex_without_spawn(self) -> None:
         popen = self._popen(CodexRunnerTest().valid_result())
         with (
@@ -3917,14 +4014,6 @@ class DispatchGateHubTest(unittest.TestCase):
             self.assertIn("require_dispatch_permit_locked(", source)
             self.assertIn("claim_permit_start_locked(", source)
             self.assertIn("release_permit_if_never_spawned(", source)
-            tree = ast.parse(source)
-            names = [
-                _call_name(node)
-                for node in ast.walk(tree)
-                if isinstance(node, ast.Call)
-            ]
-            self.assertIn("release_permit_if_never_spawned", names)
-            self.assertNotIn("release_permit_before_start", names)
 
     def test_helper_is_unique_direct_caller_and_only_releases_when_unspawned(self) -> None:
         module_path = ROOT / "scripts" / "ai_workflow_dispatch_policy.py"
@@ -3956,34 +4045,39 @@ class DispatchGateHubTest(unittest.TestCase):
         self.assertIn("release_permit_before_start", release_names)
 
     def test_popen_is_immediately_followed_by_claim(self) -> None:
-        tree = ast.parse(inspect.getsource(workflow.run_codex))
-        func = tree.body[0]
-        assert isinstance(func, ast.FunctionDef)
-        found = False
-        for block in _with_lock_blocks(workflow.run_codex):
-            statements = [
-                node
-                for node in block.body
-                if not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant))
-            ]
-            for index, statement in enumerate(statements):
-                if not isinstance(statement, ast.Assign) or not isinstance(statement.value, ast.Call):
-                    continue
-                if _call_name(statement.value) != "Popen":
-                    continue
-                following = statements[index + 1]
-                call = following.value if isinstance(following, ast.Expr) else (
-                    following if isinstance(following, ast.Expr) else None
-                )
-                if isinstance(following, ast.Expr) and isinstance(following.value, ast.Call):
-                    self.assertEqual("claim_permit_start_locked", _call_name(following.value))
-                    found = True
-                elif isinstance(following, ast.Assign) and isinstance(following.value, ast.Call):
-                    self.assertEqual("claim_permit_start_locked", _call_name(following.value))
-                    found = True
-                else:
-                    self.fail("claim_permit_start_locked must follow Popen immediately")
-        self.assertTrue(found)
+        for function in (workflow.run_codex, workflow.run_assignment):
+            found = False
+            for block in _with_lock_blocks(function):
+                statements = [
+                    node
+                    for node in block.body
+                    if not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant))
+                ]
+                for index, statement in enumerate(statements):
+                    if not isinstance(statement, ast.Assign) or not isinstance(statement.value, ast.Call):
+                        continue
+                    if _call_name(statement.value) != "Popen":
+                        continue
+                    following = statements[index + 1]
+                    if isinstance(following, ast.Expr) and isinstance(following.value, ast.Call):
+                        self.assertEqual(
+                            "claim_permit_start_locked",
+                            _call_name(following.value),
+                            function.__name__,
+                        )
+                        found = True
+                    elif isinstance(following, ast.Assign) and isinstance(following.value, ast.Call):
+                        self.assertEqual(
+                            "claim_permit_start_locked",
+                            _call_name(following.value),
+                            function.__name__,
+                        )
+                        found = True
+                    else:
+                        self.fail(
+                            f"claim_permit_start_locked must follow Popen immediately in {function.__name__}"
+                        )
+            self.assertTrue(found, function.__name__)
 
     def test_schema_materialize_failure_releases_and_retires_identity(self) -> None:
         _install_declaration(self.store, self.task, allowed_roles=("luna",), active_roles=("luna",))
@@ -4179,7 +4273,7 @@ class DispatchGateHubTest(unittest.TestCase):
         )
         with self.store.lock(self.task_id):
             ownership.record_ownership_registry(self.store, self.task_id, registry)
-        popen = self._popen(CodexRunnerTest().valid_result("terra", "IMPLEMENTED_CANDIDATE"))
+        popen = self._popen(self._terra_result())
         with (
             mock.patch.object(workflow, "capture_repo", return_value=workflow.RepoSnapshot("h" * 40, ())),
             mock.patch.object(workflow, "working_tree_paths", return_value=set()),
@@ -4190,6 +4284,208 @@ class DispatchGateHubTest(unittest.TestCase):
             with self.assertRaisesRegex(workflow.WorkflowError, "OWNERSHIP_TRANSFER_BLOCKED"):
                 workflow.run_codex("terra", self.task, "task contract", self._paths())
         self.assertEqual([], popen.calls)
+
+    def test_unknown_actual_paths_do_not_complete_write_role(self) -> None:
+        self._prepare_terra_task()
+        _install_declaration(self.store, self.task, allowed_roles=("terra",), active_roles=("terra",))
+        self._record_registry({"src": "terra"})
+        popen = self._popen(self._terra_result())
+        with (
+            mock.patch.object(workflow, "capture_fs_snapshot", return_value=None),
+            self._terra_run_patches(popen),
+        ):
+            with self.assertRaisesRegex(workflow.WorkflowError, "ACTUAL_WRITE_PATHS_UNKNOWN"):
+                workflow.run_codex("terra", self.task, "task contract", self._paths())
+        self.assertEqual(1, len(popen.calls))
+
+    def test_focused_authorization_records_lease_on_this_permit(self) -> None:
+        self._prepare_terra_task()
+        _install_declaration(self.store, self.task, allowed_roles=("terra",), active_roles=("terra",))
+        self._record_registry({"src": "luna"})
+        self._record_owner_evidence()
+        issued = self._issue_transfer()
+        popen = self._popen(self._terra_result())
+        with self._terra_run_patches(popen):
+            workflow.run_codex(
+                "terra",
+                self.task,
+                "task contract",
+                self._paths(),
+                authorization_id=issued.authorization_id,
+            )
+        self.assertEqual(1, len(popen.calls))
+        permit_id = self._permit_records()[0]["permit_id"]
+        leases = authorizations.leases_for_permit(self.store, self.task_id, permit_id)
+        self.assertEqual(1, len(leases))
+        self.assertEqual(permit_id, leases[0]["permit_id"])
+        self.assertEqual(["src"], leases[0]["allowed_paths"])
+
+    def test_over_bound_write_records_violation_then_blocks_later_dispatch(self) -> None:
+        self._prepare_terra_task(allowed_write_paths=("src/owned.py",))
+        _install_declaration(
+            self.store, self.task, allowed_roles=("terra", "luna"), active_roles=("terra", "luna")
+        )
+        self._record_registry({"src/owned.py": "terra", "src": "luna"})
+        (self.repo / "src").mkdir(parents=True, exist_ok=True)
+        popen = self._popen_writing(
+            self._terra_result(),
+            "src/x.py",
+        )
+        with self._terra_run_patches(popen):
+            with self.assertRaisesRegex(workflow.WorkflowError, "OWNERSHIP_VIOLATION"):
+                workflow.run_codex("terra", self.task, "task contract", self._paths())
+        self.assertEqual(1, len(popen.calls))
+        violations = [
+            event
+            for event in self._events()
+            if event.get("event_type") == "OWNERSHIP_VIOLATION_RECORDED"
+        ]
+        self.assertEqual(1, len(violations))
+        self.assertEqual(["src/x.py"], violations[0]["paths"])
+        side_effects = ownership.load_side_effects(self.store, self.task_id)
+        self.assertFalse(
+            any(row.get("effect_kind") == "OWNERSHIP_VIOLATION_RECORDED" for row in side_effects)
+        )
+        _RecordingPopen.reset()
+        luna_popen = self._popen(CodexRunnerTest().valid_result())
+        with (
+            mock.patch.object(workflow, "capture_repo", return_value=workflow.RepoSnapshot("h" * 40, ())),
+            mock.patch.object(workflow, "working_tree_paths", return_value=set()),
+            mock.patch.object(workflow.subprocess, "Popen", luna_popen),
+        ):
+            with self.assertRaisesRegex(
+                workflow.WorkflowError, "DISPATCH_BLOCKED_OWNERSHIP_VIOLATION"
+            ):
+                workflow.run_codex("luna", self.task, "task contract", self._paths())
+        self.assertEqual([], luna_popen.calls)
+
+    def test_historical_lease_does_not_exempt_later_hub_permit(self) -> None:
+        self._prepare_terra_task(allowed_write_paths=("src",))
+        _install_declaration(self.store, self.task, allowed_roles=("terra",), active_roles=("terra",))
+        self._record_registry({"src/owned.py": "terra", "src": "luna"})
+        self._record_owner_evidence()
+        issued = self._issue_transfer(max_dispatches=1)
+        first = self._popen_writing(
+            self._terra_result(),
+            "src/x.py",
+        )
+        with self._terra_run_patches(first):
+            workflow.run_codex(
+                "terra",
+                self.task,
+                "task contract",
+                self._paths(),
+                authorization_id=issued.authorization_id,
+            )
+        permit_a = self._permit_records()[0]["permit_id"]
+        self.assertTrue(authorizations.leases_for_permit(self.store, self.task_id, permit_a))
+        second = self._popen_writing(
+            self._terra_result(),
+            "src/y.py",
+        )
+        with (
+            mock.patch.object(workflow, "_write_scopes_for_role", return_value=("src/owned.py",)),
+            self._terra_run_patches(second),
+        ):
+            with self.assertRaisesRegex(workflow.WorkflowError, "OWNERSHIP_VIOLATION"):
+                workflow.run_codex("terra", self.task, "task contract", self._paths())
+        permit_b = self._permit_records()[-1]["permit_id"]
+        self.assertNotEqual(permit_a, permit_b)
+        self.assertEqual((), authorizations.leases_for_permit(self.store, self.task_id, permit_b))
+        violations = [
+            event
+            for event in self._events()
+            if event.get("event_type") == "OWNERSHIP_VIOLATION_RECORDED"
+        ]
+        self.assertEqual(1, len(violations))
+        self.assertEqual(permit_b, violations[0]["permit_id"])
+
+    def test_role_not_allowed_rejects_run_codex_before_spawn(self) -> None:
+        _install_declaration(self.store, self.task, allowed_roles=("luna",), active_roles=("luna",))
+        popen = self._popen(CodexRunnerTest().valid_result())
+        with (
+            mock.patch.object(workflow, "capture_repo", return_value=workflow.RepoSnapshot("h" * 40, ())),
+            mock.patch.object(workflow, "working_tree_paths", return_value=set()),
+            mock.patch.object(workflow.subprocess, "Popen", popen),
+        ):
+            with self.assertRaisesRegex(workflow.WorkflowError, "ROLE_NOT_ALLOWED"):
+                workflow.run_codex("sol_planner", self.task, "task contract", self._paths())
+        self.assertEqual([], popen.calls)
+
+    def test_role_not_preflighted_rejects_run_codex_before_spawn(self) -> None:
+        _install_declaration(
+            self.store,
+            self.task,
+            allowed_roles=("luna",),
+            active_roles=("luna",),
+            run_preflight=False,
+        )
+        popen = self._popen(CodexRunnerTest().valid_result())
+        with (
+            mock.patch.object(workflow, "capture_repo", return_value=workflow.RepoSnapshot("h" * 40, ())),
+            mock.patch.object(workflow, "working_tree_paths", return_value=set()),
+            mock.patch.object(workflow.subprocess, "Popen", popen),
+        ):
+            with self.assertRaisesRegex(workflow.WorkflowError, "ROLE_NOT_PREFLIGHTED"):
+                workflow.run_codex("luna", self.task, "task contract", self._paths())
+        self.assertEqual([], popen.calls)
+
+    def test_budget_exceeded_rejects_run_codex_before_spawn(self) -> None:
+        _install_declaration(
+            self.store,
+            self.task,
+            allowed_roles=("luna",),
+            active_roles=("luna",),
+            max_dispatches=0,
+        )
+        popen = self._popen(CodexRunnerTest().valid_result())
+        with (
+            mock.patch.object(workflow, "capture_repo", return_value=workflow.RepoSnapshot("h" * 40, ())),
+            mock.patch.object(workflow, "working_tree_paths", return_value=set()),
+            mock.patch.object(workflow.subprocess, "Popen", popen),
+        ):
+            with self.assertRaisesRegex(workflow.WorkflowError, "ROUTE_BUDGET_EXCEEDED"):
+                workflow.run_codex("luna", self.task, "task contract", self._paths())
+        self.assertEqual([], popen.calls)
+
+    def test_resume_until_gate_missing_declaration_does_not_run(self) -> None:
+        events = self.store._require_task(self.task_id) / "events.jsonl"
+        events.write_text(
+            json.dumps({"event_type": "STATE_TRANSITION", "new_state": "DRAFT"}) + "\n",
+            encoding="utf-8",
+        )
+        runner = ScriptedRunner([CodexRunnerTest().valid_result()])
+        with mock.patch.object(workflow, "WORKFLOW_STATE_ROOT", self.state_root):
+            with self.assertRaisesRegex(workflow.WorkflowError, "ROUTE_DECLARATION_MISSING"):
+                workflow._resume_stored_task(self.store, self.task_id, runner, None)
+        self.assertEqual([], runner.calls)
+
+    def test_resume_until_gate_crash_window_recovers_declared_then_continues(self) -> None:
+        declaration = _install_declaration(
+            self.store, self.task, allowed_roles=("luna", "sol_planner"), active_roles=("luna", "sol_planner")
+        )
+        path = self.store._require_task(self.task_id) / "route-declaration.json"
+        before = path.read_bytes()
+        events = self.store._require_task(self.task_id) / "events.jsonl"
+        kept = [
+            line
+            for line in events.read_text(encoding="utf-8").splitlines()
+            if json.loads(line).get("event_type") != "ROUTE_DECLARED"
+        ]
+        events.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+        runner = ScriptedRunner([RuntimeError("runner boom")])
+        with mock.patch.object(workflow, "WORKFLOW_STATE_ROOT", self.state_root):
+            with self.assertRaises(RuntimeError):
+                workflow._resume_stored_task(self.store, self.task_id, runner, None)
+        self.assertEqual(["luna"], runner.calls)
+        self.assertEqual(before, path.read_bytes())
+        restored = [
+            event
+            for event in self._events()
+            if event.get("event_type") == "ROUTE_DECLARED"
+        ]
+        self.assertEqual(1, len(restored))
+        self.assertEqual(before, path.read_bytes())
 
     def test_historical_task_without_route_decision_is_fail_closed(self) -> None:
         events = self.store._require_task(self.task_id) / "events.jsonl"

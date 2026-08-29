@@ -12,7 +12,7 @@ from scripts import ai_workflow as workflow
 from scripts import ai_workflow_artifacts as artifacts
 from scripts import ai_workflow_ownership as ownership
 from scripts import ai_workflow_repairs as repairs
-from tests.test_ai_workflow import _compat_popen, _install_declaration
+from tests.test_ai_workflow import _RecordingPopen, _compat_popen, _install_declaration
 
 
 class RepairProtocolTest(unittest.TestCase):
@@ -571,27 +571,8 @@ class AssignmentSideEffectObservationTest(unittest.TestCase):
             return result
 
         self.fx._open_with_owner = gated_open
-        original_run = repairs.run_assignment
-
-        def gated_run(store, task_id, assignment, *args, **kwargs):
-            if ownership.load_ownership_registry(store, task_id) is None:
-                role = assignment.expected_actor.role
-                registry = ownership.OwnershipRegistry(
-                    schema_version=ownership.OWNERSHIP_REGISTRY_SCHEMA_VERSION,
-                    task_id=task_id,
-                    envelope_hash=artifacts.artifact_sha256(self.fx.task),
-                    path_owners={"src": role},
-                    registered_at_utc="2026-08-28T00:00:00Z",
-                )
-                with store.lock(task_id):
-                    ownership.record_ownership_registry(store, task_id, registry)
-            return original_run(store, task_id, assignment, *args, **kwargs)
-
-        repairs.run_assignment = gated_run
-        self._original_run_assignment = original_run
 
     def tearDown(self) -> None:
-        repairs.run_assignment = self._original_run_assignment
         self.fx.tearDown()
 
     def _write_rollout(self, sessions: Path, thread_id: str, *, sandbox: str, model: str, effort: str, permission: str) -> None:
@@ -950,6 +931,224 @@ class AssignmentSideEffectObservationTest(unittest.TestCase):
         )
         actual = set(completed["actual_changed_paths"])
         self.assertEqual(actual, observed_paths)
+
+
+class AssignmentDispatchGateTest(unittest.TestCase):
+    def setUp(self) -> None:
+        from tests.test_ai_workflow_adversarial_acceptance import (
+            AcceptanceLedgerV2ContractTest,
+        )
+
+        self.fx = AcceptanceLedgerV2ContractTest()
+        self.fx.setUp()
+        self.fx.task["source_worktree"] = str(self.fx.repository_root)
+        (self.fx.repository_root / ".codex" / "sessions").mkdir(parents=True, exist_ok=True)
+        _RecordingPopen.reset()
+
+    def tearDown(self) -> None:
+        self.fx.tearDown()
+
+    def _write_rollout(self, sessions: Path, thread_id: str) -> None:
+        sessions.mkdir(parents=True, exist_ok=True)
+        (sessions / f"rollout-{thread_id}").write_text(
+            json.dumps(
+                {
+                    "thread_id": thread_id,
+                    "agent_type": None,
+                    "model": "gpt-5.6-terra",
+                    "reasoning_effort": "xhigh",
+                    "sandbox_policy": "read-only",
+                    "permission_profile": "read-only",
+                    "cwd": str(self.fx.repository_root),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def _review_result(self, role: str = "terra_xhigh_reviewer") -> dict[str, object]:
+        return {
+            "schema_version": "ai-result-1",
+            "dispatch_id": None,
+            "task_id": None,
+            "step_id": None,
+            "attempt": None,
+            "role": role,
+            "status": "ACCEPTANCE_RECOMMENDED",
+            "summary": "ok",
+            "claims": [],
+            "evidence": [],
+            "counter_checks": [],
+            "changed_files": [],
+            "blind_spots": [],
+            "unresolved_questions": [],
+            "recommended_next_state": "AWAITING_OWNER_DECISION",
+        }
+
+    def _controller_handler(self, thread_id: str, result: dict[str, object], *writes: str):
+        def controller_process(command, *args, **kwargs):
+            for relative in writes:
+                path = self.fx.repository_root / relative
+                path.write_text("OVER_BOUND = True\n", encoding="utf-8")
+            output_path = Path(command[command.index("-o") + 1])
+            output_path.write_text(json.dumps(result), encoding="utf-8")
+            events = "\n".join(
+                (
+                    json.dumps({"type": "thread.started", "thread_id": thread_id}),
+                    json.dumps({"type": "turn.completed"}),
+                )
+            )
+            return subprocess.CompletedProcess(command, 0, stdout=events + "\n", stderr="")
+
+        return controller_process
+
+    def _issue_review(self):
+        self.fx._open_with_owner("luna-owner", "luna")
+        reviewer_thread = str(uuid.uuid4())
+        review = self.fx._issue(
+            "REVIEW_1",
+            self.fx._expected_actor(
+                "terra-gate-review",
+                "terra_xhigh_reviewer",
+                runtime_instance_id=reviewer_thread,
+            ),
+        )
+        sessions = self.fx.repository_root.parent / "gate-sessions"
+        self._write_rollout(sessions, reviewer_thread)
+        return review, sessions, reviewer_thread
+
+    def test_missing_declaration_rejects_assignment_before_spawn(self) -> None:
+        review, sessions, thread_id = self._issue_review()
+        (
+            self.fx.store._require_task(self.fx.TASK_ID) / "route-declaration.json"
+        ).unlink()
+        _RecordingPopen.reset()
+        with (
+            mock.patch.object(
+                repairs.subprocess,
+                "Popen",
+                _compat_popen(self._controller_handler(thread_id, self._review_result())),
+            ),
+            self.fx._controller_codex_lookup(),
+        ):
+            with self.assertRaisesRegex(
+                workflow.WorkflowError, "ROUTE_DECLARATION_MISSING|ROUTE_DECLARATION_CORRUPT"
+            ):
+                repairs.run_assignment(self.fx.store, self.fx.TASK_ID, review, sessions)
+        self.assertEqual([], _RecordingPopen.calls)
+
+    def test_role_not_allowed_rejects_assignment_before_spawn(self) -> None:
+        self.fx._declaration_kwargs = {
+            "allowed_roles": ("luna",),
+            "active_roles": ("luna",),
+        }
+        review, sessions, thread_id = self._issue_review()
+        _RecordingPopen.reset()
+        with (
+            mock.patch.object(
+                repairs.subprocess,
+                "Popen",
+                _compat_popen(self._controller_handler(thread_id, self._review_result())),
+            ),
+            self.fx._controller_codex_lookup(),
+        ):
+            with self.assertRaisesRegex(workflow.WorkflowError, "ROLE_NOT_ALLOWED"):
+                repairs.run_assignment(self.fx.store, self.fx.TASK_ID, review, sessions)
+        self.assertEqual([], _RecordingPopen.calls)
+
+    def test_role_not_preflighted_rejects_assignment_before_spawn(self) -> None:
+        self.fx._declaration_kwargs = {"run_preflight": False}
+        review, sessions, thread_id = self._issue_review()
+        _RecordingPopen.reset()
+        with (
+            mock.patch.object(
+                repairs.subprocess,
+                "Popen",
+                _compat_popen(self._controller_handler(thread_id, self._review_result())),
+            ),
+            self.fx._controller_codex_lookup(),
+        ):
+            with self.assertRaisesRegex(workflow.WorkflowError, "ROLE_NOT_PREFLIGHTED"):
+                repairs.run_assignment(self.fx.store, self.fx.TASK_ID, review, sessions)
+        self.assertEqual([], _RecordingPopen.calls)
+
+    def test_budget_exceeded_rejects_assignment_before_spawn(self) -> None:
+        self.fx._declaration_kwargs = {"max_dispatches": 0}
+        review, sessions, thread_id = self._issue_review()
+        _RecordingPopen.reset()
+        with (
+            mock.patch.object(
+                repairs.subprocess,
+                "Popen",
+                _compat_popen(self._controller_handler(thread_id, self._review_result())),
+            ),
+            self.fx._controller_codex_lookup(),
+        ):
+            with self.assertRaisesRegex(workflow.WorkflowError, "ROUTE_BUDGET_EXCEEDED"):
+                repairs.run_assignment(self.fx.store, self.fx.TASK_ID, review, sessions)
+        self.assertEqual([], _RecordingPopen.calls)
+
+    def test_unknown_observation_does_not_complete_assignment(self) -> None:
+        review, sessions, thread_id = self._issue_review()
+        with (
+            mock.patch.object(
+                repairs, "_observe_assignment_execution_side_effects", return_value=None
+            ),
+            mock.patch.object(
+                repairs.subprocess,
+                "Popen",
+                _compat_popen(self._controller_handler(thread_id, self._review_result())),
+            ),
+            self.fx._controller_codex_lookup(),
+        ):
+            with self.assertRaisesRegex(workflow.WorkflowError, "ACTUAL_WRITE_PATHS_UNKNOWN"):
+                repairs.run_assignment(self.fx.store, self.fx.TASK_ID, review, sessions)
+
+    def test_assignment_over_bound_write_records_violation(self) -> None:
+        review, sessions, thread_id = self._issue_review()
+        with (
+            mock.patch.object(
+                repairs.subprocess,
+                "Popen",
+                _compat_popen(
+                    self._controller_handler(
+                        thread_id, self._review_result(), "src/alpha.py"
+                    )
+                ),
+            ),
+            self.fx._controller_codex_lookup(),
+        ):
+            with self.assertRaisesRegex(workflow.WorkflowError, "OWNERSHIP_VIOLATION"):
+                repairs.run_assignment(self.fx.store, self.fx.TASK_ID, review, sessions)
+        violations = [
+            json.loads(line)
+            for line in (
+                self.fx.store._require_task(self.fx.TASK_ID) / "events.jsonl"
+            ).read_text(encoding="utf-8").splitlines()
+            if line and json.loads(line).get("event_type") == "OWNERSHIP_VIOLATION_RECORDED"
+        ]
+        self.assertEqual(1, len(violations))
+        self.assertEqual(["src/alpha.py"], violations[0]["paths"])
+        side_effects = ownership.load_side_effects(self.fx.store, self.fx.TASK_ID)
+        self.assertFalse(
+            any(row.get("effect_kind") == "OWNERSHIP_VIOLATION_RECORDED" for row in side_effects)
+        )
+
+    def test_assignment_hub_keeps_plan_owner_not_actor(self) -> None:
+        review, sessions, thread_id = self._issue_review()
+        with (
+            mock.patch.object(
+                repairs.subprocess,
+                "Popen",
+                _compat_popen(self._controller_handler(thread_id, self._review_result())),
+            ),
+            self.fx._controller_codex_lookup(),
+        ):
+            repairs.run_assignment(self.fx.store, self.fx.TASK_ID, review, sessions)
+        registry = ownership.load_ownership_registry(self.fx.store, self.fx.TASK_ID)
+        self.assertIsNotNone(registry)
+        assert registry is not None
+        self.assertEqual("luna", registry.path_owners["src"])
+        self.assertNotEqual("terra_xhigh_reviewer", registry.path_owners["src"])
 
 
 class VerdictReleaseGateRepairTest(unittest.TestCase):

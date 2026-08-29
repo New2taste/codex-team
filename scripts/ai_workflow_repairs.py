@@ -2926,7 +2926,14 @@ def _observe_assignment_execution_side_effects(
         )
         return None
     if before_fs is None:
-        return ()
+        record_unobserved_side_effect(
+            store,
+            task_id,
+            role=role,
+            permit_id=permit_id,
+            reason="unobserved-assignment",
+        )
+        return None
     try:
         after_fs = capture_fs_snapshot(
             repository, exclusions=observation_exclusions(repository)
@@ -2958,6 +2965,8 @@ def run_assignment(
     assignment: AcceptanceAssignment,
     runtime_sessions_dir: Path | object,
     legacy_adapter: object | None = None,
+    *,
+    authorization_id: str | None = None,
 ) -> None:
     """Resume the issued runtime through the fixed controller execution path."""
 
@@ -3054,6 +3063,7 @@ def run_assignment(
                 assignment.expected_actor.role,
                 permit_id=permit.permit_id,
                 paths=claimed_write_paths(tuple(assignment.allowed_paths)),
+                authorization_id=authorization_id,
             )
             # Task 18: LAUNCH_INTENT_RECORDED is inserted in this critical section before spawn.
             role_config = workflow._load_role_config(assignment.expected_actor.role)
@@ -3116,6 +3126,7 @@ def run_assignment(
     try:
         completed = None
         spawned = proc is not None
+        assignment_failed = False
         try:
             try:
                 stdout, stderr = proc.communicate(
@@ -3144,6 +3155,7 @@ def run_assignment(
             except RuntimeError:
                 _fail("REPAIR_ADAPTER_REQUIRED", "controller cannot snapshot the post-launch repository")
         except BaseException:
+            assignment_failed = True
             if permit is not None:
                 release_permit_if_never_spawned(
                     store,
@@ -3168,13 +3180,17 @@ def run_assignment(
                     completed=completed,
                     permit_id=permit.permit_id if permit is not None else None,
                 )
-                if permit is not None and completed is not None and observed is not None:
+                if permit is not None and completed is not None and not assignment_failed:
                     verify_actual_write_paths(
                         store,
                         task_id,
                         assignment.expected_actor.role,
                         permit_id=permit.permit_id,
-                        actual_paths=tuple(change.path for change in observed),
+                        actual_paths=(
+                            None
+                            if observed is None
+                            else tuple(change.path for change in observed)
+                        ),
                     )
         if after.status:
             _fail("REPAIR_ADAPTER_REQUIRED", "controller rejects uncommitted assignment writes")

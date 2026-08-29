@@ -24,6 +24,7 @@ from unittest import mock
 
 from scripts import ai_workflow as workflow
 from scripts import ai_workflow_artifacts as artifacts
+from scripts import ai_workflow_authorizations as authorizations
 from scripts import ai_workflow_candidate_state as candidate_state
 from scripts import ai_workflow_ownership as ownership
 from scripts import ai_workflow_repairs as repairs
@@ -368,26 +369,28 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
             repairs.RepairFinding("finding-002", ("src/beta.py",)),
         )
         self._recorded_runtime_attempts: set[str] = set()
+        self._declaration_kwargs: dict[str, object] = {}
+        self.owner_evidence_id: str | None = None
         self._original_run_assignment = repairs.run_assignment
 
         def gated_run(store, task_id, assignment, *args, **kwargs):
-            if ownership.load_ownership_registry(store, task_id) is None:
-                role = assignment.expected_actor.role
-                scopes = tuple(getattr(assignment, "allowed_paths", ()) or ("src",))
-                path_owners = {
-                    str(path).rstrip("/") or "src": role for path in scopes
-                } or {"src": role}
-                registry = ownership.OwnershipRegistry(
-                    schema_version=ownership.OWNERSHIP_REGISTRY_SCHEMA_VERSION,
-                    task_id=task_id,
-                    envelope_hash=artifacts.artifact_sha256(
-                        workflow.load_task(store.root / task_id / "task.json")
-                    ),
-                    path_owners=path_owners,
-                    registered_at_utc="2026-08-28T00:00:00Z",
-                )
-                with store.lock(task_id):
-                    ownership.record_ownership_registry(store, task_id, registry)
+            registry = ownership.load_ownership_registry(store, task_id)
+            if registry is None:
+                task = workflow.load_task(store._require_task(task_id) / "task.json")
+                self._record_plan_ownership(task, owner_role="luna")
+                registry = ownership.load_ownership_registry(store, task_id)
+            role = assignment.expected_actor.role
+            paths = tuple(assignment.allowed_paths or ())
+            if kwargs.get("authorization_id") is None and paths:
+                owner = ownership.resolve_path_owner(store, task_id, paths[0])
+                if owner != role:
+                    existing = self._existing_assignment_transfer(
+                        store, task_id, owner, role, paths
+                    )
+                    kwargs = dict(kwargs)
+                    kwargs["authorization_id"] = existing or self._issue_assignment_transfer(
+                        store, task_id, owner, role, paths
+                    )
             return self._original_run_assignment(store, task_id, assignment, *args, **kwargs)
 
         repairs.run_assignment = gated_run
@@ -624,10 +627,8 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
     def _create_task(self, task: dict[str, object] | None = None) -> None:
         document = dict(task or self.task)
         self.store.create_task(document)
-        _install_declaration(
-            self.store,
-            document,
-            allowed_roles=(
+        declaration_kwargs = {
+            "allowed_roles": (
                 "luna",
                 "terra",
                 "terra_xhigh",
@@ -638,9 +639,87 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
                 "sol_reviewer",
                 "sol_planner",
             ),
-            active_roles=("luna", "terra_xhigh_reviewer", "sol_medium_reviewer", "sol_xhigh"),
+            "active_roles": ("luna", "terra_xhigh_reviewer", "sol_medium_reviewer", "sol_xhigh"),
+            "max_dispatches": 64,
+        }
+        declaration_kwargs.update(self._declaration_kwargs)
+        _install_declaration(self.store, document, **declaration_kwargs)
+        self._record_plan_ownership(document)
+
+    def _record_plan_ownership(
+        self, document: dict[str, object], *, owner_role: str = "luna"
+    ) -> None:
+        task_id = str(document["task_id"])
+        if ownership.load_ownership_registry(self.store, task_id) is not None:
+            return
+        registry = ownership.OwnershipRegistry(
+            schema_version=ownership.OWNERSHIP_REGISTRY_SCHEMA_VERSION,
+            task_id=task_id,
+            envelope_hash=artifacts.artifact_sha256(document),
+            path_owners={"src": owner_role},
+            registered_at_utc="2026-08-28T00:00:00Z",
+        )
+        with self.store.lock(task_id):
+            ownership.record_ownership_registry(self.store, task_id, registry)
+
+    def _existing_assignment_transfer(
+        self,
+        store: workflow.WorkflowStore,
+        task_id: str,
+        from_role: str,
+        to_role: str,
+        allowed_paths: tuple[str, ...],
+    ) -> str | None:
+        wanted = tuple(sorted(allowed_paths))
+        for row in authorizations.replay_authorizations(store, task_id):
+            if (
+                row.get("record_kind") == "authorization"
+                and row.get("authorization_type") == "OWNERSHIP_TRANSFER"
+                and row.get("from_role") == from_role
+                and row.get("to_role") == to_role
+                and tuple(row.get("allowed_paths") or ()) == wanted
+            ):
+                authorization_id = row.get("authorization_id")
+                if isinstance(authorization_id, str):
+                    return authorization_id
+        return None
+
+    def _issue_assignment_transfer(
+        self,
+        store: workflow.WorkflowStore,
+        task_id: str,
+        from_role: str,
+        to_role: str,
+        allowed_paths: tuple[str, ...],
+    ) -> str:
+        if self.owner_evidence_id is None:
+            evidence = {
+                "event_type": "OWNER_DECISION",
+                "decision": "defer",
+                "actor": "owner",
+                "timestamp_utc": "2026-08-28T00:00:00Z",
+                "previous_state": "AWAITING_OWNER_DECISION",
+                "new_state": "DEFERRED",
+                "task_sha256": artifacts.artifact_sha256(
+                    workflow.load_task(store._require_task(task_id) / "task.json")
+                ),
+            }
+            store.record_decision(task_id, evidence)
+            self.owner_evidence_id = artifacts.artifact_sha256(evidence)
+        issued = authorizations.issue_owner_authorization(
+            store,
+            task_id,
+            authorization_type="OWNERSHIP_TRANSFER",
+            actor="owner",
+            owner_evidence_id=self.owner_evidence_id,
+            issued_at_utc="2026-08-28T12:00:00Z",
+            path="src",
+            from_role=from_role,
+            to_role=to_role,
+            allowed_paths=allowed_paths,
             max_dispatches=64,
         )
+        return issued.authorization_id
 
     def _record_runtime_evidence(self, receipt: object) -> None:
         self.assertIsInstance(receipt, repairs.VerifiedActorReceipt)

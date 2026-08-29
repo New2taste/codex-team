@@ -10,6 +10,7 @@ from unittest import mock
 from scripts import ai_workflow as workflow
 from scripts import ai_workflow_artifacts as artifacts
 from scripts import ai_workflow_ownership as ownership
+from tests.test_ai_workflow import _install_declaration
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -863,6 +864,70 @@ class ConstructionDispatchGateTest(unittest.TestCase):
                 state_root=self.root,
             )
         self.assertEqual([], runner.calls)
+
+    def test_resume_construction_missing_declaration_does_not_run(self) -> None:
+        events = self.store._require_task(self.task["task_id"]) / "events.jsonl"
+        events.write_text(
+            json.dumps(
+                {
+                    "event_type": "STATE_TRANSITION",
+                    "previous_state": "DRAFT",
+                    "new_state": "TASK_VALIDATED",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        runner = BoundConstructionRunner()
+        with self.assertRaisesRegex(workflow.WorkflowError, "ROUTE_DECLARATION_MISSING"):
+            workflow._resume_stored_task(
+                self.store,
+                self.task["task_id"],
+                runner,
+                (self.plan, self.request, "construction-601", 1),
+            )
+        self.assertEqual([], runner.calls)
+
+    def test_resume_construction_crash_window_recovers_declared_then_continues(self) -> None:
+        _install_declaration(
+            self.store,
+            self.task,
+            allowed_roles=("luna_construction", "luna"),
+            active_roles=("luna_construction", "luna"),
+            mode="enforced",
+        )
+        path = self.store._require_task(self.task["task_id"]) / "route-declaration.json"
+        before = path.read_bytes()
+        events = self.store._require_task(self.task["task_id"]) / "events.jsonl"
+        kept = [
+            line
+            for line in events.read_text(encoding="utf-8").splitlines()
+            if json.loads(line).get("event_type") != "ROUTE_DECLARED"
+        ]
+        events.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+        runner = BoundConstructionRunner()
+        state = workflow._resume_stored_task(
+            self.store,
+            self.task["task_id"],
+            runner,
+            (self.plan, self.request, "construction-601", 1),
+        )
+        restored = [
+            json.loads(line)
+            for line in events.read_text(encoding="utf-8").splitlines()
+            if json.loads(line).get("event_type") == "ROUTE_DECLARED"
+        ]
+        self.assertEqual(1, len(restored))
+        self.assertEqual(before, path.read_bytes())
+        self.assertIn(
+            state,
+            {
+                "AWAITING_OWNER_DECISION",
+                "IMPLEMENTED_CANDIDATE",
+                "TASK_VALIDATED",
+                "APPROVED_FOR_EXECUTION",
+            },
+        )
 
 
 if __name__ == "__main__":

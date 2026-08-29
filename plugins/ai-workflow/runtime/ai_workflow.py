@@ -1728,6 +1728,7 @@ def run_codex(
     construction_step_id: object = None,
     construction_context: ConstructionExecutionContext | None = None,
     prompt_result: PromptBuildResult | None = None,
+    authorization_id: str | None = None,
 ) -> dict:
     """Run one pinned Codex role and accept only a validated output document."""
 
@@ -1855,6 +1856,7 @@ def run_codex(
                                 construction_context=construction_context,
                             )
                         ),
+                        authorization_id=authorization_id,
                     )
                 # Task 18: LAUNCH_INTENT_RECORDED is inserted in this critical section before spawn.
                 before_run = capture_repo(repo)
@@ -1966,6 +1968,43 @@ def run_codex(
                                 permit_id=permit_id,
                                 reason="unobserved-executor",
                             )
+                        elif permit is not None and role in TERRA_WRITE_ROLES and attempt_error is None:
+                            actual_paths = None
+                            if before_fs is not None:
+                                construction_step = (
+                                    {
+                                        "plan_sha256": construction_context.plan.plan_sha256,
+                                        "subtask_id": construction_context.step.id,
+                                    }
+                                    if construction_context is not None
+                                    else None
+                                )
+                                observed_changes = observe_execution_side_effects(
+                                    observed_store,
+                                    task["task_id"],
+                                    role=role,
+                                    permit_id=permit_id,
+                                    before=before_fs,
+                                    after=capture_fs_snapshot(
+                                        repo, exclusions=observation_exclusions(repo)
+                                    ),
+                                    rollout_events=tuple(parse_codex_jsonl(completed.stdout)),
+                                    construction_step=construction_step,
+                                )
+                                actual_paths = tuple(
+                                    change.path for change in observed_changes
+                                )
+                            verify_actual_write_paths(
+                                observed_store,
+                                task["task_id"],
+                                _ownership_claimant(
+                                    role,
+                                    luna_construction_step=luna_construction_step,
+                                    construction_context=construction_context,
+                                ),
+                                permit_id=permit.permit_id,
+                                actual_paths=actual_paths,
+                            )
                         elif before_fs is not None:
                             construction_step = (
                                 {
@@ -1987,20 +2026,6 @@ def run_codex(
                                 rollout_events=tuple(parse_codex_jsonl(completed.stdout)),
                                 construction_step=construction_step,
                             )
-                            if permit is not None and role in TERRA_WRITE_ROLES:
-                                verify_actual_write_paths(
-                                    observed_store,
-                                    task["task_id"],
-                                    _ownership_claimant(
-                                        role,
-                                        luna_construction_step=luna_construction_step,
-                                        construction_context=construction_context,
-                                    ),
-                                    permit_id=permit.permit_id,
-                                    actual_paths=tuple(
-                                        change.path for change in observed_changes
-                                    ),
-                                )
                     if before_run.head != after_run.head:
                         _fail("HEAD_DRIFT", "repository HEAD changed during the role run")
                     if role in READ_ONLY_ROLES and before_run != after_run:
@@ -4994,6 +5019,7 @@ def _run_role_with_technical_retry(
     *,
     construction_context: ConstructionExecutionContext | None = None,
     state_root: Path | None = None,
+    authorization_id: str | None = None,
 ) -> tuple[Mapping[str, object] | None, str]:
     """Run one role, allowing only the single persisted technical retry."""
 
@@ -5106,6 +5132,7 @@ def _run_role_with_technical_retry(
                                             construction_context=construction_context,
                                         )
                                     ),
+                                    authorization_id=authorization_id,
                                 )
                             # Task 18: LAUNCH_INTENT_RECORDED is inserted in this critical section before spawn.
                             claim_permit_start_locked(store, task_id, permit)
