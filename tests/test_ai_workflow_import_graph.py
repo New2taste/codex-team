@@ -49,6 +49,7 @@ IMPORT_GRAPH_ALLOWED: Mapping[str, frozenset[str]] = {
             "ai_workflow",
             "ai_workflow_repairs",
             "ai_workflow_declarations",
+            "ai_workflow_ownership",
         }
     ),
     "ai_workflow_team_call": frozenset(),
