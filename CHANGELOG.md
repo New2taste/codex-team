@@ -10,6 +10,7 @@
 - 唯一 final-acceptance child 在创建时即生成独立、不可变的所有权登记，明确 Sol medium 返工路径，避免返工启动后才发现登记缺失并留下孤儿 attempt；
 - ownership registry 的写入和读取均重新绑定已存储 task 信封哈希，防止调用方伪造任务身份；
 - root runtime、Plugin 镜像、配置清单和导入图登记保持同步。
+- README 增加中英双语项目介绍、角色边界表和默认路由 Mermaid 示意图。
 
 ### Verification snapshot
 

@@ -1,6 +1,12 @@
 # Codex Team
 
-一个面向 Codex 的、可审计的半自动多模型协作工作流。它用任务信封、确定性路由、运行时身份和人工闸门，把规划、施工、证据收集、最终验收与返工连接起来。
+[English](README.en.md)
+
+Codex Team 是一个面向 Codex 的本地、可恢复、可审计的半自动多模型协作工作流。它把“谁来做、能改什么、何时停下、谁来验收”从模型自由发挥，收束为任务信封、确定性路由、运行时身份、证据链和人工闸门。
+
+它解决的是多模型协作中最容易失控的三件事：低成本模型被派去做不适合的工作、施工范围在返工中逐渐扩大、验收结论缺少可追溯证据。Codex Team 用一套小而硬的控制面把这些边界固定下来，同时保留人工 owner 对高风险决策的最终控制权。
+
+适合：个人开发、实验性项目、需要同时利用不同模型能力且希望保留审计轨迹的本地工作流。它不是后台常驻服务，不承诺自动替用户做产品决策，也不会替用户隐式 merge、push 或删除工作区。
 
 | 项目状态 | 当前值 |
 |---|---|
@@ -15,18 +21,52 @@
 
 ## 这是什么
 
-Codex Team 不是常驻服务，也不是自动替用户做最终决定的项目经理。它是一组标准库实现、Schema、Plugin 镜像、CLI 和测试，用来把多模型协作规则固定成可检查的工程契约。
+Codex Team 由标准库实现、Schema、Plugin 镜像、CLI 和测试组成。生产路径以零模型控制面为核心：先校验任务和证据，再按冻结的角色、范围和命令执行；只有被明确授权的环节才会启动模型。
 
 核心分工：
 
-| 角色 | 主要职责 |
-|---|---|
-| Luna Max | 冻结 envelope 内的机械 coding、确定性检查、证据抽取和分发同步 |
-| Terra xhigh | 复杂施工、调试、集成和开放式问题拆解 |
-| Sol medium | 全部工程小节完成后的最终整体验收；验收失败时执行一次有界返工梯级 |
-| Sol xhigh | owner-authorized 规划，或返工梯级失败后的终局升级 |
+| 角色 | 默认模型 / 档位 | 主要职责 | 明确边界 |
+|---|---|---|---|
+| Luna Max | `gpt-5.6-luna / max` | 冻结 envelope 内的机械 coding、确定性检查、证据抽取和分发同步 | 不做 planning、review、approval 或 final acceptance |
+| Terra xhigh | `gpt-5.6-terra / xhigh` | 复杂施工、调试、集成和开放式问题拆解 | 不 merge、push 或自我验收 |
+| Sol medium | `gpt-5.6-sol / medium` | 监督总体规划实现、集中终验，并执行有界返工梯级 | 不承担常驻施工；验收保持只读、对抗式 |
+| Sol xhigh | `gpt-5.6-sol / xhigh` | owner-authorized 总体规划，或返工梯级失败后的终局升级 | 不自动启动，不绕过 owner gate |
 
 Luna 不承担 planning、review、approval 或 final acceptance；Terra 不合并、不推送、不自验；Sol xhigh 不自动启动。未明确列入配置的模型和档位不会被隐式注入流程。
+
+## 路由工作示意
+
+下面的图是 Codex Team 的默认生产路径：先走确定性分流，再进入冻结 envelope；中间工程小节只做施工自检，最终由 Sol medium 集中验收。图中的每个写入箭头都受 task scope、runtime identity、evidence 和 owner gate 约束。
+
+```mermaid
+flowchart TD
+    A[用户目标] --> B{确定性入口分类}
+    B -->|固定安全命令| C[DIRECT_L0<br/>控制器执行<br/>不调用模型]
+    B -->|只读文件事实抽取| D[DIRECT_L1<br/>Luna Max<br/>NATIVE_SUBAGENT]
+    B -->|需要规划或施工| E[PLAN_REQUIRED]
+    B -->|输入、锁或证据失败| X[BLOCKED<br/>写入阻断收据]
+
+    E --> F{计划与 owner gate}
+    F -->|缺少可执行计划| G[Sol xhigh<br/>owner-authorized 规划]
+    F -->|冻结 envelope| H{任务复杂度}
+    G --> H
+    H -->|机械、低风险、范围明确| I[Luna Max<br/>廉价工具进程]
+    H -->|复杂施工、调试、集成| J[Terra xhigh<br/>常驻施工 OS]
+    I --> K[小节自检 + 运行时证据]
+    J --> K
+    K -->|仍有未完成小节| H
+    K -->|全部小节完成| L[固定 clean candidate<br/>范围与证据核对]
+    L --> M[Sol medium<br/>集中、只读、对抗式终验]
+    M -->|ACCEPT| N[owner decision<br/>关闭任务]
+    M -->|REWORK| O[不同身份 Sol medium<br/>有界返工]
+    O --> P[另一不同身份 Sol medium<br/>只读复核]
+    P -->|ACCEPT| N
+    P -->|再次 REWORK| Q[owner authorization]
+    Q --> R[Sol xhigh<br/>一次性终局修复]
+    R --> N
+```
+
+路由的关键取舍是：Luna 负责高频、低成本且可机械验证的工作；Terra xhigh 承担需要上下文和调试能力的施工；Sol medium 只在全部工程小节完成后介入，集中寻找遗漏；Sol xhigh 仅在 owner 明确授权后处理终局例外。`optimization` 默认是 shadow 建议，不会偷偷改变这条确定性生产链。
 
 ## 快速开始
 
