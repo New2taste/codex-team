@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import io
 import json
@@ -5,6 +6,7 @@ import subprocess
 import tempfile
 import tomllib
 import unittest
+from collections.abc import Mapping
 from contextlib import redirect_stderr
 from pathlib import Path
 from unittest import mock
@@ -791,6 +793,826 @@ class RouterProbeAnalysisTest(unittest.TestCase):
         self.assertEqual(
             "KEEP_DETERMINISTIC_BASELINE",
             probe.evaluate_probe_decision(summary, minimum_cases=32),
+        )
+
+
+class RouterProbeCostLayersTest(unittest.TestCase):
+    ARCHIVE_BYTES = b"<html>official pricing capture</html>\n"
+    NOW_UTC = "2026-08-28T12:00:00Z"
+    RETRIEVED_AT = "2026-08-28T00:00:00Z"
+    AMOUNT_FIELDS = frozenset({"estimated_cost_minor", "total_cost_minor"})
+    FORBIDDEN_WINNER_LABELS = ("COST_WINNER", "REAL_COST_WINNER", "CHEAPER")
+
+    def _digest(self, payload: bytes = ARCHIVE_BYTES) -> str:
+        return hashlib.sha256(payload).hexdigest()
+
+    def _valid_sku(self, **overrides):
+        sku = {
+            "sku": "gpt-5.6-luna",
+            "model": "gpt-5.6-luna",
+            "currency": "USD",
+            "unit": "PER_1M_TOKENS",
+            "billing_channel": "api",
+            "price_uncached_input": "2.50",
+            "price_cached_input": "0.25",
+            "price_output": "10.00",
+            "cache_write_applies": True,
+            "long_context_tiers_applies": False,
+            "source_url": "https://example.test/pricing",
+            "retrieved_at": self.RETRIEVED_AT,
+        }
+        sku.update(overrides)
+        return sku
+
+    def _valid_snapshot(self, digest: str | None = None, skus=None, **overrides):
+        digest = digest or self._digest()
+        snapshot = {
+            "schema_version": "ai-rate-snapshot-1",
+            "rate_snapshot_id": "rates-2026-08-28",
+            "skus": skus
+            or [
+                self._valid_sku(),
+                self._valid_sku(sku="gpt-5.6-sol", model="gpt-5.6-sol"),
+                self._valid_sku(sku="gpt-5.6-terra", model="gpt-5.6-terra"),
+            ],
+            "effective_at": "2026-08-28T00:00:00Z",
+            "retrieved_at": self.RETRIEVED_AT,
+            "archive": {
+                "archive_path": f"docs/rate-archives/{digest}",
+                "archive_sha256": digest,
+                "mime_type": "text/html",
+                "retrieval_status": "retrieved",
+            },
+            "approved_by": "owner",
+            "approval_evidence_id": "a" * 64,
+        }
+        snapshot.update(overrides)
+        return snapshot
+
+    def _write_archive(self, root: Path, payload: bytes = ARCHIVE_BYTES) -> str:
+        digest = self._digest(payload)
+        path = root / "docs" / "rate-archives" / digest
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+        return digest
+
+    def _billing_usage(
+        self,
+        *,
+        uncached_input: int,
+        cached_input: int,
+        output: int,
+        sku: str,
+        evidence_id: str = "billing-evidence-1",
+        input_tokens: int | None = None,
+        quality: dict[str, int] | None = None,
+    ):
+        return {
+            "usage_source": "BILLING_USAGE",
+            "usage": {
+                "uncached_input": uncached_input,
+                "cached_input": cached_input,
+                "output": output,
+            },
+            "input_tokens": (
+                uncached_input + cached_input
+                if input_tokens is None
+                else input_tokens
+            ),
+            "usage_evidence_ids": [evidence_id],
+            "sku": sku,
+            "quality": quality
+            or {
+                "retries": 0,
+                "escalations": 0,
+                "reviews": 0,
+                "failures": 0,
+            },
+        }
+
+    def _text_usage(self, *, uncached_input: int, cached_input: int, output: int):
+        return {
+            "usage_source": "TEXT_TOKEN_ESTIMATE",
+            "tokens": {
+                "uncached_input": uncached_input,
+                "cached_input": cached_input,
+                "output": output,
+            },
+        }
+
+    def _unavailable_usage(self, reason: str = "no billing usage"):
+        return {"reason": reason}
+
+    def _numeric_leaves(self, value):
+        if isinstance(value, Mapping):
+            for item in value.values():
+                yield from self._numeric_leaves(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                yield from self._numeric_leaves(item)
+        elif isinstance(value, (int, float)):
+            yield value
+
+    def _arm_by_id(self, result, arm_id):
+        return next(arm for arm in result["arms"] if arm["arm_id"] == arm_id)
+
+    def test_closed_cost_layer_constants_and_wire_shape(self):
+        self.assertEqual("router-probe-summary-2", probe.PROBE_SUMMARY_SCHEMA_VERSION)
+        self.assertEqual(
+            frozenset({"BILLING_USAGE", "TEXT_TOKEN_ESTIMATE"}),
+            probe.USAGE_SOURCES,
+        )
+        self.assertEqual(
+            frozenset(
+                {
+                    "COST_ESTIMATE_UNDER_SNAPSHOT",
+                    "TEXT_TOKEN_ESTIMATE",
+                    "USAGE_AUTHORITY_UNAVAILABLE",
+                }
+            ),
+            probe.ARM_COST_TYPES,
+        )
+        self.assertEqual(
+            frozenset(
+                {
+                    "COST_ESTIMATE_UNDER_SNAPSHOT",
+                    "PRICE_STALE",
+                    "PRICE_UNKNOWN",
+                    "UNAVAILABLE_WITHOUT_RATE_SNAPSHOT",
+                }
+            ),
+            probe.COST_ESTIMATE_TYPES,
+        )
+        self.assertEqual(
+            frozenset({"COST_TOTAL_UNDER_SNAPSHOT", "COST_TOTAL_UNAVAILABLE"}),
+            probe.COST_TOTAL_TYPES,
+        )
+        self.assertEqual(
+            frozenset({"PARTIAL_AUTHORITY", "CURRENCY_MISMATCH", "UNIT_MISMATCH"}),
+            probe.COST_TOTAL_UNAVAILABLE_REASONS,
+        )
+        self.assertEqual({"USD": 2}, dict(probe.CURRENCY_MINOR_UNITS))
+        self.assertEqual(
+            ("uncached_input", "cached_input", "output"),
+            probe.USAGE_WIRE_SHAPE,
+        )
+
+    def test_three_arm_types_split_authority_text_and_unavailable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            digest = self._write_archive(root)
+            snapshot = self._valid_snapshot(digest)
+            result = probe.build_cost_estimate(
+                {
+                    "luna_resident": self._billing_usage(
+                        uncached_input=20,
+                        cached_input=80,
+                        output=10,
+                        sku="gpt-5.6-luna",
+                    ),
+                    "sol_resident": self._text_usage(
+                        uncached_input=15, cached_input=5, output=3
+                    ),
+                    "terra_resident": self._unavailable_usage(),
+                },
+                snapshot=snapshot,
+                now_utc=self.NOW_UTC,
+                root=root,
+            )
+        types = {arm["arm_id"]: arm["type"] for arm in result["arms"]}
+        self.assertEqual("COST_ESTIMATE_UNDER_SNAPSHOT", result["type"])
+        self.assertEqual("COST_ESTIMATE_UNDER_SNAPSHOT", types["luna_resident"])
+        self.assertEqual("TEXT_TOKEN_ESTIMATE", types["sol_resident"])
+        self.assertEqual("USAGE_AUTHORITY_UNAVAILABLE", types["terra_resident"])
+        self.assertEqual("BILLING_USAGE", self._arm_by_id(result, "luna_resident")["usage_source"])
+        self.assertEqual(
+            ["billing-evidence-1"],
+            self._arm_by_id(result, "luna_resident")["usage_evidence_ids"],
+        )
+        self.assertEqual(
+            set(probe.USAGE_WIRE_SHAPE),
+            set(self._arm_by_id(result, "luna_resident")["usage"]),
+        )
+        self.assertEqual(
+            set(probe.USAGE_WIRE_SHAPE),
+            set(self._arm_by_id(result, "sol_resident")["tokens"]),
+        )
+        self.assertNotIn(
+            "estimated_cost_minor", self._arm_by_id(result, "sol_resident")
+        )
+
+    def test_text_token_estimate_arm_has_no_amount_fields(self):
+        snapshot = self._valid_snapshot()
+        arm = probe.build_arm_cost_result(
+            "sol_resident",
+            self._text_usage(uncached_input=1, cached_input=0, output=1),
+            snapshot=snapshot,
+        )
+        self.assertEqual("TEXT_TOKEN_ESTIMATE", arm["type"])
+        for field in self.AMOUNT_FIELDS:
+            self.assertNotIn(field, arm)
+
+    def test_input_tokens_must_equal_uncached_plus_cached(self):
+        snapshot = self._valid_snapshot()
+        with self.assertRaisesRegex(probe.RouterProbeError, "COST_INPUT_INVALID"):
+            probe.build_arm_cost_result(
+                "luna_resident",
+                self._billing_usage(
+                    uncached_input=20,
+                    cached_input=80,
+                    output=10,
+                    sku="gpt-5.6-luna",
+                    input_tokens=99,
+                ),
+                snapshot=snapshot,
+            )
+
+    def test_negative_tokens_and_prices_are_cost_input_invalid(self):
+        snapshot = self._valid_snapshot()
+        cases = (
+            (
+                "negative tokens",
+                lambda: probe.compute_arm_cost_minor(
+                    tokens=-1, price="1.00", unit="PER_TOKEN", currency="USD"
+                ),
+            ),
+            (
+                "negative price",
+                lambda: probe.compute_arm_cost_minor(
+                    tokens=1, price="-1.00", unit="PER_TOKEN", currency="USD"
+                ),
+            ),
+            (
+                "unknown unit",
+                lambda: probe.compute_arm_cost_minor(
+                    tokens=1, price="1.00", unit="PER_REQUEST", currency="USD"
+                ),
+            ),
+            (
+                "unknown currency",
+                lambda: probe.compute_arm_cost_minor(
+                    tokens=1, price="1.00", unit="PER_TOKEN", currency="XYZ"
+                ),
+            ),
+            (
+                "negative usage token",
+                lambda: probe.build_arm_cost_result(
+                    "luna_resident",
+                    self._billing_usage(
+                        uncached_input=-1,
+                        cached_input=0,
+                        output=0,
+                        sku="gpt-5.6-luna",
+                    ),
+                    snapshot=snapshot,
+                ),
+            ),
+        )
+        for label, action in cases:
+            with self.subTest(label=label), self.assertRaisesRegex(
+                probe.RouterProbeError, "COST_INPUT_INVALID"
+            ):
+                action()
+
+    def test_unit_bases_match_hand_calculated_minor_units(self):
+        tokens = 1_000_000
+        price = "1.00"
+        expected = {
+            "PER_TOKEN": 100_000_000,
+            "PER_1K_TOKENS": 100_000,
+            "PER_1M_TOKENS": 100,
+        }
+        for unit, cents in expected.items():
+            with self.subTest(unit=unit):
+                minor = probe.compute_arm_cost_minor(
+                    tokens=tokens, price=price, unit=unit, currency="USD"
+                )
+                self.assertEqual(cents, minor)
+                self.assertIsInstance(minor, int)
+                self.assertNotIsInstance(minor, bool)
+
+    def test_half_even_rounding_boundary(self):
+        cases = (
+            ("0.005", 0),
+            ("0.015", 2),
+            ("0.025", 2),
+            ("0.035", 4),
+        )
+        for price, cents in cases:
+            with self.subTest(price=price):
+                self.assertEqual(
+                    cents,
+                    probe.compute_arm_cost_minor(
+                        tokens=1, price=price, unit="PER_TOKEN", currency="USD"
+                    ),
+                )
+
+    def test_minor_unit_amounts_are_json_ints(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            digest = self._write_archive(root)
+            snapshot = self._valid_snapshot(digest)
+            result = probe.build_cost_estimate(
+                {
+                    "luna_resident": self._billing_usage(
+                        uncached_input=1_000_000,
+                        cached_input=0,
+                        output=0,
+                        sku="gpt-5.6-luna",
+                    ),
+                    "sol_resident": self._billing_usage(
+                        uncached_input=1_000_000,
+                        cached_input=0,
+                        output=0,
+                        sku="gpt-5.6-sol",
+                    ),
+                },
+                snapshot=snapshot,
+                now_utc=self.NOW_UTC,
+                root=root,
+            )
+        luna = self._arm_by_id(result, "luna_resident")
+        self.assertIsInstance(luna["estimated_cost_minor"], int)
+        self.assertNotIsInstance(luna["estimated_cost_minor"], bool)
+        self.assertIsInstance(result["total"]["total_cost_minor"], int)
+        self.assertNotIsInstance(result["total"]["total_cost_minor"], bool)
+        round_trip = json.loads(json.dumps(result))
+        self.assertIsInstance(
+            round_trip["arms"][0]["estimated_cost_minor"], int
+        )
+        self.assertIsInstance(round_trip["total"]["total_cost_minor"], int)
+        for number in self._numeric_leaves(result):
+            self.assertIsInstance(number, int)
+            self.assertNotIsInstance(number, bool)
+            self.assertNotIsInstance(number, float)
+
+    def test_usage_and_aggregate_totals_share_wire_shape(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            digest = self._write_archive(root)
+            snapshot = self._valid_snapshot(digest)
+            result = probe.build_cost_estimate(
+                {
+                    "luna_resident": self._billing_usage(
+                        uncached_input=20,
+                        cached_input=80,
+                        output=10,
+                        sku="gpt-5.6-luna",
+                    ),
+                    "sol_resident": self._billing_usage(
+                        uncached_input=30,
+                        cached_input=70,
+                        output=5,
+                        sku="gpt-5.6-sol",
+                    ),
+                },
+                snapshot=snapshot,
+                now_utc=self.NOW_UTC,
+                root=root,
+            )
+        for arm in result["arms"]:
+            self.assertEqual(set(probe.USAGE_WIRE_SHAPE), set(arm["usage"]))
+            for key in probe.USAGE_WIRE_SHAPE:
+                self.assertIsInstance(arm["usage"][key], int)
+                self.assertNotIsInstance(arm["usage"][key], bool)
+        self.assertEqual(set(probe.USAGE_WIRE_SHAPE), set(result["total"]["usage"]))
+        self.assertEqual(
+            {
+                "uncached_input": 50,
+                "cached_input": 150,
+                "output": 15,
+            },
+            result["total"]["usage"],
+        )
+
+    def test_module_does_not_use_decimal_prec_constructor(self):
+        source = (ROOT / "scripts" / "ai_workflow_router_probe.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("Decimal(prec", source)
+
+    def test_all_authority_same_currency_unit_sums_exactly(self):
+        arms = (
+            {
+                "type": "COST_ESTIMATE_UNDER_SNAPSHOT",
+                "arm_id": "luna_resident",
+                "currency": "USD",
+                "unit": "PER_1M_TOKENS",
+                "estimated_cost_minor": 13,
+                "usage": {
+                    "uncached_input": 1,
+                    "cached_input": 2,
+                    "output": 3,
+                },
+            },
+            {
+                "type": "COST_ESTIMATE_UNDER_SNAPSHOT",
+                "arm_id": "sol_resident",
+                "currency": "USD",
+                "unit": "PER_1M_TOKENS",
+                "estimated_cost_minor": 8,
+                "usage": {
+                    "uncached_input": 4,
+                    "cached_input": 5,
+                    "output": 6,
+                },
+            },
+        )
+        total = probe.compute_cost_total(arms)
+        self.assertEqual("COST_TOTAL_UNDER_SNAPSHOT", total["type"])
+        self.assertEqual(21, total["total_cost_minor"])
+        self.assertIsInstance(total["total_cost_minor"], int)
+        self.assertEqual(
+            {"uncached_input": 5, "cached_input": 7, "output": 9},
+            total["usage"],
+        )
+
+    def test_any_degraded_arm_makes_total_partial_authority(self):
+        total = probe.compute_cost_total(
+            (
+                {
+                    "type": "COST_ESTIMATE_UNDER_SNAPSHOT",
+                    "arm_id": "luna_resident",
+                    "currency": "USD",
+                    "unit": "PER_1M_TOKENS",
+                    "estimated_cost_minor": 13,
+                    "usage": {
+                        "uncached_input": 1,
+                        "cached_input": 0,
+                        "output": 0,
+                    },
+                },
+                {
+                    "type": "TEXT_TOKEN_ESTIMATE",
+                    "arm_id": "sol_resident",
+                    "tokens": {
+                        "uncached_input": 1,
+                        "cached_input": 0,
+                        "output": 0,
+                    },
+                },
+            )
+        )
+        self.assertEqual("COST_TOTAL_UNAVAILABLE", total["type"])
+        self.assertEqual("PARTIAL_AUTHORITY", total["reason"])
+        for field in self.AMOUNT_FIELDS:
+            self.assertNotIn(field, total)
+        self.assertNotIn("usage", total)
+
+    def test_mixed_currency_is_unavailable(self):
+        total = probe.compute_cost_total(
+            (
+                {
+                    "type": "COST_ESTIMATE_UNDER_SNAPSHOT",
+                    "arm_id": "luna_resident",
+                    "currency": "USD",
+                    "unit": "PER_1M_TOKENS",
+                    "estimated_cost_minor": 1,
+                    "usage": {
+                        "uncached_input": 1,
+                        "cached_input": 0,
+                        "output": 0,
+                    },
+                },
+                {
+                    "type": "COST_ESTIMATE_UNDER_SNAPSHOT",
+                    "arm_id": "sol_resident",
+                    "currency": "EUR",
+                    "unit": "PER_1M_TOKENS",
+                    "estimated_cost_minor": 1,
+                    "usage": {
+                        "uncached_input": 1,
+                        "cached_input": 0,
+                        "output": 0,
+                    },
+                },
+            )
+        )
+        self.assertEqual("COST_TOTAL_UNAVAILABLE", total["type"])
+        self.assertEqual("CURRENCY_MISMATCH", total["reason"])
+        for field in self.AMOUNT_FIELDS:
+            self.assertNotIn(field, total)
+
+    def test_mixed_unit_is_unavailable(self):
+        total = probe.compute_cost_total(
+            (
+                {
+                    "type": "COST_ESTIMATE_UNDER_SNAPSHOT",
+                    "arm_id": "luna_resident",
+                    "currency": "USD",
+                    "unit": "PER_TOKEN",
+                    "estimated_cost_minor": 1,
+                    "usage": {
+                        "uncached_input": 1,
+                        "cached_input": 0,
+                        "output": 0,
+                    },
+                },
+                {
+                    "type": "COST_ESTIMATE_UNDER_SNAPSHOT",
+                    "arm_id": "sol_resident",
+                    "currency": "USD",
+                    "unit": "PER_1M_TOKENS",
+                    "estimated_cost_minor": 1,
+                    "usage": {
+                        "uncached_input": 1,
+                        "cached_input": 0,
+                        "output": 0,
+                    },
+                },
+            )
+        )
+        self.assertEqual("COST_TOTAL_UNAVAILABLE", total["type"])
+        self.assertEqual("UNIT_MISMATCH", total["reason"])
+        for field in self.AMOUNT_FIELDS:
+            self.assertNotIn(field, total)
+
+    def test_partial_authority_report_does_not_claim_route_total(self):
+        rows, cost_rows, source = RouterProbeAnalysisTest.measured_matrix()
+        summary = probe.aggregate_probe_results(
+            rows,
+            cost_rows,
+            source_manifest=source,
+            arm_usage={
+                "luna_resident": self._billing_usage(
+                    uncached_input=20,
+                    cached_input=80,
+                    output=10,
+                    sku="gpt-5.6-luna",
+                ),
+                "sol_resident": self._text_usage(
+                    uncached_input=1, cached_input=0, output=1
+                ),
+            },
+        )
+        report = probe.render_probe_report(summary)
+        self.assertNotIn("总计", report)
+        self.assertIn("PARTIAL_AUTHORITY", report)
+
+    def test_effective_route_stays_unchanged_under_every_pricing_status(self):
+        rows, cost_rows, source = RouterProbeAnalysisTest.measured_matrix()
+        arm_usage = {
+            "luna_resident": self._billing_usage(
+                uncached_input=20,
+                cached_input=80,
+                output=10,
+                sku="gpt-5.6-luna",
+            )
+        }
+        scenarios = [("missing snapshot", None, None)]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            digest = self._write_archive(root)
+            current = self._valid_snapshot(digest)
+            stale = self._valid_snapshot(digest)
+            unknown = self._valid_snapshot(digest)
+            del unknown["skus"][0]["price_output"]
+            scenarios.extend(
+                (
+                    ("current", current, root),
+                    ("stale", stale, root),
+                    ("unknown", unknown, root),
+                )
+            )
+            summaries = []
+            for label, snapshot, archive_root in scenarios:
+                now = (
+                    "2026-08-29T00:00:01Z"
+                    if label == "stale"
+                    else self.NOW_UTC
+                )
+                summary = probe.aggregate_probe_results(
+                    rows,
+                    cost_rows,
+                    source_manifest=source,
+                    snapshot=snapshot,
+                    now_utc=now,
+                    root=archive_root,
+                    arm_usage=arm_usage,
+                )
+                summaries.append((label, summary))
+        for label, summary in summaries:
+            with self.subTest(label=label):
+                self.assertEqual("UNCHANGED", summary["effective_route"])
+                self.assertIn(summary["cost_estimate"]["type"], probe.COST_ESTIMATE_TYPES)
+
+    def test_cost_winner_line_stays_in_original_closed_set(self):
+        rows, cost_rows, source = RouterProbeAnalysisTest.measured_matrix()
+        summary = probe.aggregate_probe_results(
+            rows, cost_rows, source_manifest=source
+        )
+        report = probe.render_probe_report(summary)
+        self.assertEqual(
+            "UNAVAILABLE_WITHOUT_RATE_SNAPSHOT_AND_DOWNSTREAM_COUNTERFACTUAL",
+            summary["cost_comparison_status"],
+        )
+        self.assertIn(
+            "cost_winner=UNAVAILABLE_WITHOUT_RATE_SNAPSHOT_AND_DOWNSTREAM_COUNTERFACTUAL",
+            report,
+        )
+        winner_value = None
+        for line in report.splitlines():
+            if line.startswith("cost_winner="):
+                winner_value = line.split("=", 1)[1]
+        self.assertEqual(
+            "UNAVAILABLE_WITHOUT_RATE_SNAPSHOT_AND_DOWNSTREAM_COUNTERFACTUAL",
+            winner_value,
+        )
+
+    def test_report_has_no_new_winner_or_cheaper_labels(self):
+        rows, cost_rows, source = RouterProbeAnalysisTest.measured_matrix()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            digest = self._write_archive(root)
+            summary = probe.aggregate_probe_results(
+                rows,
+                cost_rows,
+                source_manifest=source,
+                snapshot=self._valid_snapshot(digest),
+                now_utc=self.NOW_UTC,
+                root=root,
+                arm_usage={
+                    "luna_resident": self._billing_usage(
+                        uncached_input=20,
+                        cached_input=80,
+                        output=10,
+                        sku="gpt-5.6-luna",
+                    )
+                },
+            )
+        report = probe.render_probe_report(summary)
+        for label in self.FORBIDDEN_WINNER_LABELS:
+            self.assertNotIn(label, report)
+            self.assertNotIn(label, json.dumps(summary["cost_estimate"]))
+
+    def test_cache_candidate_fields_unchanged_after_snapshot(self):
+        rows, cost_rows, source = RouterProbeAnalysisTest.measured_matrix()
+        without = probe.aggregate_probe_results(
+            rows, cost_rows, source_manifest=source
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            digest = self._write_archive(root)
+            with_snapshot = probe.aggregate_probe_results(
+                rows,
+                cost_rows,
+                source_manifest=source,
+                snapshot=self._valid_snapshot(digest),
+                now_utc=self.NOW_UTC,
+                root=root,
+                arm_usage={
+                    arm_id: self._billing_usage(
+                        uncached_input=20,
+                        cached_input=80,
+                        output=10,
+                        sku=model,
+                    )
+                    for arm_id, (model, _effort, _condition) in probe.ARM_CONTRACTS.items()
+                },
+            )
+        ignored = {"cost_estimate"}
+        self.assertEqual(
+            {key: value for key, value in without.items() if key not in ignored},
+            {key: value for key, value in with_snapshot.items() if key not in ignored},
+        )
+        self.assertEqual(
+            probe.evaluate_probe_decision(without, minimum_cases=32),
+            probe.evaluate_probe_decision(with_snapshot, minimum_cases=32),
+        )
+        self.assertEqual(
+            "CACHE_MECHANISM_CANDIDATE_LUNA",
+            probe.evaluate_probe_decision(with_snapshot, minimum_cases=32),
+        )
+
+    def test_cost_fields_do_not_enter_optimization_gate(self):
+        summary = {
+            f"case-{index:02d}": {
+                "net_measured_cost_delta": -1.0,
+                "quality_delta_points": 0.0,
+                "measured_attempt_count": 1,
+            }
+            for index in range(8)
+        }
+        metrics = {
+            "cost_summary": summary,
+            "p0_miss_count": 0,
+            "p1_miss_count": 0,
+            "calibration_first_delivery_pass_rate": 0.5,
+            "experiment_first_delivery_pass_rate": 0.6,
+            "synthetic": False,
+        }
+        without = costs.evaluate_optimization_gate(metrics, minimum_cases=8)
+        with_cost = costs.evaluate_optimization_gate(
+            {
+                **metrics,
+                "cost_estimate": {
+                    "type": "COST_ESTIMATE_UNDER_SNAPSHOT",
+                    "total": {"type": "COST_TOTAL_UNDER_SNAPSHOT", "total_cost_minor": 1},
+                },
+            },
+            minimum_cases=8,
+        )
+        self.assertEqual(without, with_cost)
+        self.assertEqual("ALLOW_ENFORCED", without)
+
+    def test_summary_schema_version_is_router_probe_summary_2(self):
+        rows, cost_rows, source = RouterProbeAnalysisTest.measured_matrix()
+        summary = probe.aggregate_probe_results(
+            rows, cost_rows, source_manifest=source
+        )
+        self.assertEqual("router-probe-summary-2", summary["schema_version"])
+        self.assertEqual(
+            probe.PROBE_SUMMARY_SCHEMA_VERSION, summary["schema_version"]
+        )
+        self.assertIn("cost_estimate", summary)
+
+    def test_summary_2_unknown_fields_do_not_change_probe_decision(self):
+        rows, cost_rows, source = RouterProbeAnalysisTest.measured_matrix()
+        summary = probe.aggregate_probe_results(
+            rows, cost_rows, source_manifest=source
+        )
+        expected = probe.evaluate_probe_decision(summary, minimum_cases=32)
+        cloned = dict(summary)
+        cloned["cost_estimate"] = {
+            "type": "COST_ESTIMATE_UNDER_SNAPSHOT",
+            "unknown_future_field": True,
+        }
+        cloned["future_summary_field"] = {"nested": 1}
+        self.assertEqual(
+            expected, probe.evaluate_probe_decision(cloned, minimum_cases=32)
+        )
+        self.assertEqual("CACHE_MECHANISM_CANDIDATE_LUNA", expected)
+
+    def test_r1_r3_manifest_validation_ignores_summary_2_cost_fields(self):
+        fixture = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        validated = probe.validate_probe_manifest(fixture)
+        self.assertEqual("router-probe-manifest-1", validated["schema_version"])
+        leaked = copy.deepcopy(fixture)
+        leaked["cost_estimate"] = {"type": "COST_ESTIMATE_UNDER_SNAPSHOT"}
+        with self.assertRaises(probe.RouterProbeError):
+            probe.validate_probe_manifest(leaked)
+        rows, cost_rows, source = RouterProbeAnalysisTest.measured_matrix()
+        summary = probe.aggregate_probe_results(
+            rows, cost_rows, source_manifest=source
+        )
+        self.assertEqual("measured", summary["data_origin"])
+        self.assertEqual("measured", source["data_origin"])
+        self.assertNotEqual(summary["schema_version"], source["schema_version"])
+
+    def test_cost_arms_are_isolated_from_r1_r3_samples(self):
+        rows, cost_rows, source = RouterProbeAnalysisTest.measured_matrix()
+        synthetic_rows, synthetic_cost_rows, synthetic_source = (
+            RouterProbeAnalysisTest.measured_matrix(origin="synthetic")
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            digest = self._write_archive(root)
+            snapshot = self._valid_snapshot(digest)
+            measured = probe.aggregate_probe_results(
+                rows,
+                cost_rows,
+                source_manifest=source,
+                snapshot=snapshot,
+                now_utc=self.NOW_UTC,
+                root=root,
+                arm_usage={
+                    "luna_resident": self._billing_usage(
+                        uncached_input=20,
+                        cached_input=80,
+                        output=10,
+                        sku="gpt-5.6-luna",
+                    )
+                },
+            )
+            synthetic = probe.aggregate_probe_results(
+                synthetic_rows,
+                synthetic_cost_rows,
+                source_manifest=synthetic_source,
+                snapshot=snapshot,
+                now_utc=self.NOW_UTC,
+                root=root,
+                arm_usage={
+                    "luna_resident": self._billing_usage(
+                        uncached_input=20,
+                        cached_input=80,
+                        output=10,
+                        sku="gpt-5.6-luna",
+                        evidence_id="synthetic-billing",
+                    )
+                },
+            )
+        self.assertEqual("measured", measured["data_origin"])
+        self.assertEqual("synthetic", synthetic["data_origin"])
+        self.assertNotEqual(measured["data_origin"], synthetic["data_origin"])
+        self.assertNotIn("cost_estimate", measured["arms"]["luna_resident"])
+        self.assertNotIn("estimated_cost_minor", measured["arms"]["luna_resident"])
+        self.assertEqual(
+            source["batch_id"],
+            next(iter({row["batch_id"] for row in rows})),
+        )
+        self.assertNotEqual(
+            measured["cost_estimate"]["arms"][0]["usage_evidence_ids"],
+            synthetic["cost_estimate"]["arms"][0]["usage_evidence_ids"],
         )
 
 
