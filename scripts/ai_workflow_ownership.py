@@ -341,6 +341,44 @@ def _task_envelope_hash(store: TaskStoreProtocol, task_id: str) -> str:
     return artifact_sha256(task)
 
 
+def ensure_ownership_registry_locked(
+    store: TaskStoreProtocol, task_id: str, plan: FrozenPlan
+) -> OwnershipRegistry:
+    """Materialize the immutable ownership registry when a plan is frozen.
+
+    The registry is derived from the task artifact and the frozen plan while the
+    caller holds the task lock.  Existing registries are accepted only when
+    their immutable identity still matches those authoritative inputs; the
+    original registration timestamp is intentionally preserved on replay.
+    """
+
+    store._assert_lock_held(task_id)
+    if not isinstance(plan, FrozenPlan):
+        _fail("PLAN_INVALID", "ownership registry requires a frozen plan")
+    envelope_hash = _task_envelope_hash(store, task_id)
+    existing = load_ownership_registry(store, task_id)
+    expected = build_ownership_registry(
+        task_id=task_id,
+        envelope_hash=envelope_hash,
+        plan=plan,
+        registered_at_utc=_utc_now(),
+    )
+    if existing is not None:
+        if (
+            existing.schema_version != expected.schema_version
+            or existing.task_id != expected.task_id
+            or existing.envelope_hash != expected.envelope_hash
+            or existing.path_owners != expected.path_owners
+        ):
+            _fail(
+                "OWNERSHIP_REGISTRY_CONFLICT",
+                "ownership registry does not match the authoritative task or plan",
+            )
+        return existing
+    record_ownership_registry(store, task_id, expected)
+    return expected
+
+
 def _lexical_repo_path(path: str) -> str:
     if not isinstance(path, str) or not path or path != path.strip():
         _fail("PLAN_INVALID", "scope must be a non-empty literal repository-relative path")

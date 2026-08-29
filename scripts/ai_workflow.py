@@ -267,6 +267,7 @@ try:
     )
     from .ai_workflow_ownership import (
         claimed_write_paths,
+        ensure_ownership_registry_locked,
         precheck_write_ownership,
         require_write_ownership_locked,
         verify_actual_write_paths,
@@ -294,6 +295,7 @@ except ImportError:  # direct script execution
     )
     from ai_workflow_ownership import (
         claimed_write_paths,
+        ensure_ownership_registry_locked,
         precheck_write_ownership,
         require_write_ownership_locked,
         verify_actual_write_paths,
@@ -5643,6 +5645,7 @@ def _freeze_or_require_construction_plan(
         authority = _construction_authority(recorded_frozen, step, role, route_wire)
         if _frozen_construction_authority(store, task_id) != authority:
             _fail("CONSTRUCTION_AUTHORITY_DRIFT", "construction state differs from first freeze")
+        ensure_ownership_registry_locked(store, task_id, recorded_frozen)
         return recorded_frozen
     if state not in {"DRAFT", "TASK_VALIDATED"}:
         _fail(
@@ -5661,6 +5664,7 @@ def _freeze_or_require_construction_plan(
             **authority,
         },
     )
+    ensure_ownership_registry_locked(store, task_id, frozen)
     return frozen
 
 

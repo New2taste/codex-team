@@ -233,6 +233,51 @@ class EnforcedConstructionExecutionTest(unittest.TestCase):
         self.assertEqual("controller", json.loads(evidence_event["evidence"][0]["observation"])["source"])
         self.assertEqual(0, json.loads(evidence_event["evidence"][1]["observation"])["exit_code"])
 
+    def test_plan_freeze_materializes_missing_ownership_registry(self):
+        registry_path = (
+            self.root
+            / self.task["task_id"]
+            / ownership.OWNERSHIP_REGISTRY_FILENAME
+        )
+        registry_path.unlink()
+        runner = BoundConstructionRunner()
+
+        self.assertEqual(
+            "AWAITING_OWNER_DECISION",
+            workflow.run_until_gate(
+                self.task["task_id"],
+                runner=runner,
+                allow_live_model=False,
+                construction_plan=self.plan,
+                construction_request=self.request,
+                construction_step_id="construction-601",
+                construction_attempt=1,
+                state_root=self.root,
+            ),
+        )
+        registry = ownership.load_ownership_registry(self.store, self.task["task_id"])
+        self.assertIsNotNone(registry)
+        self.assertEqual(
+            artifacts.artifact_sha256(self.task),
+            registry.envelope_hash,
+        )
+        workflow._apply_owner_decision(
+            self.store, self.task["task_id"], "approve_execution", "owner"
+        )
+        self.assertEqual(
+            "IMPLEMENTED_CANDIDATE",
+            workflow.run_until_gate(
+                self.task["task_id"],
+                runner=runner,
+                allow_live_model=False,
+                construction_plan=self.plan,
+                construction_request=self.request,
+                construction_step_id="construction-601",
+                construction_attempt=1,
+                state_root=self.root,
+            ),
+        )
+
     def test_non_luna_frozen_step_runs_terra_xhigh_without_any_sol_role(self):
         task = remediation_task()
         task["task_id"] = "AWF-20260808-602"
