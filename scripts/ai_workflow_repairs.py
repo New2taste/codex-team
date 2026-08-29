@@ -2814,6 +2814,53 @@ def _v2_validate_controller_result(
     return result
 
 
+def _observe_assignment_execution_side_effects(
+    store: WorkflowStore,
+    task_id: str,
+    *,
+    role: str,
+    repository: Path,
+    before_fs: object,
+    completed: subprocess.CompletedProcess | None,
+) -> None:
+    """Record spawn-armed assignment effects; unknown results are fail-closed."""
+
+    if completed is None:
+        record_unobserved_side_effect(
+            store,
+            task_id,
+            role=role,
+            permit_id=None,
+            reason="unobserved-assignment",
+        )
+        return
+    if before_fs is None:
+        return
+    try:
+        after_fs = capture_fs_snapshot(
+            repository, exclusions=observation_exclusions(repository)
+        )
+    except Exception:
+        record_unobserved_side_effect(
+            store,
+            task_id,
+            role=role,
+            permit_id=None,
+            reason="unobserved-assignment",
+        )
+        return
+    workflow = _workflow()
+    observe_execution_side_effects(
+        store,
+        task_id,
+        role=role,
+        permit_id=None,
+        before=before_fs,
+        after=after_fs,
+        rollout_events=tuple(workflow.parse_codex_jsonl(completed.stdout)),
+    )
+
+
 def run_assignment(
     store: WorkflowStore,
     task_id: str,
@@ -2929,55 +2976,50 @@ def run_assignment(
             "-",
         ]
         launched_ns = time.time_ns()
+        completed = None
+        spawned = False
         try:
-            completed = subprocess.run(
-                command,
-                cwd=repository,
-                input=_v2_assignment_prompt(stored_task, assignment),
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=120,
-                shell=False,
-                env=workflow.sanitized_environment(os.environ),
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            record_unobserved_side_effect(
-                store,
-                task_id,
-                role=assignment.expected_actor.role,
-                permit_id=None,
-                reason="unobserved-assignment",
-            )
-            _fail("REPAIR_ADAPTER_REQUIRED", "controller assignment process could not complete")
-        if completed.returncode != 0:
-            _fail("REPAIR_ADAPTER_REQUIRED", "controller assignment process failed")
-        events = workflow.parse_codex_jsonl(completed.stdout)
-        if workflow.extract_codex_thread_id(events) != receipt.runtime_instance_id:
-            _fail("ACCEPTANCE_RECEIPT_MISMATCH", "resumed controller thread identity drifted")
-        try:
-            output_stat = output_path.stat()
-            output = json.loads(output_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            _fail("REPAIR_ADAPTER_INVALID_OUTPUT", "controller emitted no valid fresh result")
-        if output_stat.st_mtime_ns < launched_ns:
-            _fail("REPAIR_ADAPTER_INVALID_OUTPUT", "controller result predates assignment launch")
-        try:
-            after = workflow.capture_repo(repository)
-        except RuntimeError:
-            _fail("REPAIR_ADAPTER_REQUIRED", "controller cannot snapshot the post-launch repository")
-        if before_fs is not None:
-            observe_execution_side_effects(
-                store,
-                task_id,
-                role=assignment.expected_actor.role,
-                permit_id=None,
-                before=before_fs,
-                after=capture_fs_snapshot(
-                    repository, exclusions=observation_exclusions(repository)
-                ),
-                rollout_events=tuple(events),
-            )
+            spawned = True
+            try:
+                completed = subprocess.run(
+                    command,
+                    cwd=repository,
+                    input=_v2_assignment_prompt(stored_task, assignment),
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    shell=False,
+                    env=workflow.sanitized_environment(os.environ),
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                _fail("REPAIR_ADAPTER_REQUIRED", "controller assignment process could not complete")
+            if completed.returncode != 0:
+                _fail("REPAIR_ADAPTER_REQUIRED", "controller assignment process failed")
+            events = workflow.parse_codex_jsonl(completed.stdout)
+            if workflow.extract_codex_thread_id(events) != receipt.runtime_instance_id:
+                _fail("ACCEPTANCE_RECEIPT_MISMATCH", "resumed controller thread identity drifted")
+            try:
+                output_stat = output_path.stat()
+                output = json.loads(output_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                _fail("REPAIR_ADAPTER_INVALID_OUTPUT", "controller emitted no valid fresh result")
+            if output_stat.st_mtime_ns < launched_ns:
+                _fail("REPAIR_ADAPTER_INVALID_OUTPUT", "controller result predates assignment launch")
+            try:
+                after = workflow.capture_repo(repository)
+            except RuntimeError:
+                _fail("REPAIR_ADAPTER_REQUIRED", "controller cannot snapshot the post-launch repository")
+        finally:
+            if spawned:
+                _observe_assignment_execution_side_effects(
+                    store,
+                    task_id,
+                    role=assignment.expected_actor.role,
+                    repository=repository,
+                    before_fs=before_fs,
+                    completed=completed,
+                )
         if after.status:
             _fail("REPAIR_ADAPTER_REQUIRED", "controller rejects uncommitted assignment writes")
         if assignment.phase in _REVIEW_PHASES and after != before:

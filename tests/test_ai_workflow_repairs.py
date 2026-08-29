@@ -684,6 +684,134 @@ class AssignmentSideEffectObservationTest(unittest.TestCase):
         }
         self.assertIn("UNOBSERVED_ASSUMED_PRESENT", kinds)
 
+    def test_nonzero_exit_after_spawn_still_observes_worktree_mutation(self) -> None:
+        from scripts import ai_workflow_ownership as ownership
+
+        self.fx._open_with_owner("luna-owner", "luna")
+        reviewer_thread = str(uuid.uuid4())
+        review = self.fx._issue(
+            "REVIEW_1",
+            self.fx._expected_actor(
+                "terra-nonzero-review",
+                "terra_xhigh_reviewer",
+                runtime_instance_id=reviewer_thread,
+            ),
+        )
+        sessions = self.fx.repository_root.parent / "nonzero-sessions"
+        self._write_rollout(
+            sessions,
+            reviewer_thread,
+            sandbox="read-only",
+            model="gpt-5.6-terra",
+            effort="xhigh",
+            permission="read-only",
+        )
+
+        def fail_and_mutate(command, *args, **kwargs):
+            (self.fx.repository_root / "spawn-failed.txt").write_text(
+                "mutated after spawn\n", encoding="utf-8"
+            )
+            return subprocess.CompletedProcess(command, 23, stdout="", stderr="failed")
+
+        with (
+            self._patch_codex(fail_and_mutate),
+            self.fx._controller_codex_lookup(),
+            self.assertRaisesRegex(workflow.WorkflowError, "REPAIR_ADAPTER_REQUIRED"),
+        ):
+            repairs.run_assignment(self.fx.store, self.fx.TASK_ID, review, sessions)
+        rows = ownership.load_side_effects(self.fx.store, self.fx.TASK_ID)
+        kinds = {row["effect_kind"] for row in rows}
+        self.assertTrue(ownership.has_ownership_locking_side_effect(self.fx.store, self.fx.TASK_ID))
+        self.assertTrue(kinds & {"OWNED_WRITE", "UNTRACKED_WRITE", "COMMAND_GENERATED"})
+        self.assertIn("spawn-failed.txt", {row["path"] for row in rows})
+        self.assertNotIn("UNOBSERVED_ASSUMED_PRESENT", kinds)
+
+    def test_post_spawn_snapshot_failure_records_unobserved(self) -> None:
+        from scripts import ai_workflow_ownership as ownership
+        from scripts import ai_workflow_side_effects as side_effects
+
+        self.fx._open_with_owner("luna-owner", "luna")
+        reviewer_thread = str(uuid.uuid4())
+        review = self.fx._issue(
+            "REVIEW_1",
+            self.fx._expected_actor(
+                "terra-snapshot-fail-review",
+                "terra_xhigh_reviewer",
+                runtime_instance_id=reviewer_thread,
+            ),
+        )
+        sessions = self.fx.repository_root.parent / "snapshot-fail-sessions"
+        self._write_rollout(
+            sessions,
+            reviewer_thread,
+            sandbox="read-only",
+            model="gpt-5.6-terra",
+            effort="xhigh",
+            permission="read-only",
+        )
+        result = {
+            "schema_version": "ai-result-1",
+            "dispatch_id": None,
+            "task_id": None,
+            "step_id": None,
+            "attempt": None,
+            "role": "terra_xhigh_reviewer",
+            "status": "ACCEPTANCE_RECOMMENDED",
+            "summary": "ok",
+            "claims": [],
+            "evidence": [],
+            "counter_checks": [],
+            "changed_files": [],
+            "blind_spots": [],
+            "unresolved_questions": [],
+            "recommended_next_state": "AWAITING_OWNER_DECISION",
+        }
+        snapshot_calls = {"n": 0}
+        repo_calls = {"n": 0}
+        real_snapshot = side_effects.capture_fs_snapshot
+        real_capture_repo = workflow.capture_repo
+
+        def fail_after_spawn(repo, *, exclusions):
+            snapshot_calls["n"] += 1
+            if snapshot_calls["n"] == 1:
+                return real_snapshot(repo, exclusions=exclusions)
+            raise RuntimeError("cannot snapshot the post-launch repository")
+
+        def fail_post_launch_repo(*args, **kwargs):
+            repo_calls["n"] += 1
+            if repo_calls["n"] == 1:
+                return real_capture_repo(*args, **kwargs)
+            raise RuntimeError("cannot snapshot the post-launch repository")
+
+        def controller_process(command, *args, **kwargs):
+            output_path = Path(command[command.index("-o") + 1])
+            output_path.write_text(json.dumps(result), encoding="utf-8")
+            events = "\n".join(
+                (
+                    json.dumps({"type": "thread.started", "thread_id": reviewer_thread}),
+                    json.dumps({"type": "turn.completed"}),
+                )
+            )
+            return subprocess.CompletedProcess(command, 0, stdout=events + "\n", stderr="")
+
+        with (
+            mock.patch.object(side_effects, "capture_fs_snapshot", side_effect=fail_after_spawn),
+            mock.patch.object(repairs, "capture_fs_snapshot", side_effect=fail_after_spawn),
+            mock.patch.object(workflow, "capture_repo", side_effect=fail_post_launch_repo),
+            self._patch_codex(controller_process),
+            self.fx._controller_codex_lookup(),
+            self.assertRaisesRegex(workflow.WorkflowError, "REPAIR_ADAPTER_REQUIRED"),
+        ):
+            repairs.run_assignment(self.fx.store, self.fx.TASK_ID, review, sessions)
+        self.assertTrue(
+            ownership.has_ownership_locking_side_effect(self.fx.store, self.fx.TASK_ID)
+        )
+        kinds = {
+            row["effect_kind"]
+            for row in ownership.load_side_effects(self.fx.store, self.fx.TASK_ID)
+        }
+        self.assertIn("UNOBSERVED_ASSUMED_PRESENT", kinds)
+
     def test_observed_changes_match_actual_changed_paths(self) -> None:
         from scripts import ai_workflow_side_effects as side_effects
 
