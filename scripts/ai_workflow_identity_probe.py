@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
 import os
 import re
 import tomllib
@@ -28,6 +30,16 @@ IDENTITY_PROBE_BUDGET_FIELDS = (
     "max_calls",
     "max_output_tokens",
     "max_output_tokens_per_call",
+)
+IDENTITY_PROBE_USAGE_FIELDS = (
+    "uncached_input_tokens",
+    "cached_input_tokens",
+    "output_tokens",
+)
+_ARM_ORDER = ("NO_OP", "ONE_TURN", "TWO_TURN")
+_PAIRED_DELTAS = (
+    ("ONE_TURN_MINUS_NO_OP", "ONE_TURN", "NO_OP"),
+    ("TWO_TURN_MINUS_ONE_TURN", "TWO_TURN", "ONE_TURN"),
 )
 IDENTITY_PROBE_MODELS = frozenset({"gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"})
 IDENTITY_PROBE_EFFORTS = frozenset({"max", "medium", "xhigh"})
@@ -238,6 +250,201 @@ def require_identity_probe_authorized(
         )
 
 
+def _canonical_json(value: Mapping[str, object]) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _arm_config_hash(manifest: Mapping[str, object]) -> str:
+    payload = {
+        "arm": manifest["arm"],
+        "requested_launch_intent": dict(manifest["requested_launch_intent"]),
+        "seed": manifest["seed"],
+        "max_calls": manifest["max_calls"],
+        "max_output_tokens": manifest["max_output_tokens"],
+        "max_output_tokens_per_call": manifest["max_output_tokens_per_call"],
+    }
+    return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def _unavailable_identity() -> dict[str, object]:
+    return {
+        "identity_source": "SERVER_METADATA",
+        **{field: AUTHORITY_UNAVAILABLE for field in _IDENTITY_FIELDS},
+    }
+
+
+def _usage_from_executor(returned: object) -> dict[str, int] | None:
+    if not isinstance(returned, Mapping):
+        return None
+    usage: dict[str, int] = {}
+    for field in IDENTITY_PROBE_USAGE_FIELDS:
+        item = returned.get(field)
+        if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+            return None
+        usage[field] = item
+    return usage
+
+
+def _identity_from_executor(returned: Mapping[str, object]) -> dict[str, object]:
+    raw = returned.get("observed_runtime_identity")
+    if not isinstance(raw, Mapping):
+        return _unavailable_identity()
+    try:
+        return _validate_observed_runtime_identity(raw)
+    except IdentityProbeError:
+        return _unavailable_identity()
+
+
+def _percentile(values: list[int], percent: float) -> float:
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return float(ordered[0])
+    rank = (len(ordered) - 1) * (percent / 100.0)
+    low = math.floor(rank)
+    high = math.ceil(rank)
+    if low == high:
+        return float(ordered[low])
+    weight = rank - low
+    return float(ordered[low]) * (1.0 - weight) + float(ordered[high]) * weight
+
+
+def _usage_stats(values: list[int]) -> dict[str, object]:
+    return {
+        "total": sum(values),
+        "mean": sum(values) / len(values),
+        "min": min(values),
+        "max": max(values),
+        "p50": _percentile(values, 50),
+        "p90": _percentile(values, 90),
+    }
+
+
+def _write_json(path: Path, value: Mapping[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _append_jsonl(path: Path, row: Mapping[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = (
+        json.dumps(dict(row), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    )
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(line)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def aggregate_identity_probe_results(
+    records: list[Mapping[str, object]],
+) -> Mapping[str, object]:
+    by_arm: dict[str, list[Mapping[str, object]]] = {arm: [] for arm in _ARM_ORDER}
+    failures = {arm: 0 for arm in _ARM_ORDER}
+    hashes: dict[str, str] = {}
+    experiment_root: str | None = None
+    stop_reason: str | None = None
+    tokens_used = 0
+    calls_made = 0
+    for raw in records:
+        if not isinstance(raw, Mapping):
+            continue
+        arm = raw.get("arm")
+        if arm not in by_arm:
+            continue
+        root = raw.get("experiment_root")
+        if experiment_root is None and isinstance(root, str):
+            experiment_root = root
+        reason = raw.get("stop_reason")
+        if isinstance(reason, str) and reason:
+            stop_reason = reason
+        used = raw.get("tokens_used")
+        if not isinstance(used, bool) and isinstance(used, int):
+            tokens_used = max(tokens_used, used)
+        made = raw.get("calls_made")
+        if not isinstance(made, bool) and isinstance(made, int):
+            calls_made = max(calls_made, made)
+        digest = raw.get("arm_config_hash")
+        if isinstance(digest, str) and digest:
+            hashes[str(arm)] = digest
+        if raw.get("record_valid") is True:
+            by_arm[str(arm)].append(raw)
+        else:
+            failures[str(arm)] += 1
+    summary: dict[str, object] = {
+        "protocol_version": IDENTITY_PROBE_PROTOCOL_VERSION,
+        "experiment_root": experiment_root,
+        "calls_made": calls_made,
+        "tokens_used": tokens_used,
+        "stop_reason": stop_reason,
+    }
+    for arm in _ARM_ORDER:
+        samples = by_arm[arm]
+        group: dict[str, object] = {
+            "sample_count": len(samples),
+            "failure_count": failures[arm],
+            "arm_config_hash": hashes.get(arm),
+        }
+        if not samples:
+            group["status"] = "OBSERVATION_ONLY"
+            summary[arm] = group
+            continue
+        group["status"] = "MEASURED"
+        for field in IDENTITY_PROBE_USAGE_FIELDS:
+            values = [int(item[field]) for item in samples]
+            group[field] = _usage_stats(values)
+        cached_total = int(group["cached_input_tokens"]["total"])
+        uncached_total = int(group["uncached_input_tokens"]["total"])
+        input_total = cached_total + uncached_total
+        group["cache_hit_ratio"] = (
+            cached_total / input_total if input_total else 0.0
+        )
+        summary[arm] = group
+    deltas: dict[str, object] = {}
+    for name, left, right in _PAIRED_DELTAS:
+        left_group = summary[left]
+        right_group = summary[right]
+        if (
+            not isinstance(left_group, Mapping)
+            or not isinstance(right_group, Mapping)
+            or left_group.get("status") == "OBSERVATION_ONLY"
+            or right_group.get("status") == "OBSERVATION_ONLY"
+        ):
+            deltas[name] = "OBSERVATION_ONLY"
+            continue
+        deltas[name] = {
+            field: left_group[field]["mean"] - right_group[field]["mean"]
+            for field in IDENTITY_PROBE_USAGE_FIELDS
+        }
+    summary["paired_deltas"] = deltas
+    return summary
+
+
+def render_identity_probe_report(summary: Mapping[str, object]) -> str:
+    lines = [
+        "IDENTITY_PROBE_REPORT",
+        f"protocol_version={summary.get('protocol_version')}",
+        f"experiment_root={summary.get('experiment_root')}",
+        f"calls_made={summary.get('calls_made')}",
+        f"tokens_used={summary.get('tokens_used')}",
+        f"stop_reason={summary.get('stop_reason')}",
+    ]
+    for arm in _ARM_ORDER:
+        group = summary.get(arm)
+        if not isinstance(group, Mapping):
+            continue
+        lines.append(
+            f"{arm}: status={group.get('status')} "
+            f"sample_count={group.get('sample_count')} "
+            f"failure_count={group.get('failure_count')} "
+            f"cache_hit_ratio={group.get('cache_hit_ratio')}"
+        )
+    return "\n".join(lines) + "\n"
+
+
 def run_identity_probe(
     manifest: Mapping[str, object],
     *,
@@ -252,10 +459,117 @@ def run_identity_probe(
         allow_live_model=allow_live_model,
         executor_kind=executor_kind,
     )
-    raise IdentityProbeError(
-        "identity probe runner is not implemented",
-        code="IDENTITY_PROBE_RUNNER_UNIMPLEMENTED",
+    validate_identity_probe_manifest(manifest)
+    experiment_root = Path(experiment_root)
+    if experiment_root.exists() and (
+        experiment_root.is_symlink() or not experiment_root.is_dir()
+    ):
+        _fail("experiment_root must be a directory")
+    experiment_root.mkdir(parents=True, exist_ok=True)
+    max_calls = int(manifest["max_calls"])
+    max_output_tokens = int(manifest["max_output_tokens"])
+    max_output_tokens_per_call = int(manifest["max_output_tokens_per_call"])
+    arm_dir = experiment_root / str(manifest["batch_id"]) / str(manifest["arm"])
+    arm_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(arm_dir / "manifest.json", dict(manifest))
+    jsonl_path = arm_dir / "records.jsonl"
+    arm_hash = _arm_config_hash(manifest)
+    records: list[dict[str, object]] = []
+    calls_made = 0
+    tokens_used = 0
+    stop_reason = "MAX_CALLS"
+    while True:
+        if calls_made >= max_calls:
+            stop_reason = "MAX_CALLS"
+            break
+        if tokens_used + max_output_tokens_per_call >= max_output_tokens:
+            stop_reason = "MAX_OUTPUT_TOKENS"
+            break
+        payload = {
+            "arm": manifest["arm"],
+            "call_index": calls_made,
+            "protocol_version": IDENTITY_PROBE_PROTOCOL_VERSION,
+            "requested_launch_intent": dict(manifest["requested_launch_intent"]),
+        }
+        returned = executor(payload)
+        calls_made += 1
+        if not isinstance(returned, Mapping):
+            returned = {}
+        usage = _usage_from_executor(returned)
+        model_text = returned.get("model_text_output")
+        if not isinstance(model_text, str):
+            model_text = ""
+        observed = _identity_from_executor(returned)
+        record_valid = usage is not None
+        per_call_status = "OK"
+        if record_valid and usage["output_tokens"] > max_output_tokens_per_call:
+            per_call_status = "PER_CALL_CAP_EXCEEDED"
+            stop_reason = "PER_CALL_CAP_EXCEEDED"
+        if record_valid:
+            tokens_used += usage["output_tokens"]
+            cache_status = returned.get("cache_status")
+            if not isinstance(cache_status, str) or not cache_status:
+                cache_status = (
+                    "HIT" if usage["cached_input_tokens"] > 0 else "MISS"
+                )
+        else:
+            cache_status = returned.get("cache_status")
+            if not isinstance(cache_status, str) or not cache_status:
+                cache_status = "UNAVAILABLE"
+        runtime_metadata = returned.get("runtime_metadata")
+        if not isinstance(runtime_metadata, Mapping):
+            runtime_metadata = {"executor_kind": executor_kind}
+        else:
+            runtime_metadata = dict(runtime_metadata)
+            runtime_metadata.setdefault("executor_kind", executor_kind)
+        record = {
+            "protocol_version": IDENTITY_PROBE_PROTOCOL_VERSION,
+            "experiment_root": str(experiment_root),
+            "batch_id": manifest["batch_id"],
+            "arm": manifest["arm"],
+            "call_index": calls_made - 1,
+            "arm_config_hash": arm_hash,
+            "record_valid": record_valid,
+            "per_call_status": per_call_status,
+            "uncached_input_tokens": (
+                usage["uncached_input_tokens"] if usage is not None else None
+            ),
+            "cached_input_tokens": (
+                usage["cached_input_tokens"] if usage is not None else None
+            ),
+            "output_tokens": usage["output_tokens"] if usage is not None else None,
+            "cache_status": cache_status,
+            "runtime_metadata": runtime_metadata,
+            "observed_runtime_identity": observed,
+            "model_text_output": model_text,
+            "calls_made": calls_made,
+            "tokens_used": tokens_used,
+        }
+        if not record_valid:
+            record["invalid_reason"] = "USAGE_FIELDS_MISSING"
+        records.append(record)
+        _append_jsonl(jsonl_path, record)
+        if per_call_status == "PER_CALL_CAP_EXCEEDED":
+            break
+    for record in records:
+        record["stop_reason"] = stop_reason
+        record["calls_made"] = calls_made
+        record["tokens_used"] = tokens_used
+    summary = aggregate_identity_probe_results(records)
+    _write_json(arm_dir / "summary.json", summary)
+    _write_json(
+        arm_dir / "run.json",
+        {
+            "protocol_version": IDENTITY_PROBE_PROTOCOL_VERSION,
+            "experiment_root": str(experiment_root),
+            "calls_made": calls_made,
+            "tokens_used": tokens_used,
+            "stop_reason": stop_reason,
+            "arm": manifest["arm"],
+            "batch_id": manifest["batch_id"],
+        },
     )
+    return records
 
 
 def _load_manifest(path: Path) -> dict[str, object]:
