@@ -798,6 +798,8 @@ class RunCodexLaunchIntentHubTest(unittest.TestCase):
             "RUNTIME_EVIDENCE_RECORDED",
             _events(self.store, self.task_id)[event_index]["event_type"],
         )
+        self.assertEqual("AUTHORITY_UNAVAILABLE", rows[0]["fork_state"])
+        self.assertEqual("AUTHORITY_UNAVAILABLE", rows[0]["nested_state"])
 
 
 class EvidenceImportDisciplineTest(unittest.TestCase):

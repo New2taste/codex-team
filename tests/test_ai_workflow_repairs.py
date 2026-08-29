@@ -10,6 +10,7 @@ from unittest import mock
 
 from scripts import ai_workflow as workflow
 from scripts import ai_workflow_artifacts as artifacts
+from scripts import ai_workflow_evidence as evidence
 from scripts import ai_workflow_ownership as ownership
 from scripts import ai_workflow_repairs as repairs
 from tests.test_ai_workflow import _RecordingPopen, _compat_popen, _install_declaration
@@ -948,6 +949,16 @@ class AssignmentDispatchGateTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.fx.tearDown()
 
+    def _intent_events(self) -> list[dict[str, object]]:
+        path = self.fx.store._require_task(self.fx.TASK_ID) / "events.jsonl"
+        if not path.is_file():
+            return []
+        return [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line and json.loads(line).get("event_type") == "LAUNCH_INTENT_RECORDED"
+        ]
+
     def _write_rollout(self, sessions: Path, thread_id: str) -> None:
         sessions.mkdir(parents=True, exist_ok=True)
         (sessions / f"rollout-{thread_id}").write_text(
@@ -1035,14 +1046,7 @@ class AssignmentDispatchGateTest(unittest.TestCase):
             ):
                 repairs.run_assignment(self.fx.store, self.fx.TASK_ID, review, sessions)
         self.assertEqual([], _RecordingPopen.calls)
-        intents = [
-            json.loads(line)
-            for line in (
-                self.fx.store._require_task(self.fx.TASK_ID) / "events.jsonl"
-            ).read_text(encoding="utf-8").splitlines()
-            if line and json.loads(line).get("event_type") == "LAUNCH_INTENT_RECORDED"
-        ]
-        self.assertEqual([], intents)
+        self.assertEqual([], self._intent_events())
 
     def test_role_not_allowed_rejects_assignment_before_spawn(self) -> None:
         self.fx._declaration_kwargs = {
@@ -1062,6 +1066,7 @@ class AssignmentDispatchGateTest(unittest.TestCase):
             with self.assertRaisesRegex(workflow.WorkflowError, "ROLE_NOT_ALLOWED"):
                 repairs.run_assignment(self.fx.store, self.fx.TASK_ID, review, sessions)
         self.assertEqual([], _RecordingPopen.calls)
+        self.assertEqual([], self._intent_events())
 
     def test_role_not_preflighted_rejects_assignment_before_spawn(self) -> None:
         self.fx._declaration_kwargs = {"run_preflight": False}
@@ -1078,6 +1083,7 @@ class AssignmentDispatchGateTest(unittest.TestCase):
             with self.assertRaisesRegex(workflow.WorkflowError, "ROLE_NOT_PREFLIGHTED"):
                 repairs.run_assignment(self.fx.store, self.fx.TASK_ID, review, sessions)
         self.assertEqual([], _RecordingPopen.calls)
+        self.assertEqual([], self._intent_events())
 
     def test_budget_exceeded_rejects_assignment_before_spawn(self) -> None:
         self.fx._declaration_kwargs = {"max_dispatches": 0}
@@ -1094,6 +1100,60 @@ class AssignmentDispatchGateTest(unittest.TestCase):
             with self.assertRaisesRegex(workflow.WorkflowError, "ROUTE_BUDGET_EXCEEDED"):
                 repairs.run_assignment(self.fx.store, self.fx.TASK_ID, review, sessions)
         self.assertEqual([], _RecordingPopen.calls)
+        self.assertEqual([], self._intent_events())
+
+    def test_claimed_assignment_identity_does_not_record_a_second_launch_intent(self) -> None:
+        review, sessions, thread_id = self._issue_review()
+        handler = self._controller_handler(thread_id, self._review_result())
+        _RecordingPopen.reset()
+        with (
+            mock.patch.object(repairs.subprocess, "Popen", _compat_popen(handler)),
+            self.fx._controller_codex_lookup(),
+        ):
+            repairs.run_assignment(self.fx.store, self.fx.TASK_ID, review, sessions)
+        self.assertEqual(1, len(self._intent_events()))
+        _RecordingPopen.reset()
+        with (
+            mock.patch.object(repairs.subprocess, "Popen", _compat_popen(handler)),
+            self.fx._controller_codex_lookup(),
+        ):
+            with self.assertRaisesRegex(
+                workflow.WorkflowError,
+                "DISPATCH_PERMIT_ALREADY_STARTED|REPAIR_ADAPTER_REQUIRED",
+            ):
+                repairs.run_assignment(self.fx.store, self.fx.TASK_ID, review, sessions)
+        self.assertEqual([], _RecordingPopen.calls)
+        self.assertEqual(1, len(self._intent_events()))
+
+    def test_retired_assignment_identity_does_not_record_launch_intent(self) -> None:
+        review, sessions, thread_id = self._issue_review()
+        handler = self._controller_handler(thread_id, self._review_result())
+        _RecordingPopen.reset()
+        with (
+            mock.patch.object(
+                workflow,
+                "materialize_dispatch_result_schema",
+                side_effect=workflow.WorkflowError("RESULT_SCHEMA_DERIVATION_INVALID", "boom"),
+            ),
+            mock.patch.object(repairs.subprocess, "Popen", _compat_popen(handler)),
+            self.fx._controller_codex_lookup(),
+        ):
+            with self.assertRaisesRegex(workflow.WorkflowError, "RESULT_SCHEMA_DERIVATION_INVALID"):
+                repairs.run_assignment(self.fx.store, self.fx.TASK_ID, review, sessions)
+        self.assertEqual([], _RecordingPopen.calls)
+        self.assertEqual([], self._intent_events())
+        _RecordingPopen.reset()
+        with (
+            mock.patch.object(repairs.subprocess, "Popen", _compat_popen(handler)),
+            self.fx._controller_codex_lookup(),
+        ):
+            with self.assertRaisesRegex(
+                workflow.WorkflowError,
+                "DISPATCH_IDENTITY_RETIRED|ASSIGNMENT_ATTEMPT_INTERRUPTED",
+            ):
+                repairs.run_assignment(self.fx.store, self.fx.TASK_ID, review, sessions)
+        self.assertEqual([], _RecordingPopen.calls)
+        self.assertEqual([], self._intent_events())
 
     def test_unknown_observation_does_not_complete_assignment(self) -> None:
         review, sessions, thread_id = self._issue_review()
@@ -1159,6 +1219,10 @@ class AssignmentDispatchGateTest(unittest.TestCase):
         self.assertNotEqual("terra_xhigh_reviewer", registry.path_owners["src"])
         sidecar = self.fx.store._require_task(self.fx.TASK_ID) / "runtime-evidence-v2.jsonl"
         self.assertTrue(sidecar.is_file())
+        rows = evidence.replay_runtime_evidence_v2(self.fx.store, self.fx.TASK_ID)
+        self.assertTrue(rows)
+        self.assertEqual("AUTHORITY_UNAVAILABLE", rows[0]["fork_state"])
+        self.assertEqual("AUTHORITY_UNAVAILABLE", rows[0]["nested_state"])
 
     def test_legal_assignment_records_launch_intent_before_popen(self) -> None:
         review, sessions, thread_id = self._issue_review()
@@ -1176,12 +1240,14 @@ class AssignmentDispatchGateTest(unittest.TestCase):
             return real_ledger(store, task_id, name, record)
 
         inner = _compat_popen(self._controller_handler(thread_id, self._review_result()))
+        spawn_argv: list[object] = []
 
         class Popen(inner):
             def __init__(self, command, *args, **kwargs):
                 super().__init__(command, *args, **kwargs)
                 if getattr(self, "_delegate", None) is None:
                     order.append("POPEN")
+                    spawn_argv.append(command)
 
         with (
             mock.patch.object(workflow.WorkflowStore, "append_event", tracking_append),
@@ -1202,6 +1268,13 @@ class AssignmentDispatchGateTest(unittest.TestCase):
         intents = [event for event in events if event.get("event_type") == "LAUNCH_INTENT_RECORDED"]
         self.assertEqual(1, len(intents))
         self.assertEqual(artifacts.artifact_sha256(self.fx.task), intents[0]["envelope_hash"])
+        self.assertEqual(1, len(spawn_argv))
+        self.assertEqual(
+            hashlib.sha256(
+                artifacts.canonical_json(list(spawn_argv[0])).encode("utf-8")
+            ).hexdigest(),
+            intents[0]["command_sha256"],
+        )
         recorded = [event for event in events if event.get("event_type") == "RUNTIME_EVIDENCE_RECORDED"]
         self.assertTrue(recorded)
         self.assertEqual(
@@ -1215,6 +1288,10 @@ class AssignmentDispatchGateTest(unittest.TestCase):
             },
             set(recorded[-1]),
         )
+        rows = evidence.replay_runtime_evidence_v2(self.fx.store, self.fx.TASK_ID)
+        self.assertTrue(rows)
+        self.assertEqual("AUTHORITY_UNAVAILABLE", rows[-1]["fork_state"])
+        self.assertEqual("AUTHORITY_UNAVAILABLE", rows[-1]["nested_state"])
 
 
 class VerdictReleaseGateRepairTest(unittest.TestCase):

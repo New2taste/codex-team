@@ -3870,6 +3870,13 @@ class DispatchGateHubTest(unittest.TestCase):
             return []
         return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
 
+    def _intent_events(self) -> list[dict[str, object]]:
+        return [
+            event
+            for event in self._events()
+            if event.get("event_type") == "LAUNCH_INTENT_RECORDED"
+        ]
+
     def _store_task(self) -> None:
         task_dir = self.store._require_task(self.task_id)
         (task_dir / "task.json").write_text(
@@ -4027,10 +4034,7 @@ class DispatchGateHubTest(unittest.TestCase):
         self.assertEqual([], popen.calls)
         self.assertEqual([], self._permit_records())
         self.assertEqual([], self._dispatch_records())
-        self.assertEqual(
-            [],
-            [event for event in self._events() if event.get("event_type") == "LAUNCH_INTENT_RECORDED"],
-        )
+        self.assertEqual([], self._intent_events())
 
     def test_state_root_none_is_declaration_missing(self) -> None:
         paths = workflow.RunPaths(
@@ -4187,6 +4191,7 @@ class DispatchGateHubTest(unittest.TestCase):
                 with self.assertRaisesRegex(workflow.WorkflowError, "DISPATCH_IDENTITY_RETIRED"):
                     workflow.run_codex("luna", self.task, "task contract", self._paths())
         self.assertEqual([], popen.calls)
+        self.assertEqual([], self._intent_events())
 
     def test_timeout_after_spawn_does_not_release(self) -> None:
         _install_declaration(self.store, self.task, allowed_roles=("luna",), active_roles=("luna",))
@@ -4251,6 +4256,7 @@ class DispatchGateHubTest(unittest.TestCase):
             with self.assertRaisesRegex(workflow.WorkflowError, "DISPATCH_PERMIT_ALREADY_STARTED"):
                 workflow.run_codex("luna", self.task, "task contract", self._paths())
         self.assertEqual(1, len(popen.calls))
+        self.assertEqual(1, len(self._intent_events()))
 
     def test_technical_retry_gets_a_new_permit(self) -> None:
         _install_declaration(self.store, self.task, allowed_roles=("luna",), active_roles=("luna",), max_dispatches=4)
@@ -4472,6 +4478,7 @@ class DispatchGateHubTest(unittest.TestCase):
             with self.assertRaisesRegex(workflow.WorkflowError, "ROLE_NOT_ALLOWED"):
                 workflow.run_codex("sol_planner", self.task, "task contract", self._paths())
         self.assertEqual([], popen.calls)
+        self.assertEqual([], self._intent_events())
 
     def test_role_not_preflighted_rejects_run_codex_before_spawn(self) -> None:
         _install_declaration(
@@ -4490,6 +4497,7 @@ class DispatchGateHubTest(unittest.TestCase):
             with self.assertRaisesRegex(workflow.WorkflowError, "ROLE_NOT_PREFLIGHTED"):
                 workflow.run_codex("luna", self.task, "task contract", self._paths())
         self.assertEqual([], popen.calls)
+        self.assertEqual([], self._intent_events())
 
     def test_budget_exceeded_rejects_run_codex_before_spawn(self) -> None:
         _install_declaration(
@@ -4508,6 +4516,7 @@ class DispatchGateHubTest(unittest.TestCase):
             with self.assertRaisesRegex(workflow.WorkflowError, "ROUTE_BUDGET_EXCEEDED"):
                 workflow.run_codex("luna", self.task, "task contract", self._paths())
         self.assertEqual([], popen.calls)
+        self.assertEqual([], self._intent_events())
 
     def test_resume_until_gate_missing_declaration_does_not_run(self) -> None:
         events = self.store._require_task(self.task_id) / "events.jsonl"
@@ -4559,6 +4568,7 @@ class DispatchGateHubTest(unittest.TestCase):
         ]
         self.assertTrue(failures)
         self.assertEqual(code, failures[0]["error_code"])
+        self.assertEqual([], self._intent_events())
 
     def test_until_gate_role_not_allowed_does_not_run(self) -> None:
         self._assert_until_gate_rejects_before_runner(
