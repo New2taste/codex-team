@@ -220,6 +220,22 @@ def _schema_files_present() -> bool:
     return all((config_dir / name).is_file() for name in REQUIRED_SCHEMA_FILES)
 
 
+def _runtime_sessions_directory(worktree_id: str) -> Path:
+    return Path(worktree_id) / ".codex" / "sessions"
+
+
+def _sessions_directory_usable(worktree_id: str) -> bool:
+    if not isinstance(worktree_id, str) or not worktree_id.strip():
+        return False
+    path = _runtime_sessions_directory(worktree_id)
+    if not path.is_absolute():
+        return False
+    try:
+        return path.is_dir()
+    except OSError:
+        return False
+
+
 def compute_preflight_context(
     store: TaskStoreProtocol, task_id: str, *, role: str
 ) -> PreflightContext:
@@ -333,7 +349,7 @@ def run_role_preflight_locked(
     store._assert_lock_held(task_id)
     context = compute_preflight_context(store, task_id, role=role)
     result = dict(_run_preflight_checks(role, context))
-    if not _schema_files_present():
+    if not _schema_files_present() or not _sessions_directory_usable(context.worktree_id):
         result["status"] = "FAIL"
     return _append_preflight_record(store, task_id, role, context, result)
 
@@ -350,6 +366,8 @@ def is_role_preflighted_locked(
 ) -> bool:
     store._assert_lock_held(task_id)
     context = compute_preflight_context(store, task_id, role=role)
+    if not _sessions_directory_usable(context.worktree_id):
+        return False
     records = _read_preflight_records(store, task_id)
     return _preflight_record_matches(records, role, context.cache_key())
 
@@ -365,7 +383,9 @@ def require_role_preflighted_locked(
     store._assert_lock_held(task_id)
     context = compute_preflight_context(store, task_id, role=role)
     records = _read_preflight_records(store, task_id)
-    if not _preflight_record_matches(records, role, context.cache_key()):
+    if not _sessions_directory_usable(context.worktree_id) or not _preflight_record_matches(
+        records, role, context.cache_key()
+    ):
         _fail("ROLE_NOT_PREFLIGHTED", f"role {role} is not preflighted")
 
 

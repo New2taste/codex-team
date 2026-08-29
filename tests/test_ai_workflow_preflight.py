@@ -7,6 +7,7 @@ import hashlib
 import inspect
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -223,6 +224,7 @@ class _PreflightStoreMixin:
             declarations.record_route_declaration(
                 self.store, TASK_ID, self.declaration
             )
+        (self.repo / ".codex" / "sessions").mkdir(parents=True, exist_ok=True)
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -477,6 +479,22 @@ class PreflightContextAuthorityTest(_PreflightStoreMixin, unittest.TestCase):
             preflight.require_role_preflighted(self.store, TASK_ID, "luna")
         preflight.run_role_preflight(self.store, TASK_ID, "luna")
         preflight.require_role_preflighted(self.store, TASK_ID, "luna")
+
+    def test_missing_sessions_directory_does_not_pass_or_satisfy_require(self) -> None:
+        sessions = self.repo / ".codex" / "sessions"
+        if sessions.exists():
+            if sessions.is_dir():
+                shutil.rmtree(sessions)
+            else:
+                sessions.unlink()
+        self.assertFalse(sessions.is_dir())
+        result = preflight.run_role_preflight(self.store, TASK_ID, "luna")
+        self.assertNotEqual("PASS", result["status"])
+        self.assertFalse(preflight.is_role_preflighted(self.store, TASK_ID, "luna"))
+        with self.assertRaisesRegex(
+            artifacts.WorkflowError, "ROLE_NOT_PREFLIGHTED"
+        ):
+            preflight.require_role_preflighted(self.store, TASK_ID, "luna")
 
     def test_missing_install_manifest_is_unavailable(self) -> None:
         path = ROOT / "config" / preflight.RUNTIME_MANIFEST_FILENAME
