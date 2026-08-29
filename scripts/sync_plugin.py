@@ -33,6 +33,7 @@ CONFIG_FILES = (
     "ai_workflow_cost_evidence.schema.json",
     "ai_workflow_router_probe_manifest.schema.json",
     "ai_workflow_scheduler.schema.json",
+    "ai_workflow_identity_probe_manifest.schema.json",
 )
 RUNTIME_FILES = (
     "ai_workflow.py",

@@ -1049,5 +1049,26 @@ class PreflightDistributionManifestTest(unittest.TestCase):
         self.assertIn("ai_workflow_evidence.py", sync_plugin.RUNTIME_FILES)
 
 
+class IdentityProbeDistributionTest(unittest.TestCase):
+    def test_identity_probe_is_schema_only_and_excluded_from_runtime(self):
+        from scripts import sync_plugin
+
+        self.assertIn(
+            "ai_workflow_identity_probe_manifest.schema.json",
+            sync_plugin.CONFIG_FILES,
+        )
+        self.assertNotIn(
+            "ai_workflow_identity_probe.py",
+            sync_plugin.RUNTIME_FILES,
+        )
+        self.assertFalse(
+            (PLUGIN / "runtime" / "ai_workflow_identity_probe.py").exists()
+        )
+        self.assertNotIn(
+            "ai_workflow_router_probe.py",
+            sync_plugin.RUNTIME_FILES,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
