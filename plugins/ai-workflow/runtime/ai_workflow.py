@@ -261,6 +261,7 @@ try:
         derive_dispatch_identity,
         ensure_declaration_for_task,
         precheck_dispatch_permit,
+        preflight_active_roles,
         release_permit_if_never_spawned,
         require_dispatch_permit_locked,
     )
@@ -270,7 +271,7 @@ try:
         require_write_ownership_locked,
         verify_actual_write_paths,
     )
-    from .ai_workflow_preflight import run_role_preflight_locked
+    from .ai_workflow_preflight import run_role_preflight
     from .ai_workflow_declarations import load_route_declaration_locked
     from .ai_workflow_evidence import append_runtime_evidence_v2, record_launch_intent
 except ImportError:  # direct script execution
@@ -287,6 +288,7 @@ except ImportError:  # direct script execution
         derive_dispatch_identity,
         ensure_declaration_for_task,
         precheck_dispatch_permit,
+        preflight_active_roles,
         release_permit_if_never_spawned,
         require_dispatch_permit_locked,
     )
@@ -296,7 +298,7 @@ except ImportError:  # direct script execution
         require_write_ownership_locked,
         verify_actual_write_paths,
     )
-    from ai_workflow_preflight import run_role_preflight_locked
+    from ai_workflow_preflight import run_role_preflight
     from ai_workflow_declarations import load_route_declaration_locked
     from ai_workflow_evidence import append_runtime_evidence_v2, record_launch_intent
 
@@ -2832,8 +2834,7 @@ def _ensure_task_declaration(
         declaration = ensure_declaration_for_task(
             store, task_id, decision=decision, config=config
         )
-        for role in declaration.active_roles:
-            run_role_preflight_locked(store, task_id, role)
+    preflight_active_roles(store, task_id, declaration.active_roles)
     return declaration
 
 
@@ -6231,6 +6232,7 @@ def _apply_owner_decision(
         _fail("INVALID_OWNER_DECISION", "decision is not in the approved closed set")
     if not isinstance(actor, str) or not actor.strip():
         _fail("INVALID_ACTOR", "actor must be a non-empty string")
+    to_preflight: str | None = None
     with store.lock(task_id):
         store._require_task(task_id)
         state = _current_state(store, task_id)
@@ -6277,8 +6279,11 @@ def _apply_owner_decision(
             from_role = "sol_planner" if task["task_type"] == "PLAN" else "sol_reviewer"
             to_role = "sol_xhigh_planner" if from_role == "sol_planner" else "sol_xhigh"
             activate_role(store, task_id, from_role=from_role, to_role=to_role)
-            run_role_preflight_locked(store, task_id, to_role)
-        return target
+            to_preflight = to_role
+        result = target
+    if to_preflight is not None:
+        run_role_preflight(store, task_id, to_preflight)
+    return result
 
 
 def _load_construction_resume(
@@ -6905,9 +6910,8 @@ def _run_command(args: argparse.Namespace) -> int:
                 store, task["task_id"], decision=decision, config=config
             )
             declaration = load_route_declaration_locked(store, task["task_id"])
-            if declaration is not None:
-                for role in declaration.active_roles:
-                    run_role_preflight_locked(store, task["task_id"], role)
+        if declaration is not None:
+            preflight_active_roles(store, task["task_id"], declaration.active_roles)
         record_route_advice(
             store,
             task["task_id"],

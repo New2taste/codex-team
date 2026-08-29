@@ -1305,6 +1305,113 @@ class GatedPipelineTest(unittest.TestCase):
 
         self.assertEqual(escalation_runner.calls, ["sol_xhigh"])
 
+    def _task_jsonl(self, task_id: str, name: str) -> list[dict[str, object]]:
+        path = self.state_root / task_id / name
+        if not path.is_file():
+            return []
+        return [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line
+        ]
+
+    def test_upgrade_activation_preflights_before_new_role_reserved(self):
+        task_id = self._create_task(self._task("ACCEPTANCE"))
+        first_runner = ScriptedRunner(
+            [
+                self._result("luna", "SUPPORTED", "EVIDENCE_READY"),
+                self._result("sol_reviewer", "ESCALATION_PROPOSED", "ESCALATION_PROPOSED"),
+            ]
+        )
+        escalation_runner = ScriptedRunner(
+            [self._result("sol_xhigh", "OPTION_A", "ESCALATION_PROPOSED")]
+        )
+        with mock.patch.object(workflow, "WORKFLOW_STATE_ROOT", self.state_root):
+            self.assertEqual(
+                workflow.run_until_gate(task_id, runner=first_runner, allow_live_model=False),
+                "AWAITING_OWNER_DECISION",
+            )
+            self.assertEqual(
+                workflow.apply_owner_decision(task_id, "authorize_escalation", "owner"),
+                "ESCALATION_AUTHORIZED",
+            )
+            self.assertEqual(
+                workflow.run_until_gate(task_id, runner=escalation_runner, allow_live_model=False),
+                "AWAITING_OWNER_DECISION",
+            )
+        self.assertEqual(escalation_runner.calls, ["sol_xhigh"])
+        events = self._task_jsonl(task_id, "events.jsonl")
+        activated_at = next(
+            index
+            for index, event in enumerate(events)
+            if event.get("event_type") == "ROLE_ACTIVATED"
+            and event.get("to_role") == "sol_xhigh"
+        )
+        preflight_roles = [
+            row["role"]
+            for row in self._task_jsonl(task_id, preflight.PREFLIGHT_LEDGER)
+        ]
+        self.assertIn("sol_xhigh", preflight_roles)
+        xhigh_preflight_index = preflight_roles.index("sol_xhigh")
+        permits = self._task_jsonl(task_id, policy.DISPATCH_PERMIT_LEDGER)
+        xhigh_reserved = next(
+            row for row in permits if row.get("role") == "sol_xhigh" and row.get("state") == "RESERVED"
+        )
+        self.assertEqual("RESERVED", xhigh_reserved["state"])
+        self.assertGreaterEqual(xhigh_preflight_index, 0)
+        self.assertIn("ROLE_ACTIVATED", [event.get("event_type") for event in events])
+        self.assertLess(activated_at, len(events))
+
+    def test_skip_upgrade_preflight_rejects_without_new_role_permit(self):
+        task_id = self._create_task(self._task("ACCEPTANCE"))
+        first_runner = ScriptedRunner(
+            [
+                self._result("luna", "SUPPORTED", "EVIDENCE_READY"),
+                self._result("sol_reviewer", "ESCALATION_PROPOSED", "ESCALATION_PROPOSED"),
+            ]
+        )
+        with mock.patch.object(workflow, "WORKFLOW_STATE_ROOT", self.state_root):
+            workflow.run_until_gate(task_id, runner=first_runner, allow_live_model=False)
+            workflow.apply_owner_decision(task_id, "authorize_escalation", "owner")
+        ledger = self.state_root / task_id / preflight.PREFLIGHT_LEDGER
+        if ledger.is_file():
+            kept = [
+                line
+                for line in ledger.read_text(encoding="utf-8").splitlines()
+                if line and json.loads(line).get("role") != "sol_xhigh"
+            ]
+            ledger.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+        before = [
+            row
+            for row in self._task_jsonl(task_id, policy.DISPATCH_PERMIT_LEDGER)
+            if row.get("role") == "sol_xhigh"
+        ]
+        self.assertEqual([], before)
+        retry = ScriptedRunner(
+            [self._result("sol_xhigh", "OPTION_A", "ESCALATION_PROPOSED")]
+        )
+        with mock.patch.object(workflow, "WORKFLOW_STATE_ROOT", self.state_root):
+            state = workflow.run_until_gate(
+                task_id, runner=retry, allow_live_model=False
+            )
+        self.assertEqual([], retry.calls)
+        self.assertEqual("BLOCKED", state)
+        failures = [
+            event
+            for event in self._task_jsonl(task_id, "events.jsonl")
+            if event.get("event_type") == "ROLE_FAILURE"
+        ]
+        self.assertTrue(failures)
+        self.assertEqual("ROLE_NOT_PREFLIGHTED", failures[-1]["error_code"])
+        self.assertEqual(
+            [],
+            [
+                row
+                for row in self._task_jsonl(task_id, policy.DISPATCH_PERMIT_LEDGER)
+                if row.get("role") == "sol_xhigh"
+            ],
+        )
+
     def test_two_malformed_results_use_only_one_technical_retry_then_block(self):
         task_id = self._create_task(self._task())
         runner = ScriptedRunner([{"not": "ai-result-1"}, {"not": "ai-result-1"}])
@@ -4825,6 +4932,25 @@ class DispatchGateHubTest(unittest.TestCase):
         self.assertEqual(1, len(leases))
         self.assertEqual(permit_id, leases[0]["permit_id"])
         self.assertEqual(["src"], leases[0]["allowed_paths"])
+
+    def test_live_luna_preflights_active_roles_before_first_reserved(self) -> None:
+        with mock.patch.object(workflow, "run_codex") as run_codex:
+            run_codex.return_value = CodexRunnerTest().valid_result()
+            workflow._run_live_luna(self.task, self._live_luna_args())
+        run_codex.assert_called_once()
+        declaration = declarations.load_route_declaration(self.store, self.task_id)
+        self.assertIsNotNone(declaration)
+        assert declaration is not None
+        preflight_path = self.store._require_task(self.task_id) / preflight.PREFLIGHT_LEDGER
+        preflighted = [
+            json.loads(line)["role"]
+            for line in preflight_path.read_text(encoding="utf-8").splitlines()
+            if line
+        ]
+        self.assertEqual(list(declaration.active_roles), preflighted)
+        inactive = set(declaration.allowed_roles) - set(declaration.active_roles)
+        self.assertTrue(inactive.isdisjoint(set(preflighted)))
+        self.assertEqual([], self._permit_records())
 
 
 if __name__ == "__main__":

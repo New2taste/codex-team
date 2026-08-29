@@ -17,9 +17,12 @@ from unittest import mock
 from scripts import ai_workflow as workflow
 from scripts import ai_workflow_artifacts as artifacts
 from scripts import ai_workflow_declarations as declarations
+from scripts import ai_workflow_dispatch_policy as policy
 from scripts import ai_workflow_preflight as preflight
 from scripts import sync_plugin
 from scripts.ai_workflow_routing import RuntimeRouteDecision
+from tests.test_ai_workflow import ScriptedRunner, _compat_popen
+from tests.test_ai_workflow_runtime import THREAD_ID, blocked_luna_result
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -636,6 +639,265 @@ class PreflightDistributionContractTest(unittest.TestCase):
             preflight.RUNTIME_MANIFEST_FILENAME, sync_plugin.CONFIG_FILES
         )
         self.assertIn("ai_workflow_preflight.py", sync_plugin.RUNTIME_FILES)
+
+
+def _jsonl(path: Path) -> list[dict[str, object]]:
+    if not path.is_file():
+        return []
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+
+
+def _pipeline_result(role: str, status: str, state: str) -> dict[str, object]:
+    result = {
+        "schema_version": "ai-result-1",
+        "role": role,
+        "status": status,
+        "summary": "The bounded local stage completed.",
+        "claims": [],
+        "evidence": [],
+        "counter_checks": [],
+        "changed_files": [],
+        "blind_spots": [],
+        "unresolved_questions": [],
+        "recommended_next_state": state,
+    }
+    if role == "luna":
+        result["claims"] = [
+            {
+                "id": "claim-1",
+                "kind": "FACT",
+                "text": "The bounded evidence supports the result.",
+                "evidence_ids": ["evidence-1"],
+            }
+        ]
+        result["evidence"] = [
+            {
+                "id": "evidence-1",
+                "type": "FILE",
+                "locator": "README.md",
+                "observation": "The authorized evidence was checked.",
+            }
+        ]
+        result["counter_checks"] = [
+            {
+                "target_claim_id": "claim-1",
+                "method": "Check the bounded evidence for a contradiction.",
+                "result": "No contradiction found.",
+            }
+        ]
+    return result
+
+
+class PreflightProductionWiringTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        root = Path(self.temporary.name)
+        self.repo = _init_repo(root / "repository")
+        (self.repo / ".codex" / "sessions").mkdir(parents=True, exist_ok=True)
+        self.state_root = root / "state"
+        self.store = workflow.WorkflowStore(self.state_root)
+        self.task = _valid_task(task_id=TASK_ID, repository_root=self.repo)
+        self.store.create_task(self.task)
+        legacy_config = workflow._load_workflow_config()
+        legacy_config["routing"] = {"mode": "legacy", "role_policy": "legacy"}
+        self._legacy = mock.patch.object(
+            workflow, "_load_workflow_config", return_value=legacy_config
+        )
+        self._legacy.start()
+
+    def tearDown(self) -> None:
+        self._legacy.stop()
+        self.temporary.cleanup()
+
+    def _preflight_roles(self) -> list[str]:
+        return [str(row["role"]) for row in _jsonl(self._ledger_path())]
+
+    def _ledger_path(self, name: str = preflight.PREFLIGHT_LEDGER) -> Path:
+        return self.store._require_task(TASK_ID) / name
+
+    def _permit_records(self) -> list[dict[str, object]]:
+        return _jsonl(self._ledger_path(policy.DISPATCH_PERMIT_LEDGER))
+
+    def _events(self) -> list[dict[str, object]]:
+        return _jsonl(self.store._require_task(TASK_ID) / "events.jsonl")
+
+    def _run_until_gate(self, runner: ScriptedRunner) -> str:
+        with mock.patch.object(workflow, "WORKFLOW_STATE_ROOT", self.state_root):
+            return workflow.run_until_gate(
+                TASK_ID,
+                runner=runner,
+                allow_live_model=False,
+                state_root=self.state_root,
+            )
+
+    def test_require_dispatch_permit_locked_does_not_run_preflight(self) -> None:
+        source = inspect.getsource(policy.require_dispatch_permit_locked)
+        self.assertNotIn("run_role_preflight", source)
+        self.assertIn("require_role_preflighted_locked", source)
+
+    def test_preflight_active_roles_is_self_locking_orchestration(self) -> None:
+        self.assertTrue(hasattr(policy, "preflight_active_roles"))
+        parameters = inspect.signature(policy.preflight_active_roles).parameters
+        self.assertEqual(("store", "task_id", "roles"), tuple(parameters))
+        for injector in INJECTOR_NAMES:
+            self.assertNotIn(injector, parameters)
+        source = inspect.getsource(policy.preflight_active_roles)
+        self.assertIn("run_role_preflight(", source)
+        self.assertNotIn("run_role_preflight_locked", source)
+
+    def test_ensure_declaration_preflights_outside_lock_via_public_wrapper(self) -> None:
+        source = inspect.getsource(workflow._ensure_task_declaration)
+        self.assertIn("preflight_active_roles", source)
+        self.assertNotIn("run_role_preflight_locked", source)
+
+    def test_owner_escalation_preflights_new_role_outside_lock(self) -> None:
+        source = inspect.getsource(workflow._apply_owner_decision)
+        self.assertIn("run_role_preflight(", source)
+        self.assertNotIn("run_role_preflight_locked", source)
+
+    def test_until_gate_preflights_active_roles_before_first_reserved(self) -> None:
+        state = self._run_until_gate(workflow.FakeRunner())
+        self.assertEqual("AWAITING_OWNER_DECISION", state)
+        declaration = declarations.load_route_declaration(self.store, TASK_ID)
+        self.assertIsNotNone(declaration)
+        assert declaration is not None
+        preflighted = self._preflight_roles()
+        self.assertEqual(list(declaration.active_roles), preflighted)
+        inactive = set(declaration.allowed_roles) - set(declaration.active_roles)
+        self.assertTrue(inactive)
+        self.assertTrue(inactive.isdisjoint(set(preflighted)))
+        permits = self._permit_records()
+        self.assertTrue(permits)
+        first_by_role: dict[str, dict[str, object]] = {}
+        for row in permits:
+            role = str(row["role"])
+            if role not in first_by_role:
+                first_by_role[role] = row
+        for role in declaration.active_roles:
+            self.assertIn(role, first_by_role)
+            self.assertEqual("RESERVED", first_by_role[role]["state"])
+            self.assertLess(
+                preflighted.index(role),
+                len(preflighted),
+            )
+
+    def test_until_gate_deleted_preflight_rejects_without_permit_growth(self) -> None:
+        declaration = workflow._ensure_task_declaration(self.store, TASK_ID, self.task)
+        self.assertEqual(list(declaration.active_roles), self._preflight_roles())
+        ledger = self._ledger_path()
+        self.assertTrue(ledger.is_file())
+        ledger.unlink()
+        before = self._permit_records()
+        self.assertEqual([], before)
+        runner = ScriptedRunner(
+            [_pipeline_result("luna", "SUPPORTED", "EVIDENCE_READY")]
+        )
+        state = self._run_until_gate(runner)
+        self.assertEqual([], runner.calls)
+        self.assertEqual("BLOCKED", state)
+        failures = [
+            event for event in self._events() if event.get("event_type") == "ROLE_FAILURE"
+        ]
+        self.assertTrue(failures)
+        self.assertEqual("ROLE_NOT_PREFLIGHTED", failures[-1]["error_code"])
+        self.assertEqual([], self._permit_records())
+
+    def test_illegal_activate_role_is_transition_blocked(self) -> None:
+        workflow._ensure_task_declaration(self.store, TASK_ID, self.task)
+        with self.store.lock(TASK_ID):
+            with self.assertRaisesRegex(
+                artifacts.WorkflowError, "ROUTE_TRANSITION_BLOCKED"
+            ):
+                policy.activate_role(
+                    self.store, TASK_ID, from_role="luna", to_role="terra"
+                )
+
+    def test_preflight_cache_hit_still_verifies_runtime_identity(self) -> None:
+        workflow._ensure_task_declaration(self.store, TASK_ID, self.task)
+        self.assertIn("luna", self._preflight_roles())
+        sessions = Path(self.temporary.name) / "runtime-sessions"
+        sessions.mkdir(parents=True, exist_ok=True)
+        rollout = {
+            "thread_id": THREAD_ID,
+            "agent_type": None,
+            "model": "gpt-5.6-luna",
+            "reasoning_effort": "max",
+            "sandbox_policy": "read-only",
+            "permission_profile": "read-only",
+            "cwd": str(Path(self.repo).resolve()),
+            "prompt": "PROMPT_SECRET",
+            "environment": "ENV_SECRET",
+            "token": "TOKEN_SECRET",
+        }
+        (sessions / f"rollout-{THREAD_ID}").write_text(
+            json.dumps(rollout), encoding="utf-8"
+        )
+        paths = workflow.RunPaths(
+            repo=Path(self.repo).resolve(),
+            output_path=self.store._require_task(TASK_ID) / "luna-result.json",
+            schema_path=ROOT / "config" / "ai_workflow_result.schema.json",
+            logs_dir=self.store._require_task(TASK_ID) / "logs",
+            state_root=self.state_root,
+            runtime_evidence_required=True,
+            runtime_sessions_dir=sessions,
+        )
+
+        def write_result(command, *args, **kwargs):
+            attempt_output = Path(command[command.index("-o") + 1])
+            attempt_output.write_text(
+                json.dumps(blocked_luna_result()), encoding="utf-8"
+            )
+            events = "\n".join(
+                (
+                    json.dumps({"type": "thread.started", "thread_id": THREAD_ID}),
+                    json.dumps({"type": "turn.completed"}),
+                )
+            )
+            return subprocess.CompletedProcess(command, 0, stdout=events + "\n", stderr="")
+
+        with (
+            mock.patch.object(
+                workflow, "capture_repo", return_value=workflow.RepoSnapshot("h" * 40, ())
+            ),
+            mock.patch.object(workflow, "working_tree_paths", return_value=set()),
+            mock.patch.object(workflow.subprocess, "Popen", _compat_popen(write_result)),
+            mock.patch.object(
+                workflow,
+                "verify_runtime_identity",
+                wraps=workflow.verify_runtime_identity,
+            ) as identity,
+        ):
+            workflow.run_codex("luna", self.task, "Read only.", paths)
+        self.assertEqual(1, identity.call_count)
+        ledger = self._ledger_path()
+        ledger.unlink()
+        with (
+            mock.patch.object(
+                workflow, "capture_repo", return_value=workflow.RepoSnapshot("h" * 40, ())
+            ),
+            mock.patch.object(workflow, "working_tree_paths", return_value=set()),
+            mock.patch.object(
+                workflow.subprocess,
+                "Popen",
+                _compat_popen(
+                    lambda *args, **kwargs: (_ for _ in ()).throw(
+                        AssertionError("codex launched")
+                    )
+                ),
+            ),
+            mock.patch.object(
+                workflow,
+                "verify_runtime_identity",
+                wraps=workflow.verify_runtime_identity,
+            ) as identity_missing,
+        ):
+            with self.assertRaisesRegex(workflow.WorkflowError, "ROLE_NOT_PREFLIGHTED"):
+                workflow.run_codex("luna", self.task, "Read only.", paths)
+        self.assertEqual(0, identity_missing.call_count)
 
 
 if __name__ == "__main__":

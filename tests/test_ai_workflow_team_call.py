@@ -1321,6 +1321,49 @@ class TeamCallControllerTest(unittest.TestCase):
                 )
         self.assertEqual([], popen.calls)
 
+    def test_direct_l1_preflights_active_roles_and_trims_inactive(self) -> None:
+        task_id, task, paths = self._direct_l1_task()
+        store = workflow.WorkflowStore(self.root)
+        declaration = declarations.load_route_declaration(store, task_id)
+        self.assertIsNotNone(declaration)
+        assert declaration is not None
+        ledger = self.root / task_id / preflight.PREFLIGHT_LEDGER
+        self.assertTrue(ledger.is_file())
+        preflighted = [
+            json.loads(line)["role"]
+            for line in ledger.read_text(encoding="utf-8").splitlines()
+            if line
+        ]
+        self.assertEqual(list(declaration.active_roles), preflighted)
+        inactive = set(declaration.allowed_roles) - set(declaration.active_roles)
+        self.assertTrue(inactive.isdisjoint(set(preflighted)))
+
+    def test_direct_l1_deleted_preflight_does_not_grow_permits(self) -> None:
+        task_id, task, paths = self._direct_l1_task()
+        ledger = self.root / task_id / preflight.PREFLIGHT_LEDGER
+        if ledger.is_file():
+            ledger.unlink()
+        permit_path = self.root / task_id / policy.DISPATCH_PERMIT_LEDGER
+        before = permit_path.read_bytes() if permit_path.is_file() else b""
+        declaration = declarations.load_route_declaration(
+            workflow.WorkflowStore(self.root), task_id
+        )
+        self.assertIsNotNone(declaration)
+        role = declaration.active_roles[0]
+        popen = self._l1_popen()
+        with (
+            mock.patch.object(workflow, "working_tree_paths", return_value=set()),
+            mock.patch.object(
+                workflow, "capture_repo", return_value=workflow.RepoSnapshot("h" * 40, ())
+            ),
+            mock.patch.object(workflow.subprocess, "Popen", popen),
+        ):
+            with self.assertRaisesRegex(workflow.WorkflowError, "ROLE_NOT_PREFLIGHTED"):
+                workflow.run_codex(role, task, "task contract", paths)
+        self.assertEqual([], popen.calls)
+        after = permit_path.read_bytes() if permit_path.is_file() else b""
+        self.assertEqual(before, after)
+
 
 if __name__ == "__main__":
     unittest.main()

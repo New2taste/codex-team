@@ -16,6 +16,7 @@ from scripts import ai_workflow as workflow
 from scripts import ai_workflow_artifacts as artifacts
 from scripts import ai_workflow_declarations as declarations
 from scripts import ai_workflow_planning as planning
+from scripts import ai_workflow_preflight as preflight
 from scripts import ai_workflow_repairs as repairs
 from scripts import ai_workflow_scheduler as scheduler
 from scripts import sync_plugin
@@ -1988,6 +1989,18 @@ class SchedulerDeclarationGateTest(SchedulerHarness):
         with self.assertRaisesRegex(workflow.WorkflowError, "ROLE_NOT_ALLOWED"):
             scheduler.dispatch_ready_batch(self.store, self.frozen)
         self.assertEqual(original, ledger_bytes(self.store, self.frozen.task_id))
+
+    def test_schedule_batch_does_not_write_preflight_or_permit_records(self) -> None:
+        _install_scheduler_declaration(
+            self.store,
+            self.task,
+            allowed_roles=("luna", "terra", "terra_xhigh", "luna_construction"),
+        )
+        proposals = scheduler.dispatch_ready_batch(self.store, self.frozen)
+        self.assertTrue(proposals)
+        task_dir = self.store._require_task(self.frozen.task_id)
+        self.assertFalse((task_dir / preflight.PREFLIGHT_LEDGER).is_file())
+        self.assertFalse((task_dir / "dispatch-permits.jsonl").is_file())
 
 
 if __name__ == "__main__":

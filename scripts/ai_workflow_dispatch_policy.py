@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -26,7 +26,7 @@ try:
         load_route_declaration_locked,
     )
     from .ai_workflow_ownership import has_unresolved_ownership_violation_locked
-    from .ai_workflow_preflight import require_role_preflighted_locked
+    from .ai_workflow_preflight import require_role_preflighted_locked, run_role_preflight
     from .ai_workflow_routing import RuntimeRouteDecision
     from .ai_workflow_side_effects import (
         derive_effectful_roles,
@@ -51,7 +51,7 @@ except ImportError:  # direct script execution
         load_route_declaration_locked,
     )
     from ai_workflow_ownership import has_unresolved_ownership_violation_locked
-    from ai_workflow_preflight import require_role_preflighted_locked
+    from ai_workflow_preflight import require_role_preflighted_locked, run_role_preflight
     from ai_workflow_routing import RuntimeRouteDecision
     from ai_workflow_side_effects import (
         derive_effectful_roles,
@@ -430,6 +430,15 @@ def require_dispatch_permit(
             dispatch_identity=dispatch_identity,
             config=config,
         )
+
+
+def preflight_active_roles(
+    store: TaskStoreProtocol, task_id: str, roles: Sequence[str]
+) -> None:
+    """Run host-static preflight for each role. Must not be called under store.lock."""
+
+    for role in roles:
+        run_role_preflight(store, task_id, role)
 
 
 def precheck_dispatch_permit_locked(
