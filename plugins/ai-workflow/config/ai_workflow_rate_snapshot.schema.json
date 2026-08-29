@@ -1,0 +1,138 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "ai-rate-snapshot-1"
+    },
+    "rate_snapshot_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "skus": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "sku": {
+            "type": "string",
+            "minLength": 1
+          },
+          "model": {
+            "type": "string",
+            "minLength": 1
+          },
+          "currency": {
+            "type": "string",
+            "minLength": 1
+          },
+          "unit": {
+            "type": "string",
+            "enum": ["PER_TOKEN", "PER_1K_TOKENS", "PER_1M_TOKENS"]
+          },
+          "billing_channel": {
+            "type": "string",
+            "minLength": 1
+          },
+          "price_uncached_input": {
+            "type": "string",
+            "minLength": 1
+          },
+          "price_cached_input": {
+            "type": "string",
+            "minLength": 1
+          },
+          "price_output": {
+            "type": "string",
+            "minLength": 1
+          },
+          "cache_write_applies": {
+            "type": "boolean"
+          },
+          "long_context_tiers_applies": {
+            "type": "boolean"
+          },
+          "source_url": {
+            "type": "string",
+            "minLength": 1
+          },
+          "retrieved_at": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "sku",
+          "model",
+          "currency",
+          "unit",
+          "billing_channel",
+          "price_uncached_input",
+          "price_cached_input",
+          "price_output",
+          "cache_write_applies",
+          "long_context_tiers_applies",
+          "source_url",
+          "retrieved_at"
+        ]
+      }
+    },
+    "effective_at": {
+      "type": "string",
+      "minLength": 1
+    },
+    "retrieved_at": {
+      "type": "string",
+      "minLength": 1
+    },
+    "archive": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "archive_path": {
+          "type": "string",
+          "pattern": "^docs/rate-archives/[0-9a-f]{64}$"
+        },
+        "archive_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "mime_type": {
+          "type": "string",
+          "minLength": 1
+        },
+        "retrieval_status": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "archive_path",
+        "archive_sha256",
+        "mime_type",
+        "retrieval_status"
+      ]
+    },
+    "approved_by": {
+      "type": "string",
+      "minLength": 1
+    },
+    "approval_evidence_id": {
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "required": [
+    "schema_version",
+    "rate_snapshot_id",
+    "skus",
+    "effective_at",
+    "retrieved_at",
+    "archive",
+    "approved_by",
+    "approval_evidence_id"
+  ]
+}

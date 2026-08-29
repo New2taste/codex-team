@@ -1,4 +1,7 @@
+import copy
+import hashlib
 import json
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -435,6 +438,351 @@ class CostReportTest(unittest.TestCase):
         }
         report = workflow.render_report(metrics, claim_minimum_cases=8)
         self.assertIn("- optimization gate: FALLBACK_FIXED", report)
+
+
+class RateSnapshotTest(unittest.TestCase):
+    ARCHIVE_BYTES = b"<html>official pricing capture</html>\n"
+    NOW_UTC = "2026-08-28T12:00:00Z"
+    RETRIEVED_AT = "2026-08-28T00:00:00Z"
+
+    def _digest(self, payload: bytes = ARCHIVE_BYTES) -> str:
+        return hashlib.sha256(payload).hexdigest()
+
+    def _valid_sku(self, **overrides):
+        sku = {
+            "sku": "gpt-5.6-sol",
+            "model": "gpt-5.6",
+            "currency": "USD",
+            "unit": "PER_1M_TOKENS",
+            "billing_channel": "api",
+            "price_uncached_input": "2.50",
+            "price_cached_input": "0.25",
+            "price_output": "10.00",
+            "cache_write_applies": True,
+            "long_context_tiers_applies": False,
+            "source_url": "https://example.test/pricing",
+            "retrieved_at": self.RETRIEVED_AT,
+        }
+        sku.update(overrides)
+        return sku
+
+    def _valid_archive(self, digest: str, **overrides):
+        archive = {
+            "archive_path": f"docs/rate-archives/{digest}",
+            "archive_sha256": digest,
+            "mime_type": "text/html",
+            "retrieval_status": "retrieved",
+        }
+        archive.update(overrides)
+        return archive
+
+    def _valid_snapshot(self, digest: str | None = None, **overrides):
+        digest = digest or self._digest()
+        snapshot = {
+            "schema_version": "ai-rate-snapshot-1",
+            "rate_snapshot_id": "rates-2026-08-28",
+            "skus": [self._valid_sku()],
+            "effective_at": "2026-08-28T00:00:00Z",
+            "retrieved_at": self.RETRIEVED_AT,
+            "archive": self._valid_archive(digest),
+            "approved_by": "owner",
+            "approval_evidence_id": "a" * 64,
+        }
+        snapshot.update(overrides)
+        return snapshot
+
+    def _write_archive(self, root: Path, payload: bytes = ARCHIVE_BYTES) -> str:
+        digest = self._digest(payload)
+        path = root / "docs" / "rate-archives" / digest
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+        return digest
+
+    def test_closed_rate_units_and_field_sets(self):
+        self.assertEqual("ai-rate-snapshot-1", costs.RATE_SNAPSHOT_SCHEMA_VERSION)
+        self.assertEqual(
+            frozenset(
+                {
+                    "schema_version",
+                    "rate_snapshot_id",
+                    "skus",
+                    "effective_at",
+                    "retrieved_at",
+                    "archive",
+                    "approved_by",
+                    "approval_evidence_id",
+                }
+            ),
+            costs.RATE_SNAPSHOT_FIELDS,
+        )
+        self.assertEqual(
+            frozenset({"PER_TOKEN", "PER_1K_TOKENS", "PER_1M_TOKENS"}),
+            costs.RATE_UNITS,
+        )
+        self.assertEqual(
+            {"PER_TOKEN": 1, "PER_1K_TOKENS": 1_000, "PER_1M_TOKENS": 1_000_000},
+            dict(costs.RATE_UNIT_BASE),
+        )
+        self.assertEqual(
+            frozenset(
+                {
+                    "sku",
+                    "model",
+                    "currency",
+                    "unit",
+                    "billing_channel",
+                    "price_uncached_input",
+                    "price_cached_input",
+                    "price_output",
+                    "cache_write_applies",
+                    "long_context_tiers_applies",
+                    "source_url",
+                    "retrieved_at",
+                }
+            ),
+            costs.RATE_SNAPSHOT_SKU_FIELDS,
+        )
+        self.assertEqual(
+            frozenset(
+                {"archive_path", "archive_sha256", "mime_type", "retrieval_status"}
+            ),
+            costs.RATE_SNAPSHOT_ARCHIVE_FIELDS,
+        )
+        self.assertEqual(
+            frozenset({"CURRENT", "PRICE_STALE", "PRICE_UNKNOWN"}),
+            costs.PRICING_STATUSES,
+        )
+
+    def test_schema_declares_closed_units_and_required_fields(self):
+        schema = json.loads(
+            (ROOT / "config" / "ai_workflow_rate_snapshot.schema.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertFalse(schema["additionalProperties"])
+        self.assertEqual("ai-rate-snapshot-1", schema["properties"]["schema_version"]["const"])
+        self.assertEqual(sorted(costs.RATE_SNAPSHOT_FIELDS), sorted(schema["required"]))
+        sku = schema["properties"]["skus"]["items"]
+        self.assertEqual(
+            ["PER_TOKEN", "PER_1K_TOKENS", "PER_1M_TOKENS"],
+            sku["properties"]["unit"]["enum"],
+        )
+        for field in ("price_uncached_input", "price_cached_input", "price_output"):
+            self.assertEqual("string", sku["properties"][field]["type"])
+        self.assertEqual(
+            sorted(costs.RATE_SNAPSHOT_SKU_FIELDS), sorted(sku["required"])
+        )
+        archive = schema["properties"]["archive"]
+        self.assertEqual(
+            sorted(costs.RATE_SNAPSHOT_ARCHIVE_FIELDS), sorted(archive["required"])
+        )
+
+    def test_valid_snapshot_round_trips(self):
+        snapshot = self._valid_snapshot()
+        costs.validate_rate_snapshot(snapshot)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "rates-2026-08-28.json"
+            costs.write_rate_snapshot(path, snapshot)
+            loaded = costs.load_rate_snapshot(path)
+        self.assertEqual("ai-rate-snapshot-1", loaded["schema_version"])
+        self.assertEqual(snapshot["rate_snapshot_id"], loaded["rate_snapshot_id"])
+        self.assertEqual(snapshot["skus"], loaded["skus"])
+        self.assertEqual(snapshot["archive"], loaded["archive"])
+        self.assertEqual(costs.RATE_SNAPSHOT_FIELDS, set(loaded))
+
+    def test_missing_sku_required_field_is_rejected(self):
+        snapshot = self._valid_snapshot()
+        del snapshot["skus"][0]["model"]
+        with self.assertRaisesRegex(workflow.WorkflowError, "MISSING_FIELD"):
+            costs.validate_rate_snapshot(snapshot)
+
+    def test_sku_missing_source_url_is_rejected(self):
+        snapshot = self._valid_snapshot()
+        del snapshot["skus"][0]["source_url"]
+        with self.assertRaisesRegex(workflow.WorkflowError, "MISSING_FIELD"):
+            costs.validate_rate_snapshot(snapshot)
+
+    def test_sku_unit_outside_rate_units_is_rejected(self):
+        snapshot = self._valid_snapshot()
+        snapshot["skus"][0]["unit"] = "PER_REQUEST"
+        with self.assertRaisesRegex(workflow.WorkflowError, "INVALID_ENUM"):
+            costs.validate_rate_snapshot(snapshot)
+
+    def test_negative_and_non_decimal_prices_are_rejected(self):
+        for field, value in (
+            ("price_uncached_input", "-1.00"),
+            ("price_cached_input", "not-a-price"),
+            ("price_output", "1e-3"),
+            ("price_uncached_input", 2.5),
+        ):
+            snapshot = self._valid_snapshot()
+            snapshot["skus"][0][field] = value
+            with self.subTest(field=field, value=value), self.assertRaisesRegex(
+                workflow.WorkflowError, "INVALID_TYPE"
+            ):
+                costs.validate_rate_snapshot(snapshot)
+
+    def test_non_utc_timestamps_are_rejected(self):
+        for field, value in (
+            ("effective_at", "2026-08-28T00:00:00+08:00"),
+            ("retrieved_at", "2026-08-28 00:00:00"),
+            ("effective_at", "2026-08-28T00:00:00"),
+        ):
+            snapshot = self._valid_snapshot()
+            snapshot[field] = value
+            with self.subTest(field=field, value=value), self.assertRaisesRegex(
+                workflow.WorkflowError, "INVALID_TYPE"
+            ):
+                costs.validate_rate_snapshot(snapshot)
+        snapshot = self._valid_snapshot()
+        snapshot["skus"][0]["retrieved_at"] = "2026-08-28T00:00:00+00:00"
+        with self.assertRaisesRegex(workflow.WorkflowError, "INVALID_TYPE"):
+            costs.validate_rate_snapshot(snapshot)
+
+    def test_missing_archive_or_approval_is_rejected(self):
+        for field in ("archive", "approved_by", "approval_evidence_id"):
+            snapshot = self._valid_snapshot()
+            del snapshot[field]
+            with self.subTest(field=field), self.assertRaisesRegex(
+                workflow.WorkflowError, "MISSING_FIELD"
+            ):
+                costs.validate_rate_snapshot(snapshot)
+
+    def test_stale_snapshot_is_price_stale(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            digest = self._write_archive(root)
+            snapshot = self._valid_snapshot(digest)
+            costs.validate_rate_snapshot(snapshot)
+            status = costs.snapshot_pricing_status(
+                snapshot,
+                now_utc="2026-08-29T00:00:01Z",
+                max_age_seconds=86400,
+                root=root,
+            )
+        self.assertEqual("PRICE_STALE", status)
+        self.assertIn(status, costs.PRICING_STATUSES)
+
+    def test_missing_critical_price_fields_are_price_unknown(self):
+        snapshot = self._valid_snapshot()
+        del snapshot["skus"][0]["price_output"]
+        status = costs.snapshot_pricing_status(
+            snapshot,
+            now_utc=self.NOW_UTC,
+            max_age_seconds=86400,
+        )
+        self.assertEqual("PRICE_UNKNOWN", status)
+        with self.assertRaisesRegex(workflow.WorkflowError, "MISSING_FIELD"):
+            costs.validate_rate_snapshot(snapshot)
+
+    def test_resolve_archive_returns_path_when_hash_matches(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            digest = self._write_archive(root)
+            snapshot = self._valid_snapshot(digest)
+            resolved = costs.resolve_snapshot_archive(snapshot, root=root)
+            self.assertEqual(root / "docs" / "rate-archives" / digest, resolved)
+            self.assertEqual(self.ARCHIVE_BYTES, resolved.read_bytes())
+            self.assertEqual(
+                "CURRENT",
+                costs.snapshot_pricing_status(
+                    snapshot,
+                    now_utc=self.NOW_UTC,
+                    max_age_seconds=86400,
+                    root=root,
+                ),
+            )
+
+    def test_missing_or_mismatched_archive_is_unresolvable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            digest = self._digest()
+            snapshot = self._valid_snapshot(digest)
+            with self.assertRaisesRegex(
+                workflow.WorkflowError, "RATE_ARCHIVE_UNRESOLVABLE"
+            ):
+                costs.resolve_snapshot_archive(snapshot, root=root)
+            orphan = root / "docs" / "rate-archives" / digest
+            orphan.parent.mkdir(parents=True, exist_ok=True)
+            orphan.write_bytes(b"tampered pricing page\n")
+            with self.assertRaisesRegex(
+                workflow.WorkflowError, "RATE_ARCHIVE_UNRESOLVABLE"
+            ):
+                costs.resolve_snapshot_archive(snapshot, root=root)
+
+    def test_unresolvable_archive_is_price_unknown(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            snapshot = self._valid_snapshot()
+            status = costs.snapshot_pricing_status(
+                snapshot,
+                now_utc=self.NOW_UTC,
+                max_age_seconds=86400,
+                root=root,
+            )
+        self.assertEqual("PRICE_UNKNOWN", status)
+
+    def test_second_write_of_same_snapshot_id_is_rejected(self):
+        snapshot = self._valid_snapshot()
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / f"{snapshot['rate_snapshot_id']}.json"
+            costs.write_rate_snapshot(path, snapshot)
+            mutated = copy.deepcopy(snapshot)
+            mutated["approved_by"] = "other-owner"
+            mutated["skus"][0]["price_output"] = "99.00"
+            with self.assertRaisesRegex(
+                workflow.WorkflowError, "RATE_SNAPSHOT_ALREADY_FROZEN"
+            ):
+                costs.write_rate_snapshot(path, mutated)
+            loaded = costs.load_rate_snapshot(path)
+        self.assertEqual("owner", loaded["approved_by"])
+        self.assertEqual("10.00", loaded["skus"][0]["price_output"])
+
+    def test_historical_cost_evidence_keeps_old_snapshot_id(self):
+        evidence = workflow.normalize_cost_evidence(
+            cost_record(
+                evidence_class="sample_validated_projection",
+                rate_snapshot_id="rates-2026-08-01",
+                projected_cost_usd=0.25,
+            )
+        )
+        self.assertEqual("rates-2026-08-01", evidence.rate_snapshot_id)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "rates-2026-08-28.json"
+            costs.write_rate_snapshot(path, self._valid_snapshot())
+            loaded = costs.load_rate_snapshot(path)
+        self.assertEqual("rates-2026-08-28", loaded["rate_snapshot_id"])
+        self.assertEqual("rates-2026-08-01", evidence.rate_snapshot_id)
+        self.assertEqual("rates-2026-08-01", evidence.to_dict()["rate_snapshot_id"])
+
+    def test_optimization_gate_ignores_rate_snapshot(self):
+        summary = {
+            f"case-{index:02d}": {
+                "net_measured_cost_delta": -1.0,
+                "quality_delta_points": 0.0,
+                "measured_attempt_count": 1,
+            }
+            for index in range(8)
+        }
+        metrics = {
+            "cost_summary": summary,
+            "p0_miss_count": 0,
+            "p1_miss_count": 0,
+            "calibration_first_delivery_pass_rate": 0.5,
+            "experiment_first_delivery_pass_rate": 0.6,
+            "synthetic": False,
+        }
+        without = costs.evaluate_optimization_gate(metrics, minimum_cases=8)
+        with_snapshot = costs.evaluate_optimization_gate(
+            {**metrics, "rate_snapshot": self._valid_snapshot()},
+            minimum_cases=8,
+        )
+        self.assertEqual("ALLOW_ENFORCED", without)
+        self.assertEqual(without, with_snapshot)
+        self.assertEqual(
+            without.__dict__ if hasattr(without, "__dict__") else without,
+            with_snapshot.__dict__ if hasattr(with_snapshot, "__dict__") else with_snapshot,
+        )
 
 
 if __name__ == "__main__":

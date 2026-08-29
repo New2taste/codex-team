@@ -21,6 +21,7 @@ CONFIG_FILES = (
     "ai_workflow_ownership_registry.schema.json",
     "ai_workflow_side_effect.schema.json",
     "ai_workflow_owner_authorization.schema.json",
+    "ai_workflow_rate_snapshot.schema.json",
     "ai_workflow_route_advice.schema.json",
     "ai_workflow_plan.schema.json",
     "ai_workflow_runtime_evidence.schema.json",
