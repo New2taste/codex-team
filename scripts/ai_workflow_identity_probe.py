@@ -346,34 +346,47 @@ def aggregate_identity_probe_results(
     failures = {arm: 0 for arm in _ARM_ORDER}
     hashes: dict[str, str] = {}
     experiment_root: str | None = None
-    stop_reason: str | None = None
-    tokens_used = 0
-    calls_made = 0
+    per_arm_calls: dict[str, int] = {}
+    per_arm_tokens: dict[str, int] = {}
+    per_arm_stop: dict[str, str] = {}
     for raw in records:
         if not isinstance(raw, Mapping):
             continue
         arm = raw.get("arm")
         if arm not in by_arm:
             continue
+        arm_name = str(arm)
         root = raw.get("experiment_root")
         if experiment_root is None and isinstance(root, str):
             experiment_root = root
         reason = raw.get("stop_reason")
         if isinstance(reason, str) and reason:
-            stop_reason = reason
+            per_arm_stop[arm_name] = reason
         used = raw.get("tokens_used")
         if not isinstance(used, bool) and isinstance(used, int):
-            tokens_used = max(tokens_used, used)
+            per_arm_tokens[arm_name] = used
         made = raw.get("calls_made")
         if not isinstance(made, bool) and isinstance(made, int):
-            calls_made = max(calls_made, made)
+            per_arm_calls[arm_name] = made
         digest = raw.get("arm_config_hash")
         if isinstance(digest, str) and digest:
-            hashes[str(arm)] = digest
+            hashes[arm_name] = digest
         if raw.get("record_valid") is True:
-            by_arm[str(arm)].append(raw)
+            by_arm[arm_name].append(raw)
         else:
-            failures[str(arm)] += 1
+            failures[arm_name] += 1
+    calls_made = sum(per_arm_calls.get(arm, 0) for arm in _ARM_ORDER)
+    tokens_used = sum(per_arm_tokens.get(arm, 0) for arm in _ARM_ORDER)
+    ordered_reasons = [per_arm_stop[arm] for arm in _ARM_ORDER if arm in per_arm_stop]
+    unique_reasons = list(dict.fromkeys(ordered_reasons))
+    if len(unique_reasons) == 1:
+        stop_reason: str | dict[str, str] | None = unique_reasons[0]
+    elif unique_reasons:
+        stop_reason = {
+            arm: per_arm_stop[arm] for arm in _ARM_ORDER if arm in per_arm_stop
+        }
+    else:
+        stop_reason = None
     summary: dict[str, object] = {
         "protocol_version": IDENTITY_PROBE_PROTOCOL_VERSION,
         "experiment_root": experiment_root,
@@ -547,9 +560,10 @@ def run_identity_probe(
         }
         if not record_valid:
             record["invalid_reason"] = "USAGE_FIELDS_MISSING"
+            stop_reason = "USAGE_AUTHORITY_UNAVAILABLE"
         records.append(record)
         _append_jsonl(jsonl_path, record)
-        if per_call_status == "PER_CALL_CAP_EXCEEDED":
+        if per_call_status == "PER_CALL_CAP_EXCEEDED" or not record_valid:
             break
     for record in records:
         record["stop_reason"] = stop_reason

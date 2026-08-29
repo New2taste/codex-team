@@ -685,6 +685,19 @@ class IdentityProbeRunnerBudgetTest(unittest.TestCase):
                 self.assertEqual(0, arm["sample_count"])
                 self.assertGreaterEqual(arm["failure_count"], 1)
 
+    def test_missing_usage_fail_closes_without_another_executor_call(self):
+        executor = _MissingUsageExecutor("output_tokens")
+        with tempfile.TemporaryDirectory(dir="/tmp") as temporary:
+            records = _run_probe(
+                _manifest(max_calls=3, max_output_tokens=1000),
+                executor,
+                temporary,
+            )
+        self.assertEqual(1, executor.calls)
+        self.assertEqual(1, len(records))
+        self.assertFalse(records[0]["record_valid"])
+        self.assertEqual("USAGE_AUTHORITY_UNAVAILABLE", records[-1]["stop_reason"])
+
 
 class IdentityProbeReportTest(unittest.TestCase):
     def test_aggregate_groups_arms_with_usage_stats_and_paired_deltas(self):
@@ -750,6 +763,27 @@ class IdentityProbeReportTest(unittest.TestCase):
             two_minus_one["cached_input_tokens"],
         )
         self.assertNotEqual("OBSERVATION_ONLY", summary["NO_OP"].get("status"))
+
+    def test_three_arm_summary_headlines_sum_batch_budget(self):
+        executor = _UsageExecutor(output_tokens=30)
+        with tempfile.TemporaryDirectory(dir="/tmp") as temporary:
+            records = []
+            for arm in ("NO_OP", "ONE_TURN", "TWO_TURN"):
+                records.extend(
+                    _run_probe(
+                        _manifest(arm=arm, max_calls=2, max_output_tokens=1000),
+                        executor,
+                        temporary,
+                    )
+                )
+            summary = probe.aggregate_identity_probe_results(records)
+            report = probe.render_identity_probe_report(summary)
+        self.assertEqual(6, summary["calls_made"])
+        self.assertEqual(180, summary["tokens_used"])
+        self.assertEqual("MAX_CALLS", summary["stop_reason"])
+        self.assertIn("calls_made=6", report)
+        self.assertIn("tokens_used=180", report)
+        self.assertIn("MAX_CALLS", report)
 
     def test_empty_arm_is_observation_only_without_conclusions(self):
         executor = _UsageExecutor()
