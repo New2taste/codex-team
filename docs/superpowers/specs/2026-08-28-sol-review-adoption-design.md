@@ -450,6 +450,8 @@ helper 是模块源码中 `release_permit_before_start` 的唯一直接调用点
 回放。声明只是本地 JSON 写入，零模型调用，不破坏确定性路由的零模型
 成本基线。
 
+**落地状态（Task 20 收口）：** 已落地 — 施工卡 02、12、13、15。
+
 ## P0-2 终验新鲜度门
 
 ### digest 规范（CandidateState）
@@ -596,6 +598,8 @@ owner 签发并消费绑定当前 `CandidateState.state_digest()` 的
 旧账本冻结：`adversarial-acceptance-1` 事件形状不变，
 `replay_acceptance_ledger`、`_v2_append` 的既有事件字段集不变；新鲜度
 判定叠加在账本写入路径内部，不向旧事件增删字段。
+
+**落地状态（Task 20 收口）：** 已落地 — 施工卡 03、04、05。
 
 ## P0-3 所有权与副作用门
 
@@ -794,6 +798,8 @@ lease 的 `permit_id`/`dispatch_seq`/`allowed_paths`、`actor`、
   symlink 与生成文件按解析后路径判定）后再判断所有者；目录授权按前缀
   闭集匹配。
 
+**落地状态（Task 20 收口）：** 已落地 — 施工卡 06、07、08、09。
+
 ## P0-4 成本证据包（仅 router probe 研究面）
 
 ### 费率快照与归档链
@@ -876,6 +882,8 @@ lease 的 `permit_id`/`dispatch_seq`/`allowed_paths`、`actor`、
 本工件只服务 router probe 研究面：不接生产路由、不进优化门、不改
 `effective_route`、不宣布赢家。
 
+**落地状态（Task 20 收口）：** 已落地 — 施工卡 10、11。
+
 ## P1-1 按路由裁剪预检
 
 新增模块 `ai_workflow_preflight.py`（依赖 declarations 与 artifacts，
@@ -940,6 +948,8 @@ lease 的 `permit_id`/`dispatch_seq`/`allowed_paths`、`actor`、
 角色显式 `run_role_preflight`，再许可派发；跳过补预检直接派发 →
 `ROLE_NOT_PREFLIGHTED`。
 
+**落地状态（Task 20 收口）：** 已落地 — 施工卡 14、15。
+
 ## P1-2 身份前置原型（隔离实验）
 
 以独立脚本加 manifest 的形式研究「宿主权威元数据前置门控」，协议版本
@@ -983,6 +993,9 @@ lease 的 `permit_id`/`dispatch_seq`/`allowed_paths`、`actor`、
   产物只写独立实验根目录；脚本不进 `RUNTIME_FILES`，只分发 schema。
 - 结论上限：前置证据只能降低错误配置进入施工的概率，永远不能替代
   S3/S4 事后 rollout 验证；未证明低开销前不设为全局握手。
+
+**落地状态（Task 20 收口）：** 已落地 — 施工卡 16、17。不接生产链、不进
+`RUNTIME_FILES`。
 
 ## P1-3 证据链
 
@@ -1047,25 +1060,34 @@ import 它；为守住「最小 sidecar 扩展」与最小生产插件面，
 router probe、identity probe 同规），只随仓库分发脚本本身，插件镜像不
 携带。证据链只读，不回写任何账本。
 
+**落地状态（Task 20 收口）：** 已落地 — 施工卡 18、19。审计 CLI 不进
+`RUNTIME_FILES`。
+
 ## Backlog（本轮不出卡）
 
 - **P2 代理预算闭集**：任务信封级 `max_parallel_agents`、并发
   reservation、嵌套派发、fork 子任务预算继承、取消后预算回收。本轮
   P0-1 已把现有 `max_dispatches` 做成锁内原子，并发竞态不留 backlog。
+  **落地状态：** 未实施（本轮 backlog，无施工卡）。
 - **P2 owner 迁移工具**：历史无信封任务的声明迁移，必须要求 owner 授权
   工件；本轮历史任务一律 fail-closed。
+  **落地状态：** 未实施（本轮 backlog，无施工卡）。
 - **P2 事务化安装与前向 CI**：备份、原子替换、失败回滚，以及畸形
   rollout、字段冲突、POSIX/Windows 路径、升级迁移的前向场景测试。
   （digest 与所有权判断的最小路径规范已在本轮 P0 内，不延期。）
+  **落地状态：** 未实施（本轮 backlog，无施工卡）。
 - **P2 质量调整成本模型**：人工时间、延迟、长期工作负载分布后续扩展；
   本轮成本输出已记录失败/重试/升级/复核量并禁止未经质量门的路线
   比较结论。
+  **落地状态：** 未实施（本轮 backlog，无施工卡）。
 - **P2 来源与许可证核查**：本轮完全原创实现；一旦引用或搬运外部同名
   脚本，来源、许可证和提交历史核查立即升级为施工前 P0。
+  **落地状态：** 未实施（本轮 backlog，无施工卡）。
 - **P3 角色/模型解耦 ADR**：仅记录迁移触发条件（首次模型代际替换、
   第二供应商接入、单模型承担多个稳定角色）与双字段 schema 方向
   （`role_contract_id` 与运行时钉死字段分离）；不改现有角色名、闭集
   映射或运行时钉死。
+  **落地状态：** 未实施（本轮 backlog，无施工卡）。
 
 ## 不采纳项（裁定原文，逐条保留）
 
@@ -1097,6 +1119,10 @@ router probe、identity probe 同规），只随仓库分发脚本本身，插�
   skip 原因清单 + 采集命令与 base commit）；此后每卡验收都要求清单内
   用例保持通过、skip 语义不变，新增测试全绿；收口卡只能复核该
   manifest，不得首次生成。禁止用固定总数做回归判据。
+  **落地状态（Task 20 收口）：** Task 00 基线已冻结于 `e35c010`
+  （`base_commit` `ce24e14…`，588 IDs）；本卡只复核、不改 manifest。
+  宿主内核叶子化（Task 01）已落地。wire golden 与生产面负向回归见
+  `tests/test_ai_workflow_wire_golden.py`。
 - 所有门控默认 fail-closed；任何「缺声明自动补写」「预检替代验收」
   「快照改价」「调用者自报副作用/身份」「部分权威总计冒充全路线成本」
   之类的便捷路径一律视为缺陷。

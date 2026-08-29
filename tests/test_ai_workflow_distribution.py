@@ -1083,5 +1083,82 @@ class EvidenceChainDistributionTest(unittest.TestCase):
         )
 
 
+class SolReviewAdoptionDistributionManifestTest(unittest.TestCase):
+    """Closed distribution inventory for Sol review-adoption sidecars."""
+
+    CONFIG_FILES = (
+        "ai_workflow.toml",
+        "ai_workflow_task.schema.json",
+        "ai_workflow_result.schema.json",
+        "ai_workflow_route_request.schema.json",
+        "ai_workflow_route_decision.schema.json",
+        "ai_workflow_route_declaration.schema.json",
+        "ai_workflow_candidate_state.schema.json",
+        "ai_workflow_final_verdict.schema.json",
+        "ai_workflow_ownership_registry.schema.json",
+        "ai_workflow_side_effect.schema.json",
+        "ai_workflow_owner_authorization.schema.json",
+        "ai_workflow_rate_snapshot.schema.json",
+        "ai_workflow_preflight_record.schema.json",
+        "ai_workflow_runtime_evidence_v2.schema.json",
+        "ai_workflow_runtime_files.json",
+        "ai_workflow_route_advice.schema.json",
+        "ai_workflow_plan.schema.json",
+        "ai_workflow_runtime_evidence.schema.json",
+        "ai_workflow_cost_evidence.schema.json",
+        "ai_workflow_router_probe_manifest.schema.json",
+        "ai_workflow_scheduler.schema.json",
+        "ai_workflow_identity_probe_manifest.schema.json",
+    )
+    RUNTIME_FILES = (
+        "ai_workflow.py",
+        "ai_workflow_artifacts.py",
+        "ai_workflow_routing.py",
+        "ai_workflow_declarations.py",
+        "ai_workflow_candidate_state.py",
+        "ai_workflow_verdicts.py",
+        "ai_workflow_ownership.py",
+        "ai_workflow_side_effects.py",
+        "ai_workflow_authorizations.py",
+        "ai_workflow_planning.py",
+        "ai_workflow_runtime.py",
+        "ai_workflow_costs.py",
+        "ai_workflow_repairs.py",
+        "ai_workflow_team_call.py",
+        "ai_workflow_scheduler.py",
+        "ai_workflow_preflight.py",
+        "ai_workflow_dispatch_policy.py",
+        "ai_workflow_evidence.py",
+    )
+    EXCLUDED_RUNTIME = (
+        "ai_workflow_identity_probe.py",
+        "ai_workflow_evidence_chain.py",
+        "ai_workflow_router_probe.py",
+        "collect_test_baseline.py",
+    )
+
+    def test_sync_manifest_closed_sets_match_landed_sidecars(self):
+        from scripts import sync_plugin
+
+        self.assertEqual(self.CONFIG_FILES, sync_plugin.CONFIG_FILES)
+        self.assertEqual(self.RUNTIME_FILES, sync_plugin.RUNTIME_FILES)
+        for name in self.EXCLUDED_RUNTIME:
+            self.assertNotIn(name, sync_plugin.RUNTIME_FILES)
+            self.assertFalse((PLUGIN / "runtime" / name).exists(), name)
+        for name in (
+            "ai_workflow_route_declaration.schema.json",
+            "ai_workflow_candidate_state.schema.json",
+            "ai_workflow_final_verdict.schema.json",
+            "ai_workflow_ownership_registry.schema.json",
+            "ai_workflow_side_effect.schema.json",
+            "ai_workflow_owner_authorization.schema.json",
+            "ai_workflow_rate_snapshot.schema.json",
+            "ai_workflow_preflight_record.schema.json",
+            "ai_workflow_runtime_evidence_v2.schema.json",
+            "ai_workflow_identity_probe_manifest.schema.json",
+        ):
+            self.assertIn(name, sync_plugin.CONFIG_FILES)
+
+
 if __name__ == "__main__":
     unittest.main()
