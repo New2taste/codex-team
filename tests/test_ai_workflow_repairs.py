@@ -10,6 +10,7 @@ from unittest import mock
 
 from scripts import ai_workflow as workflow
 from scripts import ai_workflow_artifacts as artifacts
+from scripts import ai_workflow_dispatch_policy as policy
 from scripts import ai_workflow_evidence as evidence
 from scripts import ai_workflow_ownership as ownership
 from scripts import ai_workflow_repairs as repairs
@@ -695,7 +696,7 @@ class AssignmentSideEffectObservationTest(unittest.TestCase):
         with (
             self._patch_codex(boom),
             self.fx._controller_codex_lookup(),
-            self.assertRaisesRegex(workflow.WorkflowError, "REPAIR_ADAPTER_REQUIRED"),
+            self.assertRaisesRegex(workflow.WorkflowError, "ACTUAL_WRITE_PATHS_UNKNOWN"),
         ):
             repairs.run_assignment(self.fx.store, self.fx.TASK_ID, review, sessions)
         self.assertTrue(
@@ -739,7 +740,7 @@ class AssignmentSideEffectObservationTest(unittest.TestCase):
         with (
             self._patch_codex(fail_and_mutate),
             self.fx._controller_codex_lookup(),
-            self.assertRaisesRegex(workflow.WorkflowError, "REPAIR_ADAPTER_REQUIRED"),
+            self.assertRaisesRegex(workflow.WorkflowError, "OWNERSHIP_VIOLATION"),
         ):
             repairs.run_assignment(self.fx.store, self.fx.TASK_ID, review, sessions)
         rows = ownership.load_side_effects(self.fx.store, self.fx.TASK_ID)
@@ -823,7 +824,7 @@ class AssignmentSideEffectObservationTest(unittest.TestCase):
             mock.patch.object(workflow, "capture_repo", side_effect=fail_post_launch_repo),
             self._patch_codex(controller_process),
             self.fx._controller_codex_lookup(),
-            self.assertRaisesRegex(workflow.WorkflowError, "REPAIR_ADAPTER_REQUIRED"),
+            self.assertRaisesRegex(workflow.WorkflowError, "ACTUAL_WRITE_PATHS_UNKNOWN"),
         ):
             repairs.run_assignment(self.fx.store, self.fx.TASK_ID, review, sessions)
         self.assertTrue(
@@ -995,7 +996,13 @@ class AssignmentDispatchGateTest(unittest.TestCase):
             "recommended_next_state": "AWAITING_OWNER_DECISION",
         }
 
-    def _controller_handler(self, thread_id: str, result: dict[str, object], *writes: str):
+    def _controller_handler(
+        self,
+        thread_id: str,
+        result: dict[str, object],
+        *writes: str,
+        returncode: int = 0,
+    ):
         def controller_process(command, *args, **kwargs):
             for relative in writes:
                 path = self.fx.repository_root / relative
@@ -1008,9 +1015,29 @@ class AssignmentDispatchGateTest(unittest.TestCase):
                     json.dumps({"type": "turn.completed"}),
                 )
             )
-            return subprocess.CompletedProcess(command, 0, stdout=events + "\n", stderr="")
+            return subprocess.CompletedProcess(
+                command, returncode, stdout=events + "\n", stderr=""
+            )
 
         return controller_process
+
+    def _assert_later_dispatch_blocked(self) -> None:
+        identity = policy.derive_dispatch_identity(
+            task_sha256=artifacts.artifact_sha256(self.fx.task),
+            role="luna",
+            attempt_id="post-violation-probe",
+        )
+        with self.fx.store.lock(self.fx.TASK_ID):
+            with self.assertRaisesRegex(
+                workflow.WorkflowError, "DISPATCH_BLOCKED_OWNERSHIP_VIOLATION"
+            ):
+                policy.require_dispatch_permit_locked(
+                    self.fx.store,
+                    self.fx.TASK_ID,
+                    "luna",
+                    dispatch_identity=identity,
+                    config=workflow._load_workflow_config(),
+                )
 
     def _issue_review(self):
         self.fx._open_with_owner("luna-owner", "luna")
@@ -1199,6 +1226,64 @@ class AssignmentDispatchGateTest(unittest.TestCase):
         side_effects = ownership.load_side_effects(self.fx.store, self.fx.TASK_ID)
         self.assertFalse(
             any(row.get("effect_kind") == "OWNERSHIP_VIOLATION_RECORDED" for row in side_effects)
+        )
+
+    def test_assignment_post_spawn_failure_still_records_over_bound_violation(self) -> None:
+        review, sessions, thread_id = self._issue_review()
+        with (
+            mock.patch.object(
+                repairs.subprocess,
+                "Popen",
+                _compat_popen(
+                    self._controller_handler(
+                        thread_id,
+                        self._review_result(),
+                        "src/alpha.py",
+                        returncode=23,
+                    )
+                ),
+            ),
+            self.fx._controller_codex_lookup(),
+        ):
+            with self.assertRaisesRegex(workflow.WorkflowError, "OWNERSHIP_VIOLATION"):
+                repairs.run_assignment(self.fx.store, self.fx.TASK_ID, review, sessions)
+        violations = [
+            json.loads(line)
+            for line in (
+                self.fx.store._require_task(self.fx.TASK_ID) / "events.jsonl"
+            ).read_text(encoding="utf-8").splitlines()
+            if line and json.loads(line).get("event_type") == "OWNERSHIP_VIOLATION_RECORDED"
+        ]
+        self.assertEqual(1, len(violations))
+        self.assertEqual(["src/alpha.py"], violations[0]["paths"])
+        self._assert_later_dispatch_blocked()
+
+    def test_assignment_timeout_fail_closes_unknown_actual_paths(self) -> None:
+        review, sessions, _thread_id = self._issue_review()
+
+        def boom(command, *args, **kwargs):
+            raise subprocess.TimeoutExpired("codex", 30)
+
+        with (
+            mock.patch.object(repairs.subprocess, "Popen", _compat_popen(boom)),
+            self.fx._controller_codex_lookup(),
+        ):
+            with self.assertRaisesRegex(workflow.WorkflowError, "ACTUAL_WRITE_PATHS_UNKNOWN"):
+                repairs.run_assignment(self.fx.store, self.fx.TASK_ID, review, sessions)
+        kinds = {
+            row["effect_kind"]
+            for row in ownership.load_side_effects(self.fx.store, self.fx.TASK_ID)
+        }
+        self.assertIn("UNOBSERVED_ASSUMED_PRESENT", kinds)
+        events = [
+            json.loads(line)
+            for line in (
+                self.fx.store._require_task(self.fx.TASK_ID) / "events.jsonl"
+            ).read_text(encoding="utf-8").splitlines()
+            if line
+        ]
+        self.assertFalse(
+            any(event.get("event_type") == "OWNERSHIP_VIOLATION_RECORDED" for event in events)
         )
 
     def test_assignment_hub_keeps_plan_owner_not_actor(self) -> None:

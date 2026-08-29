@@ -1980,7 +1980,19 @@ def run_codex(
                                 permit_id=permit_id,
                                 reason="unobserved-executor",
                             )
-                        elif permit is not None and role in TERRA_WRITE_ROLES and attempt_error is None:
+                            if permit is not None and role in TERRA_WRITE_ROLES:
+                                verify_actual_write_paths(
+                                    observed_store,
+                                    task["task_id"],
+                                    _ownership_claimant(
+                                        role,
+                                        luna_construction_step=luna_construction_step,
+                                        construction_context=construction_context,
+                                    ),
+                                    permit_id=permit.permit_id,
+                                    actual_paths=None,
+                                )
+                        elif permit is not None and role in TERRA_WRITE_ROLES:
                             actual_paths = None
                             if before_fs is not None:
                                 construction_step = (

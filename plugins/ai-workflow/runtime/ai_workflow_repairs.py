@@ -3199,7 +3199,7 @@ def run_assignment(
                     completed=completed,
                     permit_id=permit.permit_id if permit is not None else None,
                 )
-                if permit is not None and completed is not None and not assignment_failed:
+                if permit is not None:
                     verify_actual_write_paths(
                         store,
                         task_id,

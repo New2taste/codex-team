@@ -4089,7 +4089,9 @@ class DispatchGateHubTest(unittest.TestCase):
         kwargs.update(overrides)
         return authorizations.issue_owner_authorization(self.store, self.task_id, **kwargs)
 
-    def _popen_writing(self, result: dict[str, object], *relative_paths: str):
+    def _popen_writing(
+        self, result: dict[str, object], *relative_paths: str, returncode: int = 0
+    ):
         repo = self.repo
 
         class Popen(_RecordingPopen):
@@ -4099,6 +4101,7 @@ class DispatchGateHubTest(unittest.TestCase):
                 super().__init__(command, *args, **kwargs)
                 if self._delegate is not None:
                     return
+                self.returncode = returncode
                 for relative in relative_paths:
                     path = repo / relative
                     path.parent.mkdir(parents=True, exist_ok=True)
@@ -4585,6 +4588,60 @@ class DispatchGateHubTest(unittest.TestCase):
             ):
                 workflow.run_codex("luna", self.task, "task contract", self._paths())
         self.assertEqual([], luna_popen.calls)
+
+    def test_write_role_post_spawn_failure_still_records_over_bound_violation(self) -> None:
+        self._prepare_terra_task(allowed_write_paths=("src/owned.py",))
+        _install_declaration(
+            self.store, self.task, allowed_roles=("terra", "luna"), active_roles=("terra", "luna")
+        )
+        self._record_registry({"src/owned.py": "terra", "src": "luna"})
+        (self.repo / "src").mkdir(parents=True, exist_ok=True)
+        popen = self._popen_writing(self._terra_result(), "src/x.py", returncode=23)
+        with self._terra_run_patches(popen):
+            with self.assertRaisesRegex(workflow.WorkflowError, "OWNERSHIP_VIOLATION"):
+                workflow.run_codex("terra", self.task, "task contract", self._paths())
+        self.assertEqual(1, len(popen.calls))
+        violations = [
+            event
+            for event in self._events()
+            if event.get("event_type") == "OWNERSHIP_VIOLATION_RECORDED"
+        ]
+        self.assertEqual(1, len(violations))
+        self.assertEqual(["src/x.py"], violations[0]["paths"])
+        side_effects = ownership.load_side_effects(self.store, self.task_id)
+        self.assertFalse(
+            any(row.get("effect_kind") == "OWNERSHIP_VIOLATION_RECORDED" for row in side_effects)
+        )
+        _RecordingPopen.reset()
+        luna_popen = self._popen(CodexRunnerTest().valid_result())
+        with (
+            mock.patch.object(workflow, "capture_repo", return_value=workflow.RepoSnapshot("h" * 40, ())),
+            mock.patch.object(workflow, "working_tree_paths", return_value=set()),
+            mock.patch.object(workflow.subprocess, "Popen", luna_popen),
+        ):
+            with self.assertRaisesRegex(
+                workflow.WorkflowError, "DISPATCH_BLOCKED_OWNERSHIP_VIOLATION"
+            ):
+                workflow.run_codex("luna", self.task, "task contract", self._paths())
+        self.assertEqual([], luna_popen.calls)
+
+    def test_write_role_unobserved_spawn_fail_closes_unknown_actual_paths(self) -> None:
+        self._prepare_terra_task()
+        _install_declaration(self.store, self.task, allowed_roles=("terra",), active_roles=("terra",))
+        self._record_registry({"src": "terra"})
+
+        class TimeoutPopen(_RecordingPopen):
+            def communicate(self, input=None, timeout=None):
+                raise subprocess.TimeoutExpired(self.args, timeout)
+
+        with self._terra_run_patches(TimeoutPopen):
+            with self.assertRaisesRegex(workflow.WorkflowError, "ACTUAL_WRITE_PATHS_UNKNOWN"):
+                workflow.run_codex("terra", self.task, "task contract", self._paths())
+        effects = ownership.load_side_effects(self.store, self.task_id)
+        self.assertTrue(any(row.get("effect_kind") == "UNOBSERVED_ASSUMED_PRESENT" for row in effects))
+        self.assertFalse(
+            any(event.get("event_type") == "OWNERSHIP_VIOLATION_RECORDED" for event in self._events())
+        )
 
     def test_historical_lease_does_not_exempt_later_hub_permit(self) -> None:
         self._prepare_terra_task(allowed_write_paths=("src",))
