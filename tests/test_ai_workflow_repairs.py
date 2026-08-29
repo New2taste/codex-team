@@ -1,5 +1,6 @@
 import json
 import hashlib
+import inspect
 import subprocess
 import tempfile
 import unittest
@@ -8,7 +9,12 @@ from pathlib import Path
 from unittest import mock
 
 from scripts import ai_workflow as workflow
+from scripts import ai_workflow_artifacts as artifacts
+from scripts import ai_workflow_dispatch_policy as policy
+from scripts import ai_workflow_evidence as evidence
+from scripts import ai_workflow_ownership as ownership
 from scripts import ai_workflow_repairs as repairs
+from tests.test_ai_workflow import _RecordingPopen, _compat_popen, _install_declaration
 
 
 class RepairProtocolTest(unittest.TestCase):
@@ -36,6 +42,9 @@ class RepairProtocolTest(unittest.TestCase):
                 "human_gates": ["PLAN_APPROVAL", "EXECUTION_APPROVAL"],
             }
         )
+        repo = Path(self.temporary_directory.name)
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True, capture_output=True)
+        (repo / ".codex" / "sessions").mkdir(parents=True, exist_ok=True)
         self.original_reviewer = repairs.ActorIdentity(
             identity="sol-reviewer-original", role="sol_medium_reviewer"
         )
@@ -280,10 +289,11 @@ class RepairProtocolTest(unittest.TestCase):
                 task.update({"base_commit": None, "candidate_commit": None})
             if task_type == "REMEDIATION":
                 task["allowed_write_paths"] = ["scripts/"]
+                task["source_worktree"] = task["repository_root"]
             else:
                 task["human_gates"] = ["FINAL_ACCEPTANCE"]
             self.store.create_task(task)
-            tasks.append((task_id, "AWAITING_OWNER_DECISION" if task_type == "REMEDIATION" else "BLOCKED"))
+            tasks.append((task_id, "AWAITING_OWNER_DECISION"))
 
         legacy_config = workflow._load_workflow_config()
         legacy_config["routing"] = {"mode": "legacy", "role_policy": "legacy"}
@@ -532,6 +542,929 @@ class RepairProtocolTest(unittest.TestCase):
         ]
         failed = [event for event in events if event.get("event_type") == "ASSIGNMENT_ATTEMPT_FAILED"]
         self.assertEqual(0, len(failed))
+
+
+class AssignmentSideEffectObservationTest(unittest.TestCase):
+    def setUp(self) -> None:
+        from tests.test_ai_workflow_adversarial_acceptance import (
+            AcceptanceLedgerV2ContractTest,
+        )
+
+        self.fx = AcceptanceLedgerV2ContractTest()
+        self.fx.setUp()
+        self.fx.task["source_worktree"] = str(self.fx.repository_root)
+        (self.fx.repository_root / ".codex" / "sessions").mkdir(parents=True, exist_ok=True)
+        original_open = self.fx._open_with_owner
+
+        def gated_open(*args, **kwargs):
+            result = original_open(*args, **kwargs)
+            _install_declaration(
+                self.fx.store,
+                self.fx.task,
+                allowed_roles=(
+                    "luna",
+                    "terra",
+                    "terra_xhigh_reviewer",
+                    "sol_medium_reviewer",
+                ),
+                active_roles=("luna", "terra_xhigh_reviewer"),
+                max_dispatches=32,
+            )
+            return result
+
+        self.fx._open_with_owner = gated_open
+
+    def tearDown(self) -> None:
+        self.fx.tearDown()
+
+    def _write_rollout(self, sessions: Path, thread_id: str, *, sandbox: str, model: str, effort: str, permission: str) -> None:
+        sessions.mkdir(parents=True, exist_ok=True)
+        (sessions / f"rollout-{thread_id}").write_text(
+            json.dumps(
+                {
+                    "thread_id": thread_id,
+                    "agent_type": None,
+                    "model": model,
+                    "reasoning_effort": effort,
+                    "sandbox_policy": sandbox,
+                    "permission_profile": permission,
+                    "cwd": str(self.fx.repository_root),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def _patch_codex(self, handler):
+        return mock.patch.object(repairs.subprocess, "Popen", _compat_popen(handler))
+
+    def test_v2_controller_captures_before_and_after_snapshots(self) -> None:
+        from scripts import ai_workflow_side_effects as side_effects
+
+        self.fx._open_with_owner("luna-owner", "luna")
+        reviewer_thread = str(uuid.uuid4())
+        review = self.fx._issue(
+            "REVIEW_1",
+            self.fx._expected_actor(
+                "terra-controller-review",
+                "terra_xhigh_reviewer",
+                runtime_instance_id=reviewer_thread,
+            ),
+        )
+        sessions = self.fx.repository_root.parent / "observe-sessions"
+        self._write_rollout(
+            sessions,
+            reviewer_thread,
+            sandbox="read-only",
+            model="gpt-5.6-terra",
+            effort="xhigh",
+            permission="read-only",
+        )
+        snapshots: list[object] = []
+        real_capture = side_effects.capture_fs_snapshot
+
+        def capturing(repo, *, exclusions):
+            snapshot = real_capture(repo, exclusions=exclusions)
+            snapshots.append(snapshot)
+            return snapshot
+
+        result = {
+            "schema_version": "ai-result-1",
+            "dispatch_id": None,
+            "task_id": None,
+            "step_id": None,
+            "attempt": None,
+            "role": "terra_xhigh_reviewer",
+            "status": "ACCEPTANCE_RECOMMENDED",
+            "summary": "ok",
+            "claims": [],
+            "evidence": [],
+            "counter_checks": [],
+            "changed_files": [],
+            "blind_spots": [],
+            "unresolved_questions": [],
+            "recommended_next_state": "AWAITING_OWNER_DECISION",
+        }
+
+        def controller_process(command, *args, **kwargs):
+            output_path = Path(command[command.index("-o") + 1])
+            output_path.write_text(json.dumps(result), encoding="utf-8")
+            events = "\n".join(
+                (
+                    json.dumps({"type": "thread.started", "thread_id": reviewer_thread}),
+                    json.dumps({"type": "turn.completed"}),
+                )
+            )
+            return subprocess.CompletedProcess(command, 0, stdout=events + "\n", stderr="")
+
+        with (
+            mock.patch.object(side_effects, "capture_fs_snapshot", side_effect=capturing),
+            mock.patch.object(
+                repairs, "capture_fs_snapshot", side_effect=capturing
+            ),
+            self._patch_codex(controller_process),
+            self.fx._controller_codex_lookup(),
+        ):
+            repairs.run_assignment(self.fx.store, self.fx.TASK_ID, review, sessions)
+        self.assertGreaterEqual(len(snapshots), 2)
+
+    def test_assignment_timeout_records_unobserved(self) -> None:
+        from scripts import ai_workflow_ownership as ownership
+
+        self.fx._open_with_owner("luna-owner", "luna")
+        reviewer_thread = str(uuid.uuid4())
+        review = self.fx._issue(
+            "REVIEW_1",
+            self.fx._expected_actor(
+                "terra-timeout-review",
+                "terra_xhigh_reviewer",
+                runtime_instance_id=reviewer_thread,
+            ),
+        )
+        sessions = self.fx.repository_root.parent / "timeout-sessions"
+        self._write_rollout(
+            sessions,
+            reviewer_thread,
+            sandbox="read-only",
+            model="gpt-5.6-terra",
+            effort="xhigh",
+            permission="read-only",
+        )
+
+        def boom(command, *args, **kwargs):
+            raise subprocess.TimeoutExpired("codex", 30)
+
+        with (
+            self._patch_codex(boom),
+            self.fx._controller_codex_lookup(),
+            self.assertRaisesRegex(workflow.WorkflowError, "ACTUAL_WRITE_PATHS_UNKNOWN"),
+        ):
+            repairs.run_assignment(self.fx.store, self.fx.TASK_ID, review, sessions)
+        self.assertTrue(
+            ownership.has_ownership_locking_side_effect(self.fx.store, self.fx.TASK_ID)
+        )
+        kinds = {
+            row["effect_kind"]
+            for row in ownership.load_side_effects(self.fx.store, self.fx.TASK_ID)
+        }
+        self.assertIn("UNOBSERVED_ASSUMED_PRESENT", kinds)
+
+    def test_nonzero_exit_after_spawn_still_observes_worktree_mutation(self) -> None:
+        from scripts import ai_workflow_ownership as ownership
+
+        self.fx._open_with_owner("luna-owner", "luna")
+        reviewer_thread = str(uuid.uuid4())
+        review = self.fx._issue(
+            "REVIEW_1",
+            self.fx._expected_actor(
+                "terra-nonzero-review",
+                "terra_xhigh_reviewer",
+                runtime_instance_id=reviewer_thread,
+            ),
+        )
+        sessions = self.fx.repository_root.parent / "nonzero-sessions"
+        self._write_rollout(
+            sessions,
+            reviewer_thread,
+            sandbox="read-only",
+            model="gpt-5.6-terra",
+            effort="xhigh",
+            permission="read-only",
+        )
+
+        def fail_and_mutate(command, *args, **kwargs):
+            (self.fx.repository_root / "src" / "spawn-failed.txt").write_text(
+                "mutated after spawn\n", encoding="utf-8"
+            )
+            return subprocess.CompletedProcess(command, 23, stdout="", stderr="failed")
+
+        with (
+            self._patch_codex(fail_and_mutate),
+            self.fx._controller_codex_lookup(),
+            self.assertRaisesRegex(workflow.WorkflowError, "OWNERSHIP_VIOLATION"),
+        ):
+            repairs.run_assignment(self.fx.store, self.fx.TASK_ID, review, sessions)
+        rows = ownership.load_side_effects(self.fx.store, self.fx.TASK_ID)
+        kinds = {row["effect_kind"] for row in rows}
+        self.assertTrue(ownership.has_ownership_locking_side_effect(self.fx.store, self.fx.TASK_ID))
+        self.assertTrue(kinds & {"OWNED_WRITE", "UNTRACKED_WRITE", "COMMAND_GENERATED"})
+        self.assertIn("src/spawn-failed.txt", {row["path"] for row in rows})
+        self.assertNotIn("UNOBSERVED_ASSUMED_PRESENT", kinds)
+
+    def test_post_spawn_snapshot_failure_records_unobserved(self) -> None:
+        from scripts import ai_workflow_ownership as ownership
+        from scripts import ai_workflow_side_effects as side_effects
+
+        self.fx._open_with_owner("luna-owner", "luna")
+        reviewer_thread = str(uuid.uuid4())
+        review = self.fx._issue(
+            "REVIEW_1",
+            self.fx._expected_actor(
+                "terra-snapshot-fail-review",
+                "terra_xhigh_reviewer",
+                runtime_instance_id=reviewer_thread,
+            ),
+        )
+        sessions = self.fx.repository_root.parent / "snapshot-fail-sessions"
+        self._write_rollout(
+            sessions,
+            reviewer_thread,
+            sandbox="read-only",
+            model="gpt-5.6-terra",
+            effort="xhigh",
+            permission="read-only",
+        )
+        result = {
+            "schema_version": "ai-result-1",
+            "dispatch_id": None,
+            "task_id": None,
+            "step_id": None,
+            "attempt": None,
+            "role": "terra_xhigh_reviewer",
+            "status": "ACCEPTANCE_RECOMMENDED",
+            "summary": "ok",
+            "claims": [],
+            "evidence": [],
+            "counter_checks": [],
+            "changed_files": [],
+            "blind_spots": [],
+            "unresolved_questions": [],
+            "recommended_next_state": "AWAITING_OWNER_DECISION",
+        }
+        snapshot_calls = {"n": 0}
+        repo_calls = {"n": 0}
+        real_snapshot = side_effects.capture_fs_snapshot
+        real_capture_repo = workflow.capture_repo
+
+        def fail_after_spawn(repo, *, exclusions):
+            snapshot_calls["n"] += 1
+            if snapshot_calls["n"] == 1:
+                return real_snapshot(repo, exclusions=exclusions)
+            raise RuntimeError("cannot snapshot the post-launch repository")
+
+        def fail_post_launch_repo(*args, **kwargs):
+            repo_calls["n"] += 1
+            if repo_calls["n"] == 1:
+                return real_capture_repo(*args, **kwargs)
+            raise RuntimeError("cannot snapshot the post-launch repository")
+
+        def controller_process(command, *args, **kwargs):
+            output_path = Path(command[command.index("-o") + 1])
+            output_path.write_text(json.dumps(result), encoding="utf-8")
+            events = "\n".join(
+                (
+                    json.dumps({"type": "thread.started", "thread_id": reviewer_thread}),
+                    json.dumps({"type": "turn.completed"}),
+                )
+            )
+            return subprocess.CompletedProcess(command, 0, stdout=events + "\n", stderr="")
+
+        with (
+            mock.patch.object(side_effects, "capture_fs_snapshot", side_effect=fail_after_spawn),
+            mock.patch.object(repairs, "capture_fs_snapshot", side_effect=fail_after_spawn),
+            mock.patch.object(workflow, "capture_repo", side_effect=fail_post_launch_repo),
+            self._patch_codex(controller_process),
+            self.fx._controller_codex_lookup(),
+            self.assertRaisesRegex(workflow.WorkflowError, "ACTUAL_WRITE_PATHS_UNKNOWN"),
+        ):
+            repairs.run_assignment(self.fx.store, self.fx.TASK_ID, review, sessions)
+        self.assertTrue(
+            ownership.has_ownership_locking_side_effect(self.fx.store, self.fx.TASK_ID)
+        )
+        kinds = {
+            row["effect_kind"]
+            for row in ownership.load_side_effects(self.fx.store, self.fx.TASK_ID)
+        }
+        self.assertIn("UNOBSERVED_ASSUMED_PRESENT", kinds)
+
+    def test_observed_changes_match_actual_changed_paths(self) -> None:
+        from scripts import ai_workflow_side_effects as side_effects
+
+        owner_actor, _ = self.fx._open_with_owner("luna-owner", "luna")
+        _, review, reviewer_receipt = self.fx._issue_with_receipt(
+            "REVIEW_1", "terra-review-one", "terra_xhigh_reviewer"
+        )
+        self.fx._review(review, reviewer_receipt, "REWORK", (self.fx.findings[0],))
+        owner_repair = self.fx._issue("OWNER_REPAIR", owner_actor)
+        owner_thread = owner_actor.identity.split(":", 1)[1]
+        sessions = self.fx.repository_root.parent / "owner-observe-sessions"
+        self._write_rollout(
+            sessions,
+            owner_thread,
+            sandbox="workspace-write",
+            model="gpt-5.6-luna",
+            effort="max",
+            permission="workspace-write",
+        )
+        observed: list[tuple[object, ...]] = []
+        real_observe = side_effects.observe_execution_side_effects
+
+        def wrapping(*args, **kwargs):
+            result = real_observe(*args, **kwargs)
+            observed.append(result)
+            return result
+
+        real_run = subprocess.run
+
+        def controller_process(command, *args, **kwargs):
+            (self.fx.repository_root / "src" / "alpha.py").write_text(
+                "CONTROLLER_REPAIR = True\n", encoding="utf-8"
+            )
+            real_run(["git", "add", "src/alpha.py"], cwd=self.fx.repository_root, check=True)
+            real_run(
+                ["git", "commit", "-q", "-m", "controller repair"],
+                cwd=self.fx.repository_root,
+                env={
+                    **__import__("os").environ,
+                    "GIT_AUTHOR_NAME": "Acceptance Contract Tests",
+                    "GIT_AUTHOR_EMAIL": "acceptance-tests@example.invalid",
+                    "GIT_COMMITTER_NAME": "Acceptance Contract Tests",
+                    "GIT_COMMITTER_EMAIL": "acceptance-tests@example.invalid",
+                },
+                check=True,
+            )
+            output_path = Path(command[command.index("-o") + 1])
+            output_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "ai-result-1",
+                        "dispatch_id": None,
+                        "task_id": None,
+                        "step_id": None,
+                        "attempt": None,
+                        "role": "luna",
+                        "status": "IMPLEMENTED_CANDIDATE",
+                        "summary": "Repaired the issued finding only.",
+                        "claims": [],
+                        "evidence": [],
+                        "counter_checks": [],
+                        "changed_files": ["src/alpha.py"],
+                        "blind_spots": [],
+                        "unresolved_questions": [],
+                        "recommended_next_state": "PRECHECK_RUNNING",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            events = "\n".join(
+                (
+                    json.dumps({"type": "thread.started", "thread_id": owner_thread}),
+                    json.dumps({"type": "turn.completed"}),
+                )
+            )
+            return subprocess.CompletedProcess(command, 0, stdout=events + "\n", stderr="")
+
+        with (
+            mock.patch.object(side_effects, "observe_execution_side_effects", side_effect=wrapping),
+            mock.patch.object(repairs, "observe_execution_side_effects", side_effect=wrapping),
+            self._patch_codex(controller_process),
+            self.fx._controller_codex_lookup(),
+        ):
+            repairs.run_assignment(self.fx.store, self.fx.TASK_ID, owner_repair, sessions)
+        self.assertTrue(observed)
+        observed_paths = {change.path for change in observed[0]}
+        events = [
+            json.loads(line)
+            for line in (
+                self.fx.state_root / self.fx.TASK_ID / "events.jsonl"
+            ).read_text(encoding="utf-8").splitlines()
+        ]
+        completed = next(
+            event for event in events if event.get("event_type") == "REPAIR_COMPLETED"
+        )
+        actual = set(completed["actual_changed_paths"])
+        self.assertEqual(actual, observed_paths)
+
+
+class AssignmentDispatchGateTest(unittest.TestCase):
+    def setUp(self) -> None:
+        from tests.test_ai_workflow_adversarial_acceptance import (
+            AcceptanceLedgerV2ContractTest,
+        )
+
+        self.fx = AcceptanceLedgerV2ContractTest()
+        self.fx.setUp()
+        self.fx.task["source_worktree"] = str(self.fx.repository_root)
+        (self.fx.repository_root / ".codex" / "sessions").mkdir(parents=True, exist_ok=True)
+        _RecordingPopen.reset()
+
+    def tearDown(self) -> None:
+        self.fx.tearDown()
+
+    def _intent_events(self) -> list[dict[str, object]]:
+        path = self.fx.store._require_task(self.fx.TASK_ID) / "events.jsonl"
+        if not path.is_file():
+            return []
+        return [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line and json.loads(line).get("event_type") == "LAUNCH_INTENT_RECORDED"
+        ]
+
+    def _write_rollout(self, sessions: Path, thread_id: str) -> None:
+        sessions.mkdir(parents=True, exist_ok=True)
+        (sessions / f"rollout-{thread_id}").write_text(
+            json.dumps(
+                {
+                    "thread_id": thread_id,
+                    "agent_type": None,
+                    "model": "gpt-5.6-terra",
+                    "reasoning_effort": "xhigh",
+                    "sandbox_policy": "read-only",
+                    "permission_profile": "read-only",
+                    "cwd": str(self.fx.repository_root),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def _review_result(self, role: str = "terra_xhigh_reviewer") -> dict[str, object]:
+        return {
+            "schema_version": "ai-result-1",
+            "dispatch_id": None,
+            "task_id": None,
+            "step_id": None,
+            "attempt": None,
+            "role": role,
+            "status": "ACCEPTANCE_RECOMMENDED",
+            "summary": "ok",
+            "claims": [],
+            "evidence": [],
+            "counter_checks": [],
+            "changed_files": [],
+            "blind_spots": [],
+            "unresolved_questions": [],
+            "recommended_next_state": "AWAITING_OWNER_DECISION",
+        }
+
+    def _controller_handler(
+        self,
+        thread_id: str,
+        result: dict[str, object],
+        *writes: str,
+        returncode: int = 0,
+    ):
+        def controller_process(command, *args, **kwargs):
+            for relative in writes:
+                path = self.fx.repository_root / relative
+                path.write_text("OVER_BOUND = True\n", encoding="utf-8")
+            output_path = Path(command[command.index("-o") + 1])
+            output_path.write_text(json.dumps(result), encoding="utf-8")
+            events = "\n".join(
+                (
+                    json.dumps({"type": "thread.started", "thread_id": thread_id}),
+                    json.dumps({"type": "turn.completed"}),
+                )
+            )
+            return subprocess.CompletedProcess(
+                command, returncode, stdout=events + "\n", stderr=""
+            )
+
+        return controller_process
+
+    def _assert_later_dispatch_blocked(self) -> None:
+        identity = policy.derive_dispatch_identity(
+            task_sha256=artifacts.artifact_sha256(self.fx.task),
+            role="luna",
+            attempt_id="post-violation-probe",
+        )
+        with self.fx.store.lock(self.fx.TASK_ID):
+            with self.assertRaisesRegex(
+                workflow.WorkflowError, "DISPATCH_BLOCKED_OWNERSHIP_VIOLATION"
+            ):
+                policy.require_dispatch_permit_locked(
+                    self.fx.store,
+                    self.fx.TASK_ID,
+                    "luna",
+                    dispatch_identity=identity,
+                    config=workflow._load_workflow_config(),
+                )
+
+    def _issue_review(self):
+        self.fx._open_with_owner("luna-owner", "luna")
+        reviewer_thread = str(uuid.uuid4())
+        review = self.fx._issue(
+            "REVIEW_1",
+            self.fx._expected_actor(
+                "terra-gate-review",
+                "terra_xhigh_reviewer",
+                runtime_instance_id=reviewer_thread,
+            ),
+        )
+        sessions = self.fx.repository_root.parent / "gate-sessions"
+        self._write_rollout(sessions, reviewer_thread)
+        return review, sessions, reviewer_thread
+
+    def test_missing_declaration_rejects_assignment_before_spawn(self) -> None:
+        review, sessions, thread_id = self._issue_review()
+        (
+            self.fx.store._require_task(self.fx.TASK_ID) / "route-declaration.json"
+        ).unlink()
+        _RecordingPopen.reset()
+        with (
+            mock.patch.object(
+                repairs.subprocess,
+                "Popen",
+                _compat_popen(self._controller_handler(thread_id, self._review_result())),
+            ),
+            self.fx._controller_codex_lookup(),
+        ):
+            with self.assertRaisesRegex(
+                workflow.WorkflowError, "ROUTE_DECLARATION_MISSING|ROUTE_DECLARATION_CORRUPT"
+            ):
+                repairs.run_assignment(self.fx.store, self.fx.TASK_ID, review, sessions)
+        self.assertEqual([], _RecordingPopen.calls)
+        self.assertEqual([], self._intent_events())
+
+    def test_role_not_allowed_rejects_assignment_before_spawn(self) -> None:
+        self.fx._declaration_kwargs = {
+            "allowed_roles": ("luna",),
+            "active_roles": ("luna",),
+        }
+        review, sessions, thread_id = self._issue_review()
+        _RecordingPopen.reset()
+        with (
+            mock.patch.object(
+                repairs.subprocess,
+                "Popen",
+                _compat_popen(self._controller_handler(thread_id, self._review_result())),
+            ),
+            self.fx._controller_codex_lookup(),
+        ):
+            with self.assertRaisesRegex(workflow.WorkflowError, "ROLE_NOT_ALLOWED"):
+                repairs.run_assignment(self.fx.store, self.fx.TASK_ID, review, sessions)
+        self.assertEqual([], _RecordingPopen.calls)
+        self.assertEqual([], self._intent_events())
+
+    def test_role_not_preflighted_rejects_assignment_before_spawn(self) -> None:
+        self.fx._declaration_kwargs = {"run_preflight": False}
+        review, sessions, thread_id = self._issue_review()
+        _RecordingPopen.reset()
+        with (
+            mock.patch.object(
+                repairs.subprocess,
+                "Popen",
+                _compat_popen(self._controller_handler(thread_id, self._review_result())),
+            ),
+            self.fx._controller_codex_lookup(),
+        ):
+            with self.assertRaisesRegex(workflow.WorkflowError, "ROLE_NOT_PREFLIGHTED"):
+                repairs.run_assignment(self.fx.store, self.fx.TASK_ID, review, sessions)
+        self.assertEqual([], _RecordingPopen.calls)
+        self.assertEqual([], self._intent_events())
+
+    def test_budget_exceeded_rejects_assignment_before_spawn(self) -> None:
+        self.fx._declaration_kwargs = {"max_dispatches": 0}
+        review, sessions, thread_id = self._issue_review()
+        _RecordingPopen.reset()
+        with (
+            mock.patch.object(
+                repairs.subprocess,
+                "Popen",
+                _compat_popen(self._controller_handler(thread_id, self._review_result())),
+            ),
+            self.fx._controller_codex_lookup(),
+        ):
+            with self.assertRaisesRegex(workflow.WorkflowError, "ROUTE_BUDGET_EXCEEDED"):
+                repairs.run_assignment(self.fx.store, self.fx.TASK_ID, review, sessions)
+        self.assertEqual([], _RecordingPopen.calls)
+        self.assertEqual([], self._intent_events())
+
+    def test_claimed_assignment_identity_does_not_record_a_second_launch_intent(self) -> None:
+        review, sessions, thread_id = self._issue_review()
+        handler = self._controller_handler(thread_id, self._review_result())
+        _RecordingPopen.reset()
+        with (
+            mock.patch.object(repairs.subprocess, "Popen", _compat_popen(handler)),
+            self.fx._controller_codex_lookup(),
+        ):
+            repairs.run_assignment(self.fx.store, self.fx.TASK_ID, review, sessions)
+        self.assertEqual(1, len(self._intent_events()))
+        _RecordingPopen.reset()
+        with (
+            mock.patch.object(repairs.subprocess, "Popen", _compat_popen(handler)),
+            self.fx._controller_codex_lookup(),
+        ):
+            with self.assertRaisesRegex(
+                workflow.WorkflowError,
+                "DISPATCH_PERMIT_ALREADY_STARTED|REPAIR_ADAPTER_REQUIRED",
+            ):
+                repairs.run_assignment(self.fx.store, self.fx.TASK_ID, review, sessions)
+        self.assertEqual([], _RecordingPopen.calls)
+        self.assertEqual(1, len(self._intent_events()))
+
+    def test_retired_assignment_identity_does_not_record_launch_intent(self) -> None:
+        review, sessions, thread_id = self._issue_review()
+        handler = self._controller_handler(thread_id, self._review_result())
+        _RecordingPopen.reset()
+        with (
+            mock.patch.object(
+                workflow,
+                "materialize_dispatch_result_schema",
+                side_effect=workflow.WorkflowError("RESULT_SCHEMA_DERIVATION_INVALID", "boom"),
+            ),
+            mock.patch.object(repairs.subprocess, "Popen", _compat_popen(handler)),
+            self.fx._controller_codex_lookup(),
+        ):
+            with self.assertRaisesRegex(workflow.WorkflowError, "RESULT_SCHEMA_DERIVATION_INVALID"):
+                repairs.run_assignment(self.fx.store, self.fx.TASK_ID, review, sessions)
+        self.assertEqual([], _RecordingPopen.calls)
+        self.assertEqual([], self._intent_events())
+        _RecordingPopen.reset()
+        with (
+            mock.patch.object(repairs.subprocess, "Popen", _compat_popen(handler)),
+            self.fx._controller_codex_lookup(),
+        ):
+            with self.assertRaisesRegex(
+                workflow.WorkflowError,
+                "DISPATCH_IDENTITY_RETIRED|ASSIGNMENT_ATTEMPT_INTERRUPTED",
+            ):
+                repairs.run_assignment(self.fx.store, self.fx.TASK_ID, review, sessions)
+        self.assertEqual([], _RecordingPopen.calls)
+        self.assertEqual([], self._intent_events())
+
+    def test_unknown_observation_does_not_complete_assignment(self) -> None:
+        review, sessions, thread_id = self._issue_review()
+        with (
+            mock.patch.object(
+                repairs, "_observe_assignment_execution_side_effects", return_value=None
+            ),
+            mock.patch.object(
+                repairs.subprocess,
+                "Popen",
+                _compat_popen(self._controller_handler(thread_id, self._review_result())),
+            ),
+            self.fx._controller_codex_lookup(),
+        ):
+            with self.assertRaisesRegex(workflow.WorkflowError, "ACTUAL_WRITE_PATHS_UNKNOWN"):
+                repairs.run_assignment(self.fx.store, self.fx.TASK_ID, review, sessions)
+
+    def test_assignment_over_bound_write_records_violation(self) -> None:
+        review, sessions, thread_id = self._issue_review()
+        with (
+            mock.patch.object(
+                repairs.subprocess,
+                "Popen",
+                _compat_popen(
+                    self._controller_handler(
+                        thread_id, self._review_result(), "src/alpha.py"
+                    )
+                ),
+            ),
+            self.fx._controller_codex_lookup(),
+        ):
+            with self.assertRaisesRegex(workflow.WorkflowError, "OWNERSHIP_VIOLATION"):
+                repairs.run_assignment(self.fx.store, self.fx.TASK_ID, review, sessions)
+        violations = [
+            json.loads(line)
+            for line in (
+                self.fx.store._require_task(self.fx.TASK_ID) / "events.jsonl"
+            ).read_text(encoding="utf-8").splitlines()
+            if line and json.loads(line).get("event_type") == "OWNERSHIP_VIOLATION_RECORDED"
+        ]
+        self.assertEqual(1, len(violations))
+        self.assertEqual(["src/alpha.py"], violations[0]["paths"])
+        side_effects = ownership.load_side_effects(self.fx.store, self.fx.TASK_ID)
+        self.assertFalse(
+            any(row.get("effect_kind") == "OWNERSHIP_VIOLATION_RECORDED" for row in side_effects)
+        )
+
+    def test_assignment_post_spawn_failure_still_records_over_bound_violation(self) -> None:
+        review, sessions, thread_id = self._issue_review()
+        with (
+            mock.patch.object(
+                repairs.subprocess,
+                "Popen",
+                _compat_popen(
+                    self._controller_handler(
+                        thread_id,
+                        self._review_result(),
+                        "src/alpha.py",
+                        returncode=23,
+                    )
+                ),
+            ),
+            self.fx._controller_codex_lookup(),
+        ):
+            with self.assertRaisesRegex(workflow.WorkflowError, "OWNERSHIP_VIOLATION"):
+                repairs.run_assignment(self.fx.store, self.fx.TASK_ID, review, sessions)
+        violations = [
+            json.loads(line)
+            for line in (
+                self.fx.store._require_task(self.fx.TASK_ID) / "events.jsonl"
+            ).read_text(encoding="utf-8").splitlines()
+            if line and json.loads(line).get("event_type") == "OWNERSHIP_VIOLATION_RECORDED"
+        ]
+        self.assertEqual(1, len(violations))
+        self.assertEqual(["src/alpha.py"], violations[0]["paths"])
+        self._assert_later_dispatch_blocked()
+
+    def test_assignment_timeout_fail_closes_unknown_actual_paths(self) -> None:
+        review, sessions, _thread_id = self._issue_review()
+
+        def boom(command, *args, **kwargs):
+            raise subprocess.TimeoutExpired("codex", 30)
+
+        with (
+            mock.patch.object(repairs.subprocess, "Popen", _compat_popen(boom)),
+            self.fx._controller_codex_lookup(),
+        ):
+            with self.assertRaisesRegex(workflow.WorkflowError, "ACTUAL_WRITE_PATHS_UNKNOWN"):
+                repairs.run_assignment(self.fx.store, self.fx.TASK_ID, review, sessions)
+        kinds = {
+            row["effect_kind"]
+            for row in ownership.load_side_effects(self.fx.store, self.fx.TASK_ID)
+        }
+        self.assertIn("UNOBSERVED_ASSUMED_PRESENT", kinds)
+        events = [
+            json.loads(line)
+            for line in (
+                self.fx.store._require_task(self.fx.TASK_ID) / "events.jsonl"
+            ).read_text(encoding="utf-8").splitlines()
+            if line
+        ]
+        self.assertFalse(
+            any(event.get("event_type") == "OWNERSHIP_VIOLATION_RECORDED" for event in events)
+        )
+
+    def test_assignment_hub_keeps_plan_owner_not_actor(self) -> None:
+        review, sessions, thread_id = self._issue_review()
+        with (
+            mock.patch.object(
+                repairs.subprocess,
+                "Popen",
+                _compat_popen(self._controller_handler(thread_id, self._review_result())),
+            ),
+            self.fx._controller_codex_lookup(),
+        ):
+            repairs.run_assignment(self.fx.store, self.fx.TASK_ID, review, sessions)
+        registry = ownership.load_ownership_registry(self.fx.store, self.fx.TASK_ID)
+        self.assertIsNotNone(registry)
+        assert registry is not None
+        self.assertEqual("luna", registry.path_owners["src"])
+        self.assertNotEqual("terra_xhigh_reviewer", registry.path_owners["src"])
+        sidecar = self.fx.store._require_task(self.fx.TASK_ID) / "runtime-evidence-v2.jsonl"
+        self.assertTrue(sidecar.is_file())
+        rows = evidence.replay_runtime_evidence_v2(self.fx.store, self.fx.TASK_ID)
+        self.assertTrue(rows)
+        self.assertEqual("AUTHORITY_UNAVAILABLE", rows[0]["fork_state"])
+        self.assertEqual("AUTHORITY_UNAVAILABLE", rows[0]["nested_state"])
+
+    def test_legal_assignment_records_launch_intent_before_popen(self) -> None:
+        review, sessions, thread_id = self._issue_review()
+        order: list[str] = []
+        real_append = workflow.WorkflowStore.append_event
+        real_ledger = workflow.WorkflowStore.append_task_ledger
+
+        def tracking_append(store, task_id, event):
+            order.append(str(event.get("event_type")))
+            return real_append(store, task_id, event)
+
+        def tracking_ledger(store, task_id, name, record):
+            if name == "dispatch-permits.jsonl":
+                order.append(f"PERMIT:{record.get('state')}")
+            return real_ledger(store, task_id, name, record)
+
+        inner = _compat_popen(self._controller_handler(thread_id, self._review_result()))
+        spawn_argv: list[object] = []
+
+        class Popen(inner):
+            def __init__(self, command, *args, **kwargs):
+                super().__init__(command, *args, **kwargs)
+                if getattr(self, "_delegate", None) is None:
+                    order.append("POPEN")
+                    spawn_argv.append(command)
+
+        with (
+            mock.patch.object(workflow.WorkflowStore, "append_event", tracking_append),
+            mock.patch.object(workflow.WorkflowStore, "append_task_ledger", tracking_ledger),
+            mock.patch.object(repairs.subprocess, "Popen", Popen),
+            self.fx._controller_codex_lookup(),
+        ):
+            repairs.run_assignment(self.fx.store, self.fx.TASK_ID, review, sessions)
+        self.assertLess(order.index("PERMIT:RESERVED"), order.index("LAUNCH_INTENT_RECORDED"))
+        self.assertLess(order.index("LAUNCH_INTENT_RECORDED"), order.index("POPEN"))
+        events = [
+            json.loads(line)
+            for line in (
+                self.fx.store._require_task(self.fx.TASK_ID) / "events.jsonl"
+            ).read_text(encoding="utf-8").splitlines()
+            if line
+        ]
+        intents = [event for event in events if event.get("event_type") == "LAUNCH_INTENT_RECORDED"]
+        self.assertEqual(1, len(intents))
+        self.assertEqual(artifacts.artifact_sha256(self.fx.task), intents[0]["envelope_hash"])
+        self.assertEqual(1, len(spawn_argv))
+        self.assertEqual(
+            hashlib.sha256(
+                artifacts.canonical_json(list(spawn_argv[0])).encode("utf-8")
+            ).hexdigest(),
+            intents[0]["command_sha256"],
+        )
+        recorded = [event for event in events if event.get("event_type") == "RUNTIME_EVIDENCE_RECORDED"]
+        self.assertTrue(recorded)
+        self.assertEqual(
+            {
+                "event_type",
+                "attempt_id",
+                "requested_role",
+                "thread_id",
+                "execution_surface",
+                "runtime_evidence_sha256",
+            },
+            set(recorded[-1]),
+        )
+        rows = evidence.replay_runtime_evidence_v2(self.fx.store, self.fx.TASK_ID)
+        self.assertTrue(rows)
+        self.assertEqual("AUTHORITY_UNAVAILABLE", rows[-1]["fork_state"])
+        self.assertEqual("AUTHORITY_UNAVAILABLE", rows[-1]["nested_state"])
+
+
+class VerdictReleaseGateRepairTest(unittest.TestCase):
+    def setUp(self) -> None:
+        from tests.test_ai_workflow_adversarial_acceptance import (
+            AcceptanceLedgerV2ContractTest,
+        )
+
+        self.fx = AcceptanceLedgerV2ContractTest()
+        self.fx.setUp()
+
+    def tearDown(self) -> None:
+        self.fx.tearDown()
+
+    def test_review_one_completion_does_not_require_final_verdict(self) -> None:
+        self.fx._open_with_owner("luna-owner", "luna")
+        _, first, receipt = self.fx._issue_with_receipt(
+            "REVIEW_1", "terra-review-one", "terra_xhigh_reviewer"
+        )
+        self.fx._review(first, receipt, "ACCEPT")
+        completed = [
+            event
+            for event in self.fx._events()
+            if event.get("event_type") == "REVIEW_COMPLETED"
+        ]
+        self.assertEqual(1, len(completed))
+
+    def test_terminal_repair_completed_without_verdict_is_missing(self) -> None:
+        self.fx.task["source_worktree"] = str(self.fx.repository_root)
+        owner_actor, _ = self.fx._open_with_owner("luna-owner", "luna")
+        _, first, reviewer_one_receipt = self.fx._issue_with_receipt(
+            "REVIEW_1", "terra-review-one", "terra_xhigh_reviewer"
+        )
+        self.fx._review(first, reviewer_one_receipt, "REWORK", self.fx.findings)
+        _, owner_repair, owner_receipt = self.fx._issue_with_receipt(
+            "OWNER_REPAIR", "luna-owner-repair", "luna", expected_actor=owner_actor
+        )
+        owner_candidate = self.fx._commit_file("src/alpha.py", "OWNER_ALPHA = 1\n")
+        self.fx._complete(
+            owner_repair, owner_receipt, owner_candidate, ("src/alpha.py",)
+        )
+        _, second, reviewer_two_receipt = self.fx._issue_with_receipt(
+            "REVIEW_2", "terra-review-two", "terra_xhigh_reviewer"
+        )
+        self.fx._review(second, reviewer_two_receipt, "REWORK", self.fx.findings)
+        _, sol_repair, sol_receipt = self.fx._issue_with_receipt(
+            "SOL_MEDIUM_REPAIR", "sol-fixer", "sol_medium_reviewer"
+        )
+        sol_candidate = self.fx._commit_file("src/alpha.py", "SOL_MEDIUM_ALPHA = 1\n")
+        self.fx._complete(sol_repair, sol_receipt, sol_candidate, ("src/alpha.py",))
+        _, peer_review, peer_receipt = self.fx._issue_with_receipt(
+            "SOL_MEDIUM_PEER_REVIEW", "sol-peer", "sol_medium_reviewer"
+        )
+        self.fx._review(peer_review, peer_receipt, "REWORK", self.fx.findings)
+        _, terminal, receipt = self.fx._issue_with_receipt(
+            "SOL_XHIGH_TERMINAL_REPAIR", "sol-xhigh", "sol_xhigh"
+        )
+        candidate = self.fx._commit_file("src/alpha.py", "TERMINAL_ALPHA = 1\n")
+        with self.assertRaisesRegex(workflow.WorkflowError, "VERDICT_MISSING"):
+            self.fx._complete(terminal, receipt, candidate, ("src/alpha.py",))
+        self.assertFalse(
+            any(
+                event.get("event_type") == "REPAIR_COMPLETED"
+                and event.get("terminal_reason") == "SOL_XHIGH_TERMINAL_REPAIR_COMPLETED"
+                for event in self.fx._events()
+            )
+        )
+
+    def test_v2_append_and_authorize_call_locked_gate(self) -> None:
+        append_source = inspect.getsource(repairs._v2_append)
+        authorize_source = inspect.getsource(repairs.authorize_final_xhigh)
+        self.assertIn("require_verdict_fresh_locked", append_source)
+        self.assertIn("require_verdict_fresh_locked", authorize_source)
+        self.assertIn("Generic pipeline", append_source)
+        self.assertNotIn(
+            "require_verdict_fresh(",
+            append_source.replace("require_verdict_fresh_locked", ""),
+        )
+        self.assertNotIn(
+            "require_verdict_fresh(",
+            authorize_source.replace("require_verdict_fresh_locked", ""),
+        )
+
+    def test_run_assignment_requires_locked_dispatch_permit(self) -> None:
+        source = inspect.getsource(self.fx._original_run_assignment)
+        self.assertIn("require_dispatch_permit_locked(", source)
+        self.assertIn("claim_permit_start_locked(", source)
+        self.assertIn("release_permit_if_never_spawned(", source)
 
 
 if __name__ == "__main__":

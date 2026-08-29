@@ -8,14 +8,20 @@ of deterministic validation needed before an artifact can be handed to them.
 from __future__ import annotations
 
 import dataclasses
+import errno
+import fcntl
 import hashlib
 import json
 import math
+import os
 import re
+import stat
+import tempfile
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import ContextManager, Protocol
 
 
 class ArtifactError(RuntimeError):
@@ -27,23 +33,336 @@ class ArtifactError(RuntimeError):
         super().__init__(f"{self.code}: {self.message}")
 
 
-def _raise(code: str, message: str) -> None:
-    """Raise the public workflow exception when the CLI module is available.
+class WorkflowError(RuntimeError):
+    def __init__(self, code: str, message: str):
+        self.code = str(code)
+        self.message = str(message)
+        super().__init__(f"{self.code}: {self.message}")
 
-    ``ai_workflow`` imports this module after defining ``WorkflowError``.  A
-    lazy import avoids a module cycle while preserving the existing public
-    exception type for all validators.  Direct imports still have a useful,
-    self-contained ``ArtifactError`` fallback.
-    """
+
+PROCESS_GENERATION: str = uuid.uuid4().hex
+_KIND_PATTERN = re.compile(r"^[a-z0-9-]+$")
+
+
+def _fail(code: str, message: str) -> None:
+    raise WorkflowError(code, message)
+
+
+def _raise(code: str, message: str) -> None:
+    """Raise the public workflow exception owned by this leaf module."""
+
+    raise WorkflowError(code, message)
+
+
+def canonical_json(value: object) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError) as exc:
+        raise WorkflowError("INVALID_RECORD", f"record is not JSON serializable: {exc}") from exc
+
+
+_canonical_json = canonical_json
+
+
+def sorted_strs(values: object) -> list[str]:
+    if isinstance(values, str) or not isinstance(values, (list, tuple, set, frozenset)):
+        raise WorkflowError("INVALID_RECORD", "sorted_strs requires a string collection")
+    strings: list[str] = []
+    for item in values:
+        if not isinstance(item, str):
+            raise WorkflowError("INVALID_RECORD", "sorted_strs rejects non-string elements")
+        strings.append(item)
+    return sorted(set(strings))
+
+
+def content_id(kind: str, fields: Mapping[str, object], *, exclude: frozenset[str]) -> str:
+    if not isinstance(kind, str) or not _KIND_PATTERN.fullmatch(kind):
+        raise WorkflowError("INVALID_CONTENT_ID", "kind must match [a-z0-9-]+")
+    if not isinstance(exclude, frozenset) or not exclude:
+        raise WorkflowError("INVALID_CONTENT_ID", "exclude must be a non-empty frozenset")
+    if not isinstance(fields, Mapping):
+        raise WorkflowError("INVALID_CONTENT_ID", "fields must be an object")
+    projected = {key: fields[key] for key in fields if key not in exclude}
+    preimage = {"kind": kind, "fields": projected}
+    return hashlib.sha256(canonical_json(preimage).encode("utf-8")).hexdigest()
+
+
+def verify_content_id(
+    kind: str,
+    record: Mapping[str, object],
+    *,
+    exclude: frozenset[str],
+    id_field: str,
+) -> None:
+    if not isinstance(id_field, str) or not id_field:
+        raise WorkflowError("INVALID_CONTENT_ID", "id_field is required")
+    if not isinstance(exclude, frozenset) or id_field not in exclude:
+        raise WorkflowError("INVALID_CONTENT_ID", "id_field must be in exclude")
+    if not isinstance(record, Mapping) or id_field not in record:
+        raise WorkflowError("INVALID_CONTENT_ID", "id_field is missing from record")
+    expected = content_id(kind, record, exclude=exclude)
+    if record[id_field] != expected:
+        raise WorkflowError("CONTENT_ID_MISMATCH", f"{id_field} does not match content id")
+
+
+class TaskStoreProtocol(Protocol):
+    def lock(self, task_id: str) -> ContextManager[None]: ...
+    def _require_task(self, task_id: str) -> Path: ...
+    def append_event(self, task_id: str, event: dict) -> None: ...
+    def write_task_artifact_once(
+        self,
+        task_id: str,
+        name: str,
+        value: Mapping[str, object],
+        *,
+        conflict_code: str,
+    ) -> Path: ...
+    def append_task_ledger(
+        self, task_id: str, name: str, record: Mapping[str, object]
+    ) -> None: ...
+    def read_task_ledger(
+        self, task_id: str, name: str
+    ) -> tuple[dict[str, object], ...]: ...
+    def _assert_lock_held(self, task_id: str) -> None: ...
+
+
+def _directory_identity_matches(path: Path, descriptor: int) -> bool:
+    """Return whether a path still names the directory pinned by ``descriptor``."""
 
     try:
-        from .ai_workflow import WorkflowError
-    except (ImportError, ModuleNotFoundError):
+        current = os.stat(path, follow_symlinks=False)
+        opened = os.fstat(descriptor)
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(current.st_mode)
+        and stat.S_ISDIR(opened.st_mode)
+        and current.st_dev == opened.st_dev
+        and current.st_ino == opened.st_ino
+    )
+
+
+def _open_parent_directory(path: Path, *, error_code: str) -> int:
+    """Open a target parent without following a replacement directory symlink."""
+
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise WorkflowError(error_code, f"cannot open parent directory for {path.name}") from exc
+    try:
+        metadata = os.fstat(descriptor)
+    except OSError as exc:
+        os.close(descriptor)
+        raise WorkflowError(error_code, f"cannot inspect parent directory for {path.name}") from exc
+    if not stat.S_ISDIR(metadata.st_mode):
+        os.close(descriptor)
+        raise WorkflowError(error_code, f"parent directory for {path.name} is not a directory")
+    return descriptor
+
+
+def _validate_regular_descriptor(
+    descriptor: int,
+    *,
+    error_code: str,
+    label: str,
+    max_bytes: int | None = None,
+) -> os.stat_result:
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        raise WorkflowError(error_code, f"{label} must be a private regular file")
+    if max_bytes is not None and metadata.st_size > max_bytes:
+        raise WorkflowError(error_code, f"{label} is too large")
+    return metadata
+
+
+def write_json_once(path: Path, value: object, *, conflict_code: str) -> str:
+    """Atomically publish one frozen JSON artifact without replacing an existing one."""
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = (_canonical_json(value) + "\n").encode("utf-8")
+    digest = hashlib.sha256(payload).hexdigest()
+    temporary: Path | None = None
+    parent_descriptor = -1
+    published = False
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        parent_descriptor = os.open(
+            target.parent,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+        )
+        fcntl.flock(parent_descriptor, fcntl.LOCK_EX)
+        if not _directory_identity_matches(target.parent, parent_descriptor):
+            raise WorkflowError(
+                "ATOMIC_WRITE_FAILED",
+                f"parent directory changed before publishing {target.name}",
+            )
         try:
-            from ai_workflow import WorkflowError
-        except (ImportError, ModuleNotFoundError):
-            raise ArtifactError(code, message)
-    raise WorkflowError(code, message)
+            existing = os.stat(target.name, dir_fd=parent_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None:
+            _fail(conflict_code, f"{target.name} is already frozen")
+        temporary_name = Path(temporary.name).name
+        temp_descriptor = -1
+        try:
+            temp_descriptor = os.open(
+                temporary_name,
+                os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=parent_descriptor,
+            )
+            _validate_regular_descriptor(
+                temp_descriptor,
+                error_code="ATOMIC_WRITE_FAILED",
+                label=temporary_name,
+            )
+            try:
+                # A same-directory hard-link is the portable POSIX no-replace
+                # primitive: it succeeds only when the destination is absent.
+                os.link(
+                    temporary_name,
+                    target.name,
+                    src_dir_fd=parent_descriptor,
+                    dst_dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileExistsError as exc:
+                _fail(conflict_code, f"{target.name} is already frozen")
+                raise AssertionError("unreachable") from exc
+            published = True
+            os.unlink(temporary_name, dir_fd=parent_descriptor)
+            temporary = None
+        finally:
+            if temp_descriptor >= 0:
+                os.close(temp_descriptor)
+        if not _directory_identity_matches(target.parent, parent_descriptor):
+            raise WorkflowError(
+                "ATOMIC_WRITE_PUBLISHED_UNSYNCED",
+                f"parent directory changed while publishing {target.name}",
+            )
+        os.fsync(parent_descriptor)
+        if not _directory_identity_matches(target.parent, parent_descriptor):
+            raise WorkflowError(
+                "ATOMIC_WRITE_PUBLISHED_UNSYNCED",
+                f"parent directory changed after publishing {target.name}",
+            )
+        return digest
+    except WorkflowError:
+        raise
+    except OSError as exc:
+        code = (
+            "ATOMIC_WRITE_PUBLISHED_UNSYNCED"
+            if published
+            else "ATOMIC_WRITE_FAILED"
+        )
+        raise WorkflowError(code, f"cannot write {target.name}") from exc
+    finally:
+        if temporary is not None:
+            try:
+                if parent_descriptor >= 0:
+                    os.unlink(Path(temporary.name).name, dir_fd=parent_descriptor)
+                else:
+                    temporary.unlink()
+            except FileNotFoundError:
+                pass
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
+
+
+def append_jsonl(path: Path, record: Mapping[str, object]) -> None:
+    """Append one compact, fsynced JSON object without rewrite/delete support."""
+
+    if not isinstance(record, Mapping):
+        raise WorkflowError("INVALID_RECORD", "JSONL record must be an object")
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    line = _canonical_json(dict(record)) + "\n"
+    parent_descriptor = -1
+    descriptor = -1
+    try:
+        parent_descriptor = _open_parent_directory(target.parent, error_code="APPEND_UNSAFE")
+        descriptor = os.open(
+            target.name,
+            os.O_WRONLY
+            | os.O_APPEND
+            | os.O_CREAT
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=parent_descriptor,
+        )
+        _validate_regular_descriptor(
+            descriptor,
+            error_code="APPEND_UNSAFE",
+            label=target.name,
+        )
+        payload = line.encode("utf-8")
+        written = 0
+        while written < len(payload):
+            written += os.write(descriptor, payload[written:])
+        os.fsync(descriptor)
+        if not _directory_identity_matches(target.parent, parent_descriptor):
+            raise WorkflowError(
+                "APPEND_UNSAFE",
+                f"parent directory changed while appending {target.name}",
+            )
+    except WorkflowError:
+        raise
+    except OSError as exc:
+        code = "APPEND_UNSAFE" if exc.errno in {errno.ELOOP, errno.ENOTDIR} else "APPEND_FAILED"
+        raise WorkflowError(code, f"cannot append {target.name}") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
+
+
+def read_jsonl(path: Path, *, code: str) -> tuple[dict[str, object], ...]:
+    """Fail-closed JSONL read: missing file is empty; any corrupt line aborts."""
+
+    target = Path(path)
+    try:
+        raw = target.read_bytes()
+    except FileNotFoundError:
+        return ()
+    except OSError as exc:
+        raise WorkflowError(f"{code}_CORRUPT", f"cannot read {target.name}") from exc
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise WorkflowError(f"{code}_CORRUPT", f"{target.name} is not valid UTF-8") from exc
+    if not text:
+        return ()
+    if not text.endswith("\n"):
+        raise WorkflowError(
+            f"{code}_CORRUPT", f"{target.name} has a truncated trailing record"
+        )
+    records: list[dict[str, object]] = []
+    for line in text.splitlines():
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise WorkflowError(
+                f"{code}_CORRUPT", f"{target.name} contains invalid JSON"
+            ) from exc
+        if not isinstance(value, dict):
+            raise WorkflowError(
+                f"{code}_CORRUPT", f"{target.name} contains a non-object line"
+            )
+        records.append(value)
+    return tuple(records)
 
 
 ROUTE_WORK_CLASSES = frozenset(

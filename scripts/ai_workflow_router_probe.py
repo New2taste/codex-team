@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import decimal
 import hashlib
 import json
 import math
@@ -17,17 +18,32 @@ import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
+from types import MappingProxyType
 from typing import Protocol
 
 try:
-    from .ai_workflow_costs import normalize_cost_evidence
+    from .ai_workflow_costs import (
+        RATE_UNIT_BASE,
+        RATE_UNITS,
+        normalize_cost_evidence,
+        snapshot_pricing_status,
+    )
 except ImportError:  # direct script execution
-    from ai_workflow_costs import normalize_cost_evidence
+    from ai_workflow_costs import (
+        RATE_UNIT_BASE,
+        RATE_UNITS,
+        normalize_cost_evidence,
+        snapshot_pricing_status,
+    )
 
 
 class RouterProbeError(RuntimeError):
-    pass
+    def __init__(self, message: str, code: str | None = None):
+        self.code = code
+        self.message = str(message)
+        super().__init__(f"{code}: {message}" if code else str(message))
 
 
 TEMPLATE_VERSION = "router-probe-v1"
@@ -51,6 +67,37 @@ ARM_CONTRACTS = {
     "luna_control_fresh": ("gpt-5.6-luna", "max", "cold_control"),
     "sol_control_fresh": ("gpt-5.6-sol", "medium", "cold_control"),
     "terra_control_fresh": ("gpt-5.6-terra", "xhigh", "cold_control"),
+}
+PROBE_SUMMARY_SCHEMA_VERSION = "router-probe-summary-2"
+USAGE_SOURCES = frozenset({"BILLING_USAGE", "TEXT_TOKEN_ESTIMATE"})
+ARM_COST_TYPES = frozenset(
+    {
+        "COST_ESTIMATE_UNDER_SNAPSHOT",
+        "TEXT_TOKEN_ESTIMATE",
+        "USAGE_AUTHORITY_UNAVAILABLE",
+    }
+)
+COST_ESTIMATE_TYPES = frozenset(
+    {
+        "COST_ESTIMATE_UNDER_SNAPSHOT",
+        "PRICE_STALE",
+        "PRICE_UNKNOWN",
+        "UNAVAILABLE_WITHOUT_RATE_SNAPSHOT",
+    }
+)
+COST_TOTAL_TYPES = frozenset({"COST_TOTAL_UNDER_SNAPSHOT", "COST_TOTAL_UNAVAILABLE"})
+COST_TOTAL_UNAVAILABLE_REASONS = frozenset(
+    {"PARTIAL_AUTHORITY", "CURRENCY_MISMATCH", "UNIT_MISMATCH"}
+)
+CURRENCY_MINOR_UNITS: Mapping[str, int] = MappingProxyType({"USD": 2})
+USAGE_WIRE_SHAPE = ("uncached_input", "cached_input", "output")
+PROBE_RATE_SNAPSHOT_MAX_AGE_SECONDS = 86400
+_QUALITY_FIELDS = ("retries", "escalations", "reviews", "failures")
+_DECIMAL_PRICE = re.compile(r"^(0|[1-9][0-9]*)(\.[0-9]+)?$")
+_SKU_PRICE_FIELDS = {
+    "uncached_input": "price_uncached_input",
+    "cached_input": "price_cached_input",
+    "output": "price_output",
 }
 _TOP_FIELDS = frozenset(
     {
@@ -111,8 +158,8 @@ def _is_finite_number(value: object) -> bool:
         return False
 
 
-def _fail(message: str) -> None:
-    raise RouterProbeError(message)
+def _fail(message: str, code: str | None = None) -> None:
+    raise RouterProbeError(message, code=code)
 
 
 def _safe_id(value: object, field: str) -> str:
@@ -522,11 +569,282 @@ def run_probe_batch(
             shutil.rmtree(temporary, ignore_errors=True)
 
 
+def _cost_input_invalid(message: str) -> None:
+    _fail(message, code="COST_INPUT_INVALID")
+
+
+def _wire_tokens(value: object, *, label: str) -> dict[str, int]:
+    if not isinstance(value, Mapping) or set(value) != set(USAGE_WIRE_SHAPE):
+        _cost_input_invalid(f"{label} must use the frozen three-key usage shape")
+    tokens: dict[str, int] = {}
+    for key in USAGE_WIRE_SHAPE:
+        number = value[key]
+        if isinstance(number, bool) or not isinstance(number, int) or number < 0:
+            _cost_input_invalid(f"{label}.{key} must be a non-negative integer")
+        tokens[key] = number
+    return tokens
+
+
+def _quality(arm_usage: Mapping[str, object]) -> dict[str, int]:
+    result = {field: 0 for field in _QUALITY_FIELDS}
+    raw = arm_usage.get("quality")
+    if raw is None:
+        return result
+    if not isinstance(raw, Mapping):
+        _cost_input_invalid("quality must be an object")
+    for field in _QUALITY_FIELDS:
+        if field not in raw:
+            continue
+        value = raw[field]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            _cost_input_invalid("quality values must be non-negative integers")
+        result[field] = value
+    return result
+
+
+def _billing_evidence_ids(arm_usage: Mapping[str, object]) -> list[str] | None:
+    if arm_usage.get("usage_source") != "BILLING_USAGE":
+        return None
+    evidence = arm_usage.get("usage_evidence_ids")
+    if not isinstance(evidence, (list, tuple)):
+        return None
+    ids = [item for item in evidence if isinstance(item, str) and item.strip()]
+    return ids or None
+
+
+def _check_input_identity(
+    arm_usage: Mapping[str, object], usage: Mapping[str, int]
+) -> None:
+    input_tokens = arm_usage.get("input_tokens")
+    if isinstance(input_tokens, bool) or not isinstance(input_tokens, int):
+        _cost_input_invalid("input_tokens must be a non-negative integer")
+    if input_tokens != usage["uncached_input"] + usage["cached_input"]:
+        _cost_input_invalid("input_tokens must equal uncached_input + cached_input")
+    if input_tokens < 0:
+        _cost_input_invalid("input_tokens must be a non-negative integer")
+
+
+def _sku_record(snapshot: Mapping[str, object], sku_id: object) -> Mapping[str, object]:
+    if not isinstance(sku_id, str) or not sku_id.strip():
+        _cost_input_invalid("sku is invalid")
+    skus = snapshot.get("skus")
+    if not isinstance(skus, list):
+        _cost_input_invalid("sku is not in the snapshot")
+    for sku in skus:
+        if isinstance(sku, Mapping) and sku.get("sku") == sku_id:
+            return sku
+    _cost_input_invalid("sku is not in the snapshot")
+    raise AssertionError("unreachable")
+
+
+def compute_arm_cost_minor(
+    *, tokens: int, price: str, unit: str, currency: str
+) -> int:
+    if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0:
+        _cost_input_invalid("tokens must be a non-negative integer")
+    if not isinstance(price, str) or _DECIMAL_PRICE.fullmatch(price) is None:
+        _cost_input_invalid("price must be a non-negative decimal string")
+    try:
+        price_number = Decimal(price)
+    except decimal.InvalidOperation:
+        _cost_input_invalid("price must be a non-negative decimal string")
+    if price_number < 0:
+        _cost_input_invalid("price must not be negative")
+    if unit not in RATE_UNITS:
+        _cost_input_invalid("unit is not supported")
+    if currency not in CURRENCY_MINOR_UNITS:
+        _cost_input_invalid("currency is not supported")
+    with decimal.localcontext(
+        decimal.Context(prec=28, rounding=decimal.ROUND_HALF_EVEN)
+    ):
+        cost = (Decimal(tokens) * Decimal(price)) / Decimal(RATE_UNIT_BASE[unit])
+        minor = (cost * (10 ** CURRENCY_MINOR_UNITS[currency])).quantize(
+            Decimal("1"), rounding=decimal.ROUND_HALF_EVEN
+        )
+        return int(minor)
+
+
+def _unavailable_arm(arm_id: str, arm_usage: Mapping[str, object]) -> dict[str, object]:
+    reason = arm_usage.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        reason = "usage authority unavailable"
+    return {
+        "type": "USAGE_AUTHORITY_UNAVAILABLE",
+        "arm_id": arm_id,
+        "reason": reason,
+    }
+
+
+def _billing_identity(
+    arm_id: str, arm_usage: Mapping[str, object]
+) -> dict[str, object] | None:
+    evidence_ids = _billing_evidence_ids(arm_usage)
+    if evidence_ids is None:
+        return None
+    usage = _wire_tokens(arm_usage.get("usage"), label="usage")
+    _check_input_identity(arm_usage, usage)
+    return {
+        "arm_id": arm_id,
+        "usage": usage,
+        "usage_source": "BILLING_USAGE",
+        "usage_evidence_ids": list(evidence_ids),
+        "quality": _quality(arm_usage),
+    }
+
+
+def _arm_without_amounts(
+    arm_id: str, arm_usage: Mapping[str, object]
+) -> dict[str, object]:
+    if _billing_identity(arm_id, arm_usage) is not None:
+        return _unavailable_arm(arm_id, arm_usage)
+    if arm_usage.get("usage_source") == "TEXT_TOKEN_ESTIMATE":
+        tokens = _wire_tokens(arm_usage.get("tokens"), label="tokens")
+        return {
+            "type": "TEXT_TOKEN_ESTIMATE",
+            "arm_id": arm_id,
+            "tokens": tokens,
+            "usage_source": "TEXT_TOKEN_ESTIMATE",
+        }
+    return _unavailable_arm(arm_id, arm_usage)
+
+
+def build_arm_cost_result(
+    arm_id: str,
+    arm_usage: Mapping[str, object],
+    *,
+    snapshot: Mapping[str, object],
+) -> Mapping[str, object]:
+    identity = _billing_identity(arm_id, arm_usage)
+    if identity is None:
+        return _arm_without_amounts(arm_id, arm_usage)
+    sku = _sku_record(snapshot, arm_usage.get("sku"))
+    unit = sku.get("unit")
+    currency = sku.get("currency")
+    if not isinstance(unit, str) or not isinstance(currency, str):
+        _cost_input_invalid("sku unit and currency must be strings")
+    usage = identity["usage"]
+    estimated = 0
+    for field, price_field in _SKU_PRICE_FIELDS.items():
+        estimated += compute_arm_cost_minor(
+            tokens=int(usage[field]),
+            price=str(sku.get(price_field, "")),
+            unit=unit,
+            currency=currency,
+        )
+    return {
+        "type": "COST_ESTIMATE_UNDER_SNAPSHOT",
+        **identity,
+        "sku": sku["sku"],
+        "currency": currency,
+        "unit": unit,
+        "estimated_cost_minor": estimated,
+    }
+
+
+def _unavailable_total(reason: str) -> dict[str, object]:
+    return {"type": "COST_TOTAL_UNAVAILABLE", "reason": reason}
+
+
+def compute_cost_total(arms: tuple[Mapping[str, object], ...]) -> Mapping[str, object]:
+    if not arms or any(
+        arm.get("type") != "COST_ESTIMATE_UNDER_SNAPSHOT" for arm in arms
+    ):
+        return _unavailable_total("PARTIAL_AUTHORITY")
+    currencies = {arm.get("currency") for arm in arms}
+    units = {arm.get("unit") for arm in arms}
+    if len(currencies) != 1:
+        return _unavailable_total("CURRENCY_MISMATCH")
+    if len(units) != 1:
+        return _unavailable_total("UNIT_MISMATCH")
+    total_minor = 0
+    usage_totals = {key: 0 for key in USAGE_WIRE_SHAPE}
+    for arm in arms:
+        minor = arm.get("estimated_cost_minor")
+        usage = arm.get("usage")
+        if isinstance(minor, bool) or not isinstance(minor, int):
+            return _unavailable_total("PARTIAL_AUTHORITY")
+        if not isinstance(usage, Mapping):
+            return _unavailable_total("PARTIAL_AUTHORITY")
+        total_minor += minor
+        for key in USAGE_WIRE_SHAPE:
+            value = usage.get(key)
+            if isinstance(value, bool) or not isinstance(value, int):
+                return _unavailable_total("PARTIAL_AUTHORITY")
+            usage_totals[key] += value
+    return {
+        "type": "COST_TOTAL_UNDER_SNAPSHOT",
+        "total_cost_minor": total_minor,
+        "usage": usage_totals,
+    }
+
+
+def _ordered_arm_ids(arm_usage: Mapping[str, Mapping[str, object]]) -> tuple[str, ...]:
+    known = tuple(arm_id for arm_id in ARM_CONTRACTS if arm_id in arm_usage)
+    extra = tuple(sorted(set(arm_usage) - set(ARM_CONTRACTS)))
+    return known + extra
+
+
+def build_cost_estimate(
+    arm_usage: Mapping[str, Mapping[str, object]],
+    *,
+    snapshot: Mapping[str, object] | None,
+    now_utc: str,
+    root: Path | None = None,
+) -> Mapping[str, object]:
+    if not isinstance(arm_usage, Mapping):
+        _cost_input_invalid("arm_usage must be an object")
+    ordered_ids = _ordered_arm_ids(arm_usage)
+    if snapshot is None:
+        arms = [
+            _arm_without_amounts(arm_id, arm_usage[arm_id]) for arm_id in ordered_ids
+        ]
+        return {
+            "type": "UNAVAILABLE_WITHOUT_RATE_SNAPSHOT",
+            "arms": arms,
+            "total": compute_cost_total(tuple(arms)),
+        }
+    status = snapshot_pricing_status(
+        snapshot,
+        now_utc=now_utc,
+        max_age_seconds=PROBE_RATE_SNAPSHOT_MAX_AGE_SECONDS,
+        root=root,
+    )
+    if status != "CURRENT":
+        arms = [
+            _arm_without_amounts(arm_id, arm_usage[arm_id]) for arm_id in ordered_ids
+        ]
+        result: dict[str, object] = {
+            "type": status,
+            "arms": arms,
+            "total": _unavailable_total("PARTIAL_AUTHORITY"),
+        }
+        snapshot_id = (
+            snapshot.get("rate_snapshot_id") if isinstance(snapshot, Mapping) else None
+        )
+        if isinstance(snapshot_id, str) and snapshot_id:
+            result["rate_snapshot_id"] = snapshot_id
+        return result
+    arms = [
+        dict(build_arm_cost_result(arm_id, arm_usage[arm_id], snapshot=snapshot))
+        for arm_id in ordered_ids
+    ]
+    return {
+        "type": "COST_ESTIMATE_UNDER_SNAPSHOT",
+        "rate_snapshot_id": snapshot["rate_snapshot_id"],
+        "arms": arms,
+        "total": compute_cost_total(tuple(arms)),
+    }
+
+
 def aggregate_probe_results(
     manifest_rows: list[Mapping[str, object]],
     cost_rows: list[Mapping[str, object]],
     *,
     source_manifest: Mapping[str, object],
+    snapshot: Mapping[str, object] | None = None,
+    now_utc: str | None = None,
+    root: Path | None = None,
+    arm_usage: Mapping[str, Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
     """Aggregate one immutable six-arm batch without enabling production routing."""
 
@@ -784,8 +1102,21 @@ def aggregate_probe_results(
         if stratum in strata_counts:
             strata_counts[str(stratum)] += 1
     strata_complete = all(count >= 8 for count in strata_counts.values())
+    if snapshot is not None and now_utc is None:
+        _fail("now_utc is required with a rate snapshot")
+    resolved_usage = dict(arm_usage) if arm_usage is not None else {}
+    for arm_id in ARM_CONTRACTS:
+        resolved_usage.setdefault(
+            arm_id, {"reason": "usage authority unavailable"}
+        )
+    cost_estimate = build_cost_estimate(
+        resolved_usage,
+        snapshot=snapshot,
+        now_utc=now_utc or "1970-01-01T00:00:00Z",
+        root=root,
+    )
     return {
-        "schema_version": "router-probe-summary-1",
+        "schema_version": PROBE_SUMMARY_SCHEMA_VERSION,
         "data_origin": data_origin,
         "paired_case_count": len(pair_arms),
         "attempt_count": len(attempts),
@@ -800,6 +1131,7 @@ def aggregate_probe_results(
             "UNAVAILABLE_WITHOUT_RATE_SNAPSHOT_AND_DOWNSTREAM_COUNTERFACTUAL"
         ),
         "effective_route": "UNCHANGED",
+        "cost_estimate": cost_estimate,
     }
 
 
@@ -875,8 +1207,23 @@ def render_probe_report(summary: Mapping[str, object]) -> str:
         f"data_origin={summary.get('data_origin')}",
         f"effective_route={summary.get('effective_route', 'UNCHANGED')}",
         f"cost_winner={summary.get('cost_comparison_status')}",
-        "CACHE_AND_COST",
     ]
+    estimate = summary.get("cost_estimate")
+    if isinstance(estimate, Mapping):
+        total = estimate.get("total")
+        if isinstance(total, Mapping) and total.get("type") == "COST_TOTAL_UNDER_SNAPSHOT":
+            total_text = str(total.get("total_cost_minor"))
+        elif isinstance(total, Mapping):
+            total_text = str(total.get("reason", "UNAVAILABLE"))
+        else:
+            total_text = "UNAVAILABLE"
+        snapshot_id = estimate.get("rate_snapshot_id")
+        if not isinstance(snapshot_id, str) or not snapshot_id:
+            snapshot_id = "none"
+        lines.append(
+            f"cost_estimate={estimate.get('type')} snapshot={snapshot_id} total={total_text}"
+        )
+    lines.append("CACHE_AND_COST")
     for arm_id in ARM_CONTRACTS:
         arm = arms.get(arm_id, {})
         lines.append(

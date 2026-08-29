@@ -1,0 +1,68 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "ai-runtime-evidence-2"
+    },
+    "evidence_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "envelope_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "event_index": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "observed_agent_type": {
+      "type": ["string", "null"]
+    },
+    "native_agent_id": {
+      "type": ["string", "null"]
+    },
+    "native_thread_id": {
+      "type": ["string", "null"]
+    },
+    "fork_state": {
+      "type": "string",
+      "enum": [
+        "VERIFIED_NONE",
+        "VERIFIED_PRESENT",
+        "AUTHORITY_UNAVAILABLE"
+      ]
+    },
+    "nested_state": {
+      "type": "string",
+      "enum": [
+        "VERIFIED_NONE",
+        "VERIFIED_PRESENT",
+        "AUTHORITY_UNAVAILABLE"
+      ]
+    },
+    "recorded_at_utc": {
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "required": [
+    "schema_version",
+    "evidence_id",
+    "task_id",
+    "envelope_hash",
+    "event_index",
+    "observed_agent_type",
+    "native_agent_id",
+    "native_thread_id",
+    "fork_state",
+    "nested_state",
+    "recorded_at_utc"
+  ]
+}

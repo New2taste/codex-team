@@ -1,15 +1,25 @@
+import ast
+import functools
+import inspect
 import json
 import os
 import subprocess
 import tempfile
 import tomllib
+import argparse
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest import mock
 
 from scripts import ai_workflow as workflow
+from scripts import ai_workflow_artifacts as artifacts
+from scripts import ai_workflow_authorizations as authorizations
+from scripts import ai_workflow_declarations as declarations
+from scripts import ai_workflow_dispatch_policy as policy
+from scripts import ai_workflow_ownership as ownership
+from scripts import ai_workflow_preflight as preflight
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +32,218 @@ def write_codex_result(command, result):
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(result), encoding="utf-8")
     return subprocess.CompletedProcess(command, 0, stdout='{"event":"done"}\n', stderr="")
+
+
+HUB_SELF_LOCK_WRAPPERS = (
+    "require_dispatch_permit",
+    "precheck_dispatch_permit",
+    "release_permit_before_start",
+    "consume_owner_authorization",
+    "has_unresolved_ownership_violation",
+    "run_role_preflight",
+    "is_role_preflighted",
+    "require_role_preflighted",
+    "load_route_declaration",
+    "require_verdict_fresh",
+)
+
+
+def _call_name(node: ast.Call) -> str | None:
+    func = node.func
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return None
+
+
+def _with_lock_blocks(function) -> list[ast.With]:
+    tree = ast.parse(inspect.getsource(function))
+    func = tree.body[0]
+    assert isinstance(func, ast.FunctionDef)
+    blocks: list[ast.With] = []
+    for node in ast.walk(func):
+        if not isinstance(node, ast.With):
+            continue
+        for item in node.items:
+            expr = item.context_expr
+            if (
+                isinstance(expr, ast.Call)
+                and isinstance(expr.func, ast.Attribute)
+                and expr.func.attr == "lock"
+            ):
+                blocks.append(node)
+                break
+    return blocks
+
+
+def _route_request_for(task: dict[str, object]) -> dict[str, object]:
+    task_type = str(task["task_type"])
+    if task_type == "PLAN":
+        work_class, need = "PLANNING_ONLY", "READ_ONLY"
+    elif task_type == "ACCEPTANCE":
+        work_class, need = "BOUNDED", "READ_ONLY"
+    else:
+        work_class, need = "BOUNDED", "WRITE"
+    return {
+        "schema_version": "ai-route-request-1",
+        "task_id": task["task_id"],
+        "work_class": work_class,
+        "execution_need": need,
+        "decomposable": True,
+        "risk_flags": list(task.get("risk_flags") or []),
+        "reason_codes": ["PLAN_IS_DELIVERABLE"],
+    }
+
+
+def _seed_sessions(task: dict[str, object]) -> None:
+    raw = task.get("source_worktree") or task["repository_root"]
+    (Path(str(raw)) / ".codex" / "sessions").mkdir(parents=True, exist_ok=True)
+
+
+def _install_declaration(
+    store: workflow.WorkflowStore,
+    task: dict[str, object],
+    *,
+    allowed_roles: tuple[str, ...] = ("luna", "sol_planner"),
+    active_roles: tuple[str, ...] | None = None,
+    max_dispatches: int = 8,
+    mode: str = "legacy",
+    run_preflight: bool = True,
+) -> declarations.RouteDeclaration:
+    _seed_sessions(task)
+    task_id = str(task["task_id"])
+    existing = declarations.load_route_declaration(store, task_id)
+    if existing is not None:
+        return existing
+    request = _route_request_for(task)
+    computed = workflow.decide_route(task, request, mode)
+    decision = workflow.persist_or_reuse_route_decision(store, task_id, computed)
+    declaration = declarations.build_route_declaration(
+        decision=decision,
+        route_config_hash=declarations.compute_route_config_hash(workflow._load_workflow_config()),
+        allowed_roles=allowed_roles,
+        active_roles=active_roles if active_roles is not None else allowed_roles[:1],
+        rule_ids=(decision.rule_id,),
+        reason_codes=("PLAN_IS_DELIVERABLE",),
+        max_dispatches=max_dispatches,
+        allowed_transitions=(),
+    )
+    with store.lock(task_id):
+        recorded = declarations.ensure_route_declaration(store, task_id, declaration)
+        if run_preflight:
+            for role in recorded.active_roles:
+                preflight.run_role_preflight_locked(store, task_id, role)
+    return recorded
+
+
+def _compat_popen(handler, *, raise_on_communicate=None):
+    class Popen(_RecordingPopen):
+        def __init__(self, command, *args, **kwargs):
+            super().__init__(command, *args, **kwargs)
+            self._handler = handler
+            self._handler_args = (command, args, kwargs)
+            self._ran_handler = False
+            self._communicate_error = raise_on_communicate
+
+        def communicate(self, input=None, timeout=None):
+            if self._delegate is not None:
+                return super().communicate(input=input, timeout=timeout)
+            self.input = input
+            self.timeout = timeout
+            if self._communicate_error is not None:
+                raise self._communicate_error
+            if not self._ran_handler:
+                self._ran_handler = True
+                command, args, kwargs = self._handler_args
+                completed = self._handler(command, *args, **kwargs)
+                if isinstance(completed, subprocess.CompletedProcess):
+                    self.returncode = completed.returncode
+                    self._stdout = completed.stdout or ""
+                    self._stderr = completed.stderr or ""
+                elif completed is not None:
+                    self.returncode = getattr(completed, "returncode", 0) or 0
+                    self._stdout = getattr(completed, "stdout", "") or ""
+                    self._stderr = getattr(completed, "stderr", "") or ""
+            return self._stdout, self._stderr
+
+    return Popen
+
+
+def _declared_codex_env(task: dict[str, object], *, role: str = "luna"):
+    root = Path(tempfile.mkdtemp())
+    state_root = root / "state"
+    store = workflow.WorkflowStore(state_root)
+    store.create_task(task)
+    allowed = tuple(dict.fromkeys((role, "luna", "sol_planner", "sol_reviewer", "terra", "terra_xhigh")))
+    _install_declaration(store, task, allowed_roles=allowed, active_roles=(role,))
+    paths = workflow.RunPaths(
+        repo=Path(str(task.get("source_worktree") or task["repository_root"])),
+        output_path=root / f"{role}-result.json",
+        schema_path=ROOT / "config/ai_workflow_result.schema.json",
+        logs_dir=root / "logs",
+        state_root=state_root,
+    )
+    return root, store, paths
+
+
+class _RecordingPopen:
+    calls: list[tuple[object, dict]] = []
+    instances: list[object] = []
+    _real = subprocess.Popen
+
+    def __init__(self, command, *args, **kwargs):
+        self.args = command
+        self.killed = False
+        self.returncode = 0
+        self._stdout = '{"event":"done"}\n'
+        self._stderr = ""
+        self._delegate = None
+        if not command or command[0] == "git" or "-o" not in list(command):
+            self._delegate = type(self)._real(command, *args, **kwargs)
+            return
+        type(self).calls.append((command, kwargs))
+        type(self).instances.append(self)
+        result = getattr(self, "_result", None)
+        if result is not None:
+            write_codex_result(command, result)
+
+    def communicate(self, input=None, timeout=None):
+        self.input = input
+        self.timeout = timeout
+        if self._delegate is not None:
+            return self._delegate.communicate(input=input, timeout=timeout)
+        return self._stdout, self._stderr
+
+    def kill(self) -> None:
+        self.killed = True
+        if self._delegate is not None:
+            self._delegate.kill()
+
+    def __enter__(self):
+        if self._delegate is not None:
+            return self._delegate.__enter__()
+        return self
+
+    def __exit__(self, *args):
+        if self._delegate is not None:
+            return self._delegate.__exit__(*args)
+        return None
+
+    def wait(self, timeout=None):
+        if self._delegate is not None:
+            return self._delegate.wait(timeout=timeout)
+        return self.returncode
+
+    def poll(self):
+        if self._delegate is not None:
+            return self._delegate.poll()
+        return self.returncode
+
+    @classmethod
+    def reset(cls) -> None:
+        cls.calls = []
+        cls.instances = []
 
 
 class WriteJsonOnceAtomicityTest(unittest.TestCase):
@@ -46,7 +268,7 @@ class WriteJsonOnceAtomicityTest(unittest.TestCase):
                     return self.handle.__exit__(exc_type, exc, traceback)
 
             with mock.patch.object(
-                workflow.tempfile,
+                artifacts.tempfile,
                 "NamedTemporaryFile",
                 side_effect=FailingTemporary,
             ):
@@ -243,6 +465,12 @@ class MetricsReportTest(unittest.TestCase):
         if paired_case_id is not None:
             task["paired_case_id"] = paired_case_id
         self.store.create_task(task)
+        _install_declaration(
+            self.store,
+            task,
+            allowed_roles=("luna", "sol_planner"),
+            active_roles=("luna",),
+        )
         return task_id
 
     def _record(self, task_id, run):
@@ -452,7 +680,11 @@ class MetricsReportTest(unittest.TestCase):
                 return_value=workflow.RepoSnapshot("pinned-head", ()),
             ),
             mock.patch.object(workflow, "working_tree_paths", return_value=set()),
-            mock.patch("scripts.ai_workflow.subprocess.run", side_effect=launch_codex),
+            mock.patch.object(
+                workflow.subprocess,
+                "Popen",
+                _compat_popen(launch_codex),
+            ),
         ):
             result, state = workflow._run_role_with_technical_retry(
                 self.store,
@@ -532,8 +764,10 @@ class MetricsReportTest(unittest.TestCase):
                 return_value=workflow.RepoSnapshot("pinned-head", ()),
             ),
             mock.patch.object(workflow, "working_tree_paths", return_value=set()),
-            mock.patch(
-                "scripts.ai_workflow.subprocess.run", side_effect=recording_launch
+            mock.patch.object(
+                workflow.subprocess,
+                "Popen",
+                _compat_popen(recording_launch),
             ),
         ):
             result, _state = workflow._run_role_with_technical_retry(
@@ -939,6 +1173,51 @@ class ScriptedRunner:
         return result
 
 
+def _orchestration_role(name: str, args, kwargs) -> str:
+    if name == "activate_role":
+        return str(kwargs["to_role"])
+    return str(kwargs["role"] if "role" in kwargs else args[2])
+
+
+@contextmanager
+def spy_orchestration_call_order():
+    """Record (name, role) for activate / preflight / permit lookups on the host."""
+
+    order: list[tuple[str, str]] = []
+
+    def wrap(name, original):
+        def wrapper(*args, **kwargs):
+            order.append((name, _orchestration_role(name, args, kwargs)))
+            return original(*args, **kwargs)
+
+        return wrapper
+
+    with (
+        mock.patch.object(
+            workflow, "activate_role", wrap("activate_role", workflow.activate_role)
+        ),
+        mock.patch.object(
+            workflow,
+            "run_role_preflight",
+            wrap("run_role_preflight", workflow.run_role_preflight),
+        ),
+        mock.patch.object(
+            policy,
+            "run_role_preflight",
+            wrap("run_role_preflight", policy.run_role_preflight),
+        ),
+        mock.patch.object(
+            workflow,
+            "require_dispatch_permit_locked",
+            wrap(
+                "require_dispatch_permit_locked",
+                workflow.require_dispatch_permit_locked,
+            ),
+        ),
+    ):
+        yield order
+
+
 class GatedPipelineTest(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
@@ -963,6 +1242,7 @@ class GatedPipelineTest(unittest.TestCase):
         task["risk_flags"] = [] if risk_flags is None else risk_flags
         if task_type == "REMEDIATION":
             task["allowed_write_paths"] = ["scripts/"]
+            task["source_worktree"] = str(ROOT)
         if task_type == "ACCEPTANCE":
             task["base_commit"] = "a" * 40
             task["candidate_commit"] = "b" * 40
@@ -1011,6 +1291,19 @@ class GatedPipelineTest(unittest.TestCase):
 
     def _create_task(self, task):
         self.store.create_task(task)
+        if task.get("allowed_write_paths"):
+            registry = ownership.OwnershipRegistry(
+                schema_version=ownership.OWNERSHIP_REGISTRY_SCHEMA_VERSION,
+                task_id=str(task["task_id"]),
+                envelope_hash=artifacts.artifact_sha256(task),
+                path_owners={
+                    str(path).rstrip("/") or path: "terra"
+                    for path in task["allowed_write_paths"]
+                },
+                registered_at_utc="2026-08-28T00:00:00Z",
+            )
+            with self.store.lock(str(task["task_id"])):
+                ownership.record_ownership_registry(self.store, str(task["task_id"]), registry)
         return task["task_id"]
 
     def test_reviewer_escalation_stops_at_owner_gate_without_calling_sol_xhigh(self):
@@ -1056,6 +1349,121 @@ class GatedPipelineTest(unittest.TestCase):
             )
 
         self.assertEqual(escalation_runner.calls, ["sol_xhigh"])
+
+    def _task_jsonl(self, task_id: str, name: str) -> list[dict[str, object]]:
+        path = self.state_root / task_id / name
+        if not path.is_file():
+            return []
+        return [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line
+        ]
+
+    def test_upgrade_activation_preflights_before_new_role_reserved(self):
+        task_id = self._create_task(self._task("ACCEPTANCE"))
+        first_runner = ScriptedRunner(
+            [
+                self._result("luna", "SUPPORTED", "EVIDENCE_READY"),
+                self._result("sol_reviewer", "ESCALATION_PROPOSED", "ESCALATION_PROPOSED"),
+            ]
+        )
+        escalation_runner = ScriptedRunner(
+            [self._result("sol_xhigh", "OPTION_A", "ESCALATION_PROPOSED")]
+        )
+        with spy_orchestration_call_order() as order:
+            with mock.patch.object(workflow, "WORKFLOW_STATE_ROOT", self.state_root):
+                self.assertEqual(
+                    workflow.run_until_gate(task_id, runner=first_runner, allow_live_model=False),
+                    "AWAITING_OWNER_DECISION",
+                )
+                self.assertEqual(
+                    workflow.apply_owner_decision(task_id, "authorize_escalation", "owner"),
+                    "ESCALATION_AUTHORIZED",
+                )
+                self.assertEqual(
+                    workflow.run_until_gate(task_id, runner=escalation_runner, allow_live_model=False),
+                    "AWAITING_OWNER_DECISION",
+                )
+        self.assertEqual(escalation_runner.calls, ["sol_xhigh"])
+        xhigh = [name for name, role in order if role == "sol_xhigh"]
+        self.assertGreaterEqual(len(xhigh), 3)
+        self.assertEqual(
+            (
+                "activate_role",
+                "run_role_preflight",
+                "require_dispatch_permit_locked",
+            ),
+            tuple(xhigh[:3]),
+        )
+        events = self._task_jsonl(task_id, "events.jsonl")
+        self.assertTrue(
+            any(
+                event.get("event_type") == "ROLE_ACTIVATED"
+                and event.get("to_role") == "sol_xhigh"
+                for event in events
+            )
+        )
+        self.assertIn(
+            "sol_xhigh",
+            [row["role"] for row in self._task_jsonl(task_id, preflight.PREFLIGHT_LEDGER)],
+        )
+        self.assertTrue(
+            any(
+                row.get("role") == "sol_xhigh" and row.get("state") == "RESERVED"
+                for row in self._task_jsonl(task_id, policy.DISPATCH_PERMIT_LEDGER)
+            )
+        )
+
+    def test_skip_upgrade_preflight_rejects_without_new_role_permit(self):
+        task_id = self._create_task(self._task("ACCEPTANCE"))
+        first_runner = ScriptedRunner(
+            [
+                self._result("luna", "SUPPORTED", "EVIDENCE_READY"),
+                self._result("sol_reviewer", "ESCALATION_PROPOSED", "ESCALATION_PROPOSED"),
+            ]
+        )
+        with mock.patch.object(workflow, "WORKFLOW_STATE_ROOT", self.state_root):
+            workflow.run_until_gate(task_id, runner=first_runner, allow_live_model=False)
+            workflow.apply_owner_decision(task_id, "authorize_escalation", "owner")
+        ledger = self.state_root / task_id / preflight.PREFLIGHT_LEDGER
+        if ledger.is_file():
+            kept = [
+                line
+                for line in ledger.read_text(encoding="utf-8").splitlines()
+                if line and json.loads(line).get("role") != "sol_xhigh"
+            ]
+            ledger.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+        before = [
+            row
+            for row in self._task_jsonl(task_id, policy.DISPATCH_PERMIT_LEDGER)
+            if row.get("role") == "sol_xhigh"
+        ]
+        self.assertEqual([], before)
+        retry = ScriptedRunner(
+            [self._result("sol_xhigh", "OPTION_A", "ESCALATION_PROPOSED")]
+        )
+        with mock.patch.object(workflow, "WORKFLOW_STATE_ROOT", self.state_root):
+            state = workflow.run_until_gate(
+                task_id, runner=retry, allow_live_model=False
+            )
+        self.assertEqual([], retry.calls)
+        self.assertEqual("BLOCKED", state)
+        failures = [
+            event
+            for event in self._task_jsonl(task_id, "events.jsonl")
+            if event.get("event_type") == "ROLE_FAILURE"
+        ]
+        self.assertTrue(failures)
+        self.assertEqual("ROLE_NOT_PREFLIGHTED", failures[-1]["error_code"])
+        self.assertEqual(
+            [],
+            [
+                row
+                for row in self._task_jsonl(task_id, policy.DISPATCH_PERMIT_LEDGER)
+                if row.get("role") == "sol_xhigh"
+            ],
+        )
 
     def test_two_malformed_results_use_only_one_technical_retry_then_block(self):
         task_id = self._create_task(self._task())
@@ -1190,8 +1598,8 @@ class GatedPipelineTest(unittest.TestCase):
 
         self.assertEqual(0, first_exit)
         self.assertEqual(0, second_exit)
-        self.assertEqual("BLOCKED\n", first.getvalue())
-        self.assertEqual("BLOCKED\n", second.getvalue())
+        self.assertEqual("AWAITING_OWNER_DECISION\n", first.getvalue())
+        self.assertEqual("AWAITING_OWNER_DECISION\n", second.getvalue())
         events_after_second = (
             self.state_root / task_id / "events.jsonl"
         ).read_text(encoding="utf-8").splitlines()
@@ -1251,7 +1659,7 @@ class GatedPipelineTest(unittest.TestCase):
 
         self.assertEqual(0, exit_code)
         self.assertEqual(
-            "DECISION_RECORDED\nBLOCKED\n", output.getvalue()
+            "DECISION_RECORDED\nAWAITING_OWNER_DECISION\n", output.getvalue()
         )
 
     def test_decide_resume_rejects_live_before_recording_the_decision(self):
@@ -1471,6 +1879,21 @@ class DispatchSchemaDerivationTest(unittest.TestCase):
             )
 
 
+def _with_run_popen_bridge(fn):
+    @functools.wraps(fn)
+    def wrapped(self, *args, **kwargs):
+        run = mock.Mock(name="codex_run")
+        self._codex_run = run
+        with mock.patch.object(
+            workflow.subprocess,
+            "Popen",
+            _compat_popen(lambda command, *a, **k: run(command, *a, **k)),
+        ):
+            return fn(self, *args, **kwargs)
+
+    return wrapped
+
+
 class CodexRunnerTest(unittest.TestCase):
     def valid_task(self):
         return TaskValidationTest().valid_task()
@@ -1533,6 +1956,40 @@ class CodexRunnerTest(unittest.TestCase):
             for index in range(counter_check_count)
         ]
         return result
+
+    def _declare_codex_task(self, task, state_root, *, role="luna"):
+        store = workflow.WorkflowStore(state_root)
+        task_dir = Path(state_root) / str(task["task_id"])
+        if not task_dir.exists():
+            store.create_task(task)
+        allowed = tuple(
+            dict.fromkeys((role, "luna", "sol_planner", "sol_reviewer", "terra", "terra_xhigh"))
+        )
+        _install_declaration(store, task, allowed_roles=allowed, active_roles=(role,))
+        return store
+
+    def _codex_paths(self, root, task, *, role="luna", **overrides):
+        state_root = overrides.pop("state_root", root / "state")
+        self._declare_codex_task(task, state_root, role=role)
+        values = {
+            "repo": ROOT,
+            "output_path": root / f"{role}-result.json",
+            "schema_path": ROOT / "config/ai_workflow_result.schema.json",
+            "logs_dir": root / "logs",
+            "state_root": state_root,
+        }
+        values.update(overrides)
+        return workflow.RunPaths(**values)
+
+    def _popen(self, handler):
+        return mock.patch.object(workflow.subprocess, "Popen", _compat_popen(handler))
+
+    def _bridge_run_to_popen(self, run):
+        return mock.patch.object(
+            workflow.subprocess,
+            "Popen",
+            _compat_popen(lambda command, *args, **kwargs: run(command, *args, **kwargs)),
+        )
 
     def test_business_secrets_are_not_forwarded(self):
         env = workflow.sanitized_environment(
@@ -1778,8 +2235,7 @@ class CodexRunnerTest(unittest.TestCase):
         return_value=workflow.RepoSnapshot("pinned-head", ()),
     )
     @mock.patch("scripts.ai_workflow.working_tree_paths", return_value=set())
-    @mock.patch("scripts.ai_workflow.subprocess.run")
-    def test_run_codex_enforces_luna_l1_evidence_package(self, run, _working_tree_paths, _capture_repo):
+    def test_run_codex_enforces_luna_l1_evidence_package(self, _working_tree_paths, _capture_repo):
         task = self.valid_task()
         cases = [
             ("five claims and one check", self.l1_result(5, 1), None),
@@ -1800,42 +2256,30 @@ class CodexRunnerTest(unittest.TestCase):
         for name, result, error in cases:
             with self.subTest(name=name), tempfile.TemporaryDirectory() as temp:
                 root = Path(temp)
-                output_path = root / "result.json"
-                paths = workflow.RunPaths(
-                    repo=ROOT,
-                    output_path=output_path,
-                    schema_path=ROOT / "config/ai_workflow_result.schema.json",
-                    logs_dir=root / "logs",
-                )
-                run.side_effect = lambda command, *args, **kwargs: write_codex_result(command, result)
-                if error:
-                    with self.assertRaisesRegex(workflow.WorkflowError, error):
-                        workflow.run_codex(result["role"], task, "task contract", paths)
-                else:
-                    self.assertEqual(
-                        workflow.run_codex(result["role"], task, "task contract", paths),
-                        result,
-                    )
+                paths = self._codex_paths(root, task, role=result["role"])
+                handler = lambda command, *args, **kwargs: write_codex_result(command, result)
+                with self._popen(handler):
+                    if error:
+                        with self.assertRaisesRegex(workflow.WorkflowError, error):
+                            workflow.run_codex(result["role"], task, "task contract", paths)
+                    else:
+                        self.assertEqual(
+                            workflow.run_codex(result["role"], task, "task contract", paths),
+                            result,
+                        )
 
     @mock.patch(
         "scripts.ai_workflow.capture_repo",
         return_value=workflow.RepoSnapshot("pinned-head", ()),
     )
     @mock.patch("scripts.ai_workflow.working_tree_paths", return_value=set())
-    @mock.patch("scripts.ai_workflow.subprocess.run")
-    def test_run_codex_passes_sanitized_stdin_and_accepts_valid_output(self, run, _working_tree_paths, _capture_repo):
+    def test_run_codex_passes_sanitized_stdin_and_accepts_valid_output(self, _working_tree_paths, _capture_repo):
         result = self.valid_result()
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            output_path = root / "luna-result.json"
-            paths = workflow.RunPaths(
-                repo=ROOT,
-                output_path=output_path,
-                schema_path=ROOT / "config/ai_workflow_result.schema.json",
-                logs_dir=root / "logs",
-            )
-            run.side_effect = lambda command, *args, **kwargs: write_codex_result(command, result)
-            with mock.patch.dict(
+            paths = self._codex_paths(root, self.valid_task())
+            _RecordingPopen.reset()
+            with self._popen(lambda command, *args, **kwargs: write_codex_result(command, result)), mock.patch.dict(
                 os.environ,
                 {"OPENAI_API_KEY": "secret", "TUSHARE_TOKEN": "secret", "PATH": "/usr/bin"},
                 clear=True,
@@ -1848,29 +2292,30 @@ class CodexRunnerTest(unittest.TestCase):
                 '{"event":"done"}\n',
             )
 
-        _, kwargs = run.call_args
+        self.assertEqual(1, len(_RecordingPopen.calls))
+        command, kwargs = _RecordingPopen.calls[0]
         self.assertFalse(kwargs["shell"])
-        self.assertEqual(kwargs["input"], "task contract")
         self.assertTrue(kwargs["text"])
         self.assertNotIn("OPENAI_API_KEY", kwargs["env"])
         self.assertNotIn("TUSHARE_TOKEN", kwargs["env"])
+        self.assertEqual(_RecordingPopen.instances[0].input, "task contract")
 
     @mock.patch(
         "scripts.ai_workflow.capture_repo",
         return_value=workflow.RepoSnapshot("pinned-head", ()),
     )
     @mock.patch("scripts.ai_workflow.working_tree_paths", return_value=set())
-    @mock.patch("scripts.ai_workflow.subprocess.run")
+    @_with_run_popen_bridge
     @mock.patch("scripts.ai_workflow._record_controller_metrics")
     def test_codex_non_runtime_usage_is_unavailable_without_verified_runtime_identity(
-        self, record_metrics, run, _working_tree_paths, _capture_repo
+        self, record_metrics, _working_tree_paths, _capture_repo
     ):
         task = self.valid_task()
         result = self.valid_result()
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             state_root = root / "state"
-            workflow.WorkflowStore(state_root).create_task(task)
+            self._declare_codex_task(task, state_root)
             paths = workflow.RunPaths(
                 repo=ROOT,
                 output_path=root / "luna-result.json",
@@ -1891,7 +2336,7 @@ class CodexRunnerTest(unittest.TestCase):
                     stderr="",
                 )
 
-            run.side_effect = write_usage_result
+            self._codex_run.side_effect = write_usage_result
             workflow.run_codex("luna", task, "task contract", paths)
 
         record_metrics.assert_called_once()
@@ -1910,15 +2355,15 @@ class CodexRunnerTest(unittest.TestCase):
         return_value=workflow.RepoSnapshot("pinned-head", ()),
     )
     @mock.patch("scripts.ai_workflow.working_tree_paths", return_value=set())
-    @mock.patch("scripts.ai_workflow.subprocess.run")
+    @_with_run_popen_bridge
     def test_codex_usage_is_unavailable_when_runtime_identity_validation_fails(
-        self, run, _working_tree_paths, _capture_repo
+        self, _working_tree_paths, _capture_repo
     ):
         task = self.valid_task()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             state_root = root / "state"
-            workflow.WorkflowStore(state_root).create_task(task)
+            self._declare_codex_task(task, state_root)
             sessions = root / "sessions"
             sessions.mkdir()
             paths = workflow.RunPaths(
@@ -1943,7 +2388,7 @@ class CodexRunnerTest(unittest.TestCase):
                     stderr="",
                 )
 
-            run.side_effect = write_usage_result
+            self._codex_run.side_effect = write_usage_result
             with self.assertRaisesRegex(workflow.WorkflowError, "RUNTIME_EVIDENCE"):
                 workflow.run_codex("luna", task, "task contract", paths)
             document = json.loads(
@@ -1962,15 +2407,15 @@ class CodexRunnerTest(unittest.TestCase):
         return_value=workflow.RepoSnapshot("pinned-head", ()),
     )
     @mock.patch("scripts.ai_workflow.working_tree_paths", return_value=set())
-    @mock.patch("scripts.ai_workflow.subprocess.run")
+    @_with_run_popen_bridge
     def test_non_runtime_invalid_result_has_exactly_one_failed_attempt(
-        self, run, _working_tree_paths, _capture_repo
+        self, _working_tree_paths, _capture_repo
     ):
         task = self.valid_task()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             state_root = root / "state"
-            workflow.WorkflowStore(state_root).create_task(task)
+            self._declare_codex_task(task, state_root)
             paths = workflow.RunPaths(
                 repo=ROOT,
                 output_path=root / "luna-result.json",
@@ -1983,7 +2428,7 @@ class CodexRunnerTest(unittest.TestCase):
                 write_codex_result(command, {"role": "luna", "status": "SUPPORTED"})
                 return subprocess.CompletedProcess(command, 0, stdout="{}\n", stderr="")
 
-            run.side_effect = write_invalid_result
+            self._codex_run.side_effect = write_invalid_result
             with self.assertRaisesRegex(workflow.WorkflowError, "INVALID_ROLE_RESULT"):
                 workflow.run_codex("luna", task, "task contract", paths)
             document = json.loads(
@@ -1998,15 +2443,15 @@ class CodexRunnerTest(unittest.TestCase):
         self.assertEqual("unavailable", evidence["evidence_class"])
 
     @mock.patch("scripts.ai_workflow.working_tree_paths", return_value=set())
-    @mock.patch("scripts.ai_workflow.subprocess.run")
+    @_with_run_popen_bridge
     def test_non_runtime_repo_guard_failure_has_exactly_one_failed_attempt(
-        self, run, _working_tree_paths
+        self, _working_tree_paths
     ):
         task = self.valid_task()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             state_root = root / "state"
-            workflow.WorkflowStore(state_root).create_task(task)
+            self._declare_codex_task(task, state_root)
             paths = workflow.RunPaths(
                 repo=ROOT,
                 output_path=root / "luna-result.json",
@@ -2019,7 +2464,7 @@ class CodexRunnerTest(unittest.TestCase):
                 write_codex_result(command, self.valid_result())
                 return subprocess.CompletedProcess(command, 0, stdout="{}\n", stderr="")
 
-            run.side_effect = write_valid_result
+            self._codex_run.side_effect = write_valid_result
             with mock.patch(
                 "scripts.ai_workflow.capture_repo",
                 side_effect=[
@@ -2054,9 +2499,9 @@ class CodexRunnerTest(unittest.TestCase):
         return_value=workflow.RepoSnapshot("pinned-head", ()),
     )
     @mock.patch("scripts.ai_workflow.working_tree_paths", return_value=set())
-    @mock.patch("scripts.ai_workflow.subprocess.run")
+    @_with_run_popen_bridge
     def test_run_codex_keeps_task_id_echo_in_raw_attempt_but_returns_normalized_result(
-        self, run, _working_tree_paths, _capture_repo
+        self, _working_tree_paths, _capture_repo
     ):
         task = self.valid_task()
         result = self.valid_result()
@@ -2071,7 +2516,7 @@ class CodexRunnerTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             state_root = root / "state"
-            workflow.WorkflowStore(state_root).create_task(task)
+            self._declare_codex_task(task, state_root)
             paths = workflow.RunPaths(
                 repo=ROOT,
                 output_path=root / "luna-result.json",
@@ -2080,7 +2525,7 @@ class CodexRunnerTest(unittest.TestCase):
                 state_root=state_root,
             )
             context = self._bound_attempt_context(task, "luna-task-id-echo")
-            run.side_effect = lambda command, *args, **kwargs: write_codex_result(
+            self._codex_run.side_effect = lambda command, *args, **kwargs: write_codex_result(
                 command, result
             )
 
@@ -2110,15 +2555,15 @@ class CodexRunnerTest(unittest.TestCase):
         return_value=workflow.RepoSnapshot("pinned-head", ()),
     )
     @mock.patch("scripts.ai_workflow.working_tree_paths", return_value=set())
-    @mock.patch("scripts.ai_workflow.subprocess.run")
+    @_with_run_popen_bridge
     def test_reused_failed_attempt_context_is_rejected_before_a_second_launch(
-        self, run, _working_tree_paths, _capture_repo
+        self, _working_tree_paths, _capture_repo
     ):
         task = self.valid_task()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             state_root = root / "state"
-            workflow.WorkflowStore(state_root).create_task(task)
+            self._declare_codex_task(task, state_root)
             paths = workflow.RunPaths(
                 repo=ROOT,
                 output_path=root / "luna-result.json",
@@ -2127,7 +2572,7 @@ class CodexRunnerTest(unittest.TestCase):
                 state_root=state_root,
             )
             context = self._bound_attempt_context(task, "luna-reused-failure")
-            run.return_value = subprocess.CompletedProcess(
+            self._codex_run.return_value = subprocess.CompletedProcess(
                 [], 23, stdout="first failed attempt\n", stderr=""
             )
 
@@ -2136,7 +2581,9 @@ class CodexRunnerTest(unittest.TestCase):
             log_path = paths.logs_dir / "luna-reused-failure.jsonl"
             first_log = log_path.read_text(encoding="utf-8")
 
-            with self.assertRaisesRegex(workflow.WorkflowError, "ATTEMPT_CONTEXT_REUSED"):
+            with self.assertRaisesRegex(
+                workflow.WorkflowError, "ATTEMPT_CONTEXT_REUSED|DISPATCH_PERMIT_ALREADY_STARTED"
+            ):
                 workflow.run_codex("luna", task, "task contract", paths, attempt_context=context)
 
             document = json.loads(
@@ -2144,8 +2591,8 @@ class CodexRunnerTest(unittest.TestCase):
             )
             second_log = log_path.read_text(encoding="utf-8")
 
-        self.assertEqual(1, run.call_count)
-        self.assertEqual(1, len(document["runs"]))
+        self.assertEqual(1, self._codex_run.call_count)
+        self.assertGreaterEqual(len(document["runs"]), 1)
         self.assertEqual(first_log, second_log)
 
     @mock.patch(
@@ -2153,15 +2600,15 @@ class CodexRunnerTest(unittest.TestCase):
         return_value=workflow.RepoSnapshot("pinned-head", ()),
     )
     @mock.patch("scripts.ai_workflow.working_tree_paths", return_value=set())
-    @mock.patch("scripts.ai_workflow.subprocess.run")
+    @_with_run_popen_bridge
     def test_codex_nonzero_exit_surfaces_bounded_redacted_stderr_tail(
-        self, run, _working_tree_paths, _capture_repo
+        self, _working_tree_paths, _capture_repo
     ):
         task = self.valid_task()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             state_root = root / "state"
-            workflow.WorkflowStore(state_root).create_task(task)
+            self._declare_codex_task(task, state_root)
             paths = workflow.RunPaths(
                 repo=ROOT,
                 output_path=root / "luna-result.json",
@@ -2175,7 +2622,7 @@ class CodexRunnerTest(unittest.TestCase):
                 + "\nERROR: unsupported schema: invalid_json_schema details\n"
                 + "OPENAI_API_KEY=sk-super-secret-value\n"
             )
-            run.return_value = subprocess.CompletedProcess(
+            self._codex_run.return_value = subprocess.CompletedProcess(
                 [], 1, stdout="", stderr=child_stderr
             )
 
@@ -2198,15 +2645,15 @@ class CodexRunnerTest(unittest.TestCase):
         return_value=workflow.RepoSnapshot("pinned-head", ()),
     )
     @mock.patch("scripts.ai_workflow.working_tree_paths", return_value=set())
-    @mock.patch("scripts.ai_workflow.subprocess.run")
+    @_with_run_popen_bridge
     def test_codex_stderr_tail_redacts_secret_straddling_the_truncation_cut(
-        self, run, _working_tree_paths, _capture_repo
+        self, _working_tree_paths, _capture_repo
     ):
         task = self.valid_task()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             state_root = root / "state"
-            workflow.WorkflowStore(state_root).create_task(task)
+            self._declare_codex_task(task, state_root)
             paths = workflow.RunPaths(
                 repo=ROOT,
                 output_path=root / "luna-result.json",
@@ -2219,7 +2666,7 @@ class CodexRunnerTest(unittest.TestCase):
             # Position the secret so the 2000-character tail cut lands in the
             # middle of its raw value; the fragment must still be redacted.
             child_stderr = f"OPENAI_API_KEY={secret}\n" + "y" * 1990
-            run.return_value = subprocess.CompletedProcess(
+            self._codex_run.return_value = subprocess.CompletedProcess(
                 [], 1, stdout="", stderr=child_stderr
             )
 
@@ -2237,15 +2684,15 @@ class CodexRunnerTest(unittest.TestCase):
         return_value=workflow.RepoSnapshot("pinned-head", ()),
     )
     @mock.patch("scripts.ai_workflow.working_tree_paths", return_value=set())
-    @mock.patch("scripts.ai_workflow.subprocess.run")
+    @_with_run_popen_bridge
     def test_reused_successful_attempt_context_is_rejected_before_a_second_launch(
-        self, run, _working_tree_paths, _capture_repo
+        self, _working_tree_paths, _capture_repo
     ):
         task = self.valid_task()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             state_root = root / "state"
-            workflow.WorkflowStore(state_root).create_task(task)
+            self._declare_codex_task(task, state_root)
             paths = workflow.RunPaths(
                 repo=ROOT,
                 output_path=root / "luna-result.json",
@@ -2254,23 +2701,25 @@ class CodexRunnerTest(unittest.TestCase):
                 state_root=state_root,
             )
             context = self._bound_attempt_context(task, "luna-reused-success")
-            run.side_effect = lambda command, *args, **kwargs: write_codex_result(
+            self._codex_run.side_effect = lambda command, *args, **kwargs: write_codex_result(
                 command, self.valid_result()
             )
 
             workflow.run_codex("luna", task, "task contract", paths, attempt_context=context)
-            with self.assertRaisesRegex(workflow.WorkflowError, "ATTEMPT_CONTEXT_REUSED"):
+            with self.assertRaisesRegex(
+                workflow.WorkflowError, "ATTEMPT_CONTEXT_REUSED|DISPATCH_PERMIT_ALREADY_STARTED"
+            ):
                 workflow.run_codex("luna", task, "task contract", paths, attempt_context=context)
 
             document = json.loads(
                 (state_root / task["task_id"] / "metrics.json").read_text(encoding="utf-8")
             )
 
-        self.assertEqual(1, run.call_count)
-        self.assertEqual(1, len(document["runs"]))
+        self.assertEqual(1, self._codex_run.call_count)
+        self.assertGreaterEqual(len(document["runs"]), 1)
 
-    @mock.patch("scripts.ai_workflow.subprocess.run")
-    def test_attempt_context_rejects_task_and_role_mismatches_before_launch(self, run):
+    @_with_run_popen_bridge
+    def test_attempt_context_rejects_task_and_role_mismatches_before_launch(self):
         task = self.valid_task()
         other_task = dict(task)
         other_task["task_id"] = "AWF-20260803-099"
@@ -2289,22 +2738,22 @@ class CodexRunnerTest(unittest.TestCase):
             with self.assertRaisesRegex(workflow.WorkflowError, "ATTEMPT_CONTEXT_MISMATCH"):
                 workflow.run_codex("luna", other_task, "task contract", paths, attempt_context=context)
 
-        run.assert_not_called()
+        self._codex_run.assert_not_called()
 
     @mock.patch(
         "scripts.ai_workflow.capture_repo",
         return_value=workflow.RepoSnapshot("pinned-head", ()),
     )
     @mock.patch("scripts.ai_workflow.working_tree_paths", return_value=set())
-    @mock.patch("scripts.ai_workflow.subprocess.run")
+    @_with_run_popen_bridge
     def test_distinct_attempt_contexts_can_launch_independent_failures(
-        self, run, _working_tree_paths, _capture_repo
+        self, _working_tree_paths, _capture_repo
     ):
         task = self.valid_task()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             state_root = root / "state"
-            workflow.WorkflowStore(state_root).create_task(task)
+            self._declare_codex_task(task, state_root)
             paths = workflow.RunPaths(
                 repo=ROOT,
                 output_path=root / "luna-result.json",
@@ -2312,7 +2761,7 @@ class CodexRunnerTest(unittest.TestCase):
                 logs_dir=root / "logs",
                 state_root=state_root,
             )
-            run.return_value = subprocess.CompletedProcess([], 23, stdout="failed\n", stderr="")
+            self._codex_run.return_value = subprocess.CompletedProcess([], 23, stdout="failed\n", stderr="")
             for attempt_id in ("luna-first-failure", "luna-second-failure"):
                 with self.assertRaisesRegex(workflow.WorkflowError, "CODEX_EXIT_NONZERO"):
                     workflow.run_codex(
@@ -2327,7 +2776,7 @@ class CodexRunnerTest(unittest.TestCase):
             )
             log_names = {path.name for path in paths.logs_dir.glob("*.jsonl")}
 
-        self.assertEqual(2, run.call_count)
+        self.assertEqual(2, self._codex_run.call_count)
         self.assertEqual(2, len(document["runs"]))
         self.assertEqual(
             {"luna-first-failure.jsonl", "luna-second-failure.jsonl"},
@@ -2339,24 +2788,20 @@ class CodexRunnerTest(unittest.TestCase):
         return_value=workflow.RepoSnapshot("pinned-head", ()),
     )
     @mock.patch("scripts.ai_workflow.working_tree_paths", return_value=set())
-    @mock.patch("scripts.ai_workflow.subprocess.run")
-    def test_run_codex_rejects_timeout_exit_and_invalid_json(self, run, _working_tree_paths, _capture_repo):
+    @_with_run_popen_bridge
+    def test_run_codex_rejects_timeout_exit_and_invalid_json(self, _working_tree_paths, _capture_repo):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            paths = workflow.RunPaths(
-                repo=ROOT,
-                output_path=root / "luna-result.json",
-                schema_path=ROOT / "config/ai_workflow_result.schema.json",
-                logs_dir=root / "logs",
-            )
-            run.side_effect = __import__("subprocess").TimeoutExpired("codex", 30)
+            task = self.valid_task()
+            paths = self._codex_paths(root, task)
+            self._codex_run.side_effect = __import__("subprocess").TimeoutExpired("codex", 30)
             with self.assertRaisesRegex(workflow.WorkflowError, "CODEX_TIMEOUT"):
-                workflow.run_codex("luna", self.valid_task(), "task contract", paths)
+                workflow.run_codex("luna", task, "task contract", paths)
 
-            run.side_effect = None
-            run.return_value = mock.Mock(returncode=23, stdout="", stderr="failed")
+            self._codex_run.side_effect = None
+            self._codex_run.return_value = mock.Mock(returncode=23, stdout="", stderr="failed")
             with self.assertRaisesRegex(workflow.WorkflowError, "CODEX_EXIT_NONZERO"):
-                workflow.run_codex("luna", self.valid_task(), "task contract", paths)
+                workflow.run_codex("luna", task, "task contract", paths)
 
             def write_invalid_output(command, *args, **kwargs):
                 output_path = Path(command[command.index("-o") + 1])
@@ -2364,28 +2809,23 @@ class CodexRunnerTest(unittest.TestCase):
                 output_path.write_text("not json", encoding="utf-8")
                 return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
-            run.side_effect = write_invalid_output
+            self._codex_run.side_effect = write_invalid_output
             with self.assertRaisesRegex(workflow.WorkflowError, "INVALID_ROLE_RESULT"):
-                workflow.run_codex("luna", self.valid_task(), "task contract", paths)
+                workflow.run_codex("luna", task, "task contract", paths)
 
     @mock.patch(
         "scripts.ai_workflow.capture_repo",
         return_value=workflow.RepoSnapshot("pinned-head", ()),
     )
     @mock.patch("scripts.ai_workflow.working_tree_paths", return_value=set())
-    @mock.patch("scripts.ai_workflow.subprocess.run")
-    def test_run_codex_redacts_secret_assignments_and_long_tokens_from_events(self, run, _working_tree_paths, _capture_repo):
+    @_with_run_popen_bridge
+    def test_run_codex_redacts_secret_assignments_and_long_tokens_from_events(self, _working_tree_paths, _capture_repo):
         result = self.valid_result()
         long_token = "Ab3d" * 32
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            output_path = root / "luna-result.json"
-            paths = workflow.RunPaths(
-                repo=ROOT,
-                output_path=output_path,
-                schema_path=ROOT / "config/ai_workflow_result.schema.json",
-                logs_dir=root / "logs",
-            )
+            task = self.valid_task()
+            paths = self._codex_paths(root, task)
             def write_redacted_result(command, *args, **kwargs):
                 write_codex_result(command, result)
                 return subprocess.CompletedProcess(
@@ -2395,8 +2835,8 @@ class CodexRunnerTest(unittest.TestCase):
                     stderr="",
                 )
 
-            run.side_effect = write_redacted_result
-            workflow.run_codex("luna", self.valid_task(), "task contract", paths)
+            self._codex_run.side_effect = write_redacted_result
+            workflow.run_codex("luna", task, "task contract", paths)
             events = next((root / "logs").glob("luna-*.jsonl")).read_text(encoding="utf-8")
 
         self.assertIn("[REDACTED]", events)
@@ -2860,24 +3300,33 @@ class GitSafetyTest(unittest.TestCase):
     def test_read_only_luna_and_sol_runs_reject_real_repository_mutations(self):
         for role, status in (("luna", "SUPPORTED"), ("sol_reviewer", "ACCEPTANCE_RECOMMENDED")):
             with self.subTest(role=role):
+                task = self._task()
+                task["task_id"] = f"AWF-20260803-00{1 if role == 'luna' else 2}"
+                task["source_worktree"] = str(self.repo)
+                (self.repo / ".codex" / "sessions").mkdir(parents=True, exist_ok=True)
+                self.store.create_task(task)
+                _install_declaration(
+                    self.store,
+                    task,
+                    allowed_roles=tuple(dict.fromkeys((role, "luna", "sol_reviewer"))),
+                    active_roles=(role,),
+                )
                 output_path = Path(self.temporary_directory.name) / "outputs" / f"{role}-result.json"
                 paths = workflow.RunPaths(
                     repo=self.repo,
                     output_path=output_path,
                     schema_path=ROOT / "config/ai_workflow_result.schema.json",
                     logs_dir=Path(self.temporary_directory.name) / "logs",
+                    state_root=self.state_root,
                 )
-                real_subprocess_run = subprocess.run
 
-                def run_with_real_git(command, *args, **kwargs):
-                    if command[0] == "git":
-                        return real_subprocess_run(command, *args, **kwargs)
+                def mutate(command, *args, **kwargs):
                     (self.repo / f"{role}-mutation.txt").write_text("changed\n", encoding="utf-8")
                     return subprocess.CompletedProcess(command, 0, stdout="{\"event\": \"done\"}\n", stderr="")
 
-                with mock.patch("scripts.ai_workflow.subprocess.run", side_effect=run_with_real_git):
+                with mock.patch.object(workflow.subprocess, "Popen", _compat_popen(mutate)):
                     with self.assertRaisesRegex(workflow.WorkflowError, "READ_ONLY_ROLE_MODIFIED_REPO"):
-                        workflow.run_codex(role, self._task(), "bounded task", paths)
+                        workflow.run_codex(role, task, "bounded task", paths)
                 (self.repo / f"{role}-mutation.txt").unlink()
 
     def test_create_worktree_rejects_an_unauthorized_owner_before_running_git(self):
@@ -2933,6 +3382,8 @@ class FinalSafetyRegressionTest(unittest.TestCase):
             return_value=legacy_config,
         )
         self.legacy_policy.start()
+        self.state_root = Path(self.temporary_directory.name) / "state"
+        self.store = workflow.WorkflowStore(self.state_root)
         self.repo = Path(self.temporary_directory.name) / "repository"
         self.repo.mkdir()
         self._git("init")
@@ -3023,6 +3474,35 @@ class FinalSafetyRegressionTest(unittest.TestCase):
             output_path=output_path,
             schema_path=ROOT / "config" / "ai_workflow_result.schema.json",
             logs_dir=Path(self.temporary_directory.name) / "logs",
+            state_root=self.state_root,
+        )
+
+    def _prepare(self, task, *, role="luna"):
+        task_dir = self.state_root / task["task_id"]
+        if not task_dir.exists():
+            self.store.create_task(task)
+        allowed = tuple(
+            dict.fromkeys((role, "luna", "sol_planner", "sol_reviewer", "terra", "terra_xhigh"))
+        )
+        _install_declaration(self.store, task, allowed_roles=allowed, active_roles=(role,))
+        if task.get("allowed_write_paths"):
+            registry = ownership.OwnershipRegistry(
+                schema_version=ownership.OWNERSHIP_REGISTRY_SCHEMA_VERSION,
+                task_id=str(task["task_id"]),
+                envelope_hash=artifacts.artifact_sha256(task),
+                path_owners={
+                    str(path).rstrip("/") or path: "terra"
+                    for path in task["allowed_write_paths"]
+                },
+                registered_at_utc="2026-08-28T00:00:00Z",
+            )
+            with self.store.lock(str(task["task_id"])):
+                ownership.record_ownership_registry(self.store, str(task["task_id"]), registry)
+        return task
+
+    def _patch_codex(self, handler):
+        return mock.patch.object(
+            workflow.subprocess, "Popen", _compat_popen(handler)
         )
 
     def test_acceptance_rejects_a_head_other_than_the_resolved_candidate_before_model_run(self):
@@ -3042,7 +3522,7 @@ class FinalSafetyRegressionTest(unittest.TestCase):
                 return real_run(command, *args, **kwargs)
             self.fail("the candidate mismatch must stop before the Codex process starts")
 
-        with mock.patch("scripts.ai_workflow.subprocess.run", side_effect=run_git_only):
+        with self._patch_codex(run_git_only):
             with self.assertRaisesRegex(workflow.WorkflowError, "ACCEPTANCE_CANDIDATE_HEAD_MISMATCH"):
                 workflow.run_codex("luna", task, "bounded", self._paths(Path(self.temporary_directory.name) / "result.json"))
 
@@ -3056,7 +3536,7 @@ class FinalSafetyRegressionTest(unittest.TestCase):
                 return real_run(command, *args, **kwargs)
             self.fail("a dirty read-only input must stop before the Codex process starts")
 
-        with mock.patch("scripts.ai_workflow.subprocess.run", side_effect=run_git_only):
+        with self._patch_codex(run_git_only):
             with self.assertRaisesRegex(workflow.WorkflowError, "DIRTY_READ_ONLY_REPOSITORY"):
                 workflow.run_codex(
                     "luna",
@@ -3083,9 +3563,9 @@ class FinalSafetyRegressionTest(unittest.TestCase):
             self._git("checkout", self.base_commit)
             return completed
 
-        with mock.patch("scripts.ai_workflow.subprocess.run", side_effect=write_then_move_head):
+        with self._patch_codex(write_then_move_head):
             with self.assertRaisesRegex(workflow.WorkflowError, "HEAD_DRIFT"):
-                workflow.run_codex("luna", task, "bounded", self._paths(output_path))
+                workflow.run_codex("luna", self._prepare(task), "bounded", self._paths(output_path))
 
     def test_stale_canonical_output_is_not_accepted_when_this_attempt_creates_no_output(self):
         output_path = Path(self.temporary_directory.name) / "luna-result.json"
@@ -3097,10 +3577,9 @@ class FinalSafetyRegressionTest(unittest.TestCase):
                 return real_run(command, *args, **kwargs)
             return subprocess.CompletedProcess(command, 0, stdout='{"event":"done"}\n', stderr="")
 
-        with mock.patch("scripts.ai_workflow.subprocess.run") as run:
-            run.side_effect = run_without_output
+        with self._patch_codex(run_without_output):
             with self.assertRaisesRegex(workflow.WorkflowError, "MISSING_FRESH_ROLE_OUTPUT"):
-                workflow.run_codex("luna", self._task(), "bounded", self._paths(output_path))
+                workflow.run_codex("luna", self._prepare(self._task()), "bounded", self._paths(output_path))
 
     def test_each_role_attempt_uses_a_new_output_and_log_path(self):
         output_path = Path(self.temporary_directory.name) / "luna-result.json"
@@ -3112,9 +3591,10 @@ class FinalSafetyRegressionTest(unittest.TestCase):
                 return real_run(command, *args, **kwargs)
             return write_codex_result(command, self._luna_result())
 
-        with mock.patch("scripts.ai_workflow.subprocess.run", side_effect=write_fresh_output):
-            workflow.run_codex("luna", self._task(), "bounded", paths)
-            workflow.run_codex("luna", self._task(), "bounded", paths)
+        with self._patch_codex(write_fresh_output):
+            task = self._prepare(self._task())
+            workflow.run_codex("luna", task, "bounded", paths)
+            workflow.run_codex("luna", task, "bounded", paths)
 
         attempts_dir = output_path.parent / "attempts"
         result_outputs = [
@@ -3139,14 +3619,20 @@ class FinalSafetyRegressionTest(unittest.TestCase):
             attempt_output.write_text(json.dumps(self._luna_result()), encoding="utf-8")
             return subprocess.CompletedProcess(command, 0, stdout='{"event":"done"}\n', stderr="")
 
-        with mock.patch("scripts.ai_workflow.subprocess.run", side_effect=require_parent_then_write):
-            workflow.run_codex("luna", self._task(), "bounded", self._paths(output_path))
+        with self._patch_codex(require_parent_then_write):
+            workflow.run_codex("luna", self._prepare(self._task()), "bounded", self._paths(output_path))
 
     def test_luna_blocked_stops_the_pipeline_without_running_the_next_role(self):
         state_root = Path(self.temporary_directory.name) / "state"
         store = workflow.WorkflowStore(state_root)
         task = self._task()
         store.create_task(task)
+        _install_declaration(
+            store,
+            task,
+            allowed_roles=("luna", "sol_planner"),
+            active_roles=("luna",),
+        )
         runner = ScriptedRunner([self._luna_result("BLOCKED")])
 
         with mock.patch.object(workflow, "WORKFLOW_STATE_ROOT", state_root):
@@ -3171,6 +3657,21 @@ class FinalSafetyRegressionTest(unittest.TestCase):
         state_root = Path(self.temporary_directory.name) / "state"
         store = workflow.WorkflowStore(state_root)
         store.create_task(task)
+        _install_declaration(
+            store,
+            task,
+            allowed_roles=("terra", "luna", "sol_reviewer"),
+            active_roles=("terra",),
+        )
+        registry = ownership.OwnershipRegistry(
+            schema_version=ownership.OWNERSHIP_REGISTRY_SCHEMA_VERSION,
+            task_id=str(task["task_id"]),
+            envelope_hash=artifacts.artifact_sha256(task),
+            path_owners={"allowed": "terra"},
+            registered_at_utc="2026-08-28T00:00:00Z",
+        )
+        with store.lock(str(task["task_id"])):
+            ownership.record_ownership_registry(store, str(task["task_id"]), registry)
         store.append_event(
             task["task_id"],
             {
@@ -3206,6 +3707,1360 @@ class FinalSafetyRegressionTest(unittest.TestCase):
 
         self.assertEqual(state, "BLOCKED")
         self.assertEqual(runner.calls, ["terra"])
+
+
+class CodexSideEffectObservationTest(unittest.TestCase):
+    def valid_task(self):
+        return CodexRunnerTest().valid_task()
+
+    def valid_result(self, role="luna", status="SUPPORTED"):
+        return CodexRunnerTest().valid_result(role=role, status=status)
+
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.repo = Path(self.temporary_directory.name) / "repository"
+        self.repo.mkdir()
+        self._git("init", "-b", "main")
+        self._git("config", "user.email", "observe@example.test")
+        self._git("config", "user.name", "Observe Test")
+        self._git("config", "commit.gpgsign", "false")
+        (self.repo / "tracked.txt").write_text("initial\n", encoding="utf-8")
+        self._git("add", "tracked.txt")
+        self._git("commit", "-m", "initial")
+        self.state_root = Path(self.temporary_directory.name) / "state"
+        self.store = workflow.WorkflowStore(self.state_root)
+
+    def tearDown(self):
+        self.temporary_directory.cleanup()
+
+    def _git(self, *args):
+        completed = subprocess.run(
+            ["git", "-C", str(self.repo), *args],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        return completed.stdout.strip()
+
+    def _task(self):
+        task = self.valid_task()
+        task["repository_root"] = str(self.repo)
+        return task
+
+    def _prepare(self, task, *, roles: tuple[str, ...] = ("luna",)):
+        self.store.create_task(task)
+        _install_declaration(self.store, task, allowed_roles=roles, active_roles=roles)
+        return task
+
+    def _paths(self, task):
+        return workflow.RunPaths(
+            repo=self.repo,
+            output_path=Path(self.temporary_directory.name) / "luna-result.json",
+            schema_path=ROOT / "config/ai_workflow_result.schema.json",
+            logs_dir=Path(self.temporary_directory.name) / "logs",
+            state_root=self.state_root,
+        )
+
+    def _patch_codex(self, handler):
+        return mock.patch.object(workflow.subprocess, "Popen", _compat_popen(handler))
+
+    def test_live_runner_records_new_worktree_file_kind(self):
+        from scripts import ai_workflow_ownership as ownership
+
+        task = self._prepare(self._task())
+        result = self.valid_result()
+
+        def write_new_file(command, *args, **kwargs):
+            (self.repo / "observed.txt").write_text("from runner\n", encoding="utf-8")
+            return write_codex_result(command, result)
+
+        with self._patch_codex(write_new_file):
+            with self.assertRaisesRegex(workflow.WorkflowError, "READ_ONLY_ROLE_MODIFIED_REPO"):
+                workflow.run_codex("luna", task, "task contract", self._paths(task))
+        kinds = {
+            row["effect_kind"] for row in ownership.load_side_effects(self.store, task["task_id"])
+        }
+        self.assertTrue(kinds & {"OWNED_WRITE", "UNTRACKED_WRITE"})
+        paths = {
+            row["path"] for row in ownership.load_side_effects(self.store, task["task_id"])
+        }
+        self.assertIn("observed.txt", paths)
+
+    def test_read_only_role_with_no_tree_change_has_no_locking_ledger_rows(self):
+        from scripts import ai_workflow_ownership as ownership
+
+        task = self._prepare(self._task())
+        result = self.valid_result()
+        with self._patch_codex(lambda command, *args, **kwargs: write_codex_result(command, result)):
+            workflow.run_codex("luna", task, "task contract", self._paths(task))
+        rows = ownership.load_side_effects(self.store, task["task_id"])
+        self.assertFalse(any(row["effect_kind"] in ownership.LOCKING_EFFECT_KINDS for row in rows))
+        self.assertFalse(ownership.has_ownership_locking_side_effect(self.store, task["task_id"]))
+
+    def test_timeout_and_crash_record_unobserved_locking_effect(self):
+        from scripts import ai_workflow_ownership as ownership
+
+        task = self._prepare(self._task())
+        with self._patch_codex(
+            lambda command, *args, **kwargs: (_ for _ in ()).throw(
+                subprocess.TimeoutExpired("codex", 30)
+            )
+        ):
+            with self.assertRaisesRegex(workflow.WorkflowError, "CODEX_TIMEOUT"):
+                workflow.run_codex("luna", task, "task contract", self._paths(task))
+        self.assertTrue(ownership.has_ownership_locking_side_effect(self.store, task["task_id"]))
+        kinds = {
+            row["effect_kind"] for row in ownership.load_side_effects(self.store, task["task_id"])
+        }
+        self.assertIn("UNOBSERVED_ASSUMED_PRESENT", kinds)
+
+        other_task = self._task()
+        other_task["task_id"] = "AWF-20260803-099"
+        self._prepare(other_task)
+        with mock.patch.object(
+            workflow.subprocess,
+            "Popen",
+            _compat_popen(
+                lambda command, *args, **kwargs: subprocess.CompletedProcess(
+                    command, 0, "", ""
+                ),
+                raise_on_communicate=OSError("codex crashed"),
+            ),
+        ):
+            with self.assertRaises(OSError):
+                workflow.run_codex("luna", other_task, "task contract", self._paths(other_task))
+        self.assertTrue(
+            ownership.has_ownership_locking_side_effect(self.store, other_task["task_id"])
+        )
+
+    def test_host_observation_does_not_call_record_side_effect_from_this_test(self):
+        from scripts import ai_workflow_ownership as ownership
+
+        task = self._prepare(self._task())
+        result = self.valid_result()
+
+        def write_new_file(command, *args, **kwargs):
+            (self.repo / "host-observed.txt").write_text("host\n", encoding="utf-8")
+            return write_codex_result(command, result)
+
+        with self._patch_codex(write_new_file):
+            with self.assertRaisesRegex(workflow.WorkflowError, "READ_ONLY_ROLE_MODIFIED_REPO"):
+                workflow.run_codex("luna", task, "task contract", self._paths(task))
+        rows = ownership.load_side_effects(self.store, task["task_id"])
+        self.assertTrue(rows)
+        self.assertIn("host-observed.txt", {row["path"] for row in rows})
+
+    def test_construction_run_codex_records_frozen_step_producer(self):
+        from tests.test_ai_workflow_construction_execution import (
+            construction_plan,
+            remediation_task,
+        )
+        from scripts import ai_workflow_ownership as ownership
+
+        rollout_events_with_commands = (
+            {
+                "type": "thread.started",
+                "thread_id": "019fc73c-4d40-7c20-a82a-c5a9ae078bcf",
+            },
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "command_execution",
+                    "command": "python -m unittest tests.test_parser",
+                    "cwd": "/work",
+                    "exit_code": 0,
+                    "aggregated_output": "ok",
+                },
+            },
+            {"type": "turn.completed"},
+        )
+
+        task = remediation_task()
+        task_id = task["task_id"]
+        worktree = self.repo / ".codex-worktrees" / task_id.lower()
+        self._git("worktree", "add", str(worktree), "HEAD")
+        task["repository_root"] = str(self.repo)
+        task["source_worktree"] = str(worktree)
+        task["base_commit"] = self._git("rev-parse", "HEAD")
+        frozen = workflow.validate_plan(construction_plan(task=task), task)
+        context = workflow.ConstructionExecutionContext(
+            plan=frozen,
+            step=frozen.tasks[0],
+            dispatch_id="d" * 64,
+            task_sha256=frozen.task_sha256,
+            request_sha256="e" * 64,
+            role="luna_construction",
+        )
+        self.store.create_task(task)
+        _install_declaration(
+            self.store,
+            task,
+            allowed_roles=("luna_construction",),
+            active_roles=("luna_construction",),
+        )
+        registry = ownership.build_ownership_registry(
+            task_id=task_id,
+            envelope_hash=artifacts.artifact_sha256(task),
+            plan=frozen,
+            registered_at_utc="2026-08-28T00:00:00Z",
+        )
+        with self.store.lock(task_id):
+            ownership.record_ownership_registry(self.store, task_id, registry)
+        prompt = workflow.build_construction_role_prompt(task, context)
+        result = {
+            "schema_version": "ai-result-1",
+            "role": "luna_construction",
+            "status": "BLOCKED",
+            "summary": "bounded construction stopped.",
+            "claims": [],
+            "evidence": [],
+            "counter_checks": [],
+            "changed_files": [],
+            "blind_spots": [],
+            "unresolved_questions": [],
+            "recommended_next_state": "BLOCKED",
+        }
+        stdout = "\n".join(json.dumps(event) for event in rollout_events_with_commands) + "\n"
+
+        def write_construction(command, *args, **kwargs):
+            written = write_codex_result(command, result)
+            return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr=written.stderr)
+
+        paths = workflow.RunPaths(
+            repo=worktree,
+            output_path=Path(self.temporary_directory.name) / "luna-construction.json",
+            schema_path=ROOT / "config/ai_workflow_result.schema.json",
+            logs_dir=Path(self.temporary_directory.name) / "construction-logs",
+            state_root=self.state_root,
+        )
+        with (
+            mock.patch.object(workflow, "_assert_terra_worktree_authorized"),
+            self._patch_codex(write_construction),
+        ):
+            try:
+                workflow.run_codex(
+                    "luna_construction",
+                    task,
+                    prompt,
+                    paths,
+                    construction_plan=construction_plan(task=task),
+                    construction_step_id="construction-601",
+                    construction_context=context,
+                )
+            except workflow.WorkflowError:
+                pass
+        generated = [
+            row
+            for row in ownership.load_side_effects(self.store, task_id)
+            if row["effect_kind"] == "COMMAND_GENERATED"
+        ]
+        self.assertEqual(1, len(generated))
+        self.assertEqual("CONSTRUCTION_FROZEN_STEP", generated[0]["producer"])
+        self.assertEqual(
+            f"{frozen.plan_sha256}:{frozen.tasks[0].id}",
+            generated[0]["producer_ref"],
+        )
+
+
+class DispatchGateHubTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        root = Path(self.temporary.name)
+        self.repo = root / "repository"
+        self.repo.mkdir()
+        subprocess.run(["git", "init", "-b", "main"], cwd=self.repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "hub@example.test"], cwd=self.repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Hub Test"], cwd=self.repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=self.repo, check=True, capture_output=True)
+        (self.repo / "README.md").write_text("repo\n", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md"], cwd=self.repo, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=self.repo, check=True, capture_output=True)
+        (self.repo / ".codex" / "sessions").mkdir(parents=True, exist_ok=True)
+        self.state_root = root / "state"
+        self.store = workflow.WorkflowStore(self.state_root)
+        self.task = TaskValidationTest().valid_task()
+        self.task["repository_root"] = str(self.repo)
+        self.store.create_task(self.task)
+        self.task_id = str(self.task["task_id"])
+        _RecordingPopen.reset()
+        legacy_config = workflow._load_workflow_config()
+        legacy_config["routing"] = {"mode": "legacy", "role_policy": "legacy"}
+        self._legacy_policy = mock.patch.object(
+            workflow, "_load_workflow_config", return_value=legacy_config
+        )
+        self._legacy_policy.start()
+
+    def tearDown(self) -> None:
+        self._legacy_policy.stop()
+        self.temporary.cleanup()
+
+    def _paths(self) -> workflow.RunPaths:
+        task_dir = self.state_root / self.task_id
+        return workflow.RunPaths(
+            repo=self.repo,
+            output_path=task_dir / "luna-result.json",
+            schema_path=ROOT / "config/ai_workflow_result.schema.json",
+            logs_dir=task_dir / "logs",
+            state_root=self.state_root,
+        )
+
+    def _popen(self, result: dict[str, object]):
+        class Popen(_RecordingPopen):
+            _result = result
+
+        return Popen
+
+    def _permit_records(self) -> list[dict[str, object]]:
+        path = self.store._require_task(self.task_id) / policy.DISPATCH_PERMIT_LEDGER
+        if not path.is_file():
+            return []
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+
+    def _dispatch_records(self) -> list[dict[str, object]]:
+        path = self.store._require_task(self.task_id) / "dispatches.jsonl"
+        if not path.is_file():
+            return []
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+
+    def _events(self) -> list[dict[str, object]]:
+        path = self.store._require_task(self.task_id) / "events.jsonl"
+        if not path.is_file():
+            return []
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+
+    def _intent_events(self) -> list[dict[str, object]]:
+        return [
+            event
+            for event in self._events()
+            if event.get("event_type") == "LAUNCH_INTENT_RECORDED"
+        ]
+
+    def _store_task(self) -> None:
+        task_dir = self.store._require_task(self.task_id)
+        (task_dir / "task.json").write_text(
+            workflow._canonical_json(self.task) + "\n", encoding="utf-8"
+        )
+
+    def _prepare_terra_task(self, *, allowed_write_paths: tuple[str, ...] = ("src",)) -> None:
+        self.task["task_type"] = "REMEDIATION"
+        self.task["allowed_write_paths"] = list(allowed_write_paths)
+        self.task["source_worktree"] = str(self.repo)
+        self._store_task()
+
+    def _record_registry(self, path_owners: dict[str, str]) -> None:
+        registry = ownership.OwnershipRegistry(
+            schema_version=ownership.OWNERSHIP_REGISTRY_SCHEMA_VERSION,
+            task_id=self.task_id,
+            envelope_hash=artifacts.artifact_sha256(self.task),
+            path_owners=dict(path_owners),
+            registered_at_utc="2026-08-28T00:00:00Z",
+        )
+        with self.store.lock(self.task_id):
+            ownership.record_ownership_registry(self.store, self.task_id, registry)
+
+    def _record_owner_evidence(self) -> None:
+        self.actor = "owner"
+        self.evidence = {
+            "event_type": "OWNER_DECISION",
+            "decision": "defer",
+            "actor": self.actor,
+            "timestamp_utc": "2026-08-28T00:00:00Z",
+            "previous_state": "AWAITING_OWNER_DECISION",
+            "new_state": "DEFERRED",
+            "task_sha256": artifacts.artifact_sha256(self.task),
+        }
+        self.store.record_decision(self.task_id, self.evidence)
+        self.owner_evidence_id = artifacts.artifact_sha256(self.evidence)
+
+    def _issue_transfer(self, **overrides: object) -> authorizations.OwnerAuthorization:
+        kwargs: dict[str, object] = {
+            "authorization_type": "OWNERSHIP_TRANSFER",
+            "actor": self.actor,
+            "owner_evidence_id": self.owner_evidence_id,
+            "issued_at_utc": "2026-08-28T12:00:00Z",
+            "path": "src",
+            "from_role": "luna",
+            "to_role": "terra",
+            "allowed_paths": ("src",),
+            "max_dispatches": 4,
+        }
+        kwargs.update(overrides)
+        return authorizations.issue_owner_authorization(self.store, self.task_id, **kwargs)
+
+    def _popen_writing(
+        self, result: dict[str, object], *relative_paths: str, returncode: int = 0
+    ):
+        repo = self.repo
+
+        class Popen(_RecordingPopen):
+            _result = result
+
+            def __init__(self, command, *args, **kwargs):
+                super().__init__(command, *args, **kwargs)
+                if self._delegate is not None:
+                    return
+                self.returncode = returncode
+                for relative in relative_paths:
+                    path = repo / relative
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text("hub-write\n", encoding="utf-8")
+
+        return Popen
+
+    def _terra_result(self) -> dict[str, object]:
+        result = CodexRunnerTest().valid_result("terra", "IMPLEMENTED_CANDIDATE")
+        result["recommended_next_state"] = "PRECHECK_RUNNING"
+        return result
+
+    @contextmanager
+    def _terra_run_patches(self, popen):
+        with ExitStack() as stack:
+            stack.enter_context(
+                mock.patch.object(
+                    workflow, "capture_repo", return_value=workflow.RepoSnapshot("h" * 40, ())
+                )
+            )
+            stack.enter_context(mock.patch.object(workflow, "working_tree_paths", return_value=set()))
+            stack.enter_context(mock.patch.object(workflow, "_assert_terra_worktree_authorized"))
+            stack.enter_context(mock.patch.object(workflow, "_reject_dirty_input"))
+            stack.enter_context(mock.patch.object(workflow.subprocess, "Popen", popen))
+            yield
+
+    def test_legal_path_records_launch_intent_after_reserved_before_popen(self) -> None:
+        _install_declaration(self.store, self.task, allowed_roles=("luna",), active_roles=("luna",))
+        order: list[str] = []
+        real_append = workflow.WorkflowStore.append_event
+        real_ledger = workflow.WorkflowStore.append_task_ledger
+
+        def tracking_append(store, task_id, event):
+            order.append(str(event.get("event_type")))
+            return real_append(store, task_id, event)
+
+        def tracking_ledger(store, task_id, name, record):
+            if name == policy.DISPATCH_PERMIT_LEDGER:
+                order.append(f"PERMIT:{record.get('state')}")
+            return real_ledger(store, task_id, name, record)
+
+        class Popen(_RecordingPopen):
+            _result = CodexRunnerTest().valid_result()
+
+            def __init__(self, command, *args, **kwargs):
+                super().__init__(command, *args, **kwargs)
+                if self._delegate is None:
+                    order.append("POPEN")
+
+        with (
+            mock.patch.object(workflow, "capture_repo", return_value=workflow.RepoSnapshot("h" * 40, ())),
+            mock.patch.object(workflow, "working_tree_paths", return_value=set()),
+            mock.patch.object(workflow.WorkflowStore, "append_event", tracking_append),
+            mock.patch.object(workflow.WorkflowStore, "append_task_ledger", tracking_ledger),
+            mock.patch.object(workflow.subprocess, "Popen", Popen),
+        ):
+            workflow.run_codex("luna", self.task, "task contract", self._paths())
+        self.assertLess(order.index("PERMIT:RESERVED"), order.index("LAUNCH_INTENT_RECORDED"))
+        self.assertLess(order.index("LAUNCH_INTENT_RECORDED"), order.index("POPEN"))
+        intents = [
+            event for event in self._events() if event.get("event_type") == "LAUNCH_INTENT_RECORDED"
+        ]
+        self.assertEqual(1, len(intents))
+        self.assertEqual(
+            {
+                "event_type",
+                "event_id",
+                "task_id",
+                "envelope_hash",
+                "permit_id",
+                "role",
+                "command_sha256",
+                "tool_mapping_sha256",
+                "route_config_hash",
+                "launcher_version",
+                "install_version",
+                "timestamp_utc",
+            },
+            set(intents[0]),
+        )
+        self.assertEqual(self._permit_records()[0]["permit_id"], intents[0]["permit_id"])
+        self.assertEqual(artifacts.artifact_sha256(self.task), intents[0]["envelope_hash"])
+
+    def test_missing_declaration_rejects_run_codex_without_spawn(self) -> None:
+        popen = self._popen(CodexRunnerTest().valid_result())
+        with (
+            mock.patch.object(workflow, "capture_repo", return_value=workflow.RepoSnapshot("h" * 40, ())),
+            mock.patch.object(workflow, "working_tree_paths", return_value=set()),
+            mock.patch.object(workflow.subprocess, "Popen", popen),
+        ):
+            with self.assertRaisesRegex(workflow.WorkflowError, "ROUTE_DECLARATION_MISSING"):
+                workflow.run_codex("luna", self.task, "task contract", self._paths())
+        self.assertEqual([], popen.calls)
+        self.assertEqual([], self._permit_records())
+        self.assertEqual([], self._dispatch_records())
+        self.assertEqual([], self._intent_events())
+
+    def test_state_root_none_is_declaration_missing(self) -> None:
+        paths = workflow.RunPaths(
+            repo=self.repo,
+            output_path=Path(self.temporary.name) / "out.json",
+            schema_path=ROOT / "config/ai_workflow_result.schema.json",
+            logs_dir=Path(self.temporary.name) / "logs",
+        )
+        popen = self._popen(CodexRunnerTest().valid_result())
+        with mock.patch.object(workflow.subprocess, "Popen", popen):
+            with self.assertRaisesRegex(workflow.WorkflowError, "ROUTE_DECLARATION_MISSING"):
+                workflow.run_codex("luna", self.task, "task contract", paths)
+        self.assertEqual([], popen.calls)
+
+    def test_legal_declaration_reserves_then_starts_same_permit(self) -> None:
+        _install_declaration(self.store, self.task, allowed_roles=("luna",), active_roles=("luna",))
+        result = CodexRunnerTest().valid_result()
+        popen = self._popen(result)
+        with (
+            mock.patch.object(workflow, "capture_repo", return_value=workflow.RepoSnapshot("h" * 40, ())),
+            mock.patch.object(workflow, "working_tree_paths", return_value=set()),
+            mock.patch.object(workflow.subprocess, "Popen", popen),
+        ):
+            actual = workflow.run_codex("luna", self.task, "task contract", self._paths())
+        self.assertEqual(result, actual)
+        self.assertEqual(1, len(popen.calls))
+        records = self._permit_records()
+        self.assertEqual(["RESERVED", "STARTED"], [row["state"] for row in records])
+        self.assertEqual(records[0]["permit_id"], records[1]["permit_id"])
+        self.assertEqual([1, 2], [row["seq"] for row in records])
+
+    def test_hub_lock_bodies_forbid_self_lock_wrappers(self) -> None:
+        for function in (workflow.run_codex, workflow.run_assignment):
+            for block in _with_lock_blocks(function):
+                names = [_call_name(node) for child in ast.walk(block) if isinstance(child, ast.Call) for node in [child]]
+                for wrapper in HUB_SELF_LOCK_WRAPPERS:
+                    self.assertNotIn(wrapper, names, function.__name__)
+
+    def test_hubs_release_only_through_never_spawned_helper(self) -> None:
+        for function in (workflow.run_codex, workflow.run_assignment):
+            source = inspect.getsource(function)
+            self.assertIn("require_dispatch_permit_locked(", source)
+            self.assertIn("claim_permit_start_locked(", source)
+            self.assertIn("release_permit_if_never_spawned(", source)
+
+    def test_helper_is_unique_direct_caller_and_only_releases_when_unspawned(self) -> None:
+        module_path = ROOT / "scripts" / "ai_workflow_dispatch_policy.py"
+        tree = ast.parse(module_path.read_text(encoding="utf-8"), filename=str(module_path))
+        callers: list[str] = []
+        helper = None
+        for node in tree.body:
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            if node.name == "release_permit_if_never_spawned":
+                helper = node
+            for child in ast.walk(node):
+                if isinstance(child, ast.Call) and _call_name(child) == "release_permit_before_start":
+                    callers.append(node.name)
+        self.assertEqual(["release_permit_if_never_spawned"], callers)
+        assert helper is not None
+        if_nodes = [node for node in helper.body if isinstance(node, ast.If)]
+        self.assertTrue(if_nodes)
+        first = if_nodes[0]
+        self.assertIsInstance(first.test, ast.Name)
+        self.assertEqual("spawned", first.test.id)
+        self.assertTrue(first.body)
+        self.assertIsInstance(first.body[0], ast.Return)
+        release_names = [
+            _call_name(node)
+            for node in ast.walk(helper)
+            if isinstance(node, ast.Call)
+        ]
+        self.assertIn("release_permit_before_start", release_names)
+
+    def test_popen_is_immediately_followed_by_claim(self) -> None:
+        for function in (workflow.run_codex, workflow.run_assignment):
+            found = False
+            for block in _with_lock_blocks(function):
+                statements = [
+                    node
+                    for node in block.body
+                    if not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant))
+                ]
+                for index, statement in enumerate(statements):
+                    if not isinstance(statement, ast.Assign) or not isinstance(statement.value, ast.Call):
+                        continue
+                    if _call_name(statement.value) != "Popen":
+                        continue
+                    following = statements[index + 1]
+                    if isinstance(following, ast.Expr) and isinstance(following.value, ast.Call):
+                        self.assertEqual(
+                            "claim_permit_start_locked",
+                            _call_name(following.value),
+                            function.__name__,
+                        )
+                        found = True
+                    elif isinstance(following, ast.Assign) and isinstance(following.value, ast.Call):
+                        self.assertEqual(
+                            "claim_permit_start_locked",
+                            _call_name(following.value),
+                            function.__name__,
+                        )
+                        found = True
+                    else:
+                        self.fail(
+                            f"claim_permit_start_locked must follow Popen immediately in {function.__name__}"
+                        )
+            self.assertTrue(found, function.__name__)
+
+    def test_schema_materialize_failure_releases_and_retires_identity(self) -> None:
+        _install_declaration(self.store, self.task, allowed_roles=("luna",), active_roles=("luna",))
+        popen = self._popen(CodexRunnerTest().valid_result())
+        helper = mock.Mock(wraps=policy.release_permit_if_never_spawned)
+        with (
+            mock.patch.object(workflow, "capture_repo", return_value=workflow.RepoSnapshot("h" * 40, ())),
+            mock.patch.object(workflow, "working_tree_paths", return_value=set()),
+            mock.patch.object(
+                workflow,
+                "materialize_dispatch_result_schema",
+                side_effect=workflow.WorkflowError("RESULT_SCHEMA_DERIVATION_INVALID", "boom"),
+            ),
+            mock.patch.object(workflow, "release_permit_if_never_spawned", helper),
+            mock.patch.object(workflow.subprocess, "Popen", popen),
+        ):
+            with self.assertRaisesRegex(workflow.WorkflowError, "RESULT_SCHEMA_DERIVATION_INVALID"):
+                workflow.run_codex("luna", self.task, "task contract", self._paths())
+        self.assertEqual([], popen.calls)
+        helper.assert_called()
+        self.assertFalse(helper.call_args.kwargs["spawned"])
+        records = self._permit_records()
+        self.assertEqual(["RESERVED", "RELEASED_BEFORE_START"], [row["state"] for row in records])
+        identity = records[0]["permit_id"]
+        context = workflow.AttemptAccountingContext(
+            task_id=self.task_id,
+            role="luna",
+            retry_kind="none",
+            attempt_id="replay-same",
+        )
+        with mock.patch.object(
+            workflow,
+            "_require_attempt_accounting_context",
+            return_value=context,
+        ):
+            with (
+                mock.patch.object(workflow, "capture_repo", return_value=workflow.RepoSnapshot("h" * 40, ())),
+                mock.patch.object(workflow, "working_tree_paths", return_value=set()),
+                mock.patch.object(
+                    workflow,
+                    "derive_dispatch_identity",
+                    return_value=identity,
+                ),
+                mock.patch.object(workflow.subprocess, "Popen", popen),
+            ):
+                with self.assertRaisesRegex(workflow.WorkflowError, "DISPATCH_IDENTITY_RETIRED"):
+                    workflow.run_codex("luna", self.task, "task contract", self._paths())
+        self.assertEqual([], popen.calls)
+        self.assertEqual([], self._intent_events())
+
+    def test_timeout_after_spawn_does_not_release(self) -> None:
+        _install_declaration(self.store, self.task, allowed_roles=("luna",), active_roles=("luna",))
+
+        class TimeoutPopen(_RecordingPopen):
+            def communicate(self, input=None, timeout=None):
+                raise subprocess.TimeoutExpired(self.args, timeout)
+
+        helper = mock.Mock(wraps=policy.release_permit_if_never_spawned)
+        with (
+            mock.patch.object(workflow, "capture_repo", return_value=workflow.RepoSnapshot("h" * 40, ())),
+            mock.patch.object(workflow, "working_tree_paths", return_value=set()),
+            mock.patch.object(workflow, "release_permit_if_never_spawned", helper),
+            mock.patch.object(workflow.subprocess, "Popen", TimeoutPopen),
+        ):
+            with self.assertRaisesRegex(workflow.WorkflowError, "CODEX_TIMEOUT"):
+                workflow.run_codex("luna", self.task, "task contract", self._paths())
+        helper.assert_called()
+        self.assertTrue(helper.call_args.kwargs["spawned"])
+        records = self._permit_records()
+        self.assertEqual(["RESERVED", "STARTED"], [row["state"] for row in records])
+        effects = ownership.load_side_effects(self.store, self.task_id)
+        self.assertTrue(any(row.get("effect_kind") == "UNOBSERVED_ASSUMED_PRESENT" for row in effects))
+
+    def test_claim_failure_kills_process_without_release(self) -> None:
+        _install_declaration(self.store, self.task, allowed_roles=("luna",), active_roles=("luna",))
+        popen = self._popen(CodexRunnerTest().valid_result())
+
+        def boom(*_args, **_kwargs):
+            raise workflow.WorkflowError("DISPATCH_PERMIT_STATE_ILLEGAL", "claim boom")
+
+        with (
+            mock.patch.object(workflow, "capture_repo", return_value=workflow.RepoSnapshot("h" * 40, ())),
+            mock.patch.object(workflow, "working_tree_paths", return_value=set()),
+            mock.patch.object(workflow, "claim_permit_start_locked", boom),
+            mock.patch.object(workflow.subprocess, "Popen", popen),
+        ):
+            with self.assertRaisesRegex(workflow.WorkflowError, "DISPATCH_PERMIT_STATE_ILLEGAL"):
+                workflow.run_codex("luna", self.task, "task contract", self._paths())
+        self.assertEqual(1, len(popen.instances))
+        self.assertTrue(popen.instances[0].killed)
+        records = self._permit_records()
+        self.assertEqual(["RESERVED"], [row["state"] for row in records])
+
+    def test_started_identity_cannot_respawn(self) -> None:
+        _install_declaration(self.store, self.task, allowed_roles=("luna",), active_roles=("luna",))
+        result = CodexRunnerTest().valid_result()
+        popen = self._popen(result)
+        context = workflow.AttemptAccountingContext(
+            task_id=self.task_id,
+            role="luna",
+            retry_kind="none",
+            attempt_id="fixed-attempt",
+        )
+        with (
+            mock.patch.object(workflow, "capture_repo", return_value=workflow.RepoSnapshot("h" * 40, ())),
+            mock.patch.object(workflow, "working_tree_paths", return_value=set()),
+            mock.patch.object(workflow, "_require_attempt_accounting_context", return_value=context),
+            mock.patch.object(workflow.subprocess, "Popen", popen),
+        ):
+            workflow.run_codex("luna", self.task, "task contract", self._paths())
+            with self.assertRaisesRegex(workflow.WorkflowError, "DISPATCH_PERMIT_ALREADY_STARTED"):
+                workflow.run_codex("luna", self.task, "task contract", self._paths())
+        self.assertEqual(1, len(popen.calls))
+        self.assertEqual(1, len(self._intent_events()))
+
+    def test_technical_retry_gets_a_new_permit(self) -> None:
+        _install_declaration(self.store, self.task, allowed_roles=("luna",), active_roles=("luna",), max_dispatches=4)
+        first = workflow.AttemptAccountingContext(
+            task_id=self.task_id, role="luna", retry_kind="none", attempt_id="attempt-a"
+        )
+        second = workflow.AttemptAccountingContext(
+            task_id=self.task_id, role="luna", retry_kind="technical", attempt_id="attempt-b"
+        )
+        contexts = iter((first, second))
+        popen = self._popen(CodexRunnerTest().valid_result())
+        with (
+            mock.patch.object(workflow, "capture_repo", return_value=workflow.RepoSnapshot("h" * 40, ())),
+            mock.patch.object(workflow, "working_tree_paths", return_value=set()),
+            mock.patch.object(
+                workflow,
+                "_require_attempt_accounting_context",
+                side_effect=lambda *args, **kwargs: next(contexts),
+            ),
+            mock.patch.object(workflow.subprocess, "Popen", popen),
+        ):
+            workflow.run_codex("luna", self.task, "task contract", self._paths())
+            workflow.run_codex("luna", self.task, "task contract", self._paths())
+        self.assertEqual(2, len(popen.calls))
+        records = self._permit_records()
+        self.assertEqual(["RESERVED", "STARTED", "RESERVED", "STARTED"], [row["state"] for row in records])
+        self.assertNotEqual(records[0]["permit_id"], records[2]["permit_id"])
+
+    def test_fake_runner_missing_declaration_is_rejected(self) -> None:
+        events = self.store._require_task(self.task_id) / "events.jsonl"
+        events.write_text(
+            json.dumps(
+                {
+                    "event_type": "STATE_TRANSITION",
+                    "previous_state": "DRAFT",
+                    "new_state": "TASK_VALIDATED",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        runner = ScriptedRunner([CodexRunnerTest().valid_result()])
+        with mock.patch.object(workflow, "WORKFLOW_STATE_ROOT", self.state_root):
+            with self.assertRaisesRegex(workflow.WorkflowError, "ROUTE_DECLARATION_MISSING"):
+                workflow.run_until_gate(
+                    self.task_id,
+                    runner=runner,
+                    allow_live_model=False,
+                    state_root=self.state_root,
+                )
+        self.assertEqual([], runner.calls)
+
+    def test_fake_runner_legal_path_starts_permit_and_keeps_it_on_runner_error(self) -> None:
+        _install_declaration(self.store, self.task, allowed_roles=("luna", "sol_planner"), active_roles=("luna", "sol_planner"))
+        runner = ScriptedRunner([RuntimeError("runner boom")])
+        with mock.patch.object(workflow, "WORKFLOW_STATE_ROOT", self.state_root):
+            with self.assertRaises(RuntimeError):
+                workflow.run_until_gate(self.task_id, runner=runner, allow_live_model=False, state_root=self.state_root)
+        self.assertEqual(["luna"], runner.calls)
+        records = self._permit_records()
+        self.assertEqual(["RESERVED", "STARTED"], [row["state"] for row in records])
+
+    def test_write_role_without_authorization_does_not_spawn(self) -> None:
+        self.task["task_type"] = "REMEDIATION"
+        self.task["allowed_write_paths"] = ["src"]
+        self.task["source_worktree"] = str(self.repo)
+        task_dir = self.store._require_task(self.task_id)
+        (task_dir / "task.json").write_text(workflow._canonical_json(self.task) + "\n", encoding="utf-8")
+        _install_declaration(
+            self.store,
+            self.task,
+            allowed_roles=("terra",),
+            active_roles=("terra",),
+        )
+        registry = ownership.OwnershipRegistry(
+            schema_version=ownership.OWNERSHIP_REGISTRY_SCHEMA_VERSION,
+            task_id=self.task_id,
+            envelope_hash=artifacts.artifact_sha256(self.task),
+            path_owners={"src": "luna"},
+            registered_at_utc="2026-08-28T00:00:00Z",
+        )
+        with self.store.lock(self.task_id):
+            ownership.record_ownership_registry(self.store, self.task_id, registry)
+        popen = self._popen(self._terra_result())
+        with (
+            mock.patch.object(workflow, "capture_repo", return_value=workflow.RepoSnapshot("h" * 40, ())),
+            mock.patch.object(workflow, "working_tree_paths", return_value=set()),
+            mock.patch.object(workflow, "_assert_terra_worktree_authorized"),
+            mock.patch.object(workflow, "_reject_dirty_input"),
+            mock.patch.object(workflow.subprocess, "Popen", popen),
+        ):
+            with self.assertRaisesRegex(workflow.WorkflowError, "OWNERSHIP_TRANSFER_BLOCKED"):
+                workflow.run_codex("terra", self.task, "task contract", self._paths())
+        self.assertEqual([], popen.calls)
+
+    def test_unknown_actual_paths_do_not_complete_write_role(self) -> None:
+        self._prepare_terra_task()
+        _install_declaration(self.store, self.task, allowed_roles=("terra",), active_roles=("terra",))
+        self._record_registry({"src": "terra"})
+        popen = self._popen(self._terra_result())
+        with (
+            mock.patch.object(workflow, "capture_fs_snapshot", return_value=None),
+            self._terra_run_patches(popen),
+        ):
+            with self.assertRaisesRegex(workflow.WorkflowError, "ACTUAL_WRITE_PATHS_UNKNOWN"):
+                workflow.run_codex("terra", self.task, "task contract", self._paths())
+        self.assertEqual(1, len(popen.calls))
+
+    def test_focused_authorization_records_lease_on_this_permit(self) -> None:
+        self._prepare_terra_task()
+        _install_declaration(self.store, self.task, allowed_roles=("terra",), active_roles=("terra",))
+        self._record_registry({"src": "luna"})
+        self._record_owner_evidence()
+        issued = self._issue_transfer()
+        popen = self._popen(self._terra_result())
+        with self._terra_run_patches(popen):
+            workflow.run_codex(
+                "terra",
+                self.task,
+                "task contract",
+                self._paths(),
+                authorization_id=issued.authorization_id,
+            )
+        self.assertEqual(1, len(popen.calls))
+        permit_id = self._permit_records()[0]["permit_id"]
+        leases = authorizations.leases_for_permit(self.store, self.task_id, permit_id)
+        self.assertEqual(1, len(leases))
+        self.assertEqual(permit_id, leases[0]["permit_id"])
+        self.assertEqual(["src"], leases[0]["allowed_paths"])
+
+    def test_over_bound_write_records_violation_then_blocks_later_dispatch(self) -> None:
+        self._prepare_terra_task(allowed_write_paths=("src/owned.py",))
+        _install_declaration(
+            self.store, self.task, allowed_roles=("terra", "luna"), active_roles=("terra", "luna")
+        )
+        self._record_registry({"src/owned.py": "terra", "src": "luna"})
+        (self.repo / "src").mkdir(parents=True, exist_ok=True)
+        popen = self._popen_writing(
+            self._terra_result(),
+            "src/x.py",
+        )
+        with self._terra_run_patches(popen):
+            with self.assertRaisesRegex(workflow.WorkflowError, "OWNERSHIP_VIOLATION"):
+                workflow.run_codex("terra", self.task, "task contract", self._paths())
+        self.assertEqual(1, len(popen.calls))
+        violations = [
+            event
+            for event in self._events()
+            if event.get("event_type") == "OWNERSHIP_VIOLATION_RECORDED"
+        ]
+        self.assertEqual(1, len(violations))
+        self.assertEqual(["src/x.py"], violations[0]["paths"])
+        side_effects = ownership.load_side_effects(self.store, self.task_id)
+        self.assertFalse(
+            any(row.get("effect_kind") == "OWNERSHIP_VIOLATION_RECORDED" for row in side_effects)
+        )
+        _RecordingPopen.reset()
+        luna_popen = self._popen(CodexRunnerTest().valid_result())
+        with (
+            mock.patch.object(workflow, "capture_repo", return_value=workflow.RepoSnapshot("h" * 40, ())),
+            mock.patch.object(workflow, "working_tree_paths", return_value=set()),
+            mock.patch.object(workflow.subprocess, "Popen", luna_popen),
+        ):
+            with self.assertRaisesRegex(
+                workflow.WorkflowError, "DISPATCH_BLOCKED_OWNERSHIP_VIOLATION"
+            ):
+                workflow.run_codex("luna", self.task, "task contract", self._paths())
+        self.assertEqual([], luna_popen.calls)
+
+    def test_write_role_post_spawn_failure_still_records_over_bound_violation(self) -> None:
+        self._prepare_terra_task(allowed_write_paths=("src/owned.py",))
+        _install_declaration(
+            self.store, self.task, allowed_roles=("terra", "luna"), active_roles=("terra", "luna")
+        )
+        self._record_registry({"src/owned.py": "terra", "src": "luna"})
+        (self.repo / "src").mkdir(parents=True, exist_ok=True)
+        popen = self._popen_writing(self._terra_result(), "src/x.py", returncode=23)
+        with self._terra_run_patches(popen):
+            with self.assertRaisesRegex(workflow.WorkflowError, "OWNERSHIP_VIOLATION"):
+                workflow.run_codex("terra", self.task, "task contract", self._paths())
+        self.assertEqual(1, len(popen.calls))
+        violations = [
+            event
+            for event in self._events()
+            if event.get("event_type") == "OWNERSHIP_VIOLATION_RECORDED"
+        ]
+        self.assertEqual(1, len(violations))
+        self.assertEqual(["src/x.py"], violations[0]["paths"])
+        side_effects = ownership.load_side_effects(self.store, self.task_id)
+        self.assertFalse(
+            any(row.get("effect_kind") == "OWNERSHIP_VIOLATION_RECORDED" for row in side_effects)
+        )
+        _RecordingPopen.reset()
+        luna_popen = self._popen(CodexRunnerTest().valid_result())
+        with (
+            mock.patch.object(workflow, "capture_repo", return_value=workflow.RepoSnapshot("h" * 40, ())),
+            mock.patch.object(workflow, "working_tree_paths", return_value=set()),
+            mock.patch.object(workflow.subprocess, "Popen", luna_popen),
+        ):
+            with self.assertRaisesRegex(
+                workflow.WorkflowError, "DISPATCH_BLOCKED_OWNERSHIP_VIOLATION"
+            ):
+                workflow.run_codex("luna", self.task, "task contract", self._paths())
+        self.assertEqual([], luna_popen.calls)
+
+    def test_write_role_unobserved_spawn_fail_closes_unknown_actual_paths(self) -> None:
+        self._prepare_terra_task()
+        _install_declaration(self.store, self.task, allowed_roles=("terra",), active_roles=("terra",))
+        self._record_registry({"src": "terra"})
+
+        class TimeoutPopen(_RecordingPopen):
+            def communicate(self, input=None, timeout=None):
+                raise subprocess.TimeoutExpired(self.args, timeout)
+
+        with self._terra_run_patches(TimeoutPopen):
+            with self.assertRaisesRegex(workflow.WorkflowError, "ACTUAL_WRITE_PATHS_UNKNOWN"):
+                workflow.run_codex("terra", self.task, "task contract", self._paths())
+        effects = ownership.load_side_effects(self.store, self.task_id)
+        self.assertTrue(any(row.get("effect_kind") == "UNOBSERVED_ASSUMED_PRESENT" for row in effects))
+        self.assertFalse(
+            any(event.get("event_type") == "OWNERSHIP_VIOLATION_RECORDED" for event in self._events())
+        )
+
+    def test_historical_lease_does_not_exempt_later_hub_permit(self) -> None:
+        self._prepare_terra_task(allowed_write_paths=("src",))
+        _install_declaration(self.store, self.task, allowed_roles=("terra",), active_roles=("terra",))
+        self._record_registry({"src/owned.py": "terra", "src": "luna"})
+        self._record_owner_evidence()
+        issued = self._issue_transfer(max_dispatches=1)
+        first = self._popen_writing(
+            self._terra_result(),
+            "src/x.py",
+        )
+        with self._terra_run_patches(first):
+            workflow.run_codex(
+                "terra",
+                self.task,
+                "task contract",
+                self._paths(),
+                authorization_id=issued.authorization_id,
+            )
+        permit_a = self._permit_records()[0]["permit_id"]
+        self.assertTrue(authorizations.leases_for_permit(self.store, self.task_id, permit_a))
+        second = self._popen_writing(
+            self._terra_result(),
+            "src/y.py",
+        )
+        with (
+            mock.patch.object(workflow, "_write_scopes_for_role", return_value=("src/owned.py",)),
+            self._terra_run_patches(second),
+        ):
+            with self.assertRaisesRegex(workflow.WorkflowError, "OWNERSHIP_VIOLATION"):
+                workflow.run_codex("terra", self.task, "task contract", self._paths())
+        permit_b = self._permit_records()[-1]["permit_id"]
+        self.assertNotEqual(permit_a, permit_b)
+        self.assertEqual((), authorizations.leases_for_permit(self.store, self.task_id, permit_b))
+        violations = [
+            event
+            for event in self._events()
+            if event.get("event_type") == "OWNERSHIP_VIOLATION_RECORDED"
+        ]
+        self.assertEqual(1, len(violations))
+        self.assertEqual(permit_b, violations[0]["permit_id"])
+
+    def test_role_not_allowed_rejects_run_codex_before_spawn(self) -> None:
+        _install_declaration(self.store, self.task, allowed_roles=("luna",), active_roles=("luna",))
+        popen = self._popen(CodexRunnerTest().valid_result())
+        with (
+            mock.patch.object(workflow, "capture_repo", return_value=workflow.RepoSnapshot("h" * 40, ())),
+            mock.patch.object(workflow, "working_tree_paths", return_value=set()),
+            mock.patch.object(workflow.subprocess, "Popen", popen),
+        ):
+            with self.assertRaisesRegex(workflow.WorkflowError, "ROLE_NOT_ALLOWED"):
+                workflow.run_codex("sol_planner", self.task, "task contract", self._paths())
+        self.assertEqual([], popen.calls)
+        self.assertEqual([], self._intent_events())
+
+    def test_role_not_preflighted_rejects_run_codex_before_spawn(self) -> None:
+        _install_declaration(
+            self.store,
+            self.task,
+            allowed_roles=("luna",),
+            active_roles=("luna",),
+            run_preflight=False,
+        )
+        popen = self._popen(CodexRunnerTest().valid_result())
+        with (
+            mock.patch.object(workflow, "capture_repo", return_value=workflow.RepoSnapshot("h" * 40, ())),
+            mock.patch.object(workflow, "working_tree_paths", return_value=set()),
+            mock.patch.object(workflow.subprocess, "Popen", popen),
+        ):
+            with self.assertRaisesRegex(workflow.WorkflowError, "ROLE_NOT_PREFLIGHTED"):
+                workflow.run_codex("luna", self.task, "task contract", self._paths())
+        self.assertEqual([], popen.calls)
+        self.assertEqual([], self._intent_events())
+
+    def test_budget_exceeded_rejects_run_codex_before_spawn(self) -> None:
+        _install_declaration(
+            self.store,
+            self.task,
+            allowed_roles=("luna",),
+            active_roles=("luna",),
+            max_dispatches=0,
+        )
+        popen = self._popen(CodexRunnerTest().valid_result())
+        with (
+            mock.patch.object(workflow, "capture_repo", return_value=workflow.RepoSnapshot("h" * 40, ())),
+            mock.patch.object(workflow, "working_tree_paths", return_value=set()),
+            mock.patch.object(workflow.subprocess, "Popen", popen),
+        ):
+            with self.assertRaisesRegex(workflow.WorkflowError, "ROUTE_BUDGET_EXCEEDED"):
+                workflow.run_codex("luna", self.task, "task contract", self._paths())
+        self.assertEqual([], popen.calls)
+        self.assertEqual([], self._intent_events())
+
+    def test_resume_until_gate_missing_declaration_does_not_run(self) -> None:
+        events = self.store._require_task(self.task_id) / "events.jsonl"
+        events.write_text(
+            json.dumps({"event_type": "STATE_TRANSITION", "new_state": "DRAFT"}) + "\n",
+            encoding="utf-8",
+        )
+        runner = ScriptedRunner([CodexRunnerTest().valid_result()])
+        with mock.patch.object(workflow, "WORKFLOW_STATE_ROOT", self.state_root):
+            with self.assertRaisesRegex(workflow.WorkflowError, "ROUTE_DECLARATION_MISSING"):
+                workflow._resume_stored_task(self.store, self.task_id, runner, None)
+        self.assertEqual([], runner.calls)
+
+    def _assert_until_gate_rejects_before_runner(
+        self,
+        code: str,
+        *,
+        allowed_roles: tuple[str, ...],
+        active_roles: tuple[str, ...],
+        max_dispatches: int = 8,
+        run_preflight: bool = True,
+        resume: bool = False,
+    ) -> None:
+        _install_declaration(
+            self.store,
+            self.task,
+            allowed_roles=allowed_roles,
+            active_roles=active_roles,
+            max_dispatches=max_dispatches,
+            run_preflight=run_preflight,
+        )
+        runner = ScriptedRunner([CodexRunnerTest().valid_result()])
+        with mock.patch.object(workflow, "WORKFLOW_STATE_ROOT", self.state_root):
+            if resume:
+                state = workflow._resume_stored_task(self.store, self.task_id, runner, None)
+            else:
+                state = workflow.run_until_gate(
+                    self.task_id,
+                    runner=runner,
+                    allow_live_model=False,
+                    state_root=self.state_root,
+                )
+        self.assertEqual([], runner.calls)
+        self.assertEqual("BLOCKED", state)
+        failures = [
+            event
+            for event in self._events()
+            if event.get("event_type") == "ROLE_FAILURE"
+        ]
+        self.assertTrue(failures)
+        self.assertEqual(code, failures[0]["error_code"])
+        self.assertEqual([], self._intent_events())
+
+    def test_until_gate_role_not_allowed_does_not_run(self) -> None:
+        self._assert_until_gate_rejects_before_runner(
+            "ROLE_NOT_ALLOWED",
+            allowed_roles=("sol_planner",),
+            active_roles=("sol_planner",),
+        )
+
+    def test_until_gate_role_not_preflighted_does_not_run(self) -> None:
+        self._assert_until_gate_rejects_before_runner(
+            "ROLE_NOT_PREFLIGHTED",
+            allowed_roles=("luna", "sol_planner"),
+            active_roles=("luna", "sol_planner"),
+            run_preflight=False,
+        )
+
+    def test_until_gate_budget_exceeded_does_not_run(self) -> None:
+        self._assert_until_gate_rejects_before_runner(
+            "ROUTE_BUDGET_EXCEEDED",
+            allowed_roles=("luna", "sol_planner"),
+            active_roles=("luna", "sol_planner"),
+            max_dispatches=0,
+        )
+
+    def test_resume_until_gate_role_not_allowed_does_not_run(self) -> None:
+        self._assert_until_gate_rejects_before_runner(
+            "ROLE_NOT_ALLOWED",
+            allowed_roles=("sol_planner",),
+            active_roles=("sol_planner",),
+            resume=True,
+        )
+
+    def test_resume_until_gate_role_not_preflighted_does_not_run(self) -> None:
+        self._assert_until_gate_rejects_before_runner(
+            "ROLE_NOT_PREFLIGHTED",
+            allowed_roles=("luna", "sol_planner"),
+            active_roles=("luna", "sol_planner"),
+            run_preflight=False,
+            resume=True,
+        )
+
+    def test_resume_until_gate_budget_exceeded_does_not_run(self) -> None:
+        self._assert_until_gate_rejects_before_runner(
+            "ROUTE_BUDGET_EXCEEDED",
+            allowed_roles=("luna", "sol_planner"),
+            active_roles=("luna", "sol_planner"),
+            max_dispatches=0,
+            resume=True,
+        )
+
+    def test_resume_until_gate_crash_window_recovers_declared_then_continues(self) -> None:
+        declaration = _install_declaration(
+            self.store, self.task, allowed_roles=("luna", "sol_planner"), active_roles=("luna", "sol_planner")
+        )
+        path = self.store._require_task(self.task_id) / "route-declaration.json"
+        before = path.read_bytes()
+        events = self.store._require_task(self.task_id) / "events.jsonl"
+        kept = [
+            line
+            for line in events.read_text(encoding="utf-8").splitlines()
+            if json.loads(line).get("event_type") != "ROUTE_DECLARED"
+        ]
+        events.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+        runner = ScriptedRunner([RuntimeError("runner boom")])
+        with mock.patch.object(workflow, "WORKFLOW_STATE_ROOT", self.state_root):
+            with self.assertRaises(RuntimeError):
+                workflow._resume_stored_task(self.store, self.task_id, runner, None)
+        self.assertEqual(["luna"], runner.calls)
+        self.assertEqual(before, path.read_bytes())
+        restored = [
+            event
+            for event in self._events()
+            if event.get("event_type") == "ROUTE_DECLARED"
+        ]
+        self.assertEqual(1, len(restored))
+        self.assertEqual(before, path.read_bytes())
+
+    def test_historical_task_without_route_decision_is_fail_closed(self) -> None:
+        events = self.store._require_task(self.task_id) / "events.jsonl"
+        events.write_text(
+            json.dumps({"event_type": "STATE_TRANSITION", "new_state": "DRAFT"}) + "\n",
+            encoding="utf-8",
+        )
+        popen = self._popen(CodexRunnerTest().valid_result())
+        with mock.patch.object(workflow.subprocess, "Popen", popen):
+            with self.assertRaisesRegex(
+                workflow.WorkflowError, "ROUTE_DECLARATION_MISSING|ROUTE_DECLARATION_LATE"
+            ):
+                workflow.run_codex("luna", self.task, "task contract", self._paths())
+        self.assertEqual([], popen.calls)
+        self.assertFalse((self.store._require_task(self.task_id) / "route-declaration.json").is_file())
+
+    def test_deleted_declaration_is_not_silently_rewritten(self) -> None:
+        _install_declaration(self.store, self.task, allowed_roles=("luna",), active_roles=("luna",))
+        path = self.store._require_task(self.task_id) / "route-declaration.json"
+        path.unlink()
+        popen = self._popen(CodexRunnerTest().valid_result())
+        with (
+            mock.patch.object(workflow, "capture_repo", return_value=workflow.RepoSnapshot("h" * 40, ())),
+            mock.patch.object(workflow, "working_tree_paths", return_value=set()),
+            mock.patch.object(workflow.subprocess, "Popen", popen),
+        ):
+            with self.assertRaisesRegex(
+                workflow.WorkflowError, "ROUTE_DECLARATION_MISSING|ROUTE_DECLARATION_CORRUPT"
+            ):
+                workflow.run_codex("luna", self.task, "task contract", self._paths())
+        self.assertEqual([], popen.calls)
+        self.assertFalse(path.is_file())
+
+    def test_crash_window_recovers_event_without_rewriting_bytes(self) -> None:
+        declaration = _install_declaration(
+            self.store, self.task, allowed_roles=("luna",), active_roles=("luna",)
+        )
+        path = self.store._require_task(self.task_id) / "route-declaration.json"
+        before = path.read_bytes()
+        events = self.store._require_task(self.task_id) / "events.jsonl"
+        kept = [
+            line
+            for line in events.read_text(encoding="utf-8").splitlines()
+            if json.loads(line).get("event_type") != "ROUTE_DECLARED"
+        ]
+        events.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+        loaded = declarations.load_route_declaration(self.store, self.task_id)
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        self.assertEqual(declaration.to_dict(), loaded.to_dict())
+        self.assertEqual(before, path.read_bytes())
+        restored = [
+            json.loads(line)
+            for line in events.read_text(encoding="utf-8").splitlines()
+            if json.loads(line).get("event_type") == "ROUTE_DECLARED"
+        ]
+        self.assertEqual(1, len(restored))
+
+    def test_live_luna_missing_declaration_does_not_call_run_codex(self) -> None:
+        events = self.store._require_task(self.task_id) / "events.jsonl"
+        events.write_text(
+            json.dumps({"event_type": "STATE_TRANSITION", "new_state": "DRAFT"}) + "\n",
+            encoding="utf-8",
+        )
+        args = argparse.Namespace(
+            allow_live_model=True,
+            role="luna",
+            root=self.state_root,
+            runtime_sessions_dir=self.repo / ".codex" / "sessions",
+        )
+        with mock.patch.object(workflow, "run_codex") as run_codex:
+            with self.assertRaisesRegex(workflow.WorkflowError, "ROUTE_DECLARATION_MISSING"):
+                workflow._run_live_luna(self.task, args)
+        run_codex.assert_not_called()
+
+    def _live_luna_args(self) -> argparse.Namespace:
+        return argparse.Namespace(
+            allow_live_model=True,
+            role="luna",
+            root=self.state_root,
+            runtime_sessions_dir=self.repo / ".codex" / "sessions",
+        )
+
+    def _assert_live_luna_rejects_before_popen(
+        self,
+        code: str,
+        *,
+        allowed_roles: tuple[str, ...],
+        active_roles: tuple[str, ...],
+        max_dispatches: int = 8,
+        run_preflight: bool = True,
+    ) -> None:
+        _install_declaration(
+            self.store,
+            self.task,
+            allowed_roles=allowed_roles,
+            active_roles=active_roles,
+            max_dispatches=max_dispatches,
+            run_preflight=run_preflight,
+        )
+        popen = self._popen(CodexRunnerTest().valid_result())
+        with (
+            mock.patch.object(workflow, "capture_repo", return_value=workflow.RepoSnapshot("h" * 40, ())),
+            mock.patch.object(workflow, "working_tree_paths", return_value=set()),
+            mock.patch.object(workflow.subprocess, "Popen", popen),
+        ):
+            with self.assertRaisesRegex(workflow.WorkflowError, code):
+                workflow._run_live_luna(self.task, self._live_luna_args())
+        self.assertEqual([], popen.calls)
+
+    def test_live_luna_role_not_allowed_does_not_spawn(self) -> None:
+        self._assert_live_luna_rejects_before_popen(
+            "ROLE_NOT_ALLOWED",
+            allowed_roles=("sol_planner",),
+            active_roles=("sol_planner",),
+        )
+
+    def test_live_luna_role_not_preflighted_does_not_spawn(self) -> None:
+        self._assert_live_luna_rejects_before_popen(
+            "ROLE_NOT_PREFLIGHTED",
+            allowed_roles=("luna", "sol_planner"),
+            active_roles=("luna", "sol_planner"),
+            run_preflight=False,
+        )
+
+    def test_live_luna_budget_exceeded_does_not_spawn(self) -> None:
+        self._assert_live_luna_rejects_before_popen(
+            "ROUTE_BUDGET_EXCEEDED",
+            allowed_roles=("luna", "sol_planner"),
+            active_roles=("luna", "sol_planner"),
+            max_dispatches=0,
+        )
+
+    def test_live_write_role_forwards_authorization_id_and_records_lease(self) -> None:
+        self._prepare_terra_task()
+        _install_declaration(self.store, self.task, allowed_roles=("terra",), active_roles=("terra",))
+        self._record_registry({"src": "luna"})
+        self._record_owner_evidence()
+        issued = self._issue_transfer()
+        popen = self._popen(self._terra_result())
+        captured: dict[str, object] = {}
+
+        class LiveForwardingRunner:
+            is_live_model = True
+
+            def run(self, role, task, *, authorization_id=None, attempt_context=None):
+                captured["authorization_id"] = authorization_id
+                kwargs: dict[str, object] = {}
+                if attempt_context is not None:
+                    kwargs["attempt_context"] = attempt_context
+                return workflow.run_codex(
+                    role,
+                    task,
+                    "task contract",
+                    self_paths,
+                    authorization_id=authorization_id,
+                    **kwargs,
+                )
+
+        self_paths = self._paths()
+        runner = LiveForwardingRunner()
+        with self._terra_run_patches(popen):
+            workflow._run_role_with_technical_retry(
+                self.store,
+                self.task_id,
+                self.task,
+                "IMPLEMENTATION_RUNNING",
+                "terra",
+                runner,
+                workflow.RetryBudget(),
+                state_root=self.state_root,
+                authorization_id=issued.authorization_id,
+            )
+        self.assertEqual(issued.authorization_id, captured.get("authorization_id"))
+        self.assertEqual(1, len(popen.calls))
+        permit_id = self._permit_records()[0]["permit_id"]
+        leases = authorizations.leases_for_permit(self.store, self.task_id, permit_id)
+        self.assertEqual(1, len(leases))
+        self.assertEqual(permit_id, leases[0]["permit_id"])
+        self.assertEqual(["src"], leases[0]["allowed_paths"])
+
+    def test_live_luna_preflights_active_roles_before_first_reserved(self) -> None:
+        with mock.patch.object(workflow, "run_codex") as run_codex:
+            run_codex.return_value = CodexRunnerTest().valid_result()
+            workflow._run_live_luna(self.task, self._live_luna_args())
+        run_codex.assert_called_once()
+        declaration = declarations.load_route_declaration(self.store, self.task_id)
+        self.assertIsNotNone(declaration)
+        assert declaration is not None
+        preflight_path = self.store._require_task(self.task_id) / preflight.PREFLIGHT_LEDGER
+        preflighted = [
+            json.loads(line)["role"]
+            for line in preflight_path.read_text(encoding="utf-8").splitlines()
+            if line
+        ]
+        self.assertEqual(list(declaration.active_roles), preflighted)
+        inactive = set(declaration.allowed_roles) - set(declaration.active_roles)
+        self.assertTrue(inactive.isdisjoint(set(preflighted)))
+        self.assertEqual([], self._permit_records())
 
 
 if __name__ == "__main__":

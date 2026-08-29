@@ -27,6 +27,55 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .ai_workflow import WorkflowStore
 
+try:
+    from .ai_workflow_side_effects import (
+        capture_fs_snapshot,
+        observation_exclusions,
+        observe_execution_side_effects,
+        record_unobserved_side_effect,
+    )
+    from .ai_workflow_verdicts import (
+        RELEASE_COMPLETION_PHASES,
+        require_verdict_fresh_locked,
+    )
+    from .ai_workflow_dispatch_policy import (
+        claim_permit_start_locked,
+        derive_assignment_dispatch_identity,
+        release_permit_if_never_spawned,
+        require_dispatch_permit_locked,
+    )
+    from .ai_workflow_ownership import (
+        claimed_write_paths,
+        ensure_ownership_registry_for_paths_locked,
+        require_write_ownership_locked,
+        verify_actual_write_paths,
+    )
+    from .ai_workflow_evidence import append_runtime_evidence_v2, record_launch_intent
+except ImportError:  # direct script execution
+    from ai_workflow_side_effects import (
+        capture_fs_snapshot,
+        observation_exclusions,
+        observe_execution_side_effects,
+        record_unobserved_side_effect,
+    )
+    from ai_workflow_verdicts import (
+        RELEASE_COMPLETION_PHASES,
+        require_verdict_fresh_locked,
+    )
+    from ai_workflow_dispatch_policy import (
+        claim_permit_start_locked,
+        derive_assignment_dispatch_identity,
+        release_permit_if_never_spawned,
+        require_dispatch_permit_locked,
+    )
+    from ai_workflow_ownership import (
+        claimed_write_paths,
+        ensure_ownership_registry_for_paths_locked,
+        require_write_ownership_locked,
+        verify_actual_write_paths,
+    )
+    from ai_workflow_evidence import append_runtime_evidence_v2, record_launch_intent
+
 
 _SHA_PATTERN = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 _ASSIGNMENT_ID_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -1290,14 +1339,65 @@ def _v2_append(
     event_type: str,
     candidate_commit: str,
     fields: Mapping[str, object],
+    *,
+    override_authorization_id: str | None = None,
 ) -> dict[str, object]:
+    """Append one adversarial-acceptance-1 event.
+
+    Generic pipeline owner decisions (CLI ``decide``) are not gated here.
+    This freshness gate only constrains adversarial-acceptance-1 ledger
+    tasks at terminal REPAIR_COMPLETED / REVIEW_COMPLETED. Whole-project
+    final children created by issue_final_acceptance still complete
+    through this append exit. authorize_final_xhigh is a separate exit.
+    """
+
     if event_type not in _ACCEPTANCE_EVENT_TYPES:
         _fail("ACCEPTANCE_LEDGER_INVALID", "event type is not part of the v2 ledger")
+    if _is_release_completion(store, task_id, event_type, fields, replay):
+        require_verdict_fresh_locked(
+            store, task_id, override_authorization_id=override_authorization_id
+        )
     event = _v2_common(replay, context, task_id, event_type, candidate_commit)
     event.update(fields)
     event["event_id"] = _v2_event_id(event)
     store.append_event(task_id, event)
     return event
+
+
+def _assignment_phase(
+    replay: _AcceptanceReplay | None, fields: Mapping[str, object]
+) -> str | None:
+    if replay is None:
+        return None
+    assignment_id = fields.get("assignment_id")
+    if not isinstance(assignment_id, str):
+        return None
+    stored = replay.assignments.get(assignment_id)
+    if stored is None:
+        return None
+    return stored.phase
+
+
+def _is_release_completion(
+    store: WorkflowStore,
+    task_id: str,
+    event_type: str,
+    fields: Mapping[str, object],
+    replay: _AcceptanceReplay | None,
+) -> bool:
+    if event_type not in {"REPAIR_COMPLETED", "REVIEW_COMPLETED"}:
+        return False
+    phase = _assignment_phase(replay, fields)
+    if phase in RELEASE_COMPLETION_PHASES:
+        return True
+    stored = _workflow().load_task(store._require_task(task_id) / "task.json")
+    if not _is_whole_project_final(stored, store=store):
+        return False
+    return (
+        event_type == "REVIEW_COMPLETED"
+        and fields.get("verdict") == "ACCEPT"
+        and phase != "REVIEW_1"
+    )
 
 
 def _v2_validate_observed_receipt(
@@ -1833,6 +1933,15 @@ def open_task_acceptance(
             allowed_owners = {"luna", "terra_xhigh", "luna_construction"}
         if owner_receipt.requested_role not in allowed_owners:
             _fail("ACCEPTANCE_RECEIPT_MISMATCH", "only Luna or Terra xhigh may own acceptance")
+        if _is_whole_project_final(stored, store=store):
+            ensure_ownership_registry_for_paths_locked(
+                store,
+                task_id,
+                path_owners={
+                    path: _SOL_MEDIUM_REVIEWER
+                    for path in stored["allowed_write_paths"]
+                },
+            )
         owner_actor = owner_receipt.actor_identity
         event = _v2_append(
             store,
@@ -2296,7 +2405,13 @@ def _require_one_final_xhigh_ticket(
     return tickets[0]
 
 
-def authorize_final_xhigh(store: WorkflowStore, task_id: str, actor: str) -> None:
+def authorize_final_xhigh(
+    store: WorkflowStore,
+    task_id: str,
+    actor: str,
+    *,
+    override_authorization_id: str | None = None,
+) -> None:
     """Record one owner-authorized Sol xhigh for whole-project final acceptance."""
 
     if not isinstance(actor, str) or not actor.strip():
@@ -2319,6 +2434,9 @@ def authorize_final_xhigh(store: WorkflowStore, task_id: str, actor: str) -> Non
         _assert_automatic_xhigh_disabled()
         if _final_xhigh_decision_records(store, task_id):
             _fail("ACCEPTANCE_SEQUENCE_INVALID", "whole-project xhigh is already authorized")
+        require_verdict_fresh_locked(
+            store, task_id, override_authorization_id=override_authorization_id
+        )
         store.record_decision(
             task_id,
             {
@@ -2670,6 +2788,15 @@ def _v2_controller_runtime_receipt(
             "runtime_evidence_sha256": evidence_sha256,
         },
     )
+    events_path = store._require_task(task_id) / "events.jsonl"
+    event_index = len(workflow.read_jsonl(events_path, code="EVENTS")) - 1
+    append_runtime_evidence_v2(
+        store,
+        task_id,
+        event_index=event_index,
+        observed=observed,
+        recorded_at_utc=str(evidence["observed_at_utc"]),
+    )
     return VerifiedActorReceipt(
         assignment_id=assignment.assignment_id,
         execution_surface=execution_surface,
@@ -2799,12 +2926,69 @@ def _v2_validate_controller_result(
     return result
 
 
+def _observe_assignment_execution_side_effects(
+    store: WorkflowStore,
+    task_id: str,
+    *,
+    role: str,
+    repository: Path,
+    before_fs: object,
+    completed: subprocess.CompletedProcess | None,
+    permit_id: str | None = None,
+) -> tuple[object, ...] | None:
+    """Record spawn-armed assignment effects; unknown results are fail-closed."""
+
+    if completed is None:
+        record_unobserved_side_effect(
+            store,
+            task_id,
+            role=role,
+            permit_id=permit_id,
+            reason="unobserved-assignment",
+        )
+        return None
+    if before_fs is None:
+        record_unobserved_side_effect(
+            store,
+            task_id,
+            role=role,
+            permit_id=permit_id,
+            reason="unobserved-assignment",
+        )
+        return None
+    try:
+        after_fs = capture_fs_snapshot(
+            repository, exclusions=observation_exclusions(repository)
+        )
+    except Exception:
+        record_unobserved_side_effect(
+            store,
+            task_id,
+            role=role,
+            permit_id=permit_id,
+            reason="unobserved-assignment",
+        )
+        return None
+    workflow = _workflow()
+    return observe_execution_side_effects(
+        store,
+        task_id,
+        role=role,
+        permit_id=permit_id,
+        before=before_fs,
+        after=after_fs,
+        rollout_events=tuple(workflow.parse_codex_jsonl(completed.stdout)),
+    )
+
+
 def run_assignment(
     store: WorkflowStore,
     task_id: str,
     assignment: AcceptanceAssignment,
     runtime_sessions_dir: Path | object,
     legacy_adapter: object | None = None,
+    *,
+    authorization_id: str | None = None,
 ) -> None:
     """Resume the issued runtime through the fixed controller execution path."""
 
@@ -2818,6 +3002,7 @@ def run_assignment(
     caller_boundary = isinstance(runtime_sessions_dir, ControllerAssignmentBoundary)
     workflow = _workflow()
     started = False
+    before_fs = None
     with store.lock(task_id):
         replay = replay_acceptance_ledger(store, task_id)
         if replay is None:
@@ -2841,6 +3026,9 @@ def run_assignment(
         if not isinstance(runtime_sessions_dir, (str, os.PathLike)):
             _fail("REPAIR_ADAPTER_REQUIRED", "fixed executor requires controller runtime sessions")
         repository, before = _v2_controller_snapshot(stored_task, replay)
+        before_fs = capture_fs_snapshot(
+            repository, exclusions=observation_exclusions(repository)
+        )
         task_dir = store._require_task(task_id)
         output_path = task_dir / "attempts" / f"{assignment.attempt_id}-assignment-result.json"
         if output_path.exists():
@@ -2861,85 +3049,188 @@ def run_assignment(
         candidate_commit=assignment.input_candidate_commit,
         actor_receipt=receipt,
     )
-    with store.lock(task_id):
-        replay = replay_acceptance_ledger(store, task_id)
-        if replay is None:
-            _fail("REPAIR_ADAPTER_REQUIRED", "v2 acceptance ledger is not open")
-        context = _v2_context(store, task_id)
-        replay = _v2_start_attempt(
-            store,
-            task_id,
-            replay,
-            context,
-            assignment,
-            receipt,
-            stored_task,
-            attestation,
-        )
-        started = True
+    permit = None
+    proc = None
     try:
-        role_config = workflow._load_role_config(assignment.expected_actor.role)
-        model = role_config.get("model")
-        effort = role_config.get("reasoning_effort")
-        if not isinstance(model, str) or not isinstance(effort, str):
-            _fail("REPAIR_ADAPTER_REQUIRED", "issued role runtime configuration is incomplete")
-        codex = shutil.which("codex", path=os.environ.get("PATH", os.defpath))
-        if not isinstance(codex, str):
-            _fail("REPAIR_ADAPTER_REQUIRED", "controller Codex executable is unavailable")
-        dispatch_schema_path = workflow.materialize_dispatch_result_schema(
-            repository / "config" / "ai_workflow_result.schema.json",
-            output_path.parent,
-            f"{assignment.attempt_id}-assignment",
-        )
-        command = [
-            codex,
-            "exec",
-            "resume",
-            "-m",
-            model,
-            "-c",
-            f'model_reasoning_effort="{effort}"',
-            "-c",
-            f'sandbox_mode="{receipt.observed_sandbox_policy}"',
-            "--json",
-            "--output-schema",
-            str(dispatch_schema_path),
-            "-o",
-            str(output_path),
-            receipt.runtime_instance_id,
-            "-",
-        ]
-        launched_ns = time.time_ns()
-        try:
-            completed = subprocess.run(
+        with store.lock(task_id):
+            replay = replay_acceptance_ledger(store, task_id)
+            if replay is None:
+                _fail("REPAIR_ADAPTER_REQUIRED", "v2 acceptance ledger is not open")
+            context = _v2_context(store, task_id)
+            if replay.whole_project_final:
+                ensure_ownership_registry_for_paths_locked(
+                    store,
+                    task_id,
+                    path_owners={
+                        path: _SOL_MEDIUM_REVIEWER
+                        for path in stored_task["allowed_write_paths"]
+                    },
+                )
+            replay = _v2_start_attempt(
+                store,
+                task_id,
+                replay,
+                context,
+                assignment,
+                receipt,
+                stored_task,
+                attestation,
+            )
+            started = True
+            permit = require_dispatch_permit_locked(
+                store,
+                task_id,
+                assignment.expected_actor.role,
+                dispatch_identity=derive_assignment_dispatch_identity(
+                    task_sha256=assignment.capability.task_sha256,
+                    assignment_id=assignment.assignment_id,
+                    attempt_id=assignment.attempt_id,
+                ),
+                config=workflow._load_workflow_config(),
+            )
+            require_write_ownership_locked(
+                store,
+                task_id,
+                assignment.expected_actor.role,
+                permit_id=permit.permit_id,
+                paths=claimed_write_paths(tuple(assignment.allowed_paths)),
+                authorization_id=authorization_id,
+            )
+            # Task 18: LAUNCH_INTENT_RECORDED is inserted in this critical section before spawn.
+            role_config = workflow._load_role_config(assignment.expected_actor.role)
+            model = role_config.get("model")
+            effort = role_config.get("reasoning_effort")
+            if not isinstance(model, str) or not isinstance(effort, str):
+                _fail("REPAIR_ADAPTER_REQUIRED", "issued role runtime configuration is incomplete")
+            codex = shutil.which("codex", path=os.environ.get("PATH", os.defpath))
+            if not isinstance(codex, str):
+                _fail("REPAIR_ADAPTER_REQUIRED", "controller Codex executable is unavailable")
+            dispatch_schema_path = workflow.materialize_dispatch_result_schema(
+                repository / "config" / "ai_workflow_result.schema.json",
+                output_path.parent,
+                f"{assignment.attempt_id}-assignment",
+            )
+            command = [
+                codex,
+                "exec",
+                "resume",
+                "-m",
+                model,
+                "-c",
+                f'model_reasoning_effort="{effort}"',
+                "-c",
+                f'sandbox_mode="{receipt.observed_sandbox_policy}"',
+                "--json",
+                "--output-schema",
+                str(dispatch_schema_path),
+                "-o",
+                str(output_path),
+                receipt.runtime_instance_id,
+                "-",
+            ]
+            record_launch_intent(
+                store,
+                task_id,
+                permit=permit,
+                role=assignment.expected_actor.role,
+                argv=tuple(command),
+                tool_mapping={},
+            )
+            launched_ns = time.time_ns()
+            proc = subprocess.Popen(
                 command,
                 cwd=repository,
-                input=_v2_assignment_prompt(stored_task, assignment),
-                check=False,
-                capture_output=True,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=120,
                 shell=False,
                 env=workflow.sanitized_environment(os.environ),
             )
-        except (OSError, subprocess.TimeoutExpired):
-            _fail("REPAIR_ADAPTER_REQUIRED", "controller assignment process could not complete")
-        if completed.returncode != 0:
-            _fail("REPAIR_ADAPTER_REQUIRED", "controller assignment process failed")
-        events = workflow.parse_codex_jsonl(completed.stdout)
-        if workflow.extract_codex_thread_id(events) != receipt.runtime_instance_id:
-            _fail("ACCEPTANCE_RECEIPT_MISMATCH", "resumed controller thread identity drifted")
+            claim_permit_start_locked(store, task_id, permit)
+    except BaseException:
+        if permit is not None:
+            release_permit_if_never_spawned(
+                store,
+                permit,
+                spawned=proc is not None,
+                reason="assignment-lock-before-communicate",
+            )
+        if proc is not None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        raise
+    try:
+        completed = None
+        spawned = proc is not None
+        assignment_failed = False
         try:
-            output_stat = output_path.stat()
-            output = json.loads(output_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            _fail("REPAIR_ADAPTER_INVALID_OUTPUT", "controller emitted no valid fresh result")
-        if output_stat.st_mtime_ns < launched_ns:
-            _fail("REPAIR_ADAPTER_INVALID_OUTPUT", "controller result predates assignment launch")
-        try:
-            after = workflow.capture_repo(repository)
-        except RuntimeError:
-            _fail("REPAIR_ADAPTER_REQUIRED", "controller cannot snapshot the post-launch repository")
+            try:
+                stdout, stderr = proc.communicate(
+                    input=_v2_assignment_prompt(stored_task, assignment),
+                    timeout=120,
+                )
+                completed = subprocess.CompletedProcess(
+                    proc.args, proc.returncode, stdout, stderr
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                _fail("REPAIR_ADAPTER_REQUIRED", "controller assignment process could not complete")
+            if completed.returncode != 0:
+                _fail("REPAIR_ADAPTER_REQUIRED", "controller assignment process failed")
+            events = workflow.parse_codex_jsonl(completed.stdout)
+            if workflow.extract_codex_thread_id(events) != receipt.runtime_instance_id:
+                _fail("ACCEPTANCE_RECEIPT_MISMATCH", "resumed controller thread identity drifted")
+            try:
+                output_stat = output_path.stat()
+                output = json.loads(output_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                _fail("REPAIR_ADAPTER_INVALID_OUTPUT", "controller emitted no valid fresh result")
+            if output_stat.st_mtime_ns < launched_ns:
+                _fail("REPAIR_ADAPTER_INVALID_OUTPUT", "controller result predates assignment launch")
+            try:
+                after = workflow.capture_repo(repository)
+            except RuntimeError:
+                _fail("REPAIR_ADAPTER_REQUIRED", "controller cannot snapshot the post-launch repository")
+        except BaseException:
+            assignment_failed = True
+            if permit is not None:
+                release_permit_if_never_spawned(
+                    store,
+                    permit,
+                    spawned=proc is not None,
+                    reason="assignment-before-or-after-spawn",
+                )
+            if proc is not None:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+            raise
+        finally:
+            if spawned:
+                observed = _observe_assignment_execution_side_effects(
+                    store,
+                    task_id,
+                    role=assignment.expected_actor.role,
+                    repository=repository,
+                    before_fs=before_fs,
+                    completed=completed,
+                    permit_id=permit.permit_id if permit is not None else None,
+                )
+                if permit is not None:
+                    verify_actual_write_paths(
+                        store,
+                        task_id,
+                        assignment.expected_actor.role,
+                        permit_id=permit.permit_id,
+                        actual_paths=(
+                            None
+                            if observed is None
+                            else tuple(change.path for change in observed)
+                        ),
+                    )
         if after.status:
             _fail("REPAIR_ADAPTER_REQUIRED", "controller rejects uncommitted assignment writes")
         if assignment.phase in _REVIEW_PHASES and after != before:

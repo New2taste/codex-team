@@ -1,0 +1,1093 @@
+"""Frozen wire golden and production-surface negative regressions."""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import inspect
+import json
+import subprocess
+import tempfile
+import unittest
+import uuid
+from pathlib import Path
+from unittest import mock
+
+from scripts import ai_workflow as workflow
+from scripts import ai_workflow_artifacts as artifacts
+from scripts import ai_workflow_authorizations as authorizations
+from scripts import ai_workflow_costs as costs
+from scripts import ai_workflow_dispatch_policy as policy
+from scripts import ai_workflow_evidence as evidence
+from scripts import ai_workflow_ownership as ownership
+from scripts import ai_workflow_repairs as repairs
+from scripts import ai_workflow_router_probe as probe
+from scripts import ai_workflow_verdicts as verdicts
+from scripts import sync_plugin
+from tests import test_ai_workflow as _workflow_tests
+from tests import test_ai_workflow_router_probe as _probe_tests
+from tests.test_ai_workflow import (
+    _RecordingPopen,
+    _install_declaration,
+)
+from tests.test_ai_workflow_construction_execution import (
+    construction_plan,
+    remediation_task,
+)
+from tests.test_ai_workflow_dispatch_policy import TASK_ID, _DispatchStoreMixin
+
+
+ROOT = Path(__file__).resolve().parents[1]
+README_DISCLAIMER = (
+    "这不是实测成本赢家，也不改生产 `effective_route`，实际仍以使用者选择为准"
+)
+FROZEN_TASK_FIELDS = frozenset(
+    {
+        "schema_version",
+        "task_id",
+        "paired_case_id",
+        "task_type",
+        "objective",
+        "repository_root",
+        "source_worktree",
+        "base_commit",
+        "candidate_commit",
+        "authoritative_files",
+        "allowed_write_paths",
+        "forbidden_actions",
+        "risk_flags",
+        "acceptance_commands",
+        "verification_level",
+        "human_gates",
+    }
+)
+FROZEN_RESULT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "role",
+        "status",
+        "summary",
+        "claims",
+        "evidence",
+        "counter_checks",
+        "changed_files",
+        "blind_spots",
+        "unresolved_questions",
+        "recommended_next_state",
+        "dispatch_id",
+        "task_id",
+        "step_id",
+        "attempt",
+    }
+)
+FROZEN_ROUTE_DECISION_FIELDS = frozenset(
+    {
+        "schema_version",
+        "task_id",
+        "route",
+        "rule_id",
+        "task_sha256",
+        "request_sha256",
+        "decided_at_utc",
+        "routing_mode",
+        "evidence_class",
+    }
+)
+FROZEN_OWNER_DECISIONS = frozenset(
+    {
+        "approve_execution",
+        "authorize_rework",
+        "authorize_escalation",
+        "defer",
+        "close",
+        "abort",
+    }
+)
+FROZEN_EFFECT_KINDS = frozenset(
+    {
+        "CONTROL_PLANE_ARTIFACT",
+        "OWNED_WRITE",
+        "UNTRACKED_WRITE",
+        "COMMAND_GENERATED",
+        "EXTERNAL",
+        "UNOBSERVED_ASSUMED_PRESENT",
+    }
+)
+FROZEN_OWNERSHIP_VIOLATION_EVENT_FIELDS = frozenset(
+    {
+        "event_type",
+        "task_id",
+        "envelope_hash",
+        "permit_id",
+        "role",
+        "paths",
+        "timestamp_utc",
+    }
+)
+FROZEN_ACCEPTANCE_EVENT_TYPES = frozenset(
+    {
+        "ACCEPTANCE_OPENED",
+        "ASSIGNMENT_ISSUED",
+        "ASSIGNMENT_ATTEMPT_STARTED",
+        "ASSIGNMENT_ATTEMPT_FAILED",
+        "REPAIR_COMPLETED",
+        "REVIEW_COMPLETED",
+    }
+)
+FROZEN_ACCEPTANCE_COMMON_FIELDS = frozenset(
+    {
+        "ledger_version",
+        "event_type",
+        "event_index",
+        "event_id",
+        "previous_event_id",
+        "timestamp_utc",
+        "task_id",
+        "task_sha256",
+        "base_commit",
+        "candidate_commit",
+    }
+)
+# Closed extras the writer may merge onto `_v2_common` for each event type
+# (required keys plus conditional terminal/attestation keys). Drift in
+# `_v2_append` call-site dicts turns the golden red.
+FROZEN_ACCEPTANCE_WRITER_EXTRAS = {
+    "ACCEPTANCE_OPENED": frozenset(
+        {
+            "owner_actor",
+            "owner_receipt",
+            "owner_receipt_sha256",
+            "initial_candidate_commit",
+        }
+    ),
+    "ASSIGNMENT_ISSUED": frozenset(
+        {
+            "assignment_id",
+            "attempt_id",
+            "phase",
+            "expected_actor",
+            "input_candidate_commit",
+            "findings",
+            "allowed_paths",
+            "capability",
+        }
+    ),
+    "ASSIGNMENT_ATTEMPT_STARTED": frozenset(
+        {
+            "assignment_id",
+            "attempt_id",
+            "actor_receipt",
+            "receipt_sha256",
+            "controller_attestation",
+            "controller_attestation_sha256",
+        }
+    ),
+    "ASSIGNMENT_ATTEMPT_FAILED": frozenset(
+        {"assignment_id", "attempt_id", "failure_code", "failure_message"}
+    ),
+    "REPAIR_COMPLETED": frozenset(
+        {
+            "assignment_id",
+            "attempt_id",
+            "actor_receipt",
+            "changed_paths",
+            "actual_changed_paths",
+            "output_candidate_commit",
+            "terminal_state",
+            "terminal_reason",
+            "whole_project_acceptance_required",
+        }
+    ),
+    "REVIEW_COMPLETED": frozenset(
+        {
+            "assignment_id",
+            "attempt_id",
+            "reviewer_receipt",
+            "verdict",
+            "findings",
+            "evidence",
+            "evidence_sha256",
+            "terminal_state",
+            "terminal_reason",
+            "whole_project_acceptance_required",
+        }
+    ),
+}
+LANDED_SIDECAR_SCHEMAS = (
+    "ai_workflow_route_declaration.schema.json",
+    "ai_workflow_candidate_state.schema.json",
+    "ai_workflow_final_verdict.schema.json",
+    "ai_workflow_ownership_registry.schema.json",
+    "ai_workflow_side_effect.schema.json",
+    "ai_workflow_owner_authorization.schema.json",
+    "ai_workflow_rate_snapshot.schema.json",
+    "ai_workflow_preflight_record.schema.json",
+    "ai_workflow_runtime_evidence_v2.schema.json",
+)
+LANDED_PRODUCTION_MODULES = (
+    "ai_workflow_declarations.py",
+    "ai_workflow_candidate_state.py",
+    "ai_workflow_verdicts.py",
+    "ai_workflow_ownership.py",
+    "ai_workflow_side_effects.py",
+    "ai_workflow_authorizations.py",
+    "ai_workflow_preflight.py",
+    "ai_workflow_dispatch_policy.py",
+    "ai_workflow_evidence.py",
+)
+EXCLUDED_RUNTIME_SCRIPTS = (
+    "ai_workflow_identity_probe.py",
+    "ai_workflow_evidence_chain.py",
+    "ai_workflow_router_probe.py",
+    "collect_test_baseline.py",
+)
+
+
+def _schema_properties(name: str) -> set[str]:
+    payload = json.loads((ROOT / "config" / name).read_text(encoding="utf-8"))
+    return set(payload["properties"])
+
+
+def _git_show(spec: str) -> bytes:
+    completed = subprocess.run(
+        ["git", "show", spec],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+    )
+    return completed.stdout
+
+
+def _repairs_tree() -> ast.Module:
+    return ast.parse((ROOT / "scripts" / "ai_workflow_repairs.py").read_text(encoding="utf-8"))
+
+
+def _dict_literal_keys(node: ast.AST | None) -> frozenset[str] | None:
+    if not isinstance(node, ast.Dict):
+        return None
+    keys: list[str] = []
+    for key in node.keys:
+        if not isinstance(key, ast.Constant) or not isinstance(key.value, str):
+            raise AssertionError("writer dict keys must be string constants")
+        keys.append(key.value)
+    return frozenset(keys)
+
+
+def _function_named(tree: ast.Module, name: str) -> ast.FunctionDef:
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    raise AssertionError(f"missing function {name}")
+
+
+def _return_dict_keys(function: ast.FunctionDef) -> frozenset[str]:
+    for node in function.body:
+        if isinstance(node, ast.Return):
+            keys = _dict_literal_keys(node.value)
+            if keys is not None:
+                return keys
+    raise AssertionError(f"{function.name} does not return a dict literal")
+
+
+def _event_field_reads(node: ast.AST) -> frozenset[str]:
+    keys: set[str] = set()
+    for child in ast.walk(node):
+        if (
+            isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Attribute)
+            and child.func.attr == "get"
+            and isinstance(child.func.value, ast.Name)
+            and child.func.value.id == "event"
+            and child.args
+            and isinstance(child.args[0], ast.Constant)
+            and isinstance(child.args[0].value, str)
+        ):
+            keys.add(child.args[0].value)
+        if (
+            isinstance(child, ast.Subscript)
+            and isinstance(child.value, ast.Name)
+            and child.value.id == "event"
+        ):
+            slice_node = child.slice
+            if isinstance(slice_node, ast.Constant) and isinstance(slice_node.value, str):
+                keys.add(slice_node.value)
+        if (
+            isinstance(child, ast.Compare)
+            and child.ops
+            and isinstance(child.ops[0], ast.In)
+            and child.comparators
+            and isinstance(child.comparators[0], ast.Name)
+            and child.comparators[0].id == "event"
+            and isinstance(child.left, ast.Constant)
+            and isinstance(child.left.value, str)
+        ):
+            keys.add(child.left.value)
+    return frozenset(keys)
+
+
+def _v2_append_event_and_fields(call: ast.Call) -> tuple[str, ast.AST] | None:
+    if not (isinstance(call.func, ast.Name) and call.func.id == "_v2_append"):
+        return None
+    if len(call.args) < 7 or not isinstance(call.args[4], ast.Constant):
+        raise AssertionError("_v2_append must pass event_type and fields positionally")
+    event_type = call.args[4].value
+    if not isinstance(event_type, str):
+        raise AssertionError("_v2_append event_type is not a string")
+    return event_type, call.args[6]
+
+
+def _walk_writer_field_sets(
+    stmts: list[ast.stmt],
+    payload_keys: frozenset[str],
+    collected: dict[str, frozenset[str]],
+) -> None:
+    assigns: list[tuple[int, frozenset[str]]] = []
+    updates: list[tuple[int, frozenset[str]]] = []
+
+    def visit(stmt: ast.stmt) -> None:
+        assign_value: ast.AST | None = None
+        assign_target: str | None = None
+        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+            target = stmt.targets[0]
+            if isinstance(target, ast.Name):
+                assign_target = target.id
+                assign_value = stmt.value
+        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+            assign_target = stmt.target.id
+            assign_value = stmt.value
+        if assign_target == "fields" and assign_value is not None:
+            keys = _dict_literal_keys(assign_value)
+            if keys is None:
+                raise AssertionError("named fields must be a dict literal")
+            assigns.append((stmt.lineno, keys))
+        calls: list[ast.Call] = []
+        if assign_value is not None and isinstance(assign_value, ast.Call):
+            calls.append(assign_value)
+        if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+            calls.append(stmt.value)
+        if isinstance(stmt, ast.Return) and isinstance(stmt.value, ast.Call):
+            calls.append(stmt.value)
+        for call in calls:
+            if (
+                isinstance(call.func, ast.Attribute)
+                and call.func.attr == "update"
+                and isinstance(call.func.value, ast.Name)
+                and call.func.value.id == "fields"
+                and call.args
+            ):
+                extra = _dict_literal_keys(call.args[0])
+                if extra is None:
+                    raise AssertionError("fields.update must pass a dict literal")
+                updates.append((call.lineno, extra))
+            extracted = _v2_append_event_and_fields(call)
+            if extracted is not None:
+                event_type, fields_node = extracted
+                collected[event_type] = _resolve_writer_fields(
+                    fields_node, call.lineno, assigns, updates, payload_keys
+                )
+        if isinstance(stmt, ast.If):
+            for child in (*stmt.body, *stmt.orelse):
+                visit(child)
+        elif isinstance(stmt, ast.With):
+            for child in stmt.body:
+                visit(child)
+        elif isinstance(stmt, ast.Try):
+            for child in (*stmt.body, *stmt.orelse, *stmt.finalbody):
+                visit(child)
+            for handler in stmt.handlers:
+                for child in handler.body:
+                    visit(child)
+        elif isinstance(stmt, (ast.For, ast.While)):
+            for child in (*stmt.body, *stmt.orelse):
+                visit(child)
+
+    for stmt in stmts:
+        visit(stmt)
+
+
+def _resolve_writer_fields(
+    fields_node: ast.AST,
+    append_lineno: int,
+    assigns: list[tuple[int, frozenset[str]]],
+    updates: list[tuple[int, frozenset[str]]],
+    payload_keys: frozenset[str],
+) -> frozenset[str]:
+    if isinstance(fields_node, ast.Name) and fields_node.id == "fields":
+        prior = [item for item in assigns if item[0] < append_lineno]
+        if not prior:
+            raise AssertionError("named fields used before assignment")
+        assigned = prior[-1]
+        extra = frozenset().union(
+            *(
+                keys
+                for lineno, keys in updates
+                if assigned[0] < lineno < append_lineno
+            )
+        )
+        return assigned[1] | extra
+    literal = _dict_literal_keys(fields_node)
+    if literal is not None:
+        return literal
+    if (
+        isinstance(fields_node, ast.Call)
+        and isinstance(fields_node.func, ast.Name)
+        and fields_node.func.id == "_v2_assignment_payload_for_event"
+    ):
+        return payload_keys
+    raise AssertionError("unsupported _v2_append fields argument")
+
+
+def _acceptance_writer_extras() -> dict[str, frozenset[str]]:
+    tree = _repairs_tree()
+    payload_keys = _return_dict_keys(
+        _function_named(tree, "_v2_assignment_payload_for_event")
+    )
+    collected: dict[str, frozenset[str]] = {}
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and any(
+            isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Name)
+            and child.func.id == "_v2_append"
+            for child in ast.walk(node)
+        ):
+            _walk_writer_field_sets(node.body, payload_keys, collected)
+    return collected
+
+
+def _acceptance_replay_extra_keys() -> dict[str, frozenset[str]]:
+    tree = _repairs_tree()
+    replay = _function_named(tree, "replay_acceptance_ledger")
+    by_type: dict[str, set[str]] = {name: set() for name in FROZEN_ACCEPTANCE_EVENT_TYPES}
+    by_type["ASSIGNMENT_ISSUED"] |= set(
+        _event_field_reads(_function_named(tree, "_v2_assignment_from_event"))
+    )
+
+    def field_reads(stmts: list[ast.stmt]) -> frozenset[str]:
+        return _event_field_reads(ast.Module(body=list(stmts), type_ignores=[]))
+
+    def visit(stmt: ast.stmt) -> None:
+        if isinstance(stmt, ast.If):
+            event_type = _event_type_equality(stmt.test)
+            if event_type is not None:
+                by_type[event_type].update(field_reads(stmt.body))
+                for child in stmt.orelse:
+                    visit(child)
+                return
+            if _is_first_event_branch(stmt.test):
+                by_type["ACCEPTANCE_OPENED"].update(field_reads(stmt.body))
+                for child in stmt.orelse:
+                    visit(child)
+                return
+            for child in (*stmt.body, *stmt.orelse):
+                visit(child)
+            return
+        if isinstance(stmt, ast.Try):
+            for child in (*stmt.body, *stmt.orelse, *stmt.finalbody):
+                visit(child)
+            for handler in stmt.handlers:
+                for child in handler.body:
+                    visit(child)
+            return
+        if isinstance(stmt, (ast.For, ast.While, ast.With)):
+            for child in stmt.body:
+                visit(child)
+
+    for stmt in replay.body:
+        visit(stmt)
+    return {event_type: frozenset(keys) for event_type, keys in by_type.items()}
+
+
+def _event_type_equality(test: ast.AST) -> str | None:
+    if (
+        not isinstance(test, ast.Compare)
+        or not test.ops
+        or not isinstance(test.ops[0], ast.Eq)
+        or not test.comparators
+    ):
+        return None
+    comparator = test.comparators[0]
+    if not isinstance(comparator, ast.Constant) or not isinstance(comparator.value, str):
+        return None
+    if comparator.value not in FROZEN_ACCEPTANCE_EVENT_TYPES:
+        return None
+    return comparator.value
+
+
+def _is_first_event_branch(test: ast.AST) -> bool:
+    return (
+        isinstance(test, ast.Compare)
+        and test.ops
+        and isinstance(test.ops[0], ast.Eq)
+        and isinstance(test.left, ast.Name)
+        and test.left.id == "index"
+        and test.comparators
+        and isinstance(test.comparators[0], ast.Constant)
+        and test.comparators[0].value == 0
+    )
+
+
+def _assignment_popen_command(call: mock._Call) -> list[object]:
+    args, kwargs = call
+    command = args[0] if args else kwargs.get("args")
+    if command is None:
+        return []
+    return list(command)
+
+
+def _is_assignment_spawn(call: mock._Call) -> bool:
+    command = _assignment_popen_command(call)
+    return bool(command) and command[0] != "git" and "-o" in command and "resume" in command
+
+
+class FrozenWireGoldenTest(unittest.TestCase):
+    def test_ai_task_1_field_set_matches_schema_and_constant(self):
+        self.assertEqual(FROZEN_TASK_FIELDS, workflow.TASK_FIELDS)
+        self.assertEqual(FROZEN_TASK_FIELDS, _schema_properties("ai_workflow_task.schema.json"))
+        self.assertEqual(
+            FROZEN_TASK_FIELDS - {"paired_case_id"},
+            workflow.REQUIRED_TASK_FIELDS,
+        )
+
+    def test_ai_result_1_field_set_matches_schema_and_constants(self):
+        combined = workflow.RESULT_REQUIRED_FIELDS | workflow.RESULT_IDENTITY_FIELDS
+        self.assertEqual(FROZEN_RESULT_FIELDS, combined)
+        self.assertEqual(
+            FROZEN_RESULT_FIELDS,
+            _schema_properties("ai_workflow_result.schema.json"),
+        )
+        self.assertEqual(
+            frozenset({"dispatch_id", "task_id", "step_id", "attempt"}),
+            workflow.RESULT_IDENTITY_FIELDS,
+        )
+
+    def test_route_decision_nine_fields_are_frozen(self):
+        self.assertEqual(9, len(FROZEN_ROUTE_DECISION_FIELDS))
+        self.assertEqual(FROZEN_ROUTE_DECISION_FIELDS, artifacts.ROUTE_DECISION_FIELDS)
+        self.assertEqual(
+            FROZEN_ROUTE_DECISION_FIELDS,
+            _schema_properties("ai_workflow_route_decision.schema.json"),
+        )
+
+    def test_acceptance_ledger_version_and_six_event_types(self):
+        self.assertEqual("adversarial-acceptance-1", repairs._ACCEPTANCE_LEDGER_VERSION)
+        self.assertEqual(FROZEN_ACCEPTANCE_EVENT_TYPES, repairs._ACCEPTANCE_EVENT_TYPES)
+        self.assertEqual(6, len(repairs._ACCEPTANCE_EVENT_TYPES))
+        self.assertEqual(FROZEN_ACCEPTANCE_COMMON_FIELDS, repairs._V2_COMMON_FIELDS)
+        common_without_id = _return_dict_keys(
+            _function_named(_repairs_tree(), "_v2_common")
+        )
+        self.assertEqual(common_without_id | {"event_id"}, repairs._V2_COMMON_FIELDS)
+        writer_extras = _acceptance_writer_extras()
+        replay_keys = _acceptance_replay_extra_keys()
+        self.assertEqual(FROZEN_ACCEPTANCE_EVENT_TYPES, set(writer_extras))
+        self.assertEqual(FROZEN_ACCEPTANCE_EVENT_TYPES, set(FROZEN_ACCEPTANCE_WRITER_EXTRAS))
+        for event_type in repairs._ACCEPTANCE_EVENT_TYPES:
+            extras = writer_extras[event_type]
+            self.assertEqual(FROZEN_ACCEPTANCE_WRITER_EXTRAS[event_type], extras, event_type)
+            self.assertTrue(extras.isdisjoint(repairs._V2_COMMON_FIELDS), event_type)
+            self.assertEqual(
+                FROZEN_ACCEPTANCE_COMMON_FIELDS | FROZEN_ACCEPTANCE_WRITER_EXTRAS[event_type],
+                repairs._V2_COMMON_FIELDS | extras,
+                event_type,
+            )
+            self.assertTrue(
+                (replay_keys[event_type] - repairs._V2_COMMON_FIELDS) <= extras,
+                (event_type, replay_keys[event_type] - repairs._V2_COMMON_FIELDS - extras),
+            )
+
+    def test_owner_decisions_closed_set(self):
+        self.assertEqual(FROZEN_OWNER_DECISIONS, workflow.OWNER_DECISIONS)
+        self.assertNotIn("authorize_final_xhigh", workflow.OWNER_DECISIONS)
+
+    def test_effect_kinds_closed_set_excludes_ownership_violation(self):
+        self.assertEqual(FROZEN_EFFECT_KINDS, ownership.EFFECT_KINDS)
+        self.assertNotIn("OWNERSHIP_VIOLATION_RECORDED", ownership.EFFECT_KINDS)
+        self.assertEqual(
+            "OWNERSHIP_VIOLATION_RECORDED",
+            ownership.OWNERSHIP_VIOLATION_EVENT_TYPE,
+        )
+        self.assertEqual(
+            FROZEN_OWNERSHIP_VIOLATION_EVENT_FIELDS,
+            ownership.OWNERSHIP_VIOLATION_EVENT_FIELDS,
+        )
+
+    def test_exclude_constants_are_per_record_class_and_not_merged(self):
+        self.assertEqual(frozenset({"authorization_id"}), authorizations.AUTHORIZATION_ID_EXCLUDE)
+        self.assertEqual(frozenset({"record_id"}), authorizations.RECORD_ID_EXCLUDE)
+        self.assertEqual(frozenset({"verdict_id"}), verdicts.VERDICT_ID_EXCLUDE)
+        self.assertEqual(frozenset({"event_id"}), evidence.LAUNCH_INTENT_ID_EXCLUDE)
+        self.assertEqual(frozenset({"evidence_id"}), evidence.RUNTIME_EVIDENCE_ID_EXCLUDE)
+        self.assertNotEqual(
+            authorizations.AUTHORIZATION_ID_EXCLUDE,
+            authorizations.RECORD_ID_EXCLUDE,
+        )
+        self.assertEqual(
+            authorizations.AUTHORIZATION_ID_EXCLUDE | authorizations.RECORD_ID_EXCLUDE,
+            frozenset({"authorization_id", "record_id"}),
+        )
+        merged = (
+            authorizations.AUTHORIZATION_ID_EXCLUDE
+            | authorizations.RECORD_ID_EXCLUDE
+            | verdicts.VERDICT_ID_EXCLUDE
+            | evidence.LAUNCH_INTENT_ID_EXCLUDE
+            | evidence.RUNTIME_EVIDENCE_ID_EXCLUDE
+        )
+        self.assertEqual(
+            merged,
+            frozenset(
+                {
+                    "authorization_id",
+                    "record_id",
+                    "verdict_id",
+                    "event_id",
+                    "evidence_id",
+                }
+            ),
+        )
+
+    def test_baseline_manifest_blob_matches_task_00_freeze(self):
+        current = (ROOT / "tests" / "baseline_manifest.json").read_bytes()
+        frozen = _git_show("e35c010:tests/baseline_manifest.json")
+        self.assertEqual(frozen, current)
+        manifest = json.loads(current)
+        self.assertEqual("ce24e14ec39107a97a4c675ea763e784caff8c60", manifest["base_commit"])
+        self.assertEqual(588, len(manifest["tests"]))
+
+
+class EffectiveRouteAndProductionSurfaceTest(unittest.TestCase):
+    def test_landed_artifacts_exist_and_probe_effective_route_stays_unchanged(self):
+        for name in LANDED_SIDECAR_SCHEMAS:
+            self.assertTrue((ROOT / "config" / name).is_file(), name)
+        for name in LANDED_PRODUCTION_MODULES:
+            self.assertTrue((ROOT / "scripts" / name).is_file(), name)
+        rows, cost_rows, source = _probe_tests.RouterProbeAnalysisTest.measured_matrix()
+        summary = probe.aggregate_probe_results(
+            rows, cost_rows, source_manifest=source
+        )
+        self.assertEqual("UNCHANGED", summary["effective_route"])
+        self.assertEqual("router-probe-summary-2", summary["schema_version"])
+
+    def test_route_declaration_does_not_change_stored_route_decision_wire(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "repository"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "config", "user.email", "golden@example.test"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Golden Test"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "config", "commit.gpgsign", "false"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+            )
+            (repo / "README.md").write_text("repo\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+            (repo / ".codex" / "sessions").mkdir(parents=True, exist_ok=True)
+            store = workflow.WorkflowStore(root / "state")
+            task = _workflow_tests.TaskValidationTest().valid_task()
+            task["repository_root"] = str(repo)
+            store.create_task(task)
+            task_id = str(task["task_id"])
+            request = {
+                "schema_version": "ai-route-request-1",
+                "task_id": task_id,
+                "work_class": "PLANNING_ONLY",
+                "execution_need": "READ_ONLY",
+                "decomposable": True,
+                "risk_flags": [],
+                "reason_codes": ["PLAN_IS_DELIVERABLE"],
+            }
+            computed = workflow.decide_route(task, request, "legacy")
+            first = workflow.persist_or_reuse_route_decision(store, task_id, computed)
+            decision_path = store._require_task(task_id) / "route-decision.json"
+            before = decision_path.read_bytes()
+            before_wire = json.loads(before)
+            self.assertEqual(FROZEN_ROUTE_DECISION_FIELDS, set(before_wire))
+            _install_declaration(
+                store, task, allowed_roles=("luna",), active_roles=("luna",)
+            )
+            reused = workflow.persist_or_reuse_route_decision(store, task_id, first)
+            after = decision_path.read_bytes()
+            self.assertEqual(before, after)
+            self.assertEqual(first.to_dict(), reused.to_dict())
+            self.assertEqual(before_wire, json.loads(after))
+
+    def test_cost_fields_are_not_parameters_of_optimization_gate(self):
+        signature = inspect.signature(costs.evaluate_optimization_gate)
+        self.assertEqual(
+            ["metrics", "minimum_cases", "quality_margin_points"],
+            list(signature.parameters),
+        )
+        for forbidden in (
+            "cost_estimate",
+            "effective_route",
+            "rate_snapshot",
+            "estimated_cost_minor",
+            "total_cost_minor",
+        ):
+            self.assertNotIn(forbidden, signature.parameters)
+        summary = {
+            f"case-{index:02d}": {
+                "net_measured_cost_delta": -1.0,
+                "quality_delta_points": 0.0,
+                "measured_attempt_count": 1,
+            }
+            for index in range(8)
+        }
+        metrics = {
+            "cost_summary": summary,
+            "p0_miss_count": 0,
+            "p1_miss_count": 0,
+            "calibration_first_delivery_pass_rate": 0.5,
+            "experiment_first_delivery_pass_rate": 0.6,
+            "synthetic": False,
+        }
+        without = costs.evaluate_optimization_gate(metrics, minimum_cases=8)
+        with_cost = costs.evaluate_optimization_gate(
+            {
+                **metrics,
+                "cost_estimate": {
+                    "type": "COST_ESTIMATE_UNDER_SNAPSHOT",
+                    "total": {"type": "COST_TOTAL_UNDER_SNAPSHOT", "total_cost_minor": 1},
+                },
+                "effective_route": "luna",
+            },
+            minimum_cases=8,
+        )
+        self.assertEqual(without, with_cost)
+        self.assertEqual("ALLOW_ENFORCED", without)
+
+    def test_identity_probe_and_evidence_chain_are_outside_runtime_files(self):
+        for name in EXCLUDED_RUNTIME_SCRIPTS:
+            self.assertNotIn(name, sync_plugin.RUNTIME_FILES)
+            self.assertFalse((ROOT / "plugins" / "ai-workflow" / "runtime" / name).exists())
+        self.assertTrue((ROOT / "scripts" / "ai_workflow_identity_probe.py").is_file())
+        self.assertTrue((ROOT / "scripts" / "ai_workflow_evidence_chain.py").is_file())
+
+
+class FourDirectPathMissingDeclarationTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        root = Path(self.temporary.name)
+        self.repo = root / "repository"
+        self.repo.mkdir()
+        subprocess.run(["git", "init", "-b", "main"], cwd=self.repo, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "config", "user.email", "golden@example.test"],
+            cwd=self.repo,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Golden Test"],
+            cwd=self.repo,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "commit.gpgsign", "false"],
+            cwd=self.repo,
+            check=True,
+            capture_output=True,
+        )
+        (self.repo / "README.md").write_text("fixture\n", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md"], cwd=self.repo, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=self.repo, check=True, capture_output=True)
+        (self.repo / ".codex" / "sessions").mkdir(parents=True, exist_ok=True)
+        self.state_root = root / "state"
+        self.store = workflow.WorkflowStore(self.state_root)
+        self.task = _workflow_tests.TaskValidationTest().valid_task()
+        self.task["repository_root"] = str(self.repo)
+        self.store.create_task(self.task)
+        self.task_id = str(self.task["task_id"])
+        _RecordingPopen.reset()
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_run_live_luna_missing_declaration_does_not_call_run_codex(self):
+        events = self.store._require_task(self.task_id) / "events.jsonl"
+        events.write_text(
+            json.dumps({"event_type": "STATE_TRANSITION", "new_state": "DRAFT"}) + "\n",
+            encoding="utf-8",
+        )
+        args = argparse.Namespace(
+            allow_live_model=True,
+            role="luna",
+            root=self.state_root,
+            runtime_sessions_dir=self.repo / ".codex" / "sessions",
+        )
+        with mock.patch.object(workflow, "run_codex") as run_codex:
+            with self.assertRaisesRegex(workflow.WorkflowError, "ROUTE_DECLARATION_MISSING"):
+                workflow._run_live_luna(self.task, args)
+        run_codex.assert_not_called()
+
+    def test_team_call_l1_production_controller_missing_declaration_does_not_spawn(self):
+        receipt = workflow.run_team_call(
+            "team call 核对文件 README.md",
+            repository_root=self.repo,
+            state_root=self.state_root,
+            controller=workflow.TeamCallFakeController(),
+        )
+        self.assertEqual("DIRECT_L1", receipt.disposition)
+        task_id = str(receipt.task_id)
+        declaration = self.state_root / task_id / "route-declaration.json"
+        self.assertTrue(declaration.is_file())
+        declaration.unlink()
+        task = workflow.load_task(self.state_root / task_id / "task.json")
+        evidence_pin = workflow._team_call_l1_evidence(self.repo, "README.md")
+        execution = workflow._team_call_l1_execution(
+            task,
+            task,
+            self.state_root / task_id / "task.json",
+            evidence_pin,
+            workflow.CODEX_EXEC_ROLE_CONTRACT,
+        )
+        controller = workflow.TeamCallProductionController(
+            self.state_root,
+            allow_live_model=True,
+            runtime_sessions_dir=self.repo / ".codex" / "sessions",
+        )
+        popen = mock.Mock()
+        with (
+            mock.patch.object(
+                workflow, "capture_repo", return_value=workflow.RepoSnapshot("h" * 40, ())
+            ),
+            mock.patch.object(workflow, "working_tree_paths", return_value=set()),
+            mock.patch.object(workflow.subprocess, "Popen", popen),
+        ):
+            with self.assertRaisesRegex(
+                workflow.WorkflowError,
+                "ROUTE_DECLARATION_MISSING|ROUTE_DECLARATION_CORRUPT",
+            ):
+                controller.run_l1(execution, role="luna")
+        popen.assert_not_called()
+
+    def test_construction_runner_missing_declaration_does_not_spawn(self):
+        task = remediation_task()
+        task_id = str(task["task_id"])
+        worktree = self.repo / ".codex-worktrees" / task_id.lower()
+        subprocess.run(
+            ["git", "worktree", "add", str(worktree), "HEAD"],
+            cwd=self.repo,
+            check=True,
+            capture_output=True,
+        )
+        (worktree / ".codex" / "sessions").mkdir(parents=True, exist_ok=True)
+        task["repository_root"] = str(self.repo)
+        task["source_worktree"] = str(worktree)
+        task["base_commit"] = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=self.repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        frozen = workflow.validate_plan(construction_plan(task=task), task)
+        context = workflow.ConstructionExecutionContext(
+            plan=frozen,
+            step=frozen.tasks[0],
+            dispatch_id="d" * 64,
+            task_sha256=frozen.task_sha256,
+            request_sha256="e" * 64,
+            role="luna_construction",
+        )
+        store = workflow.WorkflowStore(self.state_root)
+        store.create_task(task)
+        runner = workflow.CodexConstructionRunner(
+            self.state_root, worktree / ".codex" / "sessions"
+        )
+
+        class Popen(_RecordingPopen):
+            _result = _workflow_tests.CodexRunnerTest().valid_result(
+                "luna_construction", "IMPLEMENTED_CANDIDATE"
+            )
+
+        with (
+            mock.patch.object(
+                workflow, "capture_repo", return_value=workflow.RepoSnapshot("h" * 40, ())
+            ),
+            mock.patch.object(workflow, "working_tree_paths", return_value=set()),
+            mock.patch.object(workflow, "_assert_terra_worktree_authorized"),
+            mock.patch.object(workflow, "_reject_dirty_input"),
+            mock.patch.object(workflow.subprocess, "Popen", Popen),
+        ):
+            with self.assertRaisesRegex(workflow.WorkflowError, "ROUTE_DECLARATION_MISSING"):
+                runner.run_construction("luna_construction", task, context)
+        self.assertEqual([], Popen.calls)
+
+    def test_run_assignment_missing_declaration_does_not_spawn(self):
+        from tests.test_ai_workflow_adversarial_acceptance import (
+            AcceptanceLedgerV2ContractTest,
+        )
+
+        fx = AcceptanceLedgerV2ContractTest()
+        fx.setUp()
+        try:
+            fx.task["source_worktree"] = str(fx.repository_root)
+            (fx.repository_root / ".codex" / "sessions").mkdir(parents=True, exist_ok=True)
+            fx._open_with_owner("luna-owner", "luna")
+            reviewer_thread = str(uuid.uuid4())
+            review = fx._issue(
+                "REVIEW_1",
+                fx._expected_actor(
+                    "terra-gate-review",
+                    "terra_xhigh_reviewer",
+                    runtime_instance_id=reviewer_thread,
+                ),
+            )
+            sessions = fx.repository_root.parent / "gate-sessions"
+            sessions.mkdir(parents=True, exist_ok=True)
+            (sessions / f"rollout-{reviewer_thread}").write_text(
+                json.dumps(
+                    {
+                        "thread_id": reviewer_thread,
+                        "agent_type": None,
+                        "model": "gpt-5.6-terra",
+                        "reasoning_effort": "xhigh",
+                        "sandbox_policy": "read-only",
+                        "permission_profile": "read-only",
+                        "cwd": str(fx.repository_root),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (fx.store._require_task(fx.TASK_ID) / "route-declaration.json").unlink()
+            self.assertRegex(
+                inspect.getsource(fx._original_run_assignment),
+                r"\bsubprocess\.Popen\(",
+            )
+            with (
+                mock.patch.object(
+                    repairs.subprocess,
+                    "Popen",
+                    wraps=repairs.subprocess.Popen,
+                ) as spawn,
+                fx._controller_codex_lookup(),
+            ):
+                with self.assertRaisesRegex(
+                    workflow.WorkflowError,
+                    "ROUTE_DECLARATION_MISSING|ROUTE_DECLARATION_CORRUPT",
+                ):
+                    repairs.run_assignment(fx.store, fx.TASK_ID, review, sessions)
+            assignment_spawns = [
+                call for call in spawn.call_args_list if _is_assignment_spawn(call)
+            ]
+            self.assertEqual([], assignment_spawns)
+            self.assertEqual(0, len(assignment_spawns))
+        finally:
+            fx.tearDown()
+
+
+class DirectL0NeverReachesModelTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name) / "state"
+        self.repo = Path(self.temporary.name) / "repository"
+        self.repo.mkdir()
+        subprocess.run(["git", "init", "-b", "main"], cwd=self.repo, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "config", "user.email", "l0@example.test"],
+            cwd=self.repo,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "L0 Test"],
+            cwd=self.repo,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "commit.gpgsign", "false"],
+            cwd=self.repo,
+            check=True,
+            capture_output=True,
+        )
+        (self.repo / "README.md").write_text("fixture\n", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md"], cwd=self.repo, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=self.repo, check=True, capture_output=True)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_direct_l0_never_reaches_run_codex_or_consumes_a_permit(self):
+        controller = workflow.TeamCallProductionController(self.root)
+        with (
+            mock.patch.object(workflow, "run_codex") as run_codex,
+            mock.patch.object(workflow, "_run_trusted_team_call_l0", wraps=workflow._run_trusted_team_call_l0) as l0,
+        ):
+            receipt = workflow.run_team_call(
+                "team call 检查当前工作区状态",
+                repository_root=self.repo,
+                state_root=self.root,
+                controller=controller,
+            )
+        self.assertEqual("DIRECT_L0", receipt.disposition)
+        self.assertIsNone(receipt.task_id)
+        run_codex.assert_not_called()
+        l0.assert_called_once()
+        self.assertFalse(
+            any(path.is_dir() and path.name.startswith("AWF-") for path in self.root.iterdir())
+            if self.root.exists()
+            else False
+        )
+        permit_ledgers = list(self.root.rglob("dispatch-permits.jsonl")) if self.root.exists() else []
+        self.assertEqual([], permit_ledgers)
+
+
+class PermitTerminalStateRegressionTest(_DispatchStoreMixin, unittest.TestCase):
+    def test_replayed_terminal_permit_cannot_reenter(self):
+        self._preflight()
+        started = self._require(attempt_id="started")
+        with self.store.lock(TASK_ID):
+            policy.claim_permit_start_locked(self.store, TASK_ID, started)
+        replayed = policy.replay_permit_ledger(self.store, TASK_ID)
+        self.assertEqual("STARTED", policy.permit_latest_states(replayed)[started.permit_id])
+        with self.assertRaisesRegex(
+            artifacts.WorkflowError, "DISPATCH_PERMIT_ALREADY_STARTED"
+        ):
+            self._require(attempt_id="started")
+
+        released = self._require(attempt_id="released")
+        with self.store.lock(TASK_ID):
+            policy.release_permit_before_start_locked(
+                self.store, TASK_ID, released, reason="spawn-failed"
+            )
+        replayed = policy.replay_permit_ledger(self.store, TASK_ID)
+        self.assertEqual(
+            "RELEASED_BEFORE_START",
+            policy.permit_latest_states(replayed)[released.permit_id],
+        )
+        with self.assertRaisesRegex(artifacts.WorkflowError, "DISPATCH_IDENTITY_RETIRED"):
+            self._require(attempt_id="released")
+
+        orphan = self._require(attempt_id="orphan")
+        replayed = policy.replay_permit_ledger(self.store, TASK_ID)
+        self.assertEqual("RESERVED", policy.permit_latest_states(replayed)[orphan.permit_id])
+        with self.assertRaisesRegex(artifacts.WorkflowError, "DISPATCH_PERMIT_UNCLAIMED"):
+            self._require(attempt_id="orphan")
+
+
+class ReadmeDisclaimerTest(unittest.TestCase):
+    def test_readme_keeps_non_measured_cost_winner_disclaimer(self):
+        text = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn(README_DISCLAIMER, text)
+        self.assertNotIn("实测成本赢家", text.replace(README_DISCLAIMER, ""))
+        self.assertNotIn("实测推荐", text)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,117 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "identity-probe-manifest-1"
+    },
+    "protocol_version": {
+      "type": "string",
+      "const": "identity-probe-1"
+    },
+    "batch_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
+    "arm": {
+      "type": "string",
+      "enum": ["NO_OP", "ONE_TURN", "TWO_TURN"]
+    },
+    "seed": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "max_calls": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "max_output_tokens": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "max_output_tokens_per_call": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "created_at_utc": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "requested_launch_intent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "model": {
+          "type": "string",
+          "enum": ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"]
+        },
+        "effort": {
+          "type": "string",
+          "enum": ["max", "medium", "xhigh"]
+        }
+      },
+      "required": ["model", "effort"]
+    },
+    "observed_runtime_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "identity_source": {
+          "type": "string",
+          "enum": ["SERVER_METADATA", "RUNTIME_EVIDENCE"]
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "effort": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sandbox": {
+          "type": "string",
+          "minLength": 1
+        },
+        "permission": {
+          "type": "string",
+          "minLength": 1
+        },
+        "fork_state": {
+          "type": "string",
+          "minLength": 1
+        },
+        "nested_state": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "identity_source",
+        "model",
+        "effort",
+        "sandbox",
+        "permission",
+        "fork_state",
+        "nested_state"
+      ]
+    },
+    "model_text_output": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "protocol_version",
+    "batch_id",
+    "arm",
+    "seed",
+    "max_calls",
+    "max_output_tokens",
+    "max_output_tokens_per_call",
+    "created_at_utc",
+    "requested_launch_intent",
+    "observed_runtime_identity",
+    "model_text_output"
+  ]
+}

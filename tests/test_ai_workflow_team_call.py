@@ -12,7 +12,14 @@ from pathlib import Path
 from unittest import mock
 
 from scripts import ai_workflow as workflow
+from scripts import ai_workflow_declarations as declarations
+from scripts import ai_workflow_dispatch_policy as policy
+from scripts import ai_workflow_preflight as preflight
 from scripts import ai_workflow_team_call as team
+from tests.test_ai_workflow import CodexRunnerTest, _RecordingPopen
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def _concurrent_claim(state_root: str, started, results) -> None:
@@ -1154,6 +1161,208 @@ class TeamCallControllerTest(unittest.TestCase):
             shell=False,
             cwd=self.repo,
         )
+
+    def test_direct_l0_never_reaches_run_codex_or_creates_a_task(self) -> None:
+        with mock.patch.object(workflow, "run_codex") as run_codex:
+            receipt = workflow.run_team_call(
+                "team call 检查当前工作区状态",
+                repository_root=self.repo,
+                state_root=self.root,
+                controller=self.controller,
+            )
+        self.assertEqual("DIRECT_L0", receipt.disposition)
+        self.assertIsNone(receipt.task_id)
+        run_codex.assert_not_called()
+        self.assertFalse(any(path.is_dir() and path.name.startswith("AWF-") for path in self.root.iterdir()))
+
+    def test_direct_l1_creates_declaration_and_rejects_after_deletion(self) -> None:
+        (self.repo / ".codex" / "sessions").mkdir(parents=True, exist_ok=True)
+        receipt = workflow.run_team_call(
+            "team call 核对文件 README.md",
+            repository_root=self.repo,
+            state_root=self.root,
+            controller=self.controller,
+        )
+        self.assertEqual("DIRECT_L1", receipt.disposition)
+        task_id = receipt.task_id
+        self.assertIsNotNone(task_id)
+        declaration = self.root / str(task_id) / "route-declaration.json"
+        self.assertTrue(declaration.is_file())
+        declaration.unlink()
+        store = workflow.WorkflowStore(self.root)
+        task = workflow.load_task(self.root / str(task_id) / "task.json")
+        paths = workflow.RunPaths(
+            repo=self.repo,
+            output_path=self.root / str(task_id) / "luna-result.json",
+            schema_path=ROOT / "config/ai_workflow_result.schema.json",
+            logs_dir=self.root / str(task_id) / "logs",
+            state_root=self.root,
+        )
+        with (
+            mock.patch.object(workflow, "working_tree_paths", return_value=set()),
+            mock.patch.object(workflow, "capture_repo", return_value=workflow.RepoSnapshot("h" * 40, ())),
+            mock.patch.object(workflow.subprocess, "Popen") as popen,
+        ):
+            with self.assertRaisesRegex(
+                workflow.WorkflowError, "ROUTE_DECLARATION_MISSING|ROUTE_DECLARATION_CORRUPT"
+            ):
+                workflow.run_codex("luna", task, "task contract", paths)
+        popen.assert_not_called()
+
+    def _direct_l1_task(self):
+        (self.repo / ".codex" / "sessions").mkdir(parents=True, exist_ok=True)
+        receipt = workflow.run_team_call(
+            "team call 核对文件 README.md",
+            repository_root=self.repo,
+            state_root=self.root,
+            controller=self.controller,
+        )
+        self.assertEqual("DIRECT_L1", receipt.disposition)
+        task_id = str(receipt.task_id)
+        task = workflow.load_task(self.root / task_id / "task.json")
+        paths = workflow.RunPaths(
+            repo=self.repo,
+            output_path=self.root / task_id / "luna-result.json",
+            schema_path=ROOT / "config/ai_workflow_result.schema.json",
+            logs_dir=self.root / task_id / "logs",
+            state_root=self.root,
+        )
+        return task_id, task, paths
+
+    def _l1_popen(self):
+        result = CodexRunnerTest().valid_result()
+
+        class Popen(_RecordingPopen):
+            _result = result
+
+        _RecordingPopen.reset()
+        return Popen
+
+    def _assert_direct_l1_rejects_before_spawn(self, code: str, role: str, mutate) -> None:
+        task_id, task, paths = self._direct_l1_task()
+        mutate(task_id)
+        popen = self._l1_popen()
+        with (
+            mock.patch.object(workflow, "working_tree_paths", return_value=set()),
+            mock.patch.object(
+                workflow, "capture_repo", return_value=workflow.RepoSnapshot("h" * 40, ())
+            ),
+            mock.patch.object(workflow.subprocess, "Popen", popen),
+        ):
+            with self.assertRaisesRegex(workflow.WorkflowError, code):
+                workflow.run_codex(role, task, "task contract", paths)
+        self.assertEqual([], popen.calls)
+
+    def test_direct_l1_role_not_allowed_does_not_spawn(self) -> None:
+        self._assert_direct_l1_rejects_before_spawn(
+            "ROLE_NOT_ALLOWED", "luna", lambda task_id: None
+        )
+
+    def test_direct_l1_role_not_preflighted_does_not_spawn(self) -> None:
+        task_id, task, paths = self._direct_l1_task()
+        ledger = self.root / task_id / preflight.PREFLIGHT_LEDGER
+        if ledger.is_file():
+            ledger.unlink()
+        declaration = declarations.load_route_declaration(
+            workflow.WorkflowStore(self.root), task_id
+        )
+        self.assertIsNotNone(declaration)
+        role = declaration.allowed_roles[0]
+        popen = self._l1_popen()
+        with (
+            mock.patch.object(workflow, "working_tree_paths", return_value=set()),
+            mock.patch.object(
+                workflow, "capture_repo", return_value=workflow.RepoSnapshot("h" * 40, ())
+            ),
+            mock.patch.object(workflow.subprocess, "Popen", popen),
+        ):
+            with self.assertRaisesRegex(workflow.WorkflowError, "ROLE_NOT_PREFLIGHTED"):
+                workflow.run_codex(role, task, "task contract", paths)
+        self.assertEqual([], popen.calls)
+
+    def test_direct_l1_budget_exceeded_does_not_spawn(self) -> None:
+        task_id, task, paths = self._direct_l1_task()
+        store = workflow.WorkflowStore(self.root)
+        declaration = declarations.load_route_declaration(store, task_id)
+        self.assertIsNotNone(declaration)
+        path = store._require_task(task_id) / policy.DISPATCH_PERMIT_LEDGER
+        lines: list[str] = []
+        seq = 1
+        for index in range(declaration.max_dispatches):
+            permit_id = f"{index:064x}"
+            for state in ("RESERVED", "STARTED"):
+                lines.append(
+                    json.dumps(
+                        {
+                            "schema_version": policy.DISPATCH_PERMIT_SCHEMA_VERSION,
+                            "seq": seq,
+                            "permit_id": permit_id,
+                            "task_id": task_id,
+                            "role": declaration.allowed_roles[0],
+                            "state": state,
+                            "reason": "",
+                            "recorded_at_utc": "2026-08-28T00:00:00Z",
+                        }
+                    )
+                )
+                seq += 1
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        popen = self._l1_popen()
+        with (
+            mock.patch.object(workflow, "working_tree_paths", return_value=set()),
+            mock.patch.object(
+                workflow, "capture_repo", return_value=workflow.RepoSnapshot("h" * 40, ())
+            ),
+            mock.patch.object(workflow.subprocess, "Popen", popen),
+        ):
+            with self.assertRaisesRegex(workflow.WorkflowError, "ROUTE_BUDGET_EXCEEDED"):
+                workflow.run_codex(
+                    declaration.allowed_roles[0], task, "task contract", paths
+                )
+        self.assertEqual([], popen.calls)
+
+    def test_direct_l1_preflights_active_roles_and_trims_inactive(self) -> None:
+        task_id, task, paths = self._direct_l1_task()
+        store = workflow.WorkflowStore(self.root)
+        declaration = declarations.load_route_declaration(store, task_id)
+        self.assertIsNotNone(declaration)
+        assert declaration is not None
+        ledger = self.root / task_id / preflight.PREFLIGHT_LEDGER
+        self.assertTrue(ledger.is_file())
+        preflighted = [
+            json.loads(line)["role"]
+            for line in ledger.read_text(encoding="utf-8").splitlines()
+            if line
+        ]
+        self.assertEqual(list(declaration.active_roles), preflighted)
+        inactive = set(declaration.allowed_roles) - set(declaration.active_roles)
+        self.assertTrue(inactive.isdisjoint(set(preflighted)))
+
+    def test_direct_l1_deleted_preflight_does_not_grow_permits(self) -> None:
+        task_id, task, paths = self._direct_l1_task()
+        ledger = self.root / task_id / preflight.PREFLIGHT_LEDGER
+        if ledger.is_file():
+            ledger.unlink()
+        permit_path = self.root / task_id / policy.DISPATCH_PERMIT_LEDGER
+        before = permit_path.read_bytes() if permit_path.is_file() else b""
+        declaration = declarations.load_route_declaration(
+            workflow.WorkflowStore(self.root), task_id
+        )
+        self.assertIsNotNone(declaration)
+        role = declaration.active_roles[0]
+        popen = self._l1_popen()
+        with (
+            mock.patch.object(workflow, "working_tree_paths", return_value=set()),
+            mock.patch.object(
+                workflow, "capture_repo", return_value=workflow.RepoSnapshot("h" * 40, ())
+            ),
+            mock.patch.object(workflow.subprocess, "Popen", popen),
+        ):
+            with self.assertRaisesRegex(workflow.WorkflowError, "ROLE_NOT_PREFLIGHTED"):
+                workflow.run_codex(role, task, "task contract", paths)
+        self.assertEqual([], popen.calls)
+        after = permit_path.read_bytes() if permit_path.is_file() else b""
+        self.assertEqual(before, after)
 
 
 if __name__ == "__main__":

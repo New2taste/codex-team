@@ -1,0 +1,52 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "ai-final-verdict-1"
+    },
+    "verdict_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "envelope_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "candidate_state": {
+      "type": "object"
+    },
+    "verdict": {
+      "type": "string",
+      "enum": ["ACCEPT", "REJECT"]
+    },
+    "verdict_source_role": {
+      "type": "string",
+      "enum": ["sol_medium_reviewer"]
+    },
+    "issuer_evidence_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "recorded_at_utc": {
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "required": [
+    "schema_version",
+    "verdict_id",
+    "task_id",
+    "envelope_hash",
+    "candidate_state",
+    "verdict",
+    "verdict_source_role",
+    "issuer_evidence_id",
+    "recorded_at_utc"
+  ]
+}

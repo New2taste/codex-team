@@ -15,6 +15,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from collections.abc import Mapping
@@ -76,6 +77,7 @@ HUMAN_GATES = frozenset(
     }
 )
 TASK_ID_PATTERN = re.compile(r"^AWF-[0-9]{8}-[0-9]{3,}$")
+LEDGER_NAME_PATTERN = re.compile(r"^[a-z0-9-]+\.jsonl$")
 ATTEMPT_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
 ROLE_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "ai_workflow.toml"
 RESULT_REQUIRED_FIELDS = frozenset(
@@ -149,13 +151,6 @@ _LONG_HIGH_ENTROPY = re.compile(r"(?<![A-Za-z0-9_])[A-Za-z0-9+/=_-]{48,}(?![A-Za
 METRICS_SCHEMA_VERSION = "ai-metrics-1"
 
 
-class WorkflowError(RuntimeError):
-    def __init__(self, code: str, message: str):
-        self.code = str(code)
-        self.message = str(message)
-        super().__init__(f"{self.code}: {self.message}")
-
-
 try:
     from .ai_workflow_artifacts import (
         ArtifactError,
@@ -165,14 +160,22 @@ try:
         RouteDecision,
         RouteRequest,
         RuntimeEvidence,
+        WorkflowError,
+        _directory_identity_matches,
+        _open_parent_directory,
+        _validate_regular_descriptor,
+        append_jsonl,
         artifact_sha256,
+        canonical_json,
         load_artifact,
+        read_jsonl,
         validate_cost_evidence,
         validate_plan_shape,
         validate_route_advice,
         validate_route_decision,
         validate_route_request,
         validate_runtime_evidence,
+        write_json_once,
     )
 except ImportError:  # direct script execution
     from ai_workflow_artifacts import (
@@ -183,15 +186,25 @@ except ImportError:  # direct script execution
         RouteDecision,
         RouteRequest,
         RuntimeEvidence,
+        WorkflowError,
+        _directory_identity_matches,
+        _open_parent_directory,
+        _validate_regular_descriptor,
+        append_jsonl,
         artifact_sha256,
+        canonical_json,
         load_artifact,
+        read_jsonl,
         validate_cost_evidence,
         validate_plan_shape,
         validate_route_advice,
         validate_route_decision,
         validate_route_request,
         validate_runtime_evidence,
+        write_json_once,
     )
+
+_canonical_json = canonical_json
 
 try:
     from .ai_workflow_runtime import (
@@ -233,6 +246,63 @@ except ImportError:  # direct script execution
         verify_runtime_identity,
         write_runtime_evidence,
     )
+
+try:
+    from .ai_workflow_side_effects import (
+        capture_fs_snapshot,
+        observation_exclusions,
+        observe_execution_side_effects,
+        record_unobserved_side_effect,
+    )
+    from .ai_workflow_dispatch_policy import (
+        activate_role,
+        claim_permit_start_locked,
+        derive_assignment_dispatch_identity,
+        derive_dispatch_identity,
+        ensure_declaration_for_task,
+        precheck_dispatch_permit,
+        preflight_active_roles,
+        release_permit_if_never_spawned,
+        require_dispatch_permit_locked,
+    )
+    from .ai_workflow_ownership import (
+        claimed_write_paths,
+        ensure_ownership_registry_locked,
+        precheck_write_ownership,
+        require_write_ownership_locked,
+        verify_actual_write_paths,
+    )
+    from .ai_workflow_preflight import run_role_preflight
+    from .ai_workflow_declarations import load_route_declaration_locked
+    from .ai_workflow_evidence import append_runtime_evidence_v2, record_launch_intent
+except ImportError:  # direct script execution
+    from ai_workflow_side_effects import (
+        capture_fs_snapshot,
+        observation_exclusions,
+        observe_execution_side_effects,
+        record_unobserved_side_effect,
+    )
+    from ai_workflow_dispatch_policy import (
+        activate_role,
+        claim_permit_start_locked,
+        derive_assignment_dispatch_identity,
+        derive_dispatch_identity,
+        ensure_declaration_for_task,
+        precheck_dispatch_permit,
+        preflight_active_roles,
+        release_permit_if_never_spawned,
+        require_dispatch_permit_locked,
+    )
+    from ai_workflow_ownership import (
+        claimed_write_paths,
+        ensure_ownership_registry_locked,
+        precheck_write_ownership,
+        require_write_ownership_locked,
+        verify_actual_write_paths,
+    )
+    from ai_workflow_preflight import run_role_preflight
+    from ai_workflow_declarations import load_route_declaration_locked
+    from ai_workflow_evidence import append_runtime_evidence_v2, record_launch_intent
 
 try:
     from .ai_workflow_costs import (
@@ -1664,6 +1734,7 @@ def run_codex(
     construction_step_id: object = None,
     construction_context: ConstructionExecutionContext | None = None,
     prompt_result: PromptBuildResult | None = None,
+    authorization_id: str | None = None,
 ) -> dict:
     """Run one pinned Codex role and accept only a validated output document."""
 
@@ -1703,9 +1774,8 @@ def run_codex(
     accounting_context = _require_attempt_accounting_context(
         attempt_context, task["task_id"], role
     )
-    runtime_sessions_dir: Path | None = None
-    if paths.runtime_evidence_required:
-        runtime_sessions_dir = _require_runtime_sessions_directory(paths.runtime_sessions_dir)
+    if paths.state_root is None:
+        _fail("ROUTE_DECLARATION_MISSING", "dispatch requires a workflow state root")
     repo = Path(paths.repo).resolve()
     if repo != _execution_repo(task, role):
         _fail("ROLE_REPOSITORY_MISMATCH", "role repository does not match the task execution repository")
@@ -1718,39 +1788,26 @@ def run_codex(
         assert_acceptance_candidate(task, repo)
     if role in TERRA_WRITE_ROLES:
         _reject_dirty_input(repo, "DIRTY_TERRA_WORKTREE", "Terra requires a clean source_worktree")
-    _claim_attempt_context(paths, accounting_context)
+    store = WorkflowStore(paths.state_root)
+    runtime_sessions_dir: Path | None = None
     runtime_store: WorkflowStore | None = None
     runtime_task_dir: Path | None = None
     runtime_before_artifacts: RuntimeArtifactSnapshot | None = None
-    if paths.runtime_evidence_required:
-        if paths.state_root is None:
-            _fail("RUNTIME_EVIDENCE_MISSING", "live execution requires a workflow state root")
-        runtime_store = WorkflowStore(paths.state_root)
-        runtime_task_dir = runtime_store._require_task(task["task_id"])
-        # A new attempt must never leave an old canonical answer consumable if
-        # this attempt later has missing, stale, or conflicting runtime facts.
-        try:
-            Path(paths.output_path).unlink()
-        except FileNotFoundError:
-            pass
-        except OSError as exc:
-            raise WorkflowError("RUNTIME_EVIDENCE_INVALID", "cannot invalidate prior canonical output") from exc
-        runtime_before_artifacts = runtime_artifact_snapshot(
-            {"task.json": runtime_task_dir / "task.json"}
-        )
-    before_run = capture_repo(repo)
-    before_changes = working_tree_paths(repo)
+    before_run: RepoSnapshot | None = None
+    before_changes: set[str] | None = None
+    before_fs = None
+    spawned = False
+    permit = None
+    proc = None
     attempt_id = accounting_context.attempt_id
     attempt_output = Path(paths.output_path).parent / "attempts" / f"{attempt_id}.json"
     attempt_events = Path(paths.logs_dir) / f"{attempt_id}.jsonl"
     attempt_started_ns = time.time_ns()
-    attempt_output.parent.mkdir(parents=True, exist_ok=True)
-    if attempt_output.exists():
-        _fail("ATTEMPT_OUTPUT_COLLISION", "role attempt output path already exists")
     result: dict | None = None
     completed: subprocess.CompletedProcess | None = None
     attempt_error: BaseException | None = None
     attempt_recorded = False
+    observed_changes = None
 
     def _append_attempt(quality_outcome: str, runtime_usage: object) -> None:
         nonlocal attempt_recorded
@@ -1777,25 +1834,111 @@ def run_codex(
         attempt_recorded = True
 
     try:
-        dispatch_schema_path = materialize_dispatch_result_schema(
-            paths.schema_path, attempt_output.parent, attempt_id
-        )
-        command = build_codex_command(role, repo, attempt_output, dispatch_schema_path)
         try:
-            completed = subprocess.run(
-                command,
-                check=False,
-                capture_output=True,
-                input=prompt,
-                text=True,
-                timeout=CODEX_TIMEOUT_SECONDS,
-                env=sanitized_environment(os.environ),
-                cwd=str(repo),
-                shell=False,
+            with store.lock(task["task_id"]):
+                permit = require_dispatch_permit_locked(
+                    store,
+                    task["task_id"],
+                    role,
+                    dispatch_identity=_codex_dispatch_identity(
+                        task, role, accounting_context, construction_context
+                    ),
+                    config=_load_workflow_config(),
+                )
+                if role in TERRA_WRITE_ROLES:
+                    require_write_ownership_locked(
+                        store,
+                        task["task_id"],
+                        _ownership_claimant(
+                            role,
+                            luna_construction_step=luna_construction_step,
+                            construction_context=construction_context,
+                        ),
+                        permit_id=permit.permit_id,
+                        paths=claimed_write_paths(
+                            _write_scopes_for_role(
+                                task,
+                                luna_construction_step=luna_construction_step,
+                                construction_context=construction_context,
+                            )
+                        ),
+                        authorization_id=authorization_id,
+                    )
+                # Task 18: LAUNCH_INTENT_RECORDED is inserted in this critical section before spawn.
+                before_run = capture_repo(repo)
+                before_changes = working_tree_paths(repo)
+                before_fs = capture_fs_snapshot(repo, exclusions=observation_exclusions(repo))
+                if paths.runtime_evidence_required:
+                    runtime_sessions_dir = _require_runtime_sessions_directory(
+                        paths.runtime_sessions_dir
+                    )
+                _claim_attempt_context(paths, accounting_context)
+                if paths.runtime_evidence_required:
+                    runtime_store = store
+                    runtime_task_dir = runtime_store._require_task(task["task_id"])
+                    try:
+                        Path(paths.output_path).unlink()
+                    except FileNotFoundError:
+                        pass
+                    except OSError as exc:
+                        raise WorkflowError(
+                            "RUNTIME_EVIDENCE_INVALID",
+                            "cannot invalidate prior canonical output",
+                        ) from exc
+                    runtime_before_artifacts = runtime_artifact_snapshot(
+                        {"task.json": runtime_task_dir / "task.json"}
+                    )
+                attempt_output.parent.mkdir(parents=True, exist_ok=True)
+                if attempt_output.exists():
+                    _fail("ATTEMPT_OUTPUT_COLLISION", "role attempt output path already exists")
+                dispatch_schema_path = materialize_dispatch_result_schema(
+                    paths.schema_path, attempt_output.parent, attempt_id
+                )
+                command = build_codex_command(role, repo, attempt_output, dispatch_schema_path)
+                record_launch_intent(
+                    store,
+                    task["task_id"],
+                    permit=permit,
+                    role=role,
+                    argv=tuple(command),
+                    tool_mapping={},
+                )
+                proc = subprocess.Popen(
+                    command,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env=sanitized_environment(os.environ),
+                    cwd=str(repo),
+                    shell=False,
+                )
+                claim_permit_start_locked(store, task["task_id"], permit)
+            stdout, stderr = proc.communicate(input=prompt, timeout=CODEX_TIMEOUT_SECONDS)
+            completed = subprocess.CompletedProcess(
+                proc.args, proc.returncode, stdout, stderr
             )
-        except subprocess.TimeoutExpired as exc:
-            _write_role_events(attempt_events, exc.stdout)
-            raise WorkflowError("CODEX_TIMEOUT", f"{role} exceeded {CODEX_TIMEOUT_SECONDS} seconds") from exc
+        except BaseException as spawn_exc:
+            spawned = proc is not None
+            if permit is not None:
+                release_permit_if_never_spawned(
+                    store,
+                    permit,
+                    spawned=proc is not None,
+                    reason=str(getattr(spawn_exc, "code", type(spawn_exc).__name__)),
+                )
+            if proc is not None:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+            if isinstance(spawn_exc, subprocess.TimeoutExpired):
+                _write_role_events(attempt_events, spawn_exc.stdout)
+                raise WorkflowError(
+                    "CODEX_TIMEOUT", f"{role} exceeded {CODEX_TIMEOUT_SECONDS} seconds"
+                ) from spawn_exc
+            raise
+        spawned = proc is not None
         _write_role_events(attempt_events, completed.stdout)
         if completed.returncode != 0:
             message = f"{role} exited with code {completed.returncode}"
@@ -1823,26 +1966,113 @@ def run_codex(
     finally:
         try:
             try:
-                after_run = capture_repo(repo)
-                after_changes = working_tree_paths(repo)
-                if before_run.head != after_run.head:
-                    _fail("HEAD_DRIFT", "repository HEAD changed during the role run")
-                if role in READ_ONLY_ROLES and before_run != after_run:
-                    _fail("READ_ONLY_ROLE_MODIFIED_REPO", f"read-only role {role} changed the repository")
-                if task["task_type"] == "ACCEPTANCE":
-                    assert_acceptance_candidate(task, repo)
-                if role in TERRA_WRITE_ROLES:
-                    actual_changes = after_changes - before_changes
-                    assert_allowed_changes(
-                        actual_changes,
-                        (
-                            luna_construction_step.write_scope
-                            if luna_construction_step is not None
-                            else task["allowed_write_paths"]
-                        ),
-                    )
+                if before_run is None or before_changes is None:
+                    actual_changes = set()
                 else:
-                    actual_changes = after_changes - before_changes
+                    after_run = capture_repo(repo)
+                    after_changes = working_tree_paths(repo)
+                    if paths.state_root is not None and spawned:
+                        observed_store = WorkflowStore(paths.state_root)
+                        permit_id = permit.permit_id if permit is not None else None
+                        if completed is None:
+                            record_unobserved_side_effect(
+                                observed_store,
+                                task["task_id"],
+                                role=role,
+                                permit_id=permit_id,
+                                reason="unobserved-executor",
+                            )
+                            if permit is not None and role in TERRA_WRITE_ROLES:
+                                verify_actual_write_paths(
+                                    observed_store,
+                                    task["task_id"],
+                                    _ownership_claimant(
+                                        role,
+                                        luna_construction_step=luna_construction_step,
+                                        construction_context=construction_context,
+                                    ),
+                                    permit_id=permit.permit_id,
+                                    actual_paths=None,
+                                )
+                        elif permit is not None and role in TERRA_WRITE_ROLES:
+                            actual_paths = None
+                            if before_fs is not None:
+                                construction_step = (
+                                    {
+                                        "plan_sha256": construction_context.plan.plan_sha256,
+                                        "subtask_id": construction_context.step.id,
+                                    }
+                                    if construction_context is not None
+                                    else None
+                                )
+                                observed_changes = observe_execution_side_effects(
+                                    observed_store,
+                                    task["task_id"],
+                                    role=role,
+                                    permit_id=permit_id,
+                                    before=before_fs,
+                                    after=capture_fs_snapshot(
+                                        repo, exclusions=observation_exclusions(repo)
+                                    ),
+                                    rollout_events=tuple(parse_codex_jsonl(completed.stdout)),
+                                    construction_step=construction_step,
+                                )
+                                actual_paths = tuple(
+                                    change.path for change in observed_changes
+                                )
+                            verify_actual_write_paths(
+                                observed_store,
+                                task["task_id"],
+                                _ownership_claimant(
+                                    role,
+                                    luna_construction_step=luna_construction_step,
+                                    construction_context=construction_context,
+                                ),
+                                permit_id=permit.permit_id,
+                                actual_paths=actual_paths,
+                            )
+                        elif before_fs is not None:
+                            construction_step = (
+                                {
+                                    "plan_sha256": construction_context.plan.plan_sha256,
+                                    "subtask_id": construction_context.step.id,
+                                }
+                                if construction_context is not None
+                                else None
+                            )
+                            observed_changes = observe_execution_side_effects(
+                                observed_store,
+                                task["task_id"],
+                                role=role,
+                                permit_id=permit_id,
+                                before=before_fs,
+                                after=capture_fs_snapshot(
+                                    repo, exclusions=observation_exclusions(repo)
+                                ),
+                                rollout_events=tuple(parse_codex_jsonl(completed.stdout)),
+                                construction_step=construction_step,
+                            )
+                    if before_run.head != after_run.head:
+                        _fail("HEAD_DRIFT", "repository HEAD changed during the role run")
+                    if role in READ_ONLY_ROLES and before_run != after_run:
+                        _fail(
+                            "READ_ONLY_ROLE_MODIFIED_REPO",
+                            f"read-only role {role} changed the repository",
+                        )
+                    if task["task_type"] == "ACCEPTANCE":
+                        assert_acceptance_candidate(task, repo)
+                    if role in TERRA_WRITE_ROLES:
+                        actual_changes = after_changes - before_changes
+                        assert_allowed_changes(
+                            actual_changes,
+                            (
+                                luna_construction_step.write_scope
+                                if luna_construction_step is not None
+                                else task["allowed_write_paths"]
+                            ),
+                        )
+                    else:
+                        actual_changes = after_changes - before_changes
             except BaseException as exc:
                 attempt_error = exc
                 raise
@@ -1916,6 +2146,13 @@ def run_codex(
                         _canonical_json(result).encode("utf-8")
                     ).hexdigest(),
                 },
+            )
+            append_runtime_evidence_v2(
+                runtime_store,
+                task["task_id"],
+                event_index=len(_load_event_records(runtime_store, task["task_id"])) - 1,
+                observed=rollout_observation,
+                recorded_at_utc=_utc_timestamp(),
             )
         result = dict(
             validate_role_result(
@@ -2132,13 +2369,6 @@ def next_state(current: str, target: str, *, owner_authorized: bool) -> str:
     return target
 
 
-def _canonical_json(value: object) -> str:
-    try:
-        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    except (TypeError, ValueError) as exc:
-        raise WorkflowError("INVALID_RECORD", f"record is not JSON serializable: {exc}") from exc
-
-
 def atomic_write_json(path: Path, value: object) -> None:
     """Write JSON through a same-directory fsynced temporary file and replace."""
 
@@ -2169,56 +2399,6 @@ def atomic_write_json(path: Path, value: object) -> None:
                 temporary.unlink()
             except FileNotFoundError:
                 pass
-
-
-def _directory_identity_matches(path: Path, descriptor: int) -> bool:
-    """Return whether a path still names the directory pinned by ``descriptor``."""
-
-    try:
-        current = os.stat(path, follow_symlinks=False)
-        opened = os.fstat(descriptor)
-    except OSError:
-        return False
-    return (
-        stat.S_ISDIR(current.st_mode)
-        and stat.S_ISDIR(opened.st_mode)
-        and current.st_dev == opened.st_dev
-        and current.st_ino == opened.st_ino
-    )
-
-
-def _open_parent_directory(path: Path, *, error_code: str) -> int:
-    """Open a target parent without following a replacement directory symlink."""
-
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-    try:
-        descriptor = os.open(path, flags)
-    except OSError as exc:
-        raise WorkflowError(error_code, f"cannot open parent directory for {path.name}") from exc
-    try:
-        metadata = os.fstat(descriptor)
-    except OSError as exc:
-        os.close(descriptor)
-        raise WorkflowError(error_code, f"cannot inspect parent directory for {path.name}") from exc
-    if not stat.S_ISDIR(metadata.st_mode):
-        os.close(descriptor)
-        raise WorkflowError(error_code, f"parent directory for {path.name} is not a directory")
-    return descriptor
-
-
-def _validate_regular_descriptor(
-    descriptor: int,
-    *,
-    error_code: str,
-    label: str,
-    max_bytes: int | None = None,
-) -> os.stat_result:
-    metadata = os.fstat(descriptor)
-    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-        raise WorkflowError(error_code, f"{label} must be a private regular file")
-    if max_bytes is not None and metadata.st_size > max_bytes:
-        raise WorkflowError(error_code, f"{label} is too large")
-    return metadata
 
 
 def _read_regular_file(
@@ -2267,164 +2447,52 @@ def _read_regular_file(
             os.close(parent_descriptor)
 
 
-def write_json_once(path: Path, value: object, *, conflict_code: str) -> str:
-    """Atomically publish one frozen JSON artifact without replacing an existing one."""
-
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    payload = (_canonical_json(value) + "\n").encode("utf-8")
-    digest = hashlib.sha256(payload).hexdigest()
-    temporary: Path | None = None
-    parent_descriptor = -1
-    published = False
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="wb",
-            dir=target.parent,
-            prefix=f".{target.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as handle:
-            temporary = Path(handle.name)
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        parent_descriptor = os.open(
-            target.parent,
-            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
-        )
-        fcntl.flock(parent_descriptor, fcntl.LOCK_EX)
-        if not _directory_identity_matches(target.parent, parent_descriptor):
-            raise WorkflowError(
-                "ATOMIC_WRITE_FAILED",
-                f"parent directory changed before publishing {target.name}",
-            )
-        try:
-            existing = os.stat(target.name, dir_fd=parent_descriptor, follow_symlinks=False)
-        except FileNotFoundError:
-            existing = None
-        if existing is not None:
-            _fail(conflict_code, f"{target.name} is already frozen")
-        temporary_name = Path(temporary.name).name
-        temp_descriptor = -1
-        try:
-            temp_descriptor = os.open(
-                temporary_name,
-                os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
-                dir_fd=parent_descriptor,
-            )
-            _validate_regular_descriptor(
-                temp_descriptor,
-                error_code="ATOMIC_WRITE_FAILED",
-                label=temporary_name,
-            )
-            try:
-                # A same-directory hard-link is the portable POSIX no-replace
-                # primitive: it succeeds only when the destination is absent.
-                os.link(
-                    temporary_name,
-                    target.name,
-                    src_dir_fd=parent_descriptor,
-                    dst_dir_fd=parent_descriptor,
-                    follow_symlinks=False,
-                )
-            except FileExistsError as exc:
-                _fail(conflict_code, f"{target.name} is already frozen")
-                raise AssertionError("unreachable") from exc
-            published = True
-            os.unlink(temporary_name, dir_fd=parent_descriptor)
-            temporary = None
-        finally:
-            if temp_descriptor >= 0:
-                os.close(temp_descriptor)
-        if not _directory_identity_matches(target.parent, parent_descriptor):
-            raise WorkflowError(
-                "ATOMIC_WRITE_PUBLISHED_UNSYNCED",
-                f"parent directory changed while publishing {target.name}",
-            )
-        os.fsync(parent_descriptor)
-        if not _directory_identity_matches(target.parent, parent_descriptor):
-            raise WorkflowError(
-                "ATOMIC_WRITE_PUBLISHED_UNSYNCED",
-                f"parent directory changed after publishing {target.name}",
-            )
-        return digest
-    except WorkflowError:
-        raise
-    except OSError as exc:
-        code = (
-            "ATOMIC_WRITE_PUBLISHED_UNSYNCED"
-            if published
-            else "ATOMIC_WRITE_FAILED"
-        )
-        raise WorkflowError(code, f"cannot write {target.name}") from exc
-    finally:
-        if temporary is not None:
-            try:
-                if parent_descriptor >= 0:
-                    os.unlink(Path(temporary.name).name, dir_fd=parent_descriptor)
-                else:
-                    temporary.unlink()
-            except FileNotFoundError:
-                pass
-        if parent_descriptor >= 0:
-            os.close(parent_descriptor)
-
-
-def append_jsonl(path: Path, record: Mapping[str, object]) -> None:
-    """Append one compact, fsynced JSON object without rewrite/delete support."""
-
-    if not isinstance(record, Mapping):
-        raise WorkflowError("INVALID_RECORD", "JSONL record must be an object")
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    line = _canonical_json(dict(record)) + "\n"
-    parent_descriptor = -1
-    descriptor = -1
-    try:
-        parent_descriptor = _open_parent_directory(target.parent, error_code="APPEND_UNSAFE")
-        descriptor = os.open(
-            target.name,
-            os.O_WRONLY
-            | os.O_APPEND
-            | os.O_CREAT
-            | os.O_NOFOLLOW
-            | getattr(os, "O_CLOEXEC", 0),
-            0o600,
-            dir_fd=parent_descriptor,
-        )
-        _validate_regular_descriptor(
-            descriptor,
-            error_code="APPEND_UNSAFE",
-            label=target.name,
-        )
-        payload = line.encode("utf-8")
-        written = 0
-        while written < len(payload):
-            written += os.write(descriptor, payload[written:])
-        os.fsync(descriptor)
-        if not _directory_identity_matches(target.parent, parent_descriptor):
-            raise WorkflowError(
-                "APPEND_UNSAFE",
-                f"parent directory changed while appending {target.name}",
-            )
-    except WorkflowError:
-        raise
-    except OSError as exc:
-        code = "APPEND_UNSAFE" if exc.errno in {errno.ELOOP, errno.ENOTDIR} else "APPEND_FAILED"
-        raise WorkflowError(code, f"cannot append {target.name}") from exc
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-        if parent_descriptor >= 0:
-            os.close(parent_descriptor)
-
-
 class WorkflowStore:
     """Filesystem-backed task store with append-only event and decision ledgers."""
 
     def __init__(self, root: Path):
         self.root = Path(root)
+        self._held_locks = threading.local()
+
+    def _held_task_ids(self) -> set[str]:
+        held = getattr(self._held_locks, "task_ids", None)
+        if held is None:
+            held = set()
+            self._held_locks.task_ids = held
+        return held
+
+    def _assert_lock_held(self, task_id: str) -> None:
+        held = getattr(self._held_locks, "task_ids", None)
+        if not held or task_id not in held:
+            raise WorkflowError("LOCK_REQUIRED", f"task lock is required for {task_id}")
+
+    def _ledger_path(self, task_id: str, name: str) -> Path:
+        if not isinstance(name, str) or not LEDGER_NAME_PATTERN.fullmatch(name):
+            raise WorkflowError("INVALID_RECORD", f"ledger name is invalid: {name}")
+        return self._require_task(task_id) / name
+
+    def write_task_artifact_once(
+        self,
+        task_id: str,
+        name: str,
+        value: Mapping[str, object],
+        *,
+        conflict_code: str,
+    ) -> Path:
+        task_dir = self._require_task(task_id)
+        path = task_dir / name
+        write_json_once(path, value, conflict_code=conflict_code)
+        return path
+
+    def append_task_ledger(
+        self, task_id: str, name: str, record: Mapping[str, object]
+    ) -> None:
+        append_jsonl(self._ledger_path(task_id, name), record)
+
+    def read_task_ledger(self, task_id: str, name: str) -> tuple[dict[str, object], ...]:
+        path = self._ledger_path(task_id, name)
+        code = name[: -len(".jsonl")].replace("-", "_").upper()
+        return read_jsonl(path, code=code)
 
     @staticmethod
     def _validate_task_id(task_id: str) -> None:
@@ -2543,6 +2611,8 @@ class WorkflowStore:
 
     @contextlib.contextmanager
     def lock(self, task_id: str):
+        if task_id in self._held_task_ids():
+            raise WorkflowError("TASK_ALREADY_RUNNING", f"task {task_id} is already running")
         task_dir = self._require_task(task_id)
         lock_path = task_dir / ".lock"
         try:
@@ -2558,9 +2628,12 @@ class WorkflowStore:
                 if exc.errno in (errno.EACCES, errno.EAGAIN):
                     raise WorkflowError("TASK_ALREADY_RUNNING", f"task {task_id} is already running") from exc
                 raise WorkflowError("LOCK_FAILED", f"cannot lock task {task_id}") from exc
+            held = self._held_task_ids()
+            held.add(task_id)
             try:
                 yield
             finally:
+                held.discard(task_id)
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         finally:
             handle.close()
@@ -2579,6 +2652,7 @@ try:
         record_route_decision as _record_route_decision,
         resolve_optimization_policy as _resolve_optimization_policy,
         resolve_role_policy as _resolve_role_policy,
+        roles_for_policy as _roles_for_policy,
         terra_os_read_only_role as _terra_os_read_only_role,
     )
 except ImportError:  # direct script execution
@@ -2594,6 +2668,7 @@ except ImportError:  # direct script execution
         record_route_decision as _record_route_decision,
         resolve_optimization_policy as _resolve_optimization_policy,
         resolve_role_policy as _resolve_role_policy,
+        roles_for_policy as _roles_for_policy,
         terra_os_read_only_role as _terra_os_read_only_role,
     )
 
@@ -2653,6 +2728,169 @@ def persist_or_reuse_route_decision(
     """Write a route decision, or reuse the stored wire when retry semantics match."""
 
     return _persist_or_reuse_route_decision(store, task_id, decision)
+
+
+def _default_route_request(task: Mapping[str, object]) -> dict[str, object]:
+    task_type = str(task["task_type"])
+    if task_type == "PLAN":
+        work_class, need = "PLANNING_ONLY", "READ_ONLY"
+    elif task_type == "ACCEPTANCE":
+        work_class, need = "BOUNDED", "READ_ONLY"
+    else:
+        work_class, need = "BOUNDED", "WRITE"
+    return {
+        "schema_version": "ai-route-request-1",
+        "task_id": task["task_id"],
+        "work_class": work_class,
+        "execution_need": need,
+        "decomposable": True,
+        "risk_flags": list(task["risk_flags"]),
+        "reason_codes": ["PLAN_IS_DELIVERABLE"],
+    }
+
+
+def _task_has_historical_ledger(store: WorkflowStore, task_id: str) -> bool:
+    events = store.read_task_ledger(task_id, "events.jsonl")
+    return bool(events)
+
+
+def _runtime_decision_from_stored(
+    stored: Mapping[str, object],
+    task: Mapping[str, object],
+    *,
+    request: object | None = None,
+    construction_plan: object | None = None,
+    construction_step_id: object = None,
+) -> RuntimeRouteDecision:
+    """Rebuild a runtime decision from a frozen wire without re-selecting the route."""
+
+    validate_route_decision(stored)
+    policy = "terra_os" if stored.get("routing_mode") == "enforced" else "legacy"
+    roles = _roles_for_policy(
+        task,
+        request if request is not None else _default_route_request(task),
+        str(stored["route"]),
+        policy,
+        construction_plan=construction_plan,
+        construction_step_id=construction_step_id,
+    )
+    wire = RouteDecision(
+        schema_version=str(stored["schema_version"]),
+        task_id=str(stored["task_id"]),
+        route=str(stored["route"]),
+        rule_id=str(stored["rule_id"]),
+        task_sha256=str(stored["task_sha256"]),
+        request_sha256=str(stored["request_sha256"]),
+        decided_at_utc=str(stored["decided_at_utc"]),
+        routing_mode=str(stored["routing_mode"]),
+        evidence_class=str(stored["evidence_class"]),
+    )
+    return RuntimeRouteDecision(
+        wire=wire,
+        roles=roles,
+        shadow_route=None,
+        effective_roles=roles,
+    )
+
+
+def _ensure_task_declaration(
+    store: WorkflowStore,
+    task_id: str,
+    task: Mapping[str, object],
+    *,
+    request: object | None = None,
+    construction_plan: object | None = None,
+    construction_step_id: object = None,
+) -> object:
+    """Unique-create a route declaration from a frozen decision; never a gate fallback."""
+
+    task_dir = store._require_task(task_id)
+    events = store.read_task_ledger(task_id, "events.jsonl")
+    declared = any(event.get("event_type") == "ROUTE_DECLARED" for event in events)
+    with store.lock(task_id):
+        existing = load_route_declaration_locked(store, task_id)
+        if existing is not None:
+            return existing
+        if declared:
+            _fail(
+                "ROUTE_DECLARATION_MISSING",
+                "route declaration was deleted after unique-create",
+            )
+    decision_path = task_dir / "route-decision.json"
+    if not decision_path.is_file():
+        if events:
+            _fail(
+                "ROUTE_DECLARATION_MISSING",
+                "historical task has no frozen route decision",
+            )
+        computed = decide_route(
+            task,
+            request if request is not None else _default_route_request(task),
+            construction_plan=construction_plan,
+            construction_step_id=construction_step_id,
+        )
+        decision = persist_or_reuse_route_decision(store, task_id, computed)
+    else:
+        stored = load_artifact(decision_path)
+        decision = persist_or_reuse_route_decision(
+            store,
+            task_id,
+            _runtime_decision_from_stored(
+                stored,
+                task,
+                request=request,
+                construction_plan=construction_plan,
+                construction_step_id=construction_step_id,
+            ),
+        )
+    config = _load_workflow_config()
+    with store.lock(task_id):
+        declaration = ensure_declaration_for_task(
+            store, task_id, decision=decision, config=config
+        )
+    preflight_active_roles(store, task_id, declaration.active_roles)
+    return declaration
+
+
+def _codex_dispatch_identity(
+    task: Mapping[str, object],
+    role: str,
+    accounting_context: AttemptAccountingContext,
+    construction_context: ConstructionExecutionContext | None,
+) -> str:
+    if construction_context is not None:
+        return construction_context.dispatch_id
+    return derive_dispatch_identity(
+        task_sha256=artifact_sha256(task),
+        role=role,
+        attempt_id=accounting_context.attempt_id,
+    )
+
+
+def _write_scopes_for_role(
+    task: Mapping[str, object],
+    *,
+    luna_construction_step: FrozenSubtask | None = None,
+    construction_context: ConstructionExecutionContext | None = None,
+) -> tuple[str, ...]:
+    if luna_construction_step is not None:
+        return tuple(luna_construction_step.write_scope)
+    if construction_context is not None:
+        return tuple(construction_context.step.write_scope)
+    return tuple(task.get("allowed_write_paths") or ())
+
+
+def _ownership_claimant(
+    role: str,
+    *,
+    luna_construction_step: FrozenSubtask | None = None,
+    construction_context: ConstructionExecutionContext | None = None,
+) -> str:
+    if luna_construction_step is not None:
+        return luna_construction_step.id
+    if construction_context is not None:
+        return construction_context.step.id
+    return role
 
 
 def resolve_optimization_policy(config: object) -> OptimizationPolicy:
@@ -4362,6 +4600,7 @@ def run_team_call(
             stored_task = load_task(stored_path)
             if stored_task != task:
                 _fail("TASK_STORE_MISMATCH", "Team Call task was not persisted exactly")
+            _ensure_task_declaration(store, task["task_id"], stored_task)
             repository_before = capture_repo(repository)
             repository_files_before = _team_call_filesystem_snapshot(repository)
             git_control_before = _team_call_git_control_snapshot(repository)
@@ -4446,6 +4685,7 @@ class CodexConstructionRunner:
         context: ConstructionExecutionContext,
         *,
         attempt_context: AttemptAccountingContext | None = None,
+        authorization_id: str | None = None,
     ) -> Mapping[str, object]:
         if not isinstance(context, ConstructionExecutionContext) or context.role != role:
             _fail("CONSTRUCTION_CONTEXT_INVALID", "live construction context does not match role")
@@ -4475,6 +4715,7 @@ class CodexConstructionRunner:
             construction_step_id=context.step.id,
             construction_context=context,
             prompt_result=prompt_result,
+            authorization_id=authorization_id,
         )
 
 
@@ -4812,6 +5053,7 @@ def _run_role_with_technical_retry(
     *,
     construction_context: ConstructionExecutionContext | None = None,
     state_root: Path | None = None,
+    authorization_id: str | None = None,
 ) -> tuple[Mapping[str, object] | None, str]:
     """Run one role, allowing only the single persisted technical retry."""
 
@@ -4827,7 +5069,9 @@ def _run_role_with_technical_retry(
         _fail("CONSTRUCTION_CONTEXT_INVALID", "construction role does not match its frozen context")
 
     retry_kind = "none"
+    attempt_index = 0
     while True:
+        attempt_index += 1
         runner_owns_attempt_accounting = bool(
             getattr(runner, "owns_cost_attempt_accounting", False)
         )
@@ -4866,10 +5110,89 @@ def _run_role_with_technical_retry(
                     assert_acceptance_candidate(task, guarded_repo)
                 before_snapshot = capture_repo(guarded_repo)
                 before_changes = working_tree_paths(guarded_repo)
+                precheck_dispatch_permit(
+                    store, task_id, role, config=_load_workflow_config()
+                )
+                if role in TERRA_WRITE_ROLES:
+                    precheck_write_ownership(
+                        store,
+                        task_id,
+                        _ownership_claimant(
+                            role, construction_context=construction_context
+                        ),
+                        paths=claimed_write_paths(
+                            _write_scopes_for_role(
+                                task, construction_context=construction_context
+                            )
+                        ),
+                    )
             started_monotonic = time.monotonic()
             attempt_error: BaseException | None = None
             runtime_usage = None
+            permit = None
+            claimed = False
             try:
+                if not getattr(runner, "is_live_model", False):
+                    try:
+                        with store.lock(task_id):
+                            attempt_token = (
+                                attempt_context.attempt_id
+                                if attempt_context is not None
+                                else f"{retry_kind}:{attempt_index}"
+                            )
+                            permit = require_dispatch_permit_locked(
+                                store,
+                                task_id,
+                                role,
+                                dispatch_identity=derive_dispatch_identity(
+                                    task_sha256=artifact_sha256(task),
+                                    role=role,
+                                    attempt_id=attempt_token,
+                                ),
+                                config=_load_workflow_config(),
+                            )
+                            if role in TERRA_WRITE_ROLES:
+                                require_write_ownership_locked(
+                                    store,
+                                    task_id,
+                                    _ownership_claimant(
+                                        role,
+                                        construction_context=construction_context,
+                                    ),
+                                    permit_id=permit.permit_id,
+                                    paths=claimed_write_paths(
+                                        _write_scopes_for_role(
+                                            task,
+                                            construction_context=construction_context,
+                                        )
+                                    ),
+                                    authorization_id=authorization_id,
+                                )
+                            # Task 18: LAUNCH_INTENT_RECORDED is inserted in this critical section before spawn.
+                            record_launch_intent(
+                                store,
+                                task_id,
+                                permit=permit,
+                                role=role,
+                                argv=("fake-runner", role),
+                                tool_mapping={},
+                            )
+                            claim_permit_start_locked(store, task_id, permit)
+                            claimed = True
+                    except BaseException:
+                        if permit is not None:
+                            release_permit_if_never_spawned(
+                                store,
+                                permit,
+                                spawned=claimed,
+                                reason="fake-runner-before-start",
+                            )
+                        raise
+                extra: dict[str, object] = {}
+                if attempt_context is not None:
+                    extra["attempt_context"] = attempt_context
+                if getattr(runner, "is_live_model", False) and authorization_id is not None:
+                    extra["authorization_id"] = authorization_id
                 if construction_context is not None:
                     run_construction = getattr(runner, "run_construction", None)
                     if not callable(run_construction):
@@ -4877,19 +5200,11 @@ def _run_role_with_technical_retry(
                             "CONSTRUCTION_CONTEXT_INVALID",
                             "construction runner must accept the frozen contract",
                         )
-                    if attempt_context is None:
-                        result = run_construction(role, task, construction_context)
-                    else:
-                        result = run_construction(
-                            role,
-                            task,
-                            construction_context,
-                            attempt_context=attempt_context,
-                        )
-                elif attempt_context is None:
-                    result = runner.run(role, task)
+                    result = run_construction(role, task, construction_context, **extra)
+                elif extra:
+                    result = runner.run(role, task, **extra)
                 else:
-                    result = runner.run(role, task, attempt_context=attempt_context)
+                    result = runner.run(role, task)
                 if construction_context is not None:
                     result = _bind_controller_construction_evidence(
                         result, task, construction_context
@@ -5130,6 +5445,7 @@ def _run_pipeline_role(
     budget: RetryBudget,
     *,
     state_root: Path | None = None,
+    authorization_id: str | None = None,
 ) -> str:
     result, state_after_retry = _run_role_with_technical_retry(
         store,
@@ -5140,6 +5456,7 @@ def _run_pipeline_role(
         runner,
         budget,
         state_root=state_root,
+        authorization_id=authorization_id,
     )
     if result is None:
         return state_after_retry
@@ -5328,6 +5645,7 @@ def _freeze_or_require_construction_plan(
         authority = _construction_authority(recorded_frozen, step, role, route_wire)
         if _frozen_construction_authority(store, task_id) != authority:
             _fail("CONSTRUCTION_AUTHORITY_DRIFT", "construction state differs from first freeze")
+        ensure_ownership_registry_locked(store, task_id, recorded_frozen)
         return recorded_frozen
     if state not in {"DRAFT", "TASK_VALIDATED"}:
         _fail(
@@ -5346,6 +5664,7 @@ def _freeze_or_require_construction_plan(
             **authority,
         },
     )
+    ensure_ownership_registry_locked(store, task_id, frozen)
     return frozen
 
 
@@ -5542,6 +5861,7 @@ def run_enforced_construction(
     runner: Runner,
     allow_live_model: bool,
     state_root: Path | None = None,
+    authorization_id: str | None = None,
 ) -> str:
     """Run exactly one approved construction step; never infer it from route wire data."""
 
@@ -5554,6 +5874,15 @@ def run_enforced_construction(
     if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
         _fail("DISPATCH_IDENTITY_DRIFT", "construction attempt must be a positive integer")
     store = WorkflowStore(state_root or WORKFLOW_STATE_ROOT)
+    task = load_task(store._require_task(task_id) / "task.json")
+    _ensure_task_declaration(
+        store,
+        task_id,
+        task,
+        request=request,
+        construction_plan=construction_plan,
+        construction_step_id=step_id,
+    )
     with store.lock(task_id):
         if repair_ledger_claims_task(store, task_id):
             _fail(
@@ -5671,17 +6000,19 @@ def run_enforced_construction(
             request_sha256=str(route_wire["request_sha256"]),
             role=role,
         )
-        result, state_after_retry = _run_role_with_technical_retry(
-            store,
-            task_id,
-            task,
-            state,
-            role,
-            runner,
-            budget,
-            construction_context=context,
-            state_root=store.root,
-        )
+    result, state_after_retry = _run_role_with_technical_retry(
+        store,
+        task_id,
+        task,
+        state,
+        role,
+        runner,
+        budget,
+        construction_context=context,
+        state_root=store.root,
+        authorization_id=authorization_id,
+    )
+    with store.lock(task_id):
         if result is None:
             return state_after_retry
         return _role_state_after_result(
@@ -5699,6 +6030,7 @@ def run_until_gate(
     construction_step_id: object = None,
     construction_attempt: int | None = None,
     state_root: Path | None = None,
+    authorization_id: str | None = None,
 ) -> str:
     """Advance one bounded pipeline only until its next owner-controlled gate."""
 
@@ -5729,6 +6061,7 @@ def run_until_gate(
             runner=runner,
             allow_live_model=allow_live_model,
             state_root=state_root,
+            authorization_id=authorization_id,
         )
     if not isinstance(allow_live_model, bool):
         _fail("INVALID_LIVE_MODEL_FLAG", "allow_live_model must be a boolean")
@@ -5736,92 +6069,96 @@ def run_until_gate(
         _fail("INVALID_RUNNER", "runner must provide run(role, task)")
     if getattr(runner, "is_live_model", False) and not allow_live_model:
         _fail("LIVE_MODEL_NOT_AUTHORIZED", "live model execution requires explicit authorization")
-    with store.lock(task_id):
-        if repair_ledger_claims_task(store, task_id):
-            _fail(
-                "REPAIR_ADAPTER_REQUIRED",
-                "adversarial-acceptance-1 tasks require the verified assignment adapter",
-            )
-        task_path = store._require_task(task_id) / "task.json"
-        task = load_task(task_path)
-        state = _current_state(store, task_id)
-        budget = _budget_from_events(store, task_id)
-        config = _load_workflow_config()
-        enforced_read_only_role: str | None = None
-        if (
-            _configured_routing_mode(config) == "enforced"
-            and _resolve_role_policy(config) == "terra_os"
-        ):
-            if state == "IMPLEMENTATION_RUNNING" and has_active_repair_assignment(store, task_id):
-                return _transition(
-                    store,
-                    task_id,
-                    state,
-                    "BLOCKED",
-                    budget,
-                    event_type="REPAIR_EXECUTION_INTEGRATION_BLOCKED",
-                )
-            if task["task_type"] in {"PLAN", "ACCEPTANCE"}:
-                enforced_read_only_role = _load_enforced_read_only_route_role(
-                    store, task_id, task
-                )
-            else:
+    task_path = store._require_task(task_id) / "task.json"
+    task = load_task(task_path)
+    _ensure_task_declaration(store, task_id, task)
+    while True:
+        pending_role: str | None = None
+        pending_state: str | None = None
+        with store.lock(task_id):
+            if repair_ledger_claims_task(store, task_id):
                 _fail(
-                    "CONSTRUCTION_CONTEXT_REQUIRED",
-                    "terra_os remediation requires a validated construction context",
+                    "REPAIR_ADAPTER_REQUIRED",
+                    "adversarial-acceptance-1 tasks require the verified assignment adapter",
                 )
-        while True:
+            task = load_task(task_path)
+            state = _current_state(store, task_id)
+            budget = _budget_from_events(store, task_id)
+            config = _load_workflow_config()
+            enforced_read_only_role: str | None = None
+            if (
+                _configured_routing_mode(config) == "enforced"
+                and _resolve_role_policy(config) == "terra_os"
+            ):
+                if state == "IMPLEMENTATION_RUNNING" and has_active_repair_assignment(store, task_id):
+                    return _transition(
+                        store,
+                        task_id,
+                        state,
+                        "BLOCKED",
+                        budget,
+                        event_type="REPAIR_EXECUTION_INTEGRATION_BLOCKED",
+                    )
+                if task["task_type"] in {"PLAN", "ACCEPTANCE"}:
+                    enforced_read_only_role = _load_enforced_read_only_route_role(
+                        store, task_id, task
+                    )
+                else:
+                    _fail(
+                        "CONSTRUCTION_CONTEXT_REQUIRED",
+                        "terra_os remediation requires a validated construction context",
+                    )
             if getattr(runner, "is_live_model", False) and task["task_type"] == "ACCEPTANCE":
                 assert_acceptance_candidate(task, _execution_repo(task, "luna"))
             if state in {"BLOCKED", "CLOSED", "ABORTED", "DEFERRED", "AWAITING_OWNER_DECISION"}:
                 return state
             if state == "DRAFT":
-                state = _transition(store, task_id, state, "TASK_VALIDATED", budget)
+                _transition(store, task_id, state, "TASK_VALIDATED", budget)
                 continue
             if state == "TASK_VALIDATED":
                 if enforced_read_only_role is not None:
-                    state = _transition(
+                    _transition(
                         store, task_id, state, "PLAN_OR_REVIEW_RUNNING", budget
                     )
                     continue
                 if task["task_type"] in {"PLAN", "ACCEPTANCE"}:
-                    state = _transition(store, task_id, state, "EVIDENCE_RUNNING", budget)
+                    _transition(store, task_id, state, "EVIDENCE_RUNNING", budget)
                     continue
                 if task["risk_flags"]:
-                    state = _transition(store, task_id, state, "PLAN_OR_REVIEW_RUNNING", budget)
+                    _transition(store, task_id, state, "PLAN_OR_REVIEW_RUNNING", budget)
                     continue
-                state = _transition(store, task_id, state, "AWAITING_OWNER_DECISION", budget)
+                _transition(store, task_id, state, "AWAITING_OWNER_DECISION", budget)
                 continue
             if state == "EVIDENCE_RUNNING":
-                state = _run_pipeline_role(store, task_id, task, state, "luna", runner, budget)
+                pending_role = "luna"
+                pending_state = state
+            elif state == "EVIDENCE_READY":
+                _transition(store, task_id, state, "PLAN_OR_REVIEW_RUNNING", budget)
                 continue
-            if state == "EVIDENCE_READY":
-                state = _transition(store, task_id, state, "PLAN_OR_REVIEW_RUNNING", budget)
-                continue
-            if state == "APPROVED_FOR_EXECUTION":
+            elif state == "APPROVED_FOR_EXECUTION":
                 if not _authorization_is_recorded(
                     store, task_id, state, "approve_execution"
                 ):
                     return state
                 if task["task_type"] == "REMEDIATION" and getattr(runner, "is_live_model", False):
                     create_worktree(task, owner_authorized=True, store=store)
-                state = _transition(
+                _transition(
                     store, task_id, state, "WORKTREE_READY", budget, owner_authorized=True
                 )
                 continue
-            if state == "WORKTREE_READY":
-                state = _transition(store, task_id, state, "IMPLEMENTATION_RUNNING", budget)
+            elif state == "WORKTREE_READY":
+                _transition(store, task_id, state, "IMPLEMENTATION_RUNNING", budget)
                 continue
-            if state == "REWORK_AUTHORIZED":
+            elif state == "REWORK_AUTHORIZED":
                 if not _authorization_is_recorded(
                     store, task_id, state, "authorize_rework"
                 ):
                     return state
-                state = _transition(
+                _transition(
                     store, task_id, state, "IMPLEMENTATION_RUNNING", budget, owner_authorized=True
                 )
                 continue
-            if state == "IMPLEMENTATION_RUNNING":
+            elif state == "IMPLEMENTATION_RUNNING":
                 if has_active_repair_assignment(store, task_id):
                     return _transition(
                         store,
@@ -5831,18 +6168,18 @@ def run_until_gate(
                         budget,
                         event_type="REPAIR_EXECUTION_INTEGRATION_BLOCKED",
                     )
-                state = _run_pipeline_role(store, task_id, task, state, "terra", runner, budget)
+                pending_role = "terra"
+                pending_state = state
+            elif state == "IMPLEMENTED_CANDIDATE":
+                _transition(store, task_id, state, "PRECHECK_RUNNING", budget)
                 continue
-            if state == "IMPLEMENTED_CANDIDATE":
-                state = _transition(store, task_id, state, "PRECHECK_RUNNING", budget)
+            elif state == "PRECHECK_RUNNING":
+                pending_role = "luna"
+                pending_state = state
+            elif state == "PRECHECK_READY":
+                _transition(store, task_id, state, "PLAN_OR_REVIEW_RUNNING", budget)
                 continue
-            if state == "PRECHECK_RUNNING":
-                state = _run_pipeline_role(store, task_id, task, state, "luna", runner, budget)
-                continue
-            if state == "PRECHECK_READY":
-                state = _transition(store, task_id, state, "PLAN_OR_REVIEW_RUNNING", budget)
-                continue
-            if state == "ESCALATION_AUTHORIZED":
+            elif state == "ESCALATION_AUTHORIZED":
                 if not _authorization_is_recorded(
                     store, task_id, state, "authorize_escalation"
                 ):
@@ -5858,7 +6195,7 @@ def run_until_gate(
                         budget,
                         event_type="ESCALATION_BUDGET_EXHAUSTED",
                     )
-                state = _transition(
+                _transition(
                     store,
                     task_id,
                     state,
@@ -5867,8 +6204,8 @@ def run_until_gate(
                     owner_authorized=True,
                 )
                 continue
-            if state == "PLAN_OR_REVIEW_RUNNING":
-                role = (
+            elif state == "PLAN_OR_REVIEW_RUNNING":
+                pending_role = (
                     enforced_read_only_role
                     if enforced_read_only_role is not None
                     and not _authorization_is_recorded(
@@ -5879,12 +6216,21 @@ def run_until_gate(
                     )
                     else _role_for_plan_or_review(store, task_id, task)
                 )
-                state = _run_pipeline_role(
-                    store, task_id, task, state, role, runner, budget,
-                    state_root=store.root,
-                )
-                continue
-            _fail("INVALID_STATE", f"cannot run task from state {state}")
+                pending_state = state
+            else:
+                _fail("INVALID_STATE", f"cannot run task from state {state}")
+        if pending_role is not None and pending_state is not None:
+            _run_pipeline_role(
+                store,
+                task_id,
+                task,
+                pending_state,
+                pending_role,
+                runner,
+                budget,
+                state_root=store.root,
+                authorization_id=authorization_id,
+            )
 
 
 def apply_owner_decision(task_id: str, decision: str, actor: str) -> str:
@@ -5902,6 +6248,7 @@ def _apply_owner_decision(
         _fail("INVALID_OWNER_DECISION", "decision is not in the approved closed set")
     if not isinstance(actor, str) or not actor.strip():
         _fail("INVALID_ACTOR", "actor must be a non-empty string")
+    to_preflight: str | None = None
     with store.lock(task_id):
         store._require_task(task_id)
         state = _current_state(store, task_id)
@@ -5943,7 +6290,16 @@ def _apply_owner_decision(
         event = dict(record)
         event["retry_budget"] = _budget_record(budget)
         store.append_event(task_id, event)
-        return target
+        if decision == "authorize_escalation":
+            task = load_task(store._require_task(task_id) / "task.json")
+            from_role = "sol_planner" if task["task_type"] == "PLAN" else "sol_reviewer"
+            to_role = "sol_xhigh_planner" if from_role == "sol_planner" else "sol_xhigh"
+            activate_role(store, task_id, from_role=from_role, to_role=to_role)
+            to_preflight = to_role
+        result = target
+    if to_preflight is not None:
+        run_role_preflight(store, task_id, to_preflight)
+    return result
 
 
 def _load_construction_resume(
@@ -6089,6 +6445,8 @@ def _resume_stored_task(
     task_id: str,
     runner: Runner,
     context: tuple[object, Mapping[str, object], str, int] | None,
+    *,
+    authorization_id: str | None = None,
 ) -> str:
     if context is not None:
         plan, request, step_id, attempt = context
@@ -6101,12 +6459,14 @@ def _resume_stored_task(
             runner=runner,
             allow_live_model=getattr(runner, "is_live_model", False),
             state_root=store.root,
+            authorization_id=authorization_id,
         )
     return run_until_gate(
         task_id,
         runner=runner,
         allow_live_model=False,
         state_root=store.root,
+        authorization_id=authorization_id,
     )
 
 
@@ -6276,6 +6636,7 @@ def _run_live_luna(task: dict[str, object], args: argparse.Namespace) -> dict:
     stored_task = load_task(task_dir / "task.json")
     if stored_task != task:
         _fail("TASK_STORE_MISMATCH", "live task input does not match the stored task")
+    _ensure_task_declaration(store, task["task_id"], task)
     contract = {
         "acceptance_commands": task["acceptance_commands"],
         "verification_level": task["verification_level"],
@@ -6559,6 +6920,14 @@ def _run_command(args: argparse.Namespace) -> int:
         computed = decide_route(task, request, args.mode)
         store = WorkflowStore(args.root)
         decision = persist_or_reuse_route_decision(store, task["task_id"], computed)
+        config = _load_workflow_config()
+        with store.lock(task["task_id"]):
+            ensure_declaration_for_task(
+                store, task["task_id"], decision=decision, config=config
+            )
+            declaration = load_route_declaration_locked(store, task["task_id"])
+        if declaration is not None:
+            preflight_active_roles(store, task["task_id"], declaration.active_roles)
         record_route_advice(
             store,
             task["task_id"],

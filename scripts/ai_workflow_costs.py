@@ -11,8 +11,14 @@ estimated.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import math
+import re
 from collections.abc import Iterable, Mapping
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 try:
@@ -22,6 +28,8 @@ try:
         EXECUTION_SURFACES,
         ROLES,
         ROUTES,
+        load_artifact,
+        write_json_once,
     )
 except ImportError:  # direct script execution
     from ai_workflow_artifacts import (
@@ -30,6 +38,8 @@ except ImportError:  # direct script execution
         EXECUTION_SURFACES,
         ROLES,
         ROUTES,
+        load_artifact,
+        write_json_once,
     )
 
 
@@ -64,6 +74,59 @@ _ALIASES = {
 }
 _TOKEN_FIELDS = ("input_tokens", "cached_input_tokens", "output_tokens")
 COST_EVIDENCE_ROLES = (ROLES - {"host"}) | {"router_probe"}
+RATE_SNAPSHOT_SCHEMA_VERSION = "ai-rate-snapshot-1"
+RATE_SNAPSHOT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "rate_snapshot_id",
+        "skus",
+        "effective_at",
+        "retrieved_at",
+        "archive",
+        "approved_by",
+        "approval_evidence_id",
+    }
+)
+RATE_UNITS = frozenset({"PER_TOKEN", "PER_1K_TOKENS", "PER_1M_TOKENS"})
+RATE_UNIT_BASE: Mapping[str, int] = MappingProxyType(
+    {"PER_TOKEN": 1, "PER_1K_TOKENS": 1_000, "PER_1M_TOKENS": 1_000_000}
+)
+RATE_SNAPSHOT_SKU_FIELDS = frozenset(
+    {
+        "sku",
+        "model",
+        "currency",
+        "unit",
+        "billing_channel",
+        "price_uncached_input",
+        "price_cached_input",
+        "price_output",
+        "cache_write_applies",
+        "long_context_tiers_applies",
+        "source_url",
+        "retrieved_at",
+    }
+)
+RATE_SNAPSHOT_ARCHIVE_FIELDS = frozenset(
+    {"archive_path", "archive_sha256", "mime_type", "retrieval_status"}
+)
+PRICING_STATUSES = frozenset({"CURRENT", "PRICE_STALE", "PRICE_UNKNOWN"})
+_SKU_PRICE_FIELDS = (
+    "price_uncached_input",
+    "price_cached_input",
+    "price_output",
+)
+_SKU_BOOLEAN_FIELDS = ("cache_write_applies", "long_context_tiers_applies")
+_SKU_STRING_FIELDS = (
+    "sku",
+    "model",
+    "currency",
+    "billing_channel",
+    "source_url",
+)
+_DECIMAL_PRICE = re.compile(r"^(0|[1-9][0-9]*)(\.[0-9]+)?$")
+_UTC_TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _PRICE_FIELDS = frozenset(
     {
         "cost",
@@ -147,6 +210,211 @@ def _workflow_exception(code: str, message: str) -> BaseException:
 
 def _fail(code: str, message: str) -> None:
     raise _workflow_exception(code, message)
+
+
+def _error_code(exc: BaseException) -> str | None:
+    code = getattr(exc, "code", None)
+    return code if isinstance(code, str) else None
+
+
+def _closed_fields(
+    payload: Mapping[str, object], expected: frozenset[str], *, label: str
+) -> None:
+    unknown = sorted(set(payload) - expected)
+    if unknown:
+        _fail("UNKNOWN_FIELD", f"{label} unsupported field {unknown[0]}")
+    missing = sorted(expected - set(payload))
+    if missing:
+        _fail("MISSING_FIELD", f"{label} missing field {missing[0]}")
+
+
+def _snapshot_string(value: object, field: str) -> str:
+    if not isinstance(value, str):
+        _fail("INVALID_TYPE", f"{field} must be a string")
+    if not value.strip():
+        _fail("EMPTY_FIELD", f"{field} must not be empty")
+    return value
+
+
+def _utc_timestamp(value: object, field: str) -> datetime:
+    text = _snapshot_string(value, field)
+    if _UTC_TIMESTAMP.fullmatch(text) is None:
+        _fail("INVALID_TYPE", f"{field} must be a UTC timestamp")
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        _fail("INVALID_TYPE", f"{field} must be a UTC timestamp")
+    if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
+        _fail("INVALID_TYPE", f"{field} must be a UTC timestamp")
+    return parsed.astimezone(timezone.utc)
+
+
+def _decimal_price(value: object, field: str) -> Decimal:
+    if not isinstance(value, str) or _DECIMAL_PRICE.fullmatch(value) is None:
+        _fail("INVALID_TYPE", f"{field} must be a non-negative decimal string")
+    try:
+        number = Decimal(value)
+    except InvalidOperation:
+        _fail("INVALID_TYPE", f"{field} must be a non-negative decimal string")
+    if number < 0:
+        _fail("INVALID_TYPE", f"{field} must be a non-negative decimal string")
+    return number
+
+
+def _boolean(value: object, field: str) -> bool:
+    if not isinstance(value, bool):
+        _fail("INVALID_TYPE", f"{field} must be a boolean")
+    return value
+
+
+def _validate_sku(value: object, index: int) -> None:
+    label = f"skus[{index}]"
+    if not isinstance(value, Mapping):
+        _fail("INVALID_TYPE", f"{label} must be an object")
+    sku = dict(value)
+    _closed_fields(sku, RATE_SNAPSHOT_SKU_FIELDS, label=label)
+    for field in _SKU_STRING_FIELDS:
+        _snapshot_string(sku[field], f"{label}.{field}")
+    unit = _snapshot_string(sku["unit"], f"{label}.unit")
+    if unit not in RATE_UNITS:
+        _fail("INVALID_ENUM", f"{label}.unit is not supported")
+    for field in _SKU_PRICE_FIELDS:
+        _decimal_price(sku[field], f"{label}.{field}")
+    for field in _SKU_BOOLEAN_FIELDS:
+        _boolean(sku[field], f"{label}.{field}")
+    _utc_timestamp(sku["retrieved_at"], f"{label}.retrieved_at")
+
+
+def _validate_archive(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        _fail("INVALID_TYPE", "archive must be an object")
+    archive = dict(value)
+    _closed_fields(archive, RATE_SNAPSHOT_ARCHIVE_FIELDS, label="archive")
+    digest = _snapshot_string(archive["archive_sha256"], "archive.archive_sha256")
+    if _SHA256.fullmatch(digest) is None:
+        _fail("INVALID_TYPE", "archive.archive_sha256 must be a SHA256 digest")
+    path = _snapshot_string(archive["archive_path"], "archive.archive_path")
+    expected = f"docs/rate-archives/{digest}"
+    if path != expected:
+        _fail("INVALID_TYPE", "archive.archive_path must be content-addressed")
+    _snapshot_string(archive["mime_type"], "archive.mime_type")
+    _snapshot_string(archive["retrieval_status"], "archive.retrieval_status")
+    return archive
+
+
+def _sku_prices_present(snapshot: Mapping[str, object]) -> bool:
+    skus = snapshot.get("skus")
+    if not isinstance(skus, list) or not skus:
+        return False
+    for sku in skus:
+        if not isinstance(sku, Mapping):
+            return False
+        for field in _SKU_PRICE_FIELDS:
+            value = sku.get(field)
+            if not isinstance(value, str) or not value.strip():
+                return False
+    return True
+
+
+def validate_rate_snapshot(value: Mapping[str, object]) -> None:
+    """Fail-closed closed-set validation for ``ai-rate-snapshot-1``."""
+
+    if not isinstance(value, Mapping):
+        _fail("INVALID_TYPE", "rate snapshot must be an object")
+    payload = dict(value)
+    _closed_fields(payload, RATE_SNAPSHOT_FIELDS, label="rate snapshot")
+    if payload.get("schema_version") != RATE_SNAPSHOT_SCHEMA_VERSION:
+        _fail(
+            "SCHEMA_VERSION",
+            f"schema_version must be {RATE_SNAPSHOT_SCHEMA_VERSION}",
+        )
+    _snapshot_string(payload["rate_snapshot_id"], "rate_snapshot_id")
+    _utc_timestamp(payload["effective_at"], "effective_at")
+    _utc_timestamp(payload["retrieved_at"], "retrieved_at")
+    _snapshot_string(payload["approved_by"], "approved_by")
+    _snapshot_string(payload["approval_evidence_id"], "approval_evidence_id")
+    skus = payload["skus"]
+    if not isinstance(skus, list):
+        _fail("INVALID_TYPE", "skus must be an array")
+    if not skus:
+        _fail("EMPTY_ARRAY", "skus must not be empty")
+    for index, sku in enumerate(skus):
+        _validate_sku(sku, index)
+    _validate_archive(payload["archive"])
+
+
+def load_rate_snapshot(path: Path) -> Mapping[str, object]:
+    """Load one immutable rate snapshot and validate it."""
+
+    snapshot = load_artifact(Path(path))
+    validate_rate_snapshot(snapshot)
+    return snapshot
+
+
+def write_rate_snapshot(path: Path, snapshot: Mapping[str, object]) -> None:
+    """Publish one frozen rate snapshot without replacing an existing file."""
+
+    validate_rate_snapshot(snapshot)
+    write_json_once(
+        Path(path),
+        dict(snapshot),
+        conflict_code="RATE_SNAPSHOT_ALREADY_FROZEN",
+    )
+
+
+def resolve_snapshot_archive(snapshot: Mapping[str, object], *, root: Path) -> Path:
+    """Resolve a content-addressed archive to a real file whose hash matches."""
+
+    validate_rate_snapshot(snapshot)
+    archive = snapshot["archive"]
+    if not isinstance(archive, Mapping):
+        _fail("RATE_ARCHIVE_UNRESOLVABLE", "archive is not resolvable")
+    relative = Path(str(archive["archive_path"]))
+    if relative.is_absolute() or ".." in relative.parts:
+        _fail("RATE_ARCHIVE_UNRESOLVABLE", "archive path is not resolvable")
+    target = Path(root) / relative
+    try:
+        payload = target.read_bytes()
+    except OSError:
+        _fail("RATE_ARCHIVE_UNRESOLVABLE", "archive file is missing")
+    digest = hashlib.sha256(payload).hexdigest()
+    if digest != archive["archive_sha256"]:
+        _fail("RATE_ARCHIVE_UNRESOLVABLE", "archive hash does not match file contents")
+    return target
+
+
+def snapshot_pricing_status(
+    snapshot: Mapping[str, object],
+    *,
+    now_utc: str,
+    max_age_seconds: int,
+    root: Path | None = None,
+) -> str:
+    """Classify a snapshot as current, stale, or unknown without naming a winner."""
+
+    if (
+        isinstance(max_age_seconds, bool)
+        or not isinstance(max_age_seconds, int)
+        or max_age_seconds < 0
+    ):
+        _fail("INVALID_TYPE", "max_age_seconds must be a non-negative integer")
+    now = _utc_timestamp(now_utc, "now_utc")
+    if not isinstance(snapshot, Mapping) or not _sku_prices_present(snapshot):
+        return "PRICE_UNKNOWN"
+    validate_rate_snapshot(snapshot)
+    if root is None:
+        return "PRICE_UNKNOWN"
+    try:
+        resolve_snapshot_archive(snapshot, root=root)
+    except Exception as exc:
+        if _error_code(exc) == "RATE_ARCHIVE_UNRESOLVABLE":
+            return "PRICE_UNKNOWN"
+        raise
+    retrieved = _utc_timestamp(snapshot["retrieved_at"], "retrieved_at")
+    age = (now - retrieved).total_seconds()
+    if age > max_age_seconds:
+        return "PRICE_STALE"
+    return "CURRENT"
 
 
 def finite_nonnegative_or_none(value: object, field: str) -> int | float | None:
@@ -753,11 +1021,23 @@ def render_cost_sections(
 __all__ = [
     "CostError",
     "CostEvidence",
+    "PRICING_STATUSES",
+    "RATE_SNAPSHOT_ARCHIVE_FIELDS",
+    "RATE_SNAPSHOT_FIELDS",
+    "RATE_SNAPSHOT_SCHEMA_VERSION",
+    "RATE_SNAPSHOT_SKU_FIELDS",
+    "RATE_UNIT_BASE",
+    "RATE_UNITS",
     "aggregate_paired_cases",
     "evaluate_cost_claim",
     "evaluate_optimization_gate",
     "finite_nonnegative_or_none",
     "finite_signed_or_none",
+    "load_rate_snapshot",
     "normalize_cost_evidence",
     "render_cost_sections",
+    "resolve_snapshot_archive",
+    "snapshot_pricing_status",
+    "validate_rate_snapshot",
+    "write_rate_snapshot",
 ]

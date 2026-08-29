@@ -23,7 +23,13 @@ from types import SimpleNamespace
 from unittest import mock
 
 from scripts import ai_workflow as workflow
+from scripts import ai_workflow_artifacts as artifacts
+from scripts import ai_workflow_authorizations as authorizations
+from scripts import ai_workflow_candidate_state as candidate_state
+from scripts import ai_workflow_ownership as ownership
 from scripts import ai_workflow_repairs as repairs
+from scripts import ai_workflow_verdicts as verdicts
+from tests.test_ai_workflow import _compat_popen, _install_declaration
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -347,7 +353,7 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
             "task_type": "REMEDIATION",
             "objective": "Repair the bounded candidate under adversarial acceptance",
             "repository_root": str(self.repository_root),
-            "source_worktree": None,
+            "source_worktree": str(self.repository_root),
             "base_commit": self.base_commit,
             "candidate_commit": self.input_candidate,
             "authoritative_files": ["README.md"],
@@ -363,6 +369,31 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
             repairs.RepairFinding("finding-002", ("src/beta.py",)),
         )
         self._recorded_runtime_attempts: set[str] = set()
+        self._declaration_kwargs: dict[str, object] = {}
+        self.owner_evidence_id: str | None = None
+        self._original_run_assignment = repairs.run_assignment
+
+        def gated_run(store, task_id, assignment, *args, **kwargs):
+            registry = ownership.load_ownership_registry(store, task_id)
+            if registry is None:
+                task = workflow.load_task(store._require_task(task_id) / "task.json")
+                self._record_plan_ownership(task, owner_role="luna")
+                registry = ownership.load_ownership_registry(store, task_id)
+            role = assignment.expected_actor.role
+            paths = tuple(assignment.allowed_paths or ())
+            if kwargs.get("authorization_id") is None and paths:
+                owner = ownership.resolve_path_owner(store, task_id, paths[0])
+                if owner != role:
+                    existing = self._existing_assignment_transfer(
+                        store, task_id, owner, role, paths
+                    )
+                    kwargs = dict(kwargs)
+                    kwargs["authorization_id"] = existing or self._issue_assignment_transfer(
+                        store, task_id, owner, role, paths
+                    )
+            return self._original_run_assignment(store, task_id, assignment, *args, **kwargs)
+
+        repairs.run_assignment = gated_run
 
     def _git(self, *args: str) -> str:
         env = os.environ.copy()
@@ -402,6 +433,7 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
         return self._git("rev-parse", "HEAD")
 
     def tearDown(self) -> None:
+        repairs.run_assignment = self._original_run_assignment
         self.temporary_directory.cleanup()
 
     @staticmethod
@@ -593,7 +625,101 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
         return api["execute_adversarial_evidence"](self.store, self.TASK_ID)
 
     def _create_task(self, task: dict[str, object] | None = None) -> None:
-        self.store.create_task(dict(task or self.task))
+        document = dict(task or self.task)
+        self.store.create_task(document)
+        declaration_kwargs = {
+            "allowed_roles": (
+                "luna",
+                "terra",
+                "terra_xhigh",
+                "terra_xhigh_reviewer",
+                "sol_medium_reviewer",
+                "sol_xhigh",
+                "luna_construction",
+                "sol_reviewer",
+                "sol_planner",
+            ),
+            "active_roles": ("luna", "terra_xhigh_reviewer", "sol_medium_reviewer", "sol_xhigh"),
+            "max_dispatches": 64,
+        }
+        declaration_kwargs.update(self._declaration_kwargs)
+        _install_declaration(self.store, document, **declaration_kwargs)
+        self._record_plan_ownership(document)
+
+    def _record_plan_ownership(
+        self, document: dict[str, object], *, owner_role: str = "luna"
+    ) -> None:
+        task_id = str(document["task_id"])
+        if ownership.load_ownership_registry(self.store, task_id) is not None:
+            return
+        registry = ownership.OwnershipRegistry(
+            schema_version=ownership.OWNERSHIP_REGISTRY_SCHEMA_VERSION,
+            task_id=task_id,
+            envelope_hash=artifacts.artifact_sha256(document),
+            path_owners={"src": owner_role},
+            registered_at_utc="2026-08-28T00:00:00Z",
+        )
+        with self.store.lock(task_id):
+            ownership.record_ownership_registry(self.store, task_id, registry)
+
+    def _existing_assignment_transfer(
+        self,
+        store: workflow.WorkflowStore,
+        task_id: str,
+        from_role: str,
+        to_role: str,
+        allowed_paths: tuple[str, ...],
+    ) -> str | None:
+        wanted = tuple(sorted(allowed_paths))
+        for row in authorizations.replay_authorizations(store, task_id):
+            if (
+                row.get("record_kind") == "authorization"
+                and row.get("authorization_type") == "OWNERSHIP_TRANSFER"
+                and row.get("from_role") == from_role
+                and row.get("to_role") == to_role
+                and tuple(row.get("allowed_paths") or ()) == wanted
+            ):
+                authorization_id = row.get("authorization_id")
+                if isinstance(authorization_id, str):
+                    return authorization_id
+        return None
+
+    def _issue_assignment_transfer(
+        self,
+        store: workflow.WorkflowStore,
+        task_id: str,
+        from_role: str,
+        to_role: str,
+        allowed_paths: tuple[str, ...],
+    ) -> str:
+        if self.owner_evidence_id is None:
+            evidence = {
+                "event_type": "OWNER_DECISION",
+                "decision": "defer",
+                "actor": "owner",
+                "timestamp_utc": "2026-08-28T00:00:00Z",
+                "previous_state": "AWAITING_OWNER_DECISION",
+                "new_state": "DEFERRED",
+                "task_sha256": artifacts.artifact_sha256(
+                    workflow.load_task(store._require_task(task_id) / "task.json")
+                ),
+            }
+            store.record_decision(task_id, evidence)
+            self.owner_evidence_id = artifacts.artifact_sha256(evidence)
+        issued = authorizations.issue_owner_authorization(
+            store,
+            task_id,
+            authorization_type="OWNERSHIP_TRANSFER",
+            actor="owner",
+            owner_evidence_id=self.owner_evidence_id,
+            issued_at_utc="2026-08-28T12:00:00Z",
+            path="src",
+            from_role=from_role,
+            to_role=to_role,
+            allowed_paths=allowed_paths,
+            max_dispatches=64,
+        )
+        return issued.authorization_id
 
     def _record_runtime_evidence(self, receipt: object) -> None:
         self.assertIsInstance(receipt, repairs.VerifiedActorReceipt)
@@ -695,12 +821,93 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
         self._record_runtime_evidence(receipt)
         return expected, assignment, receipt
 
+    def _gate_evidence_ids(self) -> tuple[str, ...]:
+        ids: list[str] = []
+        for event in self.store.read_task_ledger(self.TASK_ID, "events.jsonl"):
+            if event.get("event_type") != "RUNTIME_EVIDENCE_RECORDED":
+                continue
+            digest = event.get("runtime_evidence_sha256")
+            if isinstance(digest, str) and digest:
+                ids.append(digest)
+        return tuple(ids)
+
+    def _seed_verdict_issuer(self) -> str:
+        evidence = {
+            "schema_version": "runtime-evidence-1",
+            "attempt_id": "final-verdict-issuer",
+            "requested_role": "sol_medium_reviewer",
+            "execution_surface": "CODEX_EXEC_ROLE_CONTRACT",
+            "observed_agent_type": None,
+            "native_agent_id": None,
+            "native_thread_id": None,
+            "observed_model": "gpt-5.6-sol",
+            "observed_reasoning_effort": "medium",
+            "observed_sandbox_policy": "read-only",
+            "observed_permission_profile": "read-only",
+            "observed_cwd": str(self.repository_root),
+            "evidence_source": "LOCAL_ROLLOUT",
+            "observed_at_utc": "2026-08-28T00:00:00Z",
+            "verification_status": "VERIFIED",
+            "failure_reasons": [],
+        }
+        issuer_id = artifacts.artifact_sha256(evidence)
+        existing = {
+            artifacts.artifact_sha256(row)
+            for row in self.store.read_task_ledger(self.TASK_ID, "runtime-evidence.jsonl")
+        }
+        if issuer_id not in existing:
+            self.store.append_task_ledger(
+                self.TASK_ID, "runtime-evidence.jsonl", evidence
+            )
+        events = self.store.read_task_ledger(self.TASK_ID, "events.jsonl")
+        if not any(
+            event.get("event_type") == "RUNTIME_EVIDENCE_RECORDED"
+            and event.get("runtime_evidence_sha256") == issuer_id
+            for event in events
+        ):
+            self.store.append_event(
+                self.TASK_ID,
+                {
+                    "event_type": "RUNTIME_EVIDENCE_RECORDED",
+                    "attempt_id": evidence["attempt_id"],
+                    "requested_role": evidence["requested_role"],
+                    "runtime_evidence_sha256": issuer_id,
+                },
+            )
+        return issuer_id
+
+    def _record_fresh_verdict(
+        self,
+        *,
+        verdict: str = "ACCEPT",
+        recorded_at: str = "2026-08-28T12:00:00Z",
+    ) -> candidate_state.CandidateState:
+        issuer_id = self._seed_verdict_issuer()
+        state = candidate_state.capture_candidate_state(
+            self.store,
+            self.TASK_ID,
+            baseline_commit=self.base_commit,
+            runtime_evidence_ids=self._gate_evidence_ids(),
+        )
+        with self.store.lock(self.TASK_ID):
+            verdicts.record_final_verdict(
+                self.store,
+                self.TASK_ID,
+                verdict=verdict,
+                candidate_state=state,
+                issuer_evidence_id=issuer_id,
+                recorded_at=recorded_at,
+            )
+        return state
+
     def _complete(
         self,
         assignment: object,
         actor: object,
         output_candidate: str,
         changed_paths: tuple[str, ...] = ("src/alpha.py",),
+        *,
+        override_authorization_id: str | None = None,
     ) -> object:
         with self.store.lock(self.TASK_ID):
             replay = repairs.replay_acceptance_ledger(self.store, self.TASK_ID)
@@ -758,6 +965,9 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
                             "whole_project_acceptance_required": "PENDING",
                         }
                     )
+                extra = {}
+                if override_authorization_id is not None:
+                    extra["override_authorization_id"] = override_authorization_id
                 repairs._v2_append(
                     self.store,
                     self.TASK_ID,
@@ -766,6 +976,7 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
                     "REPAIR_COMPLETED",
                     output_candidate,
                     fields,
+                    **extra,
                 )
             except RuntimeError as exc:
                 repairs._v2_fail_attempt(
@@ -785,6 +996,8 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
         verdict: str,
         findings: tuple[object, ...] = (),
         evidence: object | None = None,
+        *,
+        override_authorization_id: str | None = None,
     ) -> object:
         with self.store.lock(self.TASK_ID):
             replay = repairs.replay_acceptance_ledger(self.store, self.TASK_ID)
@@ -876,6 +1089,9 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
                             "whole_project_acceptance_required": "PENDING",
                         }
                     )
+                extra = {}
+                if override_authorization_id is not None:
+                    extra["override_authorization_id"] = override_authorization_id
                 repairs._v2_append(
                     self.store,
                     self.TASK_ID,
@@ -884,6 +1100,7 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
                     "REVIEW_COMPLETED",
                     replay.current_candidate_commit,
                     fields,
+                    **extra,
                 )
             except RuntimeError as exc:
                 repairs._v2_fail_attempt(
@@ -1450,13 +1667,14 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
                 raise AssertionError("caller-authored evidence reached Codex execution")
             return real_run(command, *args, **kwargs)
 
+        handler = mock.Mock(side_effect=no_codex_launch)
         with mock.patch.object(
-            workflow.subprocess, "run", side_effect=no_codex_launch
-        ) as launched:
+            repairs.subprocess, "Popen", _compat_popen(handler)
+        ):
             with self.assertRaises(workflow.WorkflowError):
                 repairs.run_assignment(self.store, self.TASK_ID, review, sessions)
         self.assertFalse(
-            any(Path(call.args[0][0]).name == "codex" for call in launched.call_args_list)
+            any(Path(call.args[0][0]).name == "codex" for call in handler.call_args_list)
         )
         with self.assertRaisesRegex(workflow.WorkflowError, "REPAIR_ADAPTER_REQUIRED"):
             repairs.record_adversarial_review(
@@ -1556,7 +1774,7 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
 
         with (
             mock.patch.object(
-                workflow.subprocess, "run", side_effect=controller_process
+                repairs.subprocess, "Popen", _compat_popen(controller_process)
             ),
             self._controller_codex_lookup(),
         ):
@@ -1659,7 +1877,7 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
 
         with (
             mock.patch.object(
-                workflow.subprocess, "run", side_effect=controller_process
+                repairs.subprocess, "Popen", _compat_popen(controller_process)
             ),
             self._controller_codex_lookup(),
         ):
@@ -1780,7 +1998,7 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
 
         with (
             mock.patch.object(
-                workflow.subprocess, "run", side_effect=controller_process
+                repairs.subprocess, "Popen", _compat_popen(controller_process)
             ),
             self._controller_codex_lookup(),
         ):
@@ -1850,7 +2068,7 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
             return real_run(command, *args, **kwargs)
 
         with mock.patch.object(
-            workflow.subprocess, "run", side_effect=reject_codex_launch
+            repairs.subprocess, "Popen", _compat_popen(reject_codex_launch)
         ):
             with self.assertRaisesRegex(
                 workflow.WorkflowError, "ACCEPTANCE_RECEIPT_MISMATCH"
@@ -1961,6 +2179,7 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
         self._assert_terminal_ladder_closed()
 
     def test_sol_peer_rework_creates_one_sol_xhigh_terminal_repair(self):
+        self.task["source_worktree"] = str(self.repository_root)
         owner_actor, _ = self._open_with_owner("luna-owner", "luna")
         _, first, reviewer_one_receipt = self._issue_with_receipt(
             "REVIEW_1", "terra-review-one", "terra_xhigh_reviewer"
@@ -2045,6 +2264,7 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
                     },
                     check=True,
                 )
+                self._record_fresh_verdict()
                 output_path = Path(command[command.index("-o") + 1])
                 output_path.write_text(
                     json.dumps(
@@ -2083,9 +2303,9 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
 
         with (
             mock.patch.object(
-                workflow.subprocess,
-                "run",
-                side_effect=terminal_controller_process,
+                repairs.subprocess,
+                "Popen",
+                _compat_popen(terminal_controller_process),
             ),
             self._controller_codex_lookup(),
         ):
@@ -2595,6 +2815,75 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
             self._v2()["repair_ledger_claims_task"](self.store, legacy_task_id),
             "repair-ledger-1 history must not be reported as v2 acceptance ownership",
         )
+
+
+class VerdictReleaseExitTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.fx = AcceptanceLedgerV2ContractTest()
+        self.fx.setUp()
+
+    def tearDown(self) -> None:
+        self.fx.tearDown()
+
+    def test_review_one_accept_does_not_require_final_verdict(self) -> None:
+        self.fx._open_with_owner("luna-owner", "luna")
+        _, first, receipt = self.fx._issue_with_receipt(
+            "REVIEW_1", "terra-review-one", "terra_xhigh_reviewer"
+        )
+        self.fx._review(first, receipt, "ACCEPT")
+        events = [
+            event
+            for event in self.fx._events()
+            if event.get("event_type") == "REVIEW_COMPLETED"
+        ]
+        self.assertEqual(1, len(events))
+        self.assertEqual("ACCEPT", events[0]["verdict"])
+
+    def test_stale_accept_blocks_terminal_repair_completed(self) -> None:
+        self.fx.task["source_worktree"] = str(self.fx.repository_root)
+        owner_actor, _ = self.fx._open_with_owner("luna-owner", "luna")
+        _, first, reviewer_one_receipt = self.fx._issue_with_receipt(
+            "REVIEW_1", "terra-review-one", "terra_xhigh_reviewer"
+        )
+        self.fx._review(first, reviewer_one_receipt, "REWORK", self.fx.findings)
+        _, owner_repair, owner_receipt = self.fx._issue_with_receipt(
+            "OWNER_REPAIR", "luna-owner-repair", "luna", expected_actor=owner_actor
+        )
+        owner_candidate = self.fx._commit_file("src/alpha.py", "OWNER_ALPHA = 1\n")
+        self.fx._complete(
+            owner_repair, owner_receipt, owner_candidate, ("src/alpha.py",)
+        )
+        _, second, reviewer_two_receipt = self.fx._issue_with_receipt(
+            "REVIEW_2", "terra-review-two", "terra_xhigh_reviewer"
+        )
+        self.fx._review(second, reviewer_two_receipt, "REWORK", self.fx.findings)
+        _, sol_repair, sol_receipt = self.fx._issue_with_receipt(
+            "SOL_MEDIUM_REPAIR", "sol-fixer", "sol_medium_reviewer"
+        )
+        sol_candidate = self.fx._commit_file("src/alpha.py", "SOL_MEDIUM_ALPHA = 1\n")
+        self.fx._complete(sol_repair, sol_receipt, sol_candidate, ("src/alpha.py",))
+        _, peer_review, peer_receipt = self.fx._issue_with_receipt(
+            "SOL_MEDIUM_PEER_REVIEW", "sol-peer", "sol_medium_reviewer"
+        )
+        self.fx._review(peer_review, peer_receipt, "REWORK", self.fx.findings)
+        _, terminal, receipt = self.fx._issue_with_receipt(
+            "SOL_XHIGH_TERMINAL_REPAIR", "sol-xhigh", "sol_xhigh"
+        )
+        self.fx._record_fresh_verdict()
+        candidate = self.fx._commit_file("src/alpha.py", "STALE_AFTER_ACCEPT = 1\n")
+        with self.assertRaisesRegex(workflow.WorkflowError, "VERDICT_STALE"):
+            self.fx._complete(terminal, receipt, candidate, ("src/alpha.py",))
+        self.assertFalse(
+            any(
+                event.get("event_type") == "REPAIR_COMPLETED"
+                and event.get("terminal_reason") == "SOL_XHIGH_TERMINAL_REPAIR_COMPLETED"
+                for event in self.fx._events()
+            )
+        )
+        replay = repairs.replay_acceptance_ledger(self.fx.store, self.fx.TASK_ID)
+        self.assertIsNotNone(replay)
+        assert replay is not None
+        self.assertFalse(replay.terminal)
 
 
 if __name__ == "__main__":

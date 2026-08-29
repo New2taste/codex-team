@@ -1,0 +1,92 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "ai-owner-authorization-1"
+    },
+    "record_kind": {
+      "type": "string",
+      "enum": ["authorization", "consumption", "transfer_lease"]
+    },
+    "authorization_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "record_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "authorization_type": {
+      "type": "string",
+      "enum": ["VERDICT_STALE_OVERRIDE", "OWNERSHIP_TRANSFER"]
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "envelope_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "candidate_state_digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "path": {
+      "type": "string",
+      "minLength": 1
+    },
+    "from_role": {
+      "type": "string",
+      "minLength": 1
+    },
+    "to_role": {
+      "type": "string",
+      "minLength": 1
+    },
+    "allowed_paths": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "max_dispatches": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "permit_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "dispatch_seq": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "binding": {
+      "type": "object"
+    },
+    "actor": {
+      "type": "string",
+      "minLength": 1
+    },
+    "owner_evidence_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "issued_at_utc": {
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "required": [
+    "schema_version",
+    "record_kind",
+    "authorization_id",
+    "task_id",
+    "envelope_hash",
+    "issued_at_utc"
+  ]
+}
