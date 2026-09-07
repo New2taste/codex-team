@@ -516,10 +516,17 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
             permission = "workspace-write"
         elif role == "sol_xhigh":
             model, effort, sandbox, permission = (
-                "gpt-5.6-sol",
-                "xhigh",
+                "gpt-6-astra",
+                "medium",
                 "workspace-write",
                 "assignment-scoped-write",
+            )
+        elif role == "astra_low_reviewer":
+            model, effort, sandbox, permission = (
+                "gpt-6-astra",
+                "low",
+                "read-only",
+                "read-only",
             )
         else:
             model, effort, sandbox, permission = (
@@ -634,12 +641,19 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
                 "terra_xhigh",
                 "terra_xhigh_reviewer",
                 "sol_medium_reviewer",
+                "astra_low_reviewer",
                 "sol_xhigh",
                 "luna_construction",
                 "sol_reviewer",
                 "sol_planner",
             ),
-            "active_roles": ("luna", "terra_xhigh_reviewer", "sol_medium_reviewer", "sol_xhigh"),
+            "active_roles": (
+                "luna",
+                "terra_xhigh_reviewer",
+                "sol_medium_reviewer",
+                "astra_low_reviewer",
+                "sol_xhigh",
+            ),
             "max_dispatches": 64,
         }
         declaration_kwargs.update(self._declaration_kwargs)
@@ -831,17 +845,22 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
                 ids.append(digest)
         return tuple(ids)
 
-    def _seed_verdict_issuer(self) -> str:
+    def _seed_verdict_issuer(self, *, role: str = "sol_medium_reviewer") -> str:
+        model, effort = (
+            ("gpt-6-astra", "low")
+            if role == "astra_low_reviewer"
+            else ("gpt-5.6-sol", "medium")
+        )
         evidence = {
             "schema_version": "runtime-evidence-1",
             "attempt_id": "final-verdict-issuer",
-            "requested_role": "sol_medium_reviewer",
+            "requested_role": role,
             "execution_surface": "CODEX_EXEC_ROLE_CONTRACT",
             "observed_agent_type": None,
             "native_agent_id": None,
             "native_thread_id": None,
-            "observed_model": "gpt-5.6-sol",
-            "observed_reasoning_effort": "medium",
+            "observed_model": model,
+            "observed_reasoning_effort": effort,
             "observed_sandbox_policy": "read-only",
             "observed_permission_profile": "read-only",
             "observed_cwd": str(self.repository_root),
@@ -881,8 +900,9 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
         *,
         verdict: str = "ACCEPT",
         recorded_at: str = "2026-08-28T12:00:00Z",
+        issuer_role: str = "sol_medium_reviewer",
     ) -> candidate_state.CandidateState:
-        issuer_id = self._seed_verdict_issuer()
+        issuer_id = self._seed_verdict_issuer(role=issuer_role)
         state = candidate_state.capture_candidate_state(
             self.store,
             self.TASK_ID,
@@ -2230,8 +2250,8 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
                 {
                     "thread_id": terminal_thread,
                     "agent_type": None,
-                    "model": "gpt-5.6-sol",
-                    "reasoning_effort": "xhigh",
+                    "model": "gpt-6-astra",
+                    "reasoning_effort": "medium",
                     "sandbox_policy": "workspace-write",
                     "permission_profile": "assignment-scoped-write",
                     "cwd": str(self.repository_root),

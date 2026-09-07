@@ -66,17 +66,20 @@ level, human owner gates, or the final-acceptance boundary.
   if HEAD/scope/child-hash bind) and `issue_final_acceptance` (one
   Sol-medium `REVIEW_1` only, retryable after a failed assignment append).
   If it returns
-  `REWORK`, a **different Sol-medium fixer** may receive one
+  `REWORK`, a **Sol-medium fixer** may receive one
   owner-authorized, assignment-scoped write capability limited to the frozen
   findings, candidate, paths, and verification commands. The accepting
-  reviewer never repairs its own verdict. A **different Sol-medium recheck**
-  (different from both acceptor and fixer) is read-only and may not widen
-  scope. Owner xhigh authorization is `decide <task_id> authorize_final_xhigh`
-  and must not be combined with `--resume`.
-- **Sol xhigh** handles owner-authorized planning and terminal escalation in a
-  closed case file. Only a `REWORK` from that different Sol-medium recheck may
-  authorize one terminal repair without task-level review. It never starts
-  automatically and never bypasses final Sol-medium acceptance.
+  reviewer never repairs its own verdict. An **Astra low** peer reviewer
+  (`astra_low_reviewer`, `gpt-6-astra / low`) independently rechecks the
+  Sol-medium repair in read-only mode and may not widen scope. Owner terminal
+  authorization is exposed through the compatibility command
+  `decide <task_id> authorize_final_xhigh` and must not be combined with
+  `--resume`.
+- **Astra medium** handles owner-authorized overall planning, closed-set
+  decisions, and one terminal repair in a closed case file. Only a `REWORK`
+  from the independent Astra-low peer may authorize that terminal repair
+  without task-level review. It never starts automatically and never bypasses
+  final Sol-medium acceptance.
 - Only roles explicitly listed in the frozen configuration may be selected;
   unspecified models and reasoning levels are never silently substituted.
 
@@ -96,9 +99,10 @@ hash-bound receipt consumed by `schedule-receipt`.
 After all receipts complete, `schedule-final` creates the unique acceptance
 child and its directed `scheduler-parent.json` binding. Supplying both a
 verified `--owner-receipt` and a Sol-medium `--acceptor` issues the single
-`REVIEW_1`. If the bounded repair ladder later reaches terminal escalation,
-the owner uses `decide <child_id> authorize_final_xhigh`; no scheduler command
-starts a model, merges, or pushes.
+`REVIEW_1`. If the bounded repair ladder later reaches terminal escalation, the
+owner uses the compatibility command `decide <child_id> authorize_final_xhigh`
+to trigger Astra medium; no scheduler command starts a model, merges, or
+pushes.
 
 ## Codex Team natural-language contract
 
@@ -120,7 +124,7 @@ writes.
 |---|---|---|
 | `DIRECT_L0` | Exact fixed L0 allowlist only. | **L0 controller/no model**: the controller runs the registered argv and starts no model. |
 | `DIRECT_L1` | Exact `核对文件 <repo-relative-path>` evidence request only. | **L1 Luna read-only**: Luna may extract the pinned evidence only; the existing L0/L1/L2 evidence contract still applies. |
-| `PLAN_REQUIRED` | Any other safe objective. | **plan fallback** to the existing frozen-envelope workflow with human owner gates; do not automatically invoke Sol xhigh. |
+| `PLAN_REQUIRED` | Any other safe objective. | **plan fallback** to the existing frozen-envelope workflow with human owner gates; do not automatically invoke Astra medium. |
 | `BLOCKED` | Invalid input, an active receipt, missing authority, or failed execution. | Write a blocking receipt; do not promise a model run, task, merge, or push. |
 
 Team Call neither grants Luna review, approval, or final-acceptance authority

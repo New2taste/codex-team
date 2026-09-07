@@ -81,6 +81,7 @@ _SHA_PATTERN = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 _ASSIGNMENT_ID_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _TERRA_XHIGH = "terra_xhigh"
 _SOL_MEDIUM_REVIEWER = "sol_medium_reviewer"
+_ASTRA_LOW_REVIEWER = "astra_low_reviewer"
 _REPAIR_EVENT_TYPES = frozenset(
     {
         "REPAIR_ASSIGNED",
@@ -159,7 +160,7 @@ _FROZEN_FINAL_ACCEPTANCE_REWORK = {
     "fixer_role": "sol_medium_reviewer",
     "fixer_permission_profile": "assignment-scoped-write",
     "fixer_distinct_from_acceptor": True,
-    "recheck_role": "sol_medium_reviewer",
+    "recheck_role": "astra_low_reviewer",
     "recheck_distinct_from_fixer": True,
     "terminal_escalation_role": "sol_xhigh",
     "terminal_review_required": False,
@@ -1411,7 +1412,8 @@ def _v2_validate_observed_receipt(
         "terra_xhigh": ("gpt-5.6-terra", "xhigh", "workspace-write", "workspace-write"),
         "terra_xhigh_reviewer": ("gpt-5.6-terra", "xhigh", "read-only", "read-only"),
         "sol_medium_reviewer": ("gpt-5.6-sol", "medium", "read-only", "read-only"),
-        "sol_xhigh": ("gpt-5.6-sol", "xhigh", "workspace-write", "assignment-scoped-write"),
+        "astra_low_reviewer": ("gpt-6-astra", "low", "read-only", "read-only"),
+        "sol_xhigh": ("gpt-6-astra", "medium", "workspace-write", "assignment-scoped-write"),
     }.get(receipt.requested_role)
     if expected is None or (
         receipt.observed_model,
@@ -2114,7 +2116,7 @@ def replay_acceptance_ledger(store: WorkflowStore, task_id: str) -> _AcceptanceR
                         or event.get("whole_project_acceptance_required") != "PENDING"
                         or not isinstance(event.get("terminal_reason"), str)
                     ):
-                        _fail("ACCEPTANCE_LEDGER_INVALID", "terminal Sol repair is not bounded")
+                        _fail("ACCEPTANCE_LEDGER_INVALID", "terminal Astra medium repair is not bounded")
                     replay.terminal = True
             elif event_type == "REVIEW_COMPLETED":
                 if event.get("candidate_commit") != replay.current_candidate_commit:
@@ -2203,10 +2205,10 @@ def _v2_next_phase(replay: _AcceptanceReplay) -> tuple[str, tuple[RepairFinding,
         if "SOL_MEDIUM_PEER_REVIEW" not in outcomes:
             return "SOL_MEDIUM_PEER_REVIEW", replay.pending_findings
         if outcomes["SOL_MEDIUM_PEER_REVIEW"] != "REWORK":
-            _fail("ACCEPTANCE_SEQUENCE_INVALID", "Sol peer acceptance already terminally closed the task")
+            _fail("ACCEPTANCE_SEQUENCE_INVALID", "Astra low peer acceptance already terminally closed the task")
         if "SOL_XHIGH_TERMINAL_REPAIR" not in outcomes:
             return "SOL_XHIGH_TERMINAL_REPAIR", replay.pending_findings
-        _fail("ACCEPTANCE_SEQUENCE_INVALID", "terminal Sol repair already closed the task")
+        _fail("ACCEPTANCE_SEQUENCE_INVALID", "terminal Astra medium repair already closed the task")
     if "OWNER_REPAIR" not in outcomes:
         return "OWNER_REPAIR", replay.pending_findings
     if "REVIEW_2" not in outcomes:
@@ -2221,7 +2223,7 @@ def _v2_next_phase(replay: _AcceptanceReplay) -> tuple[str, tuple[RepairFinding,
         _fail("ACCEPTANCE_SEQUENCE_INVALID", "Sol peer acceptance already terminally closed the task")
     if "SOL_XHIGH_TERMINAL_REPAIR" not in outcomes:
         return "SOL_XHIGH_TERMINAL_REPAIR", replay.pending_findings
-    _fail("ACCEPTANCE_SEQUENCE_INVALID", "terminal Sol repair already closed the task")
+    _fail("ACCEPTANCE_SEQUENCE_INVALID", "terminal Astra medium repair already closed the task")
 
 
 def _v2_validate_whole_project_phase_actor(
@@ -2246,11 +2248,15 @@ def _v2_validate_whole_project_phase_actor(
     if phase == "SOL_MEDIUM_PEER_REVIEW":
         fixer = replay.repairer_identities.get("SOL_MEDIUM_REPAIR")
         if (
-            actor.role != policy["recheck_role"]
+            actor.role != _ASTRA_LOW_REVIEWER
+            or actor.role != policy["recheck_role"]
             or actor.identity == fixer
             or actor.identity in replay.reviewer_identities
         ):
-            _fail("ACCEPTANCE_SEQUENCE_INVALID", "Sol recheck must be distinct from acceptor and fixer")
+            _fail(
+                "ACCEPTANCE_SEQUENCE_INVALID",
+                "Astra low peer must be distinct from acceptor and fixer",
+            )
         return
     if phase == "SOL_XHIGH_TERMINAL_REPAIR" and actor.role == policy["terminal_escalation_role"]:
         return
@@ -2329,7 +2335,7 @@ def issue_acceptance_assignment(
         if replay.whole_project_final and phase == "SOL_XHIGH_TERMINAL_REPAIR":
             _assert_automatic_xhigh_disabled()
             if any(item.phase == "SOL_XHIGH_TERMINAL_REPAIR" for item in replay.assignments.values()):
-                _fail("ACCEPTANCE_SEQUENCE_INVALID", "terminal Sol xhigh may be issued only once")
+                _fail("ACCEPTANCE_SEQUENCE_INVALID", "terminal Astra medium repair may be issued only once")
             _require_one_final_xhigh_ticket(store, task_id, replay)
         _v2_append(
             store,
@@ -2399,9 +2405,9 @@ def _require_one_final_xhigh_ticket(
 ) -> Mapping[str, object]:
     tickets = _final_xhigh_decision_records(store, task_id)
     if any(not _final_xhigh_ticket_is_valid(ticket, store, task_id, replay) for ticket in tickets):
-        _fail("ACCEPTANCE_SEQUENCE_INVALID", "final-xhigh authorization ticket is invalid")
+        _fail("ACCEPTANCE_SEQUENCE_INVALID", "Astra medium terminal-authorization ticket is invalid")
     if len(tickets) != 1:
-        _fail("ACCEPTANCE_SEQUENCE_INVALID", "exactly one final-xhigh authorization ticket is required")
+        _fail("ACCEPTANCE_SEQUENCE_INVALID", "exactly one Astra medium terminal-authorization ticket is required")
     return tickets[0]
 
 
@@ -2412,7 +2418,7 @@ def authorize_final_xhigh(
     *,
     override_authorization_id: str | None = None,
 ) -> None:
-    """Record one owner-authorized Sol xhigh for whole-project final acceptance."""
+    """Record one owner-authorized Astra medium repair for whole-project final acceptance."""
 
     if not isinstance(actor, str) or not actor.strip():
         _fail("INVALID_ACTOR", "actor must be a non-empty string")
@@ -2422,18 +2428,18 @@ def authorize_final_xhigh(
         if not _is_whole_project_final(stored, store=store):
             _fail(
                 "ACCEPTANCE_SEQUENCE_INVALID",
-                "xhigh authorization is reserved for whole-project final acceptance",
+                "Astra medium terminal authorization is reserved for whole-project final acceptance",
             )
         replay = replay_acceptance_ledger(store, task_id)
         if replay is None:
-            _fail("ACCEPTANCE_SEQUENCE_INVALID", "acceptance must be opened before authorizing xhigh")
+            _fail("ACCEPTANCE_SEQUENCE_INVALID", "acceptance must be opened before authorizing Astra medium terminal repair")
         if replay.phase_outcomes.get("SOL_MEDIUM_PEER_REVIEW") != "REWORK":
-            _fail("ACCEPTANCE_SEQUENCE_INVALID", "xhigh authorization requires peer REWORK")
+            _fail("ACCEPTANCE_SEQUENCE_INVALID", "Astra medium terminal authorization requires peer REWORK")
         if any(item.phase == "SOL_XHIGH_TERMINAL_REPAIR" for item in replay.assignments.values()):
-            _fail("ACCEPTANCE_SEQUENCE_INVALID", "terminal Sol xhigh has already been used")
+            _fail("ACCEPTANCE_SEQUENCE_INVALID", "terminal Astra medium repair has already been used")
         _assert_automatic_xhigh_disabled()
         if _final_xhigh_decision_records(store, task_id):
-            _fail("ACCEPTANCE_SEQUENCE_INVALID", "whole-project xhigh is already authorized")
+            _fail("ACCEPTANCE_SEQUENCE_INVALID", "Astra medium terminal repair is already authorized")
         require_verdict_fresh_locked(
             store, task_id, override_authorization_id=override_authorization_id
         )
@@ -2723,7 +2729,8 @@ def _v2_controller_runtime_receipt(
             if assignment.phase == "SOL_MEDIUM_REPAIR"
             else "read-only",
         ),
-        "sol_xhigh": ("gpt-5.6-sol", "xhigh", "assignment-scoped-write"),
+        "astra_low_reviewer": ("gpt-6-astra", "low", "read-only"),
+        "sol_xhigh": ("gpt-6-astra", "medium", "assignment-scoped-write"),
     }.get(assignment.expected_actor.role)
     if role_runtime is None:
         _fail("REPAIR_ADAPTER_REQUIRED", "issued role has no fixed controller runtime")

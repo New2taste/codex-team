@@ -417,6 +417,7 @@ ROLES = frozenset(
         "terra_xhigh_planner",
         "terra_xhigh_reviewer",
         "sol_medium_reviewer",
+        "astra_low_reviewer",
         "sol_xhigh_planner",
     }
 )

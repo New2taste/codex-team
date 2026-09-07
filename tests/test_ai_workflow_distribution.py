@@ -442,7 +442,7 @@ class DistributionContractTest(unittest.TestCase):
             "sol medium",
             "final",
             "acceptance",
-            "sol xhigh",
+            "astra medium",
             "escalation",
         ):
             self.assertIn(phrase, published, phrase)
@@ -464,8 +464,8 @@ class DistributionContractTest(unittest.TestCase):
             "section_self_check_only",
             "intermediate engineering sections",
             "different sol-medium fixer",
-            "different sol-medium recheck",
-            "owner-authorized sol-xhigh terminal repair",
+            "astra low",
+            "owner-authorized astra-medium terminal repair",
             "dual-key",
             "compact_prompts",
             "armed field projection",
@@ -494,7 +494,7 @@ class DistributionContractTest(unittest.TestCase):
                     "fixer_role": "sol_medium_reviewer",
                     "fixer_permission_profile": "assignment-scoped-write",
                     "fixer_distinct_from_acceptor": True,
-                    "recheck_role": "sol_medium_reviewer",
+                    "recheck_role": "astra_low_reviewer",
                     "recheck_distinct_from_fixer": True,
                     "terminal_escalation_role": "sol_xhigh",
                     "terminal_review_required": False,
@@ -531,6 +531,7 @@ class DistributionContractTest(unittest.TestCase):
             self.assertIn("luna_construction", role_names)
             self.assertIn("terra_xhigh_reviewer", role_names)
             self.assertIn("sol_medium_reviewer", role_names)
+            self.assertIn("astra_low_reviewer", role_names)
             self.assertIn("sol_xhigh_planner", role_names)
 
     def test_published_default_defers_adversarial_review_until_final_acceptance(self):
@@ -545,8 +546,8 @@ class DistributionContractTest(unittest.TestCase):
             "intermediate engineering sections",
             "section_self_check_only",
             "different sol-medium fixer",
-            "different sol-medium recheck",
-            "owner-authorized sol-xhigh terminal repair",
+            "astra low",
+            "owner-authorized astra-medium terminal repair",
         ):
             self.assertIn(phrase, published, phrase)
         self.assertRegex(published, r"sol[- ]medium\s+final\s+acceptance")
@@ -576,7 +577,7 @@ class DistributionContractTest(unittest.TestCase):
         self.assertRegex(
             skill,
             re.compile(
-                r"sol xhigh.*?terminal escalation.*?never starts\s+automatically",
+                r"astra medium.*?terminal repair.*?never starts\s+automatically",
                 re.DOTALL,
             ),
         )

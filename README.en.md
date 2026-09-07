@@ -16,7 +16,7 @@ It is intended for personal development, experiments, and local workflows that u
 | Resident entry-route suggestion | Luna max; documentation-only suggestion, effective routing remains deterministic and user-selected |
 | Default construction OS | Terra xhigh |
 | Final acceptance | Concentrated, read-only, adversarial Sol medium review |
-| Last updated | 2026-08-29 |
+| Last updated | 2026-09-07 |
 | License | Not declared; public visibility does not grant redistribution rights |
 
 ## What this is
@@ -29,10 +29,11 @@ Codex Team consists of standard-library implementations, schemas, a Plugin mirro
 |---|---|---|---|
 | Luna Max | `gpt-5.6-luna / max` | Mechanical coding inside a frozen envelope, deterministic checks, evidence extraction, and distribution sync | Never planning, reviewing, approving, or final acceptance |
 | Terra xhigh | `gpt-5.6-terra / xhigh` | Complex construction, debugging, integration, and open-ended problem decomposition | Never merge, push, or self-accept |
-| Sol medium | `gpt-5.6-sol / medium` | Supervise the implementation of the overall plan, perform concentrated final acceptance, and run the bounded rework ladder | Not resident construction; acceptance stays read-only and adversarial |
-| Sol xhigh | `gpt-5.6-sol / xhigh` | Owner-authorized overall planning or terminal escalation after the rework ladder | Never starts automatically or bypasses the owner gate |
+| Sol medium | `gpt-5.6-sol / medium` | Supervise overall-plan execution, perform concentrated final acceptance, and perform the first bounded repair | Not resident construction; final acceptance stays read-only and adversarial, with no independent second recheck |
+| Astra low | `gpt-6-astra / low` | Independent, read-only recheck after the first Sol-medium repair | Never planning, constructing, approving, or performing terminal repair |
+| Astra medium | `gpt-6-astra / medium` | Owner-authorized overall planning, closed-set decisions, or one-time terminal repair after the rework ladder | Never starts automatically or bypasses the owner gate or final acceptance |
 
-Luna does not perform planning, review, approval, or final acceptance. Terra does not merge, push, or self-accept. Sol xhigh does not start automatically. Models and reasoning levels not explicitly listed in configuration are never silently injected into the workflow.
+Luna does not perform planning, review, approval, or final acceptance. Terra does not merge, push, or self-accept. Astra medium does not start automatically. Models and reasoning levels not explicitly listed in configuration are never silently injected into the workflow.
 
 ## Routing at a glance
 
@@ -47,7 +48,7 @@ flowchart TD
     B -->|Invalid input, lock, or evidence| X[BLOCKED<br/>Append blocking receipt]
 
     E --> F{Plan and owner gate}
-    F -->|No executable plan| G[Sol xhigh<br/>Owner-authorized planning]
+    F -->|No executable plan| G[Astra medium<br/>Owner-authorized planning and decision]
     F -->|Frozen envelope| H{Task complexity}
     G --> H
     H -->|Mechanical, low risk, bounded| I[Luna Max<br/>Low-cost tool process]
@@ -58,15 +59,15 @@ flowchart TD
     K -->|All sections complete| L[Pin clean candidate<br/>Check scope and evidence]
     L --> M[Sol medium<br/>Concentrated, read-only,<br/>adversarial final acceptance]
     M -->|ACCEPT| N[Owner decision<br/>Close task]
-    M -->|REWORK| O[Different Sol medium<br/>Bounded repair]
-    O --> P[Another different Sol medium<br/>Read-only recheck]
+    M -->|REWORK| O[Sol medium<br/>First bounded repair]
+    O --> P[Astra low<br/>Independent, read-only recheck]
     P -->|ACCEPT| N
     P -->|REWORK again| Q[Owner authorization]
-    Q --> R[Sol xhigh<br/>One-time terminal repair]
+    Q --> R[Astra medium<br/>One-time terminal repair]
     R --> N
 ```
 
-The routing trade-off is deliberate: Luna handles frequent, low-cost, mechanically verifiable work; Terra xhigh handles construction that needs context and debugging; Sol medium enters only after all engineering sections are complete and looks for omissions; Sol xhigh handles the terminal exception only after explicit owner authorization. `optimization` is shadow advice by default and never silently changes this deterministic production chain.
+The routing trade-off is deliberate: Luna handles frequent, low-cost, mechanically verifiable work; Terra xhigh handles construction that needs context and debugging; Sol medium enters only after all engineering sections are complete, looks for omissions, and performs the first bounded repair; Astra low independently rechecks that repair; Astra medium handles planning, closed-set decisions, and the terminal exception only after explicit owner authorization. `optimization` is shadow advice by default and never silently changes this deterministic production chain.
 
 ## Quick start
 
@@ -127,7 +128,7 @@ The command does not modify, merge, push, or replace final acceptance. Failed ca
 ```text
 Objective → task envelope and deterministic evidence checks
 → DIRECT_L1 Luna fact extraction when needed
-→ Terra read-only planning only when an executable plan is missing
+→ Astra medium read-only planning only when an executable plan is missing
 → owner decision
 ```
 
@@ -148,12 +149,12 @@ The scheduler creates one whole-project `ACCEPTANCE` child after all section rec
 ```text
 Sol medium REWORK
 → human approval of frozen findings, paths, and commands
-→ different Sol-medium fixer with bounded write access
-→ another different Sol-medium read-only recheck
-→ only a second REWORK may reach owner-authorized Sol-xhigh terminal repair
+→ Sol-medium fixer with bounded write access
+→ Astra low independent read-only recheck
+→ only a second REWORK may reach owner-authorized Astra-medium terminal repair
 ```
 
-Rework cannot expand the candidate, allowed paths, or verification commands. The Sol-xhigh terminal repair is a one-time exception and does not grant ordinary resident construction permission.
+Rework cannot expand the candidate, allowed paths, or verification commands. The Astra-medium terminal repair is a one-time exception and does not grant ordinary resident construction permission.
 
 ## Identity and evidence
 

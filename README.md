@@ -16,7 +16,7 @@ Codex Team 是一个面向 Codex 的本地、可恢复、可审计的半自动�
 | 常驻路由建议 | Luna max；仅项目说明建议，生效路由仍由确定性规则与使用者自行选择 |
 | 默认施工 OS | Terra xhigh |
 | 最终验收 | Sol medium 集中、只读、对抗式验收 |
-| 最近更新 | 2026-08-29 |
+| 最近更新 | 2026-09-07 |
 | 许可证 | 尚未声明；公开可见不等于授予再分发许可 |
 
 ## 这是什么
@@ -29,10 +29,11 @@ Codex Team 由标准库实现、Schema、Plugin 镜像、CLI 和测试组成。�
 |---|---|---|---|
 | Luna Max | `gpt-5.6-luna / max` | 冻结 envelope 内的机械 coding、确定性检查、证据抽取和分发同步 | 不做 planning、review、approval 或 final acceptance |
 | Terra xhigh | `gpt-5.6-terra / xhigh` | 复杂施工、调试、集成和开放式问题拆解 | 不 merge、push 或自我验收 |
-| Sol medium | `gpt-5.6-sol / medium` | 监督总体规划实现、集中终验，并执行有界返工梯级 | 不承担常驻施工；验收保持只读、对抗式 |
-| Sol xhigh | `gpt-5.6-sol / xhigh` | owner-authorized 总体规划，或返工梯级失败后的终局升级 | 不自动启动，不绕过 owner gate |
+| Sol medium | `gpt-5.6-sol / medium` | 监督总体规划实现、集中终验，并执行首轮有界返工 | 不承担常驻施工；终验保持只读、对抗式，不负责独立二次复验 |
+| Astra low | `gpt-6-astra / low` | 首轮返工后的独立、只读复验 | 不做规划、施工、批准或终局修复 |
+| Astra medium | `gpt-6-astra / medium` | owner-authorized 总体规划、闭集裁定，或返工梯级失败后的终局修复 | 不自动启动，不绕过 owner gate 或最终验收 |
 
-Luna 不承担 planning、review、approval 或 final acceptance；Terra 不合并、不推送、不自验；Sol xhigh 不自动启动。未明确列入配置的模型和档位不会被隐式注入流程。
+Luna 不承担 planning、review、approval 或 final acceptance；Terra 不合并、不推送、不自验；Astra medium 不自动启动。未明确列入配置的模型和档位不会被隐式注入流程。
 
 ## 路由工作示意
 
@@ -47,7 +48,7 @@ flowchart TD
     B -->|输入、锁或证据失败| X[BLOCKED<br/>写入阻断收据]
 
     E --> F{计划与 owner gate}
-    F -->|缺少可执行计划| G[Sol xhigh<br/>owner-authorized 规划]
+    F -->|缺少可执行计划| G[Astra medium<br/>owner-authorized 规划与裁定]
     F -->|冻结 envelope| H{任务复杂度}
     G --> H
     H -->|机械、低风险、范围明确| I[Luna Max<br/>廉价工具进程]
@@ -58,15 +59,15 @@ flowchart TD
     K -->|全部小节完成| L[固定 clean candidate<br/>范围与证据核对]
     L --> M[Sol medium<br/>集中、只读、对抗式终验]
     M -->|ACCEPT| N[owner decision<br/>关闭任务]
-    M -->|REWORK| O[不同身份 Sol medium<br/>有界返工]
-    O --> P[另一不同身份 Sol medium<br/>只读复核]
+    M -->|REWORK| O[Sol medium<br/>首轮有界返工]
+    O --> P[Astra low<br/>独立、只读复验]
     P -->|ACCEPT| N
     P -->|再次 REWORK| Q[owner authorization]
-    Q --> R[Sol xhigh<br/>一次性终局修复]
+    Q --> R[Astra medium<br/>一次性终局修复]
     R --> N
 ```
 
-路由的关键取舍是：Luna 负责高频、低成本且可机械验证的工作；Terra xhigh 承担需要上下文和调试能力的施工；Sol medium 只在全部工程小节完成后介入，集中寻找遗漏；Sol xhigh 仅在 owner 明确授权后处理终局例外。`optimization` 默认是 shadow 建议，不会偷偷改变这条确定性生产链。
+路由的关键取舍是：Luna 负责高频、低成本且可机械验证的工作；Terra xhigh 承担需要上下文和调试能力的施工；Sol medium 只在全部工程小节完成后介入，集中寻找遗漏并执行首轮返工；Astra low 对首轮返工做独立只读复验；Astra medium 仅在 owner 明确授权后负责总体规划、闭集裁定和终局例外。`optimization` 默认是 shadow 建议，不会偷偷改变这条确定性生产链。
 
 ## English overview
 
@@ -80,8 +81,9 @@ It is designed for personal development, experiments, and local workflows that c
 |---|---|---|---|
 | Luna Max | `gpt-5.6-luna / max` | Mechanical coding inside a frozen envelope, deterministic checks, evidence extraction, and distribution sync | Never planning, reviewing, approving, or final acceptance |
 | Terra xhigh | `gpt-5.6-terra / xhigh` | Complex construction, debugging, integration, and open-ended problem decomposition | Never merge, push, or self-accept |
-| Sol medium | `gpt-5.6-sol / medium` | Supervise overall-plan execution, perform concentrated final acceptance, and run bounded rework | Not resident construction; acceptance stays read-only and adversarial |
-| Sol xhigh | `gpt-5.6-sol / xhigh` | Owner-authorized overall planning or terminal escalation after the rework ladder | Never starts automatically or bypasses the owner gate |
+| Sol medium | `gpt-5.6-sol / medium` | Supervise overall-plan execution, perform concentrated final acceptance, and perform the first bounded repair | Not resident construction; final acceptance stays read-only and adversarial, with no independent second recheck |
+| Astra low | `gpt-6-astra / low` | Independent, read-only recheck after the first Sol-medium repair | Never planning, constructing, approving, or performing terminal repair |
+| Astra medium | `gpt-6-astra / medium` | Owner-authorized overall planning, closed-set decisions, or one-time terminal repair after the rework ladder | Never starts automatically or bypasses the owner gate or final acceptance |
 
 ### Routing at a glance
 
@@ -96,7 +98,7 @@ flowchart TD
     B -->|Invalid input, lock, or evidence| X[BLOCKED<br/>Append blocking receipt]
 
     E --> F{Plan and owner gate}
-    F -->|No executable plan| G[Sol xhigh<br/>Owner-authorized planning]
+    F -->|No executable plan| G[Astra medium<br/>Owner-authorized planning and decision]
     F -->|Frozen envelope| H{Task complexity}
     G --> H
     H -->|Mechanical, low risk, bounded| I[Luna Max<br/>Low-cost tool process]
@@ -108,14 +110,14 @@ flowchart TD
     L --> M[Sol medium<br/>Concentrated, read-only,<br/>adversarial final acceptance]
     M -->|ACCEPT| N[Owner decision<br/>Close task]
     M -->|REWORK| O[Different Sol medium<br/>Bounded repair]
-    O --> P[Another different Sol medium<br/>Read-only recheck]
+    O --> P[Astra low<br/>Independent, read-only recheck]
     P -->|ACCEPT| N
     P -->|REWORK again| Q[Owner authorization]
-    Q --> R[Sol xhigh<br/>One-time terminal repair]
+    Q --> R[Astra medium<br/>One-time terminal repair]
     R --> N
 ```
 
-Luna handles frequent, low-cost, mechanically verifiable work; Terra xhigh handles context-heavy construction and debugging; Sol medium looks for omissions only after the engineering sections are complete; Sol xhigh handles the terminal exception only after explicit owner authorization. `optimization` is shadow advice by default and never silently changes the deterministic production route.
+Luna handles frequent, low-cost, mechanically verifiable work; Terra xhigh handles context-heavy construction and debugging; Sol medium looks for omissions only after the engineering sections are complete and performs the first bounded repair; Astra low independently rechecks that repair; Astra medium handles planning, closed-set decisions, and the terminal exception only after explicit owner authorization. `optimization` is shadow advice by default and never silently changes the deterministic production route.
 
 For installation, CLI usage, lifecycle details, identity/evidence requirements, security boundaries, and limitations, see the [full English documentation](README.en.md).
 
@@ -178,7 +180,7 @@ Codex Team 只有四种受限 disposition：
 ```text
 目标 → 任务信封/确定性证据校验
 → 必要时用 DIRECT_L1 Luna 做有界事实抽取
-→ 缺少可执行计划时才由 Terra xhigh 只读成案
+→ 缺少可执行计划时才由 Astra medium 只读成案
 → owner decision
 ```
 
@@ -200,11 +202,11 @@ Codex Team 只有四种受限 disposition：
 Sol medium REWORK
 → 人工批准冻结 findings / paths / commands
 → different Sol-medium fixer 有界返工
-→ different Sol-medium read-only recheck
-→ 仍 REWORK 才可 owner-authorized Sol-xhigh terminal repair
+→ Astra low independent read-only recheck
+→ 仍 REWORK 才可 owner-authorized Astra-medium terminal repair
 ```
 
-返工不能扩大 candidate、允许路径或验证命令；Sol xhigh 的 terminal repair 是一次性例外，不产生普通常驻施工权限。
+返工不能扩大 candidate、允许路径或验证命令；Astra medium 的 terminal repair 是一次性例外，不产生普通常驻施工权限。
 
 ## 身份与证据
 
@@ -247,7 +249,7 @@ plugins/ai-workflow/             # 对外 Plugin；runtime/config 与根目录�
 tests/                           # fake runner、负向注入和发布一致性测试
 ```
 
-CLI 命令：`new`、`validate`、`team-call`、`run`、`route`、`schedule-batch`、`schedule-result`、`schedule-receipt`、`schedule-final`、`status`、`decide`、`resume`、`abort`、`report`。调度链按 `schedule-batch --task TASK --plan PLAN` 取得冻结批次；小节执行在既有 runner 边界外完成后，controller 用 `schedule-result TASK_ID --plan PLAN --dispatch-id ID --result RESULT` 将 `ai-result-1` 补齐并严格核对 `dispatch_id/task_id/step_id/attempt` 自绑定后，原子写入由 dispatch 唯一确定的 `scheduler-results/<dispatch_id>.json` 并输出 receipt；结果文件拒绝 symlink、hardlink、目录换绑和超限内容。`schedule-receipt` 记录该 receipt。全部完成后，`schedule-final` 创建集中终验 child；再次同时提供 `--owner-receipt` 与 `--acceptor` 时签发首个 Sol-medium `REVIEW_1`。终验返工梯到达授权点后，owner 仍使用 `decide <child_id> authorize_final_xhigh`。
+CLI 命令：`new`、`validate`、`team-call`、`run`、`route`、`schedule-batch`、`schedule-result`、`schedule-receipt`、`schedule-final`、`status`、`decide`、`resume`、`abort`、`report`。调度链按 `schedule-batch --task TASK --plan PLAN` 取得冻结批次；小节执行在既有 runner 边界外完成后，controller 用 `schedule-result TASK_ID --plan PLAN --dispatch-id ID --result RESULT` 将 `ai-result-1` 补齐并严格核对 `dispatch_id/task_id/step_id/attempt` 自绑定后，原子写入由 dispatch 唯一确定的 `scheduler-results/<dispatch_id>.json` 并输出 receipt；结果文件拒绝 symlink、hardlink、目录换绑和超限内容。`schedule-receipt` 记录该 receipt。全部完成后，`schedule-final` 创建集中终验 child；再次同时提供 `--owner-receipt` 与 `--acceptor` 时签发首个 Sol-medium `REVIEW_1`。终验返工梯到达授权点后，owner 通过既有终局授权接口触发 Astra medium；兼容命令 ID `authorize_final_xhigh` 保持不变。
 
 `[optimization]` 默认 `mode=shadow`，由 `evaluate_and_apply_route_advice` 读取，与 `route --mode` 的 routing 模式分开。`actual_route`/`recommended_route` 只进入 runtime advice 与 `ai-route-advice-1` sidecar，永不改 `ai-route-decision-1` 九字段或生效 roles。`mode=enforced` 仅当内部计算的四门全过且推荐是闭集成本降级时才应用；否则固定链回退。缺 miss 报告或缺省 period/origin 不能开门。Scheduler 在 shadow 下不执行推荐。
 
@@ -271,7 +273,7 @@ live 历史案例重放必须先把 pinned `[router_probe].enabled` 设为 true�
 
 compact prompt 是双钥匙 armed 字段投影，不改变角色语义，也不做摘要或 LLM 压缩。公开 `build_role_prompt` / `build_construction_role_prompt` 只从 pinned `[optimization]` 与 `aggregate_metrics(state_root)` 决策，调用方不能传 config/metrics 武装 compact；无 state_root、shadow、缺/非法 metrics 或门未过时一律完整 prompt。只有 `[optimization].compact_prompts=true`、`mode=enforced`，且 `evaluate_optimization_gate==ALLOW_ENFORCED`，并且 compact UTF-8 bytes 小于 full 才生效。投影必须逐字保留 task_id、schema/role 身份与角色指令、objective、repository_root/source_worktree、base_commit/candidate_commit、authoritative_files、allowed_write_paths、forbidden_actions、risk_flags、acceptance_commands、verification_level、human_gates，以及调用上下文中的 frozen plan/step id、write_scope、acceptance criteria、dependencies、permission profile、candidate/evidence hashes、runtime/session bindings、owner decisions/authorization tickets 和 required output schema/path；并保留 full prompt 中的证据授权句。未知关键字段默认保留或禁用 compact。acceptance repair ladder 的 assignment prompt 不参与 compact，永远 full。
 
-`resume <task_id>` 从已持久化状态继续；施工任务会复用 owner gate 前冻结的 plan、route request、step 和 attempt。重复恢复终态或门状态不会重复派发。`abort <task_id>` 只追加 owner 决策和 `ABORTED` 状态，不删除已有任务、结果或证据。`decide ... --resume` 可在一次显式命令中记录决策并继续；live 恢复仍必须重新提供 `--allow-live-model` 和有效的绝对 `--runtime-sessions-dir`。`decide <task_id> authorize_final_xhigh` 只调用 repairs 的 owner xhigh 授权，不进入通用 `OWNER_DECISIONS` / REMEDIATION 状态机，也不得与 `--resume` 组合。
+`resume <task_id>` 从已持久化状态继续；施工任务会复用 owner gate 前冻结的 plan、route request、step 和 attempt。重复恢复终态或门状态不会重复派发。`abort <task_id>` 只追加 owner 决策和 `ABORTED` 状态，不删除已有任务、结果或证据。`decide ... --resume` 可在一次显式命令中记录决策并继续；live 恢复仍必须重新提供 `--allow-live-model` 和有效的绝对 `--runtime-sessions-dir`。`decide <task_id> authorize_final_xhigh` 是保留的兼容命令 ID；它只调用 repairs 的 owner 授权接口，由 Astra medium 执行一次终局修复，不进入通用 `OWNER_DECISIONS` / REMEDIATION 状态机，也不得与 `--resume` 组合。
 
 ## 验证与开发
 

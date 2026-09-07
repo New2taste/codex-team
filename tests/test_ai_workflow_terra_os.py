@@ -143,7 +143,7 @@ class TerraOSConfigTest(unittest.TestCase):
                 "fixer_role": "sol_medium_reviewer",
                 "fixer_permission_profile": "assignment-scoped-write",
                 "fixer_distinct_from_acceptor": True,
-                "recheck_role": "sol_medium_reviewer",
+                "recheck_role": "astra_low_reviewer",
                 "recheck_distinct_from_fixer": True,
                 "terminal_escalation_role": "sol_xhigh",
                 "terminal_review_required": False,
@@ -166,7 +166,21 @@ class TerraOSConfigTest(unittest.TestCase):
             tuple(roles["terra_xhigh"][key] for key in ("model", "reasoning_effort", "sandbox")),
         )
         self.assertEqual(
-            ("gpt-5.6-sol", "xhigh", "read-only"),
+            ("gpt-6-astra", "medium", "read-only"),
+            tuple(
+                roles["sol_xhigh"][key]
+                for key in ("model", "reasoning_effort", "sandbox")
+            ),
+        )
+        self.assertEqual(
+            ("gpt-6-astra", "low", "read-only"),
+            tuple(
+                roles["astra_low_reviewer"][key]
+                for key in ("model", "reasoning_effort", "sandbox")
+            ),
+        )
+        self.assertEqual(
+            ("gpt-6-astra", "medium", "read-only"),
             tuple(
                 roles["sol_xhigh_planner"][key]
                 for key in ("model", "reasoning_effort", "sandbox")
@@ -203,6 +217,7 @@ class TerraOSRolePolicyTest(unittest.TestCase):
                 "luna_construction",
                 "sol_medium_supervisor",
                 "sol_medium_reviewer",
+                "astra_low_reviewer",
                 "terra_medium",
                 "sol_high",
                 "sol_xhigh",

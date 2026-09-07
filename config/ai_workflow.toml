@@ -27,7 +27,7 @@ compact_prompts = false
 fixer_role = "sol_medium_reviewer"
 fixer_permission_profile = "assignment-scoped-write"
 fixer_distinct_from_acceptor = true
-recheck_role = "sol_medium_reviewer"
+recheck_role = "astra_low_reviewer"
 recheck_distinct_from_fixer = true
 terminal_escalation_role = "sol_xhigh"
 terminal_review_required = false
@@ -68,8 +68,8 @@ allowed_statuses = ["ACCEPTANCE_RECOMMENDED", "ACCEPTANCE_WITH_NOTES_RECOMMENDED
 instructions = """Review the pinned candidate against the task contract and evidence. Recommend a verdict but never enact owner decisions. Do not over-design; require only the smallest change needed to satisfy the frozen objective and acceptance criteria."""
 
 [roles.sol_xhigh]
-model = "gpt-5.6-sol"
-reasoning_effort = "xhigh"
+model = "gpt-6-astra"
+reasoning_effort = "medium"
 sandbox = "read-only"
 requires_owner_approval = true
 allowed_statuses = ["OPTION_A", "OPTION_B", "OPTION_C", "INSUFFICIENT_EVIDENCE"]
@@ -110,9 +110,16 @@ sandbox = "read-only"
 allowed_statuses = ["ACCEPTANCE_RECOMMENDED", "ACCEPTANCE_WITH_NOTES_RECOMMENDED", "REWORK_RECOMMENDED", "REJECT_RECOMMENDED", "ESCALATION_PROPOSED"]
 instructions = """Reserved for the scoped fallback repair and peer-review ladder. Do not select this role for ordinary terra_os task planning, construction, or local acceptance. Do not over-design; make or require only the smallest change needed to satisfy the frozen objective and acceptance criteria."""
 
+[roles.astra_low_reviewer]
+model = "gpt-6-astra"
+reasoning_effort = "low"
+sandbox = "read-only"
+allowed_statuses = ["ACCEPTANCE_RECOMMENDED", "ACCEPTANCE_WITH_NOTES_RECOMMENDED", "REWORK_RECOMMENDED", "REJECT_RECOMMENDED", "ESCALATION_PROPOSED"]
+instructions = """Independently recheck only the scoped whole-project final repair after the Sol medium fixer. Do not implement, alter scope, merge, push, or self-approve. Do not over-design; require only the smallest change needed to satisfy the frozen objective and acceptance criteria."""
+
 [roles.sol_xhigh_planner]
-model = "gpt-5.6-sol"
-reasoning_effort = "xhigh"
+model = "gpt-6-astra"
+reasoning_effort = "medium"
 sandbox = "read-only"
 requires_owner_approval = true
 allowed_statuses = ["OPTION_A", "OPTION_B", "OPTION_C", "INSUFFICIENT_EVIDENCE"]

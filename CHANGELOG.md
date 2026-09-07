@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased — 2026-09-07
+
+本轮将 Astra medium（`gpt-6-astra / medium`）设为 owner-authorized 总体规划、闭集裁定和终局修复角色；Terra xhigh 继续负责常驻施工，Luna max 继续负责有界低成本工具任务。Sol medium 仍负责集中最终验收和首轮有界修订；新增 Astra low（`astra_low_reviewer`，`gpt-6-astra / low`）对首轮修订执行独立、只读 peer 验收。
+
+### Changed
+
+- 更新默认角色说明、路由示意和编排 Skill，使 Astra medium 成为规划/裁定/终局修复的当前执行角色；
+- 保留既有终局授权接口的兼容 ID，旧账本可重放但新运行时身份使用 Astra；
+- 记录 Sol-medium 首轮修订 → Astra-low 独立复验 → owner-authorized Astra-medium 终局修复的验收梯级。
+
 ## Unreleased — 2026-08-29
 
 本轮更新补强了 Sol medium 集中终验与返工链路的所有权控制面，并保持 Terra xhigh 常驻施工、Luna max 廉价工具进程的既定分工。

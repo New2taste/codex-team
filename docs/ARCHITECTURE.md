@@ -17,8 +17,9 @@ Codex Team 是一个本地、可恢复、可审计的半自动编排层。它把
 |---|---|---|
 | Luna Max | 冻结 envelope 内的机械 coding、确定性检查、证据抽取、分发同步 | planning、review、语义仲裁、final acceptance |
 | Terra xhigh | 复杂施工、调试、集成、开放式问题拆解 | merge、push、自我验收 |
-| Sol medium | 所有工程小节完成后的集中、只读、对抗式 final acceptance | 普通 construction、常驻 planning |
-| Sol xhigh | owner-authorized planning；Sol-medium 梯级失败后的 terminal repair | 普通施工、绕过 final acceptance |
+| Sol medium | 所有工程小节完成后的集中、只读、对抗式 final acceptance；失败后的首轮有界修订 | 普通 construction、常驻 planning、独立二次复验 |
+| Astra low (`astra_low_reviewer`) | Sol-medium 首轮修订后的独立、只读 peer acceptance | planning、construction、批准、终局修复 |
+| Astra medium | owner-authorized 总体规划、闭集裁定；Astra-low 复验仍失败后的 terminal repair | 普通施工、绕过 final acceptance |
 
 角色名称、模型和推理档是独立字段，必须来自闭集配置，不能用“同名路径”或调用者自报替代运行时身份。
 
@@ -30,7 +31,7 @@ Codex Team 是一个本地、可恢复、可审计的半自动编排层。它把
 用户目标
   → task envelope / Schema 校验
   → 控制器确定性检查或 DIRECT_L1 Luna 有界事实抽取（需要时）
-  → Terra 只读规划（仅缺少可执行计划时）
+  → Astra medium 只读规划（仅缺少可执行计划时）
   → Luna 有界施工或 Terra 复杂施工
   → 各工程小节完成自检
   → 固定 candidate commit
@@ -42,19 +43,19 @@ Codex Team 是一个本地、可恢复、可审计的半自动编排层。它把
 
 `ACCEPTANCE` task 的 Terra xhigh reviewer 是显式本地审查入口，不代表全工程终验。正常计划调度在全部工程小节 receipt 完成后生成唯一 whole-project `ACCEPTANCE` child。final candidate 可以不同于 FrozenPlan 初始 candidate，但必须是当前 clean HEAD、初始 candidate 的 git 祖先后代，且 diff 落在授权 write union 内；parent ledger 用 `acceptance_task_sha256` 绑定完整 child，child 的 `scheduler-parent.json` 反向定向绑定唯一 parent task、plan、final event 和 candidate，分类时不扫描无关任务。`schedule-final` 通过现有 adversarial-acceptance-1 API 只签发一次 Sol-medium `REVIEW_1`，open 后 assignment 失败可续签。standalone `ACCEPTANCE` 入口保持不变。
 
-生产 CLI 的零模型调度控制面是 `schedule-batch` → `schedule-result` → `schedule-receipt` → `schedule-final`。`schedule-result` 接收既有执行边界产出的 `ai-result-1`，由 controller 补齐并核对 `dispatch_id/task_id/step_id/attempt`，输出位置不能由调用方指定：controller 从已重放 dispatch 唯一确定 `<state_root>/<task_id>/scheduler-results/<dispatch_id>.json` 并原子冻结，再按该文件 bytes 生成 receipt。结果读取按已打开的目录 fd 定位，拒绝目录换绑、symlink、hardlink 和超限文件。`schedule-final` 先创建 child；同时提供已记录 runtime evidence 对应的 `--owner-receipt` 与 Sol-medium `--acceptor` 时签发 `REVIEW_1`。后续 repair ladder 到达 terminal 授权点后使用 `decide <child_id> authorize_final_xhigh`。
+生产 CLI 的零模型调度控制面是 `schedule-batch` → `schedule-result` → `schedule-receipt` → `schedule-final`。`schedule-result` 接收既有执行边界产出的 `ai-result-1`，由 controller 补齐并核对 `dispatch_id/task_id/step_id/attempt`，输出位置不能由调用方指定：controller 从已重放 dispatch 唯一确定 `<state_root>/<task_id>/scheduler-results/<dispatch_id>.json` 并原子冻结，再按该文件 bytes 生成 receipt。结果读取按已打开的目录 fd 定位，拒绝目录换绑、symlink、hardlink 和超限文件。`schedule-final` 先创建 child；同时提供已记录 runtime evidence 对应的 `--owner-receipt` 与 Sol-medium `--acceptor` 时签发 `REVIEW_1`。后续 repair ladder 到达 terminal 授权点后，owner 通过既有终局授权接口触发 Astra medium；兼容命令 ID `authorize_final_xhigh` 保持不变。
 
 ### Final acceptance 返工路径
 
 ```text
 Sol medium REWORK
   → 人工批准冻结 findings / paths / commands
-  → 不同身份的 Sol-medium fixer 有界返工
-  → 另一不同身份的 Sol-medium read-only recheck
-  → 再次 REWORK 才可 owner-authorize Sol-xhigh terminal repair
+  → Sol-medium fixer 首轮有界返工
+  → Astra low (`astra_low_reviewer`) 独立、只读 peer acceptance
+  → 再次 REWORK 才可 owner-authorize Astra-medium terminal repair
 ```
 
-Sol-xhigh terminal repair 是一次性的例外，不自动启动，也不增加普通 Sol-xhigh construction 权限。
+Astra-medium terminal repair 是一次性的例外，不自动启动，也不增加普通 Astra-medium construction 权限。
 
 ## 4. Codex Team 入口
 
@@ -119,7 +120,7 @@ write-once。分析只有在 measured、六臂完整、至少 32 个 paired case
 
 `resume <task_id>` 只从持久化状态继续。施工首次到达 owner gate 前，控制器会冻结最小恢复上下文（plan、route request、step、attempt）；后续恢复重新校验这些 artifact，并依赖已有 dispatch 记录防止重复派发。`decide ... --resume` 先完整预检恢复参数，再写入 owner decision；live 恢复不会继承上次授权。
 
-`abort <task_id>` 是 owner 决策，可从 `TRANSITIONS` 中的非终态进入 `ABORTED`（这些状态都有 `ABORTED` 出边）。`BLOCKED`、`CLOSED` 与 `ABORTED` 是终态、无出边，不能再 abort。它只追加决策和状态事件，不删除 task、result、runtime evidence 或历史账本。`decide <task_id> authorize_final_xhigh` 只写入 whole-project xhigh 授权票，不改变 REMEDIATION 状态机，且拒绝 `--resume`。
+`abort <task_id>` 是 owner 决策，可从 `TRANSITIONS` 中的非终态进入 `ABORTED`（这些状态都有 `ABORTED` 出边）。`BLOCKED`、`CLOSED` 与 `ABORTED` 是终态、无出边，不能再 abort。它只追加决策和状态事件，不删除 task、result、runtime evidence 或历史账本。`decide <task_id> authorize_final_xhigh` 是保留的兼容命令 ID，只写入 whole-project owner 授权票，由 Astra medium 执行一次终局修复，不改变 REMEDIATION 状态机，且拒绝 `--resume`。
 
 ## 6. 安全边界
 
