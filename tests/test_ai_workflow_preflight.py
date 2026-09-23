@@ -531,7 +531,7 @@ class PreflightContextAuthorityTest(_PreflightStoreMixin, unittest.TestCase):
         with mock.patch.object(
             preflight,
             "_load_role_config",
-            return_value={"model": "gpt-5.6-luna"},
+            return_value={"model": "gpt-6-luna"},
         ):
             result = preflight.run_role_preflight(self.store, TASK_ID, "luna")
         self.assertEqual("FAIL", result["status"])
@@ -832,7 +832,7 @@ class PreflightProductionWiringTest(unittest.TestCase):
         rollout = {
             "thread_id": THREAD_ID,
             "agent_type": None,
-            "model": "gpt-5.6-luna",
+            "model": "gpt-6-luna",
             "reasoning_effort": "max",
             "sandbox_policy": "read-only",
             "permission_profile": "read-only",

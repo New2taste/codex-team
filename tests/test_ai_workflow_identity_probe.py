@@ -49,7 +49,7 @@ def _build_kwargs(**overrides):
     payload = {
         "batch_id": "identity-batch-1",
         "arm": "NO_OP",
-        "model": "gpt-5.6-sol",
+        "model": "gpt-6-sol",
         "effort": "medium",
         "seed": 1,
         "max_calls": 3,
@@ -236,7 +236,7 @@ class IdentityProbeManifestContractTest(unittest.TestCase):
             ["NO_OP", "ONE_TURN", "TWO_TURN"],
             properties["arm"]["enum"],
         )
-        self.assertEqual({"gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"}, set(
+        self.assertEqual({"gpt-6-luna", "gpt-6-sol", "gpt-6-astra"}, set(
             properties["requested_launch_intent"]["properties"]["model"]["enum"]
         ))
         self.assertEqual(
@@ -267,7 +267,7 @@ class IdentityProbeManifestContractTest(unittest.TestCase):
         self.assertEqual(100, built["max_output_tokens"])
         self.assertEqual(40, built["max_output_tokens_per_call"])
         requested = built["requested_launch_intent"]
-        self.assertEqual("gpt-5.6-sol", requested["model"])
+        self.assertEqual("gpt-6-sol", requested["model"])
         self.assertEqual("medium", requested["effort"])
         observed = built["observed_runtime_identity"]
         self.assertIn(observed["identity_source"], probe.IDENTITY_FIELD_SOURCES)
@@ -458,14 +458,14 @@ class IdentityProbeDualKeyTest(unittest.TestCase):
 class IdentityProbeIdentitySourceTest(unittest.TestCase):
     def test_model_text_cannot_fill_identity_fields(self):
         claimed = {
-            "model": "gpt-5.6-luna",
+            "model": "gpt-6-luna",
             "effort": "max",
             "sandbox": "workspace-write",
             "permission": "full",
             "fork_state": "VERIFIED_NONE",
             "nested_state": "VERIFIED_NONE",
         }
-        manifest = _manifest(model="gpt-5.6-sol", effort="medium")
+        manifest = _manifest(model="gpt-6-sol", effort="medium")
         polluted = copy.deepcopy(dict(manifest))
         polluted["model_text_output"] = json.dumps(claimed)
         probe.validate_identity_probe_manifest(polluted)
@@ -475,7 +475,7 @@ class IdentityProbeIdentitySourceTest(unittest.TestCase):
             self.assertEqual("AUTHORITY_UNAVAILABLE", observed[field])
             self.assertNotEqual(claimed[field], observed[field])
             self.assertNotIn(str(claimed[field]), json.dumps(observed))
-        self.assertEqual("gpt-5.6-sol", requested["model"])
+        self.assertEqual("gpt-6-sol", requested["model"])
         self.assertEqual("medium", requested["effort"])
         self.assertNotEqual(claimed["model"], requested["model"])
         self.assertNotEqual(claimed["effort"], requested["effort"])
@@ -877,7 +877,7 @@ class IdentityProbeProductionIsolationTest(unittest.TestCase):
     def test_model_text_identity_claim_stays_authority_unavailable(self):
         claimed = json.dumps(
             {
-                "model": "gpt-5.6-luna",
+                "model": "gpt-6-luna",
                 "effort": "max",
                 "sandbox": "workspace-write",
                 "permission": "full",
@@ -888,7 +888,7 @@ class IdentityProbeProductionIsolationTest(unittest.TestCase):
         executor = _UsageExecutor(model_text_output=claimed)
         with tempfile.TemporaryDirectory(dir="/tmp") as temporary:
             records = _run_probe(
-                _manifest(model="gpt-5.6-sol", effort="medium", max_calls=1),
+                _manifest(model="gpt-6-sol", effort="medium", max_calls=1),
                 executor,
                 temporary,
             )

@@ -42,38 +42,38 @@
   "arms": [
     {
       "arm_id": "luna_resident",
-      "model": "gpt-5.6-luna",
+      "model": "gpt-6-luna",
       "reasoning_effort": "max",
       "cache_condition": "resident"
     },
     {
       "arm_id": "sol_resident",
-      "model": "gpt-5.6-sol",
-      "reasoning_effort": "medium",
-      "cache_condition": "resident"
-    },
-    {
-      "arm_id": "terra_resident",
-      "model": "gpt-5.6-terra",
+      "model": "gpt-6-sol",
       "reasoning_effort": "xhigh",
       "cache_condition": "resident"
     },
     {
+      "arm_id": "terra_resident",
+      "model": "gpt-6-sol",
+      "reasoning_effort": "medium",
+      "cache_condition": "resident"
+    },
+    {
       "arm_id": "luna_control_fresh",
-      "model": "gpt-5.6-luna",
+      "model": "gpt-6-luna",
       "reasoning_effort": "max",
       "cache_condition": "cold_control"
     },
     {
       "arm_id": "sol_control_fresh",
-      "model": "gpt-5.6-sol",
-      "reasoning_effort": "medium",
+      "model": "gpt-6-sol",
+      "reasoning_effort": "xhigh",
       "cache_condition": "cold_control"
     },
     {
       "arm_id": "terra_control_fresh",
-      "model": "gpt-5.6-terra",
-      "reasoning_effort": "xhigh",
+      "model": "gpt-6-sol",
+      "reasoning_effort": "medium",
       "cache_condition": "cold_control"
     }
   ]

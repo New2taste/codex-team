@@ -113,7 +113,7 @@ def valid_runtime_evidence(**overrides):
         "observed_agent_type": None,
         "native_agent_id": None,
         "native_thread_id": None,
-        "observed_model": "gpt-5.6-luna",
+        "observed_model": "gpt-6-luna",
         "observed_reasoning_effort": "max",
         "observed_sandbox_policy": "read-only",
         "observed_permission_profile": "read-only",

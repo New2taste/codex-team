@@ -429,7 +429,7 @@ def verify_runtime_identity(requested: object, observed: object) -> RuntimeEvide
             _fail("RUNTIME_IDENTITY_CONFLICT", "native subagent role must be luna")
         if expected["agent_type"] is not None or actual.agent_type is not None:
             _fail("RUNTIME_IDENTITY_CONFLICT", "native subagent agent_type must be null")
-        if expected["model"] != "gpt-5.6-luna" or actual.model != "gpt-5.6-luna":
+        if expected["model"] != "gpt-6-luna" or actual.model != "gpt-6-luna":
             _fail("RUNTIME_IDENTITY_CONFLICT", "native subagent model is controller-pinned")
         if expected["reasoning_effort"] != "max" or actual.reasoning_effort != "max":
             _fail("RUNTIME_IDENTITY_CONFLICT", "native subagent effort is controller-pinned")

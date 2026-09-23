@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased — 2026-09-23
+
+默认模型执行面升级：Terra OS 施工角色现绑定 `gpt-6-sol / medium`，原 Sol medium 规划监督与集中终验角色现绑定 `gpt-6-sol / xhigh`，原生 Luna 工具角色升级至 `gpt-6-luna / max`。职责、权限、Astra 角色和兼容用的角色 ID 保持不变；历史账本与研究样本继续保留其实际观测到的旧模型身份。
+
+### Changed
+
+- 同步主配置、运行时身份校验、最终验收收据、探针闭集和 Plugin 分发镜像；
+- README 中英文首页、架构说明与编排 Skill 改为展示当前模型绑定；
+- 不改变任务路由、返工次数、owner gate、Astra 规划/复验/终局修复职责或 Luna max 推理档。
+
 ## Unreleased — 2026-09-07
 
 本轮将 Astra medium（`gpt-6-astra / medium`）设为 owner-authorized 总体规划、闭集裁定和终局修复角色；Terra xhigh 继续负责常驻施工，Luna max 继续负责有界低成本工具任务。Sol medium 仍负责集中最终验收和首轮有界修订；新增 Astra low（`astra_low_reviewer`，`gpt-6-astra / low`）对首轮修订执行独立、只读 peer 验收。

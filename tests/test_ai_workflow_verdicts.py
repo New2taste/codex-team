@@ -100,8 +100,8 @@ def _issuer_evidence(**overrides: object) -> dict[str, object]:
         "observed_agent_type": None,
         "native_agent_id": None,
         "native_thread_id": None,
-        "observed_model": "gpt-5.6-sol",
-        "observed_reasoning_effort": "medium",
+        "observed_model": "gpt-6-sol",
+        "observed_reasoning_effort": "xhigh",
         "observed_sandbox_policy": "read-only",
         "observed_permission_profile": "read-only",
         "observed_cwd": str(ROOT),
@@ -349,8 +349,8 @@ class IssuerAttestationTest(_VerdictStoreMixin, unittest.TestCase):
 
     def test_identity_tuple_mismatch_each_field(self) -> None:
         mutations = (
-            {"observed_model": "gpt-5.6-terra"},
-            {"observed_reasoning_effort": "xhigh"},
+            {"observed_model": "gpt-6-luna"},
+            {"observed_reasoning_effort": "medium"},
             {"observed_sandbox_policy": "workspace-write"},
             {"observed_permission_profile": "workspace-write"},
         )
@@ -399,11 +399,11 @@ class IssuerAttestationTest(_VerdictStoreMixin, unittest.TestCase):
     def test_issuer_role_contracts_match_acceptance_mapping(self) -> None:
         source = inspect.getsource(repairs._v2_validate_observed_receipt)
         self.assertIn(
-            '"sol_medium_reviewer": ("gpt-5.6-sol", "medium", "read-only", "read-only")',
+            '"sol_medium_reviewer": ("gpt-6-sol", "xhigh", "read-only", "read-only")',
             source,
         )
         self.assertEqual(
-            ("gpt-5.6-sol", "medium", "read-only", "read-only"),
+            ("gpt-6-sol", "xhigh", "read-only", "read-only"),
             verdicts.ISSUER_ROLE_CONTRACTS["sol_medium_reviewer"],
         )
         self.assertIn(

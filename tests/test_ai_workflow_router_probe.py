@@ -42,7 +42,7 @@ class RouterProbeContractTest(unittest.TestCase):
             set(arm["properties"]["arm_id"]["enum"]),
         )
         self.assertEqual(
-            {"gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"},
+            {"gpt-6-luna", "gpt-6-sol"},
             set(arm["properties"]["model"]["enum"]),
         )
         self.assertEqual(
@@ -86,16 +86,16 @@ class RouterProbeContractTest(unittest.TestCase):
         self.assertEqual(
             {
                 "luna": {
-                    "model": "gpt-5.6-luna",
+                    "model": "gpt-6-luna",
                     "reasoning_effort": "max",
                 },
                 "sol": {
-                    "model": "gpt-5.6-sol",
-                    "reasoning_effort": "medium",
+                    "model": "gpt-6-sol",
+                    "reasoning_effort": "xhigh",
                 },
                 "terra": {
-                    "model": "gpt-5.6-terra",
-                    "reasoning_effort": "xhigh",
+                    "model": "gpt-6-sol",
+                    "reasoning_effort": "medium",
                 },
             },
             probe_config["models"],
@@ -432,7 +432,7 @@ class RouterProbeRunnerTest(unittest.TestCase):
 
         run.side_effect = complete
         result = probe.CodexProbeExecutor(codex_binary="/safe/codex").run(
-            model="gpt-5.6-luna",
+            model="gpt-6-luna",
             reasoning_effort="max",
             prompt="bounded prompt",
             arm_id="luna_resident",
@@ -454,7 +454,7 @@ class RouterProbeRunnerTest(unittest.TestCase):
             probe.RouterProbeError, "model and reasoning effort pair"
         ):
             probe.CodexProbeExecutor(codex_binary="/safe/codex").run(
-                model="gpt-5.6-luna",
+                model="gpt-6-luna",
                 reasoning_effort="xhigh",
                 prompt="bounded prompt",
                 arm_id="luna_resident",
@@ -547,12 +547,8 @@ class RouterProbeAnalysisTest(unittest.TestCase):
                             "attempt_id": attempt_id,
                             "batch_id": "measured-batch",
                             "arm_id": arm_id,
-                            "model": f"gpt-5.6-{family}",
-                            "reasoning_effort": {
-                                "luna": "max",
-                                "sol": "medium",
-                                "terra": "xhigh",
-                            }[family],
+                            "model": probe.ARM_CONTRACTS[arm_id][0],
+                            "reasoning_effort": probe.ARM_CONTRACTS[arm_id][1],
                             "cache_condition": condition,
                             "prefix_sha256": (
                                 hashlib.sha256(family.encode()).hexdigest()
@@ -808,8 +804,8 @@ class RouterProbeCostLayersTest(unittest.TestCase):
 
     def _valid_sku(self, **overrides):
         sku = {
-            "sku": "gpt-5.6-luna",
-            "model": "gpt-5.6-luna",
+            "sku": "gpt-6-luna",
+            "model": "gpt-6-luna",
             "currency": "USD",
             "unit": "PER_1M_TOKENS",
             "billing_channel": "api",
@@ -832,6 +828,8 @@ class RouterProbeCostLayersTest(unittest.TestCase):
             "skus": skus
             or [
                 self._valid_sku(),
+                self._valid_sku(sku="gpt-6-sol", model="gpt-6-sol"),
+                self._valid_sku(sku="gpt-5.6-luna", model="gpt-5.6-luna"),
                 self._valid_sku(sku="gpt-5.6-sol", model="gpt-5.6-sol"),
                 self._valid_sku(sku="gpt-5.6-terra", model="gpt-5.6-terra"),
             ],

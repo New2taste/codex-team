@@ -127,7 +127,8 @@ class TerraOSConfigTest(unittest.TestCase):
         sol_roles = {
             name: role
             for name, role in self.config["roles"].items()
-            if role["model"] == "gpt-5.6-sol"
+            if name.startswith("sol")
+            and role["model"] == "gpt-6-sol"
             and role["reasoning_effort"] in {"medium", "xhigh"}
         }
         self.assertTrue(sol_roles)
@@ -155,14 +156,14 @@ class TerraOSConfigTest(unittest.TestCase):
     def test_terra_os_roles_pin_luna_construction_and_terra_xhigh(self):
         roles = self.config["roles"]
         self.assertEqual(
-            ("gpt-5.6-luna", "max", "workspace-write"),
+            ("gpt-6-luna", "max", "workspace-write"),
             tuple(
                 roles["luna_construction"][key]
                 for key in ("model", "reasoning_effort", "sandbox")
             ),
         )
         self.assertEqual(
-            ("gpt-5.6-terra", "xhigh", "workspace-write"),
+            ("gpt-6-sol", "medium", "workspace-write"),
             tuple(roles["terra_xhigh"][key] for key in ("model", "reasoning_effort", "sandbox")),
         )
         self.assertEqual(
@@ -189,7 +190,7 @@ class TerraOSConfigTest(unittest.TestCase):
         for role in ("terra_xhigh_planner", "terra_xhigh_reviewer"):
             with self.subTest(role=role):
                 self.assertEqual(
-                    ("gpt-5.6-terra", "xhigh", "read-only"),
+                    ("gpt-6-sol", "medium", "read-only"),
                     tuple(
                         roles[role][key]
                         for key in ("model", "reasoning_effort", "sandbox")
@@ -444,7 +445,7 @@ class TerraOSExecutionGuardTest(unittest.TestCase):
                 "observed_agent_type": None,
                 "native_agent_id": None,
                 "native_thread_id": None,
-                "observed_model": "gpt-5.6-luna",
+                "observed_model": "gpt-6-luna",
                 "observed_reasoning_effort": "max",
                 "observed_sandbox_policy": "workspace-write",
                 "observed_permission_profile": "workspace-write",

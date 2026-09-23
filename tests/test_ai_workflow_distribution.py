@@ -263,7 +263,7 @@ class DistributionContractTest(unittest.TestCase):
         self.assertFalse((ROOT / ".codex" / "agents" / "luna-max.toml").exists())
         self.assertFalse((PLUGIN / "agents" / "luna-max.toml").exists())
         self.assertIn("native_subagent", skill)
-        self.assertIn("gpt-5.6-luna", skill)
+        self.assertIn("gpt-6-luna", skill)
         self.assertIn("reasoning_effort=max", skill)
         self.assertNotIn("cmp -s \"$repository_root/.codex/agents/luna-max.toml\"", verifier)
         self.assertNotIn("require the exact custom agent name", skill)
@@ -426,7 +426,7 @@ class DistributionContractTest(unittest.TestCase):
 
         self.assertIn("luna max", published)
         self.assertIn("native_subagent", published)
-        self.assertIn("gpt-5.6-luna", published)
+        self.assertIn("gpt-6-luna", published)
         self.assertNotIn("luna_worker", published)
         self.assertNotIn("luna-max.toml", published)
 
@@ -435,11 +435,11 @@ class DistributionContractTest(unittest.TestCase):
             "frozen envelope",
             "mechanical",
             "distribution",
-            "terra xhigh",
+            "terra os",
             "complex construction",
             "independent",
             "adversarial review",
-            "sol medium",
+            "gpt-6 sol xhigh",
             "final",
             "acceptance",
             "astra medium",
@@ -463,7 +463,7 @@ class DistributionContractTest(unittest.TestCase):
         for lifecycle_phrase in (
             "section_self_check_only",
             "intermediate engineering sections",
-            "different sol-medium fixer",
+            "different gpt-6 sol xhigh fixer",
             "astra low",
             "owner-authorized astra-medium terminal repair",
             "dual-key",
@@ -474,8 +474,8 @@ class DistributionContractTest(unittest.TestCase):
             self.assertIn(lifecycle_phrase, published, lifecycle_phrase)
         self.assertRegex(
             published,
-            r"sol[- ]medium\s+final\s+acceptance",
-            "Sol medium final acceptance",
+            r"gpt-6 sol xhigh\s+final\s+acceptance",
+            "GPT-6 Sol xhigh final acceptance",
         )
         self.assertRegex(
             published,
@@ -504,7 +504,8 @@ class DistributionContractTest(unittest.TestCase):
             self.assertNotIn("repair", config)
             for name, role in config["roles"].items():
                 if (
-                    role["model"] == "gpt-5.6-sol"
+                    name.startswith("sol")
+                    and role["model"] == "gpt-6-sol"
                     and role["reasoning_effort"] in {"medium", "xhigh"}
                 ):
                     with self.subTest(role=name):
@@ -545,12 +546,12 @@ class DistributionContractTest(unittest.TestCase):
         for phrase in (
             "intermediate engineering sections",
             "section_self_check_only",
-            "different sol-medium fixer",
+            "different gpt-6 sol xhigh fixer",
             "astra low",
             "owner-authorized astra-medium terminal repair",
         ):
             self.assertIn(phrase, published, phrase)
-        self.assertRegex(published, r"sol[- ]medium\s+final\s+acceptance")
+        self.assertRegex(published, r"gpt-6 sol xhigh\s+final\s+acceptance")
         self.assertNotIn("every task needs an independent terra xhigh adversarial review", published)
         self.assertNotIn("第二次 terra xhigh 失败后的冻结梯级", published)
 

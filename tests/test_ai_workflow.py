@@ -303,7 +303,7 @@ class ContractFilesTest(unittest.TestCase):
         self.assertEqual(config["version"], "ai-workflow-1")
         self.assertEqual(
             (config["roles"]["luna"]["model"], config["roles"]["luna"]["reasoning_effort"]),
-            ("gpt-5.6-luna", "max"),
+            ("gpt-6-luna", "max"),
         )
         self.assertEqual(
             config["roles"]["luna"]["allowed_statuses"],
@@ -311,7 +311,7 @@ class ContractFilesTest(unittest.TestCase):
         )
         self.assertEqual(
             (config["roles"]["terra"]["model"], config["roles"]["terra"]["reasoning_effort"]),
-            ("gpt-5.6-terra", "xhigh"),
+            ("gpt-6-sol", "medium"),
         )
         self.assertFalse(config["policy"]["automatic_xhigh"])
         self.assertFalse(config["policy"]["automatic_merge"])
@@ -1790,7 +1790,7 @@ class CodexCommandTest(unittest.TestCase):
         command = workflow.build_codex_command(
             "luna", ROOT, Path("result.json"), ROOT / "config/ai_workflow_result.schema.json"
         )
-        self.assertIn("gpt-5.6-luna", command)
+        self.assertIn("gpt-6-luna", command)
         self.assertIn('model_reasoning_effort="max"', command)
         self.assertIn("read-only", command)
         self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", command)

@@ -38,10 +38,10 @@ prompts do not participate in compact and stay full.
 
 The default Luna route uses a controller-dispatched native subagent. The
 controller must record
-`execution_surface=NATIVE_SUBAGENT`, `model=gpt-5.6-luna`,
+`execution_surface=NATIVE_SUBAGENT`, `model=gpt-6-luna`,
 `reasoning_effort=max`, native thread/agent evidence, sandbox, permission, and
 cwd before promoting a result. A native `luna` dispatch and an automated
-`codex exec -m gpt-5.6-luna` role-contract invocation are different execution
+`codex exec -m gpt-6-luna` role-contract invocation are different execution
 surfaces. Neither surface may erase the task envelope, L0/L1/L2 evidence
 level, human owner gates, or the final-acceptance boundary.
 
@@ -56,22 +56,22 @@ level, human owner gates, or the final-acceptance boundary.
   construction owner must run the frozen-envelope checks, target tests,
   negative checks, scope checks, and runtime-evidence gate, then advance to
   the next section. Do not dispatch a separate adversarial review per section.
-- **Terra xhigh** owns complex construction, integration, and open-ended
+- **Terra OS (`gpt-6-sol / medium`)** owns complex construction, integration, and open-ended
   debugging in an isolated worktree. Its construction self-check is not an
   independent acceptance or a permission to self-approve.
-- **Sol medium** performs one read-only, adversarial **Sol-medium final
-  acceptance** after every engineering section is complete. The scheduler
+- **GPT-6 Sol xhigh** performs one read-only, adversarial final acceptance
+  after every engineering section is complete. The scheduler
   APIs are `create_final_acceptance_case` (unique `ACCEPTANCE` child after
   every receipt; final candidate may descend from the frozen plan candidate
   if HEAD/scope/child-hash bind) and `issue_final_acceptance` (one
-  Sol-medium `REVIEW_1` only, retryable after a failed assignment append).
+  GPT-6 Sol xhigh `REVIEW_1` only, retryable after a failed assignment append).
   If it returns
-  `REWORK`, a **Sol-medium fixer** may receive one
+  `REWORK`, a **GPT-6 Sol xhigh fixer** may receive one
   owner-authorized, assignment-scoped write capability limited to the frozen
   findings, candidate, paths, and verification commands. The accepting
   reviewer never repairs its own verdict. An **Astra low** peer reviewer
   (`astra_low_reviewer`, `gpt-6-astra / low`) independently rechecks the
-  Sol-medium repair in read-only mode and may not widen scope. Owner terminal
+  GPT-6 Sol xhigh repair in read-only mode and may not widen scope. Owner terminal
   authorization is exposed through the compatibility command
   `decide <task_id> authorize_final_xhigh` and must not be combined with
   `--resume`.
@@ -79,7 +79,7 @@ level, human owner gates, or the final-acceptance boundary.
   decisions, and one terminal repair in a closed case file. Only a `REWORK`
   from the independent Astra-low peer may authorize that terminal repair
   without task-level review. It never starts automatically and never bypasses
-  final Sol-medium acceptance.
+  final GPT-6 Sol xhigh acceptance.
 - Only roles explicitly listed in the frozen configuration may be selected;
   unspecified models and reasoning levels are never silently substituted.
 
@@ -98,7 +98,7 @@ hash-bound receipt consumed by `schedule-receipt`.
 
 After all receipts complete, `schedule-final` creates the unique acceptance
 child and its directed `scheduler-parent.json` binding. Supplying both a
-verified `--owner-receipt` and a Sol-medium `--acceptor` issues the single
+verified `--owner-receipt` and a GPT-6 Sol xhigh `--acceptor` issues the single
 `REVIEW_1`. If the bounded repair ladder later reaches terminal escalation, the
 owner uses the compatibility command `decide <child_id> authorize_final_xhigh`
 to trigger Astra medium; no scheduler command starts a model, merges, or

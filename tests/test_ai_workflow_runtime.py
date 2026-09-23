@@ -25,7 +25,7 @@ def runtime_expected(*, surface="NATIVE_SUBAGENT", **overrides):
         "agent_type": None,
         "native_agent_id": AGENT_ID if surface == "NATIVE_SUBAGENT" else None,
         "native_thread_id": THREAD_ID if surface == "NATIVE_SUBAGENT" else None,
-        "model": "gpt-5.6-luna",
+        "model": "gpt-6-luna",
         "reasoning_effort": "max",
         "sandbox_policy": "read-only",
         "permission_profile": "read-only",
@@ -45,7 +45,7 @@ def runtime_observation(*, surface="NATIVE_SUBAGENT", **overrides):
         "agent_type": None,
         "native_agent_id": AGENT_ID if surface == "NATIVE_SUBAGENT" else None,
         "native_thread_id": THREAD_ID if surface == "NATIVE_SUBAGENT" else None,
-        "model": "gpt-5.6-luna",
+        "model": "gpt-6-luna",
         "reasoning_effort": "max",
         "sandbox_policy": "read-only",
         "permission_profile": "read-only",
@@ -94,7 +94,7 @@ def blocked_luna_result():
     }
 
 
-def write_exec_rollout(sessions: Path, *, model="gpt-5.6-luna", agent_type=None, native_agent_id=None):
+def write_exec_rollout(sessions: Path, *, model="gpt-6-luna", agent_type=None, native_agent_id=None):
     sessions.mkdir(parents=True, exist_ok=True)
     rollout = {
         "thread_id": THREAD_ID,
@@ -122,7 +122,7 @@ class RuntimeIdentityTest(unittest.TestCase):
 
         self.assertEqual("VERIFIED", evidence.verification_status)
         self.assertIsNone(evidence.observed_agent_type)
-        self.assertEqual("gpt-5.6-luna", evidence.observed_model)
+        self.assertEqual("gpt-6-luna", evidence.observed_model)
         self.assertEqual("max", evidence.observed_reasoning_effort)
         self.assertEqual(AGENT_ID, evidence.native_agent_id)
         self.assertEqual(THREAD_ID, evidence.native_thread_id)
@@ -130,8 +130,8 @@ class RuntimeIdentityTest(unittest.TestCase):
     def test_native_contract_is_controller_owned_and_rejects_self_consistent_wrong_model(self):
         with self.assertRaisesRegex(workflow.WorkflowError, "RUNTIME_IDENTITY_CONFLICT"):
             workflow.verify_runtime_identity(
-                runtime_expected(model="gpt-5.6-sol", reasoning_effort="high"),
-                runtime_observation(model="gpt-5.6-sol", reasoning_effort="high"),
+                runtime_expected(model="gpt-6-sol", reasoning_effort="high"),
+                runtime_observation(model="gpt-6-sol", reasoning_effort="high"),
             )
 
     def test_native_contract_rejects_non_luna_role_even_when_request_and_observation_agree(self):
@@ -247,7 +247,7 @@ class RuntimeIdentityTest(unittest.TestCase):
 
     def test_model_effort_and_cwd_are_exact_identity_matches(self):
         for field, value in (
-            ("model", "gpt-5.6-sol"),
+            ("model", "gpt-6-sol"),
             ("reasoning_effort", "xhigh"),
             ("cwd", "/different/worktree"),
         ):
@@ -306,12 +306,12 @@ class RuntimeIdentityTest(unittest.TestCase):
     def test_conflicting_public_and_rollout_values_fail_closed(self):
         with self.assertRaisesRegex(workflow.WorkflowError, "RUNTIME_IDENTITY_CONFLICT"):
             workflow.merge_runtime_observations(
-                runtime_observation(model="gpt-5.6-luna"),
-                runtime_observation(model="gpt-5.6-sol"),
+                runtime_observation(model="gpt-6-luna"),
+                runtime_observation(model="gpt-6-sol"),
             )
 
     def test_conflicting_canonical_and_observed_aliases_fail_closed(self):
-        observed = runtime_observation(observed_model="gpt-5.6-sol")
+        observed = runtime_observation(observed_model="gpt-6-sol")
         with self.assertRaisesRegex(workflow.WorkflowError, "RUNTIME_IDENTITY_CONFLICT"):
             workflow.verify_runtime_identity(runtime_expected(), observed)
 
@@ -330,7 +330,7 @@ class RuntimeIdentityTest(unittest.TestCase):
             "execution_surface": "NATIVE_SUBAGENT",
             "agent_type": None,
             "native_agent_id": AGENT_ID,
-            "model": "gpt-5.6-luna",
+            "model": "gpt-6-luna",
             "sandbox_policy": "read-only",
             "permission_profile": "read-only",
             "cwd": str(ROOT),
@@ -339,7 +339,7 @@ class RuntimeIdentityTest(unittest.TestCase):
         rollout = {
             "execution_surface": "NATIVE_SUBAGENT",
             "native_thread_id": THREAD_ID,
-            "model": "gpt-5.6-luna",
+            "model": "gpt-6-luna",
             "reasoning_effort": "max",
             "evidence_source": "LOCAL_ROLLOUT",
         }
@@ -490,7 +490,7 @@ class RuntimeInspectorTest(unittest.TestCase):
             records.append(
                 {
                     "type": "turn_context",
-                    "payload": {"model": "gpt-5.6-sol"},
+                    "payload": {"model": "gpt-6-sol"},
                 }
             )
 
@@ -665,7 +665,7 @@ class RuntimeLiveIntegrationTest(unittest.TestCase):
             store.create_task(task)
             _install_declaration(store, task, allowed_roles=("luna",), active_roles=("luna",))
             sessions = Path(temporary) / "sessions"
-            write_exec_rollout(sessions, model="gpt-5.6-sol")
+            write_exec_rollout(sessions, model="gpt-6-sol")
             paths = self._run_paths(temporary, state_root, sessions)
             with (
                 mock.patch(

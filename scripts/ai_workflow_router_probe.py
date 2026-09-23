@@ -61,12 +61,12 @@ _PROMPT_PREFIX = "\n".join(
     )
 )
 ARM_CONTRACTS = {
-    "luna_resident": ("gpt-5.6-luna", "max", "resident"),
-    "sol_resident": ("gpt-5.6-sol", "medium", "resident"),
-    "terra_resident": ("gpt-5.6-terra", "xhigh", "resident"),
-    "luna_control_fresh": ("gpt-5.6-luna", "max", "cold_control"),
-    "sol_control_fresh": ("gpt-5.6-sol", "medium", "cold_control"),
-    "terra_control_fresh": ("gpt-5.6-terra", "xhigh", "cold_control"),
+    "luna_resident": ("gpt-6-luna", "max", "resident"),
+    "sol_resident": ("gpt-6-sol", "xhigh", "resident"),
+    "terra_resident": ("gpt-6-sol", "medium", "resident"),
+    "luna_control_fresh": ("gpt-6-luna", "max", "cold_control"),
+    "sol_control_fresh": ("gpt-6-sol", "xhigh", "cold_control"),
+    "terra_control_fresh": ("gpt-6-sol", "medium", "cold_control"),
 }
 PROBE_SUMMARY_SCHEMA_VERSION = "router-probe-summary-2"
 USAGE_SOURCES = frozenset({"BILLING_USAGE", "TEXT_TOKEN_ESTIMATE"})

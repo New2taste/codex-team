@@ -213,7 +213,7 @@ def _roles_for(route_name: str, legacy_role_chain: tuple[str, ...]) -> tuple[str
 
 
 def terra_os_read_only_role(task: Mapping[str, object]) -> str:
-    """Return the task-typed Terra xhigh role for a non-writing route."""
+    """Return the task-typed Terra OS role for a non-writing route."""
 
     task_type = task.get("task_type")
     if task_type == "ACCEPTANCE":
@@ -276,7 +276,7 @@ def _has_verified_luna_construction_envelope(
     The frozen route request has no owner or envelope fields.  Treating one as
     an authority source would permit a caller to grow Luna's scope by changing
     route JSON, so the only positive branch here is a fresh plan validation.
-    Every other input is a closed fallback to Terra xhigh.
+    Every other input is a closed fallback to Terra OS.
     """
 
     if (

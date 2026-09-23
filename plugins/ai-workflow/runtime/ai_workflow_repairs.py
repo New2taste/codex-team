@@ -338,12 +338,12 @@ def _assignment_fields(
         _fail("REPAIR_REVIEWER_CONFLICT", "a fixer must not review its own repair")
     if repair_round in {1, 2}:
         if fixer != ActorIdentity(_TERRA_XHIGH, _TERRA_XHIGH) or peer is not None:
-            _fail("REPAIR_ACTOR_MISMATCH", "rounds 1 and 2 require fixed Terra xhigh and no peer")
+            _fail("REPAIR_ACTOR_MISMATCH", "rounds 1 and 2 require fixed Terra OS and no peer")
     else:
         if fixer.role != _SOL_MEDIUM_REVIEWER or peer is None or reviewer != peer:
             _fail(
                 "REPAIR_REVIEWER_CONFLICT",
-                "round 3 requires the original Sol fixer and one distinct Sol medium peer",
+                "round 3 requires the original GPT-6 Sol xhigh fixer and one distinct peer",
             )
         if peer.identity == fixer.identity:
             _fail("REPAIR_REVIEWER_CONFLICT", "round 3 peer must differ from the fixer")
@@ -1407,11 +1407,11 @@ def _v2_validate_observed_receipt(
     expected_runtime: tuple[str, str, str, str] | None = None,
 ) -> None:
     expected = expected_runtime or {
-        "luna": ("gpt-5.6-luna", "max", "workspace-write", "workspace-write"),
-        "luna_construction": ("gpt-5.6-luna", "max", "workspace-write", "workspace-write"),
-        "terra_xhigh": ("gpt-5.6-terra", "xhigh", "workspace-write", "workspace-write"),
-        "terra_xhigh_reviewer": ("gpt-5.6-terra", "xhigh", "read-only", "read-only"),
-        "sol_medium_reviewer": ("gpt-5.6-sol", "medium", "read-only", "read-only"),
+        "luna": ("gpt-6-luna", "max", "workspace-write", "workspace-write"),
+        "luna_construction": ("gpt-6-luna", "max", "workspace-write", "workspace-write"),
+        "terra_xhigh": ("gpt-6-sol", "medium", "workspace-write", "workspace-write"),
+        "terra_xhigh_reviewer": ("gpt-6-sol", "medium", "read-only", "read-only"),
+        "sol_medium_reviewer": ("gpt-6-sol", "xhigh", "read-only", "read-only"),
         "astra_low_reviewer": ("gpt-6-astra", "low", "read-only", "read-only"),
         "sol_xhigh": ("gpt-6-astra", "medium", "workspace-write", "assignment-scoped-write"),
     }.get(receipt.requested_role)
@@ -1539,8 +1539,8 @@ def _v2_validate_assignment_receipt(
     expected_runtime = None
     if assignment.phase == "SOL_MEDIUM_REPAIR":
         expected_runtime = (
-            "gpt-5.6-sol",
-            "medium",
+            "gpt-6-sol",
+            "xhigh",
             "workspace-write",
             "assignment-scoped-write",
         )
@@ -1934,7 +1934,7 @@ def open_task_acceptance(
         if _is_whole_project_final(stored, store=store):
             allowed_owners = {"luna", "terra_xhigh", "luna_construction"}
         if owner_receipt.requested_role not in allowed_owners:
-            _fail("ACCEPTANCE_RECEIPT_MISMATCH", "only Luna or Terra xhigh may own acceptance")
+            _fail("ACCEPTANCE_RECEIPT_MISMATCH", "only Luna or Terra OS may own acceptance")
         if _is_whole_project_final(stored, store=store):
             ensure_ownership_registry_for_paths_locked(
                 store,
@@ -2239,7 +2239,7 @@ def _v2_validate_whole_project_phase_actor(
         )
     if phase == "REVIEW_1":
         if actor.role != _SOL_MEDIUM_REVIEWER:
-            _fail("ACCEPTANCE_SEQUENCE_INVALID", "whole-project REVIEW_1 requires Sol medium acceptor")
+            _fail("ACCEPTANCE_SEQUENCE_INVALID", "whole-project REVIEW_1 requires GPT-6 Sol xhigh acceptor")
         return
     if phase == "SOL_MEDIUM_REPAIR":
         if actor.role != policy["fixer_role"] or actor.identity in replay.reviewer_identities:
@@ -2277,7 +2277,7 @@ def _v2_validate_phase_actor(
         return
     if phase in {"REVIEW_1", "REVIEW_2"}:
         if actor.role != "terra_xhigh_reviewer":
-            _fail("ACCEPTANCE_SEQUENCE_INVALID", "Terra reviews require Terra xhigh reviewer role")
+            _fail("ACCEPTANCE_SEQUENCE_INVALID", "Terra reviews require the Terra OS reviewer role")
         forbidden = set(replay.reviewer_identities) | {replay.owner_actor.identity}
         owner_repair = replay.repairer_identities.get("OWNER_REPAIR")
         if owner_repair is not None:
@@ -2719,12 +2719,12 @@ def _v2_controller_runtime_receipt(
     if not sessions.is_absolute() or not sessions.is_dir() or sessions.is_symlink():
         _fail("REPAIR_ADAPTER_REQUIRED", "controller runtime sessions directory is invalid")
     role_runtime = {
-        "luna": ("gpt-5.6-luna", "max", "workspace-write"),
-        "terra_xhigh": ("gpt-5.6-terra", "xhigh", "workspace-write"),
-        "terra_xhigh_reviewer": ("gpt-5.6-terra", "xhigh", "read-only"),
+        "luna": ("gpt-6-luna", "max", "workspace-write"),
+        "terra_xhigh": ("gpt-6-sol", "medium", "workspace-write"),
+        "terra_xhigh_reviewer": ("gpt-6-sol", "medium", "read-only"),
         "sol_medium_reviewer": (
-            "gpt-5.6-sol",
-            "medium",
+            "gpt-6-sol",
+            "xhigh",
             "assignment-scoped-write"
             if assignment.phase == "SOL_MEDIUM_REPAIR"
             else "read-only",

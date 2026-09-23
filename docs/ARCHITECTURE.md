@@ -6,7 +6,7 @@ Codex Team 是一个本地、可恢复、可审计的半自动编排层。它把
 
 | 执行面 | 默认用途 | 身份约束 | 权限边界 |
 |---|---|---|---|
-| `NATIVE_SUBAGENT` | Luna Max 默认路径 | `role=luna`、`gpt-5.6-luna/max`、`agent_type=null`、native agent/thread UUID | 由冻结 envelope 决定；通常只读或有界写 |
+| `NATIVE_SUBAGENT` | Luna Max 默认路径 | `role=luna`、`gpt-6-luna/max`、`agent_type=null`、native agent/thread UUID | 由冻结 envelope 决定；通常只读或有界写 |
 | `CODEX_EXEC_ROLE_CONTRACT` | 明确授权的独立 `codex exec` 会话 | 独立记录，不能冒充原生子代理 | 由任务信封和 assignment capability 决定 |
 
 原生身份必须由控制器签发并由运行时证据闭环证明。模型、推理档、执行面、权限、沙箱、cwd 或 UUID 缺失/冲突时，流程 fail-closed；调用者自报不能补齐证据。
@@ -15,13 +15,13 @@ Codex Team 是一个本地、可恢复、可审计的半自动编排层。它把
 
 | 角色 | 负责什么 | 明确不负责什么 |
 |---|---|---|
-| Luna Max | 冻结 envelope 内的机械 coding、确定性检查、证据抽取、分发同步 | planning、review、语义仲裁、final acceptance |
-| Terra xhigh | 复杂施工、调试、集成、开放式问题拆解 | merge、push、自我验收 |
-| Sol medium | 所有工程小节完成后的集中、只读、对抗式 final acceptance；失败后的首轮有界修订 | 普通 construction、常驻 planning、独立二次复验 |
-| Astra low (`astra_low_reviewer`) | Sol-medium 首轮修订后的独立、只读 peer acceptance | planning、construction、批准、终局修复 |
+| Luna Max (`gpt-6-luna / max`) | 冻结 envelope 内的机械 coding、确定性检查、证据抽取、分发同步 | planning、review、语义仲裁、final acceptance |
+| Terra OS (`gpt-6-sol / medium`) | 复杂施工、调试、集成、开放式问题拆解 | merge、push、自我验收 |
+| Sol xhigh (`gpt-6-sol / xhigh`) | 所有工程小节完成后的集中、只读、对抗式 final acceptance；失败后的首轮有界修订 | 普通 construction、常驻 planning、独立二次复验 |
+| Astra low (`astra_low_reviewer`) | GPT-6 Sol xhigh 首轮修订后的独立、只读 peer acceptance | planning、construction、批准、终局修复 |
 | Astra medium | owner-authorized 总体规划、闭集裁定；Astra-low 复验仍失败后的 terminal repair | 普通施工、绕过 final acceptance |
 
-角色名称、模型和推理档是独立字段，必须来自闭集配置，不能用“同名路径”或调用者自报替代运行时身份。
+角色名称、模型和推理档是独立字段，必须来自闭集配置，不能用“同名路径”或调用者自报替代运行时身份。为兼容既有账本，`sol_medium_reviewer` 仍是内部角色 ID、当前绑定 `gpt-6-sol / xhigh`；`sol_xhigh` 仍是 Astra medium 终局角色的兼容 ID。
 
 ## 3. 生命周期
 
@@ -35,22 +35,22 @@ Codex Team 是一个本地、可恢复、可审计的半自动编排层。它把
   → Luna 有界施工或 Terra 复杂施工
   → 各工程小节完成自检
   → 固定 candidate commit
-  → Sol medium 集中 final acceptance
+  → GPT-6 Sol xhigh 集中 final acceptance
   → 人工 owner decision
 ```
 
 中间工程小节不再单独派发对抗式审查，但施工 owner 仍必须执行冻结信封内的目标测试、负向检查、范围核对和运行时证据门。这里的自检不能被写成“独立验收”。
 
-`ACCEPTANCE` task 的 Terra xhigh reviewer 是显式本地审查入口，不代表全工程终验。正常计划调度在全部工程小节 receipt 完成后生成唯一 whole-project `ACCEPTANCE` child。final candidate 可以不同于 FrozenPlan 初始 candidate，但必须是当前 clean HEAD、初始 candidate 的 git 祖先后代，且 diff 落在授权 write union 内；parent ledger 用 `acceptance_task_sha256` 绑定完整 child，child 的 `scheduler-parent.json` 反向定向绑定唯一 parent task、plan、final event 和 candidate，分类时不扫描无关任务。`schedule-final` 通过现有 adversarial-acceptance-1 API 只签发一次 Sol-medium `REVIEW_1`，open 后 assignment 失败可续签。standalone `ACCEPTANCE` 入口保持不变。
+`ACCEPTANCE` task 的 Terra OS reviewer 是显式本地审查入口，不代表全工程终验。正常计划调度在全部工程小节 receipt 完成后生成唯一 whole-project `ACCEPTANCE` child。final candidate 可以不同于 FrozenPlan 初始 candidate，但必须是当前 clean HEAD、初始 candidate 的 git 祖先后代，且 diff 落在授权 write union 内；parent ledger 用 `acceptance_task_sha256` 绑定完整 child，child 的 `scheduler-parent.json` 反向定向绑定唯一 parent task、plan、final event 和 candidate，分类时不扫描无关任务。`schedule-final` 通过现有 adversarial-acceptance-1 API 只签发一次 GPT-6 Sol xhigh `REVIEW_1`，open 后 assignment 失败可续签。standalone `ACCEPTANCE` 入口保持不变。
 
-生产 CLI 的零模型调度控制面是 `schedule-batch` → `schedule-result` → `schedule-receipt` → `schedule-final`。`schedule-result` 接收既有执行边界产出的 `ai-result-1`，由 controller 补齐并核对 `dispatch_id/task_id/step_id/attempt`，输出位置不能由调用方指定：controller 从已重放 dispatch 唯一确定 `<state_root>/<task_id>/scheduler-results/<dispatch_id>.json` 并原子冻结，再按该文件 bytes 生成 receipt。结果读取按已打开的目录 fd 定位，拒绝目录换绑、symlink、hardlink 和超限文件。`schedule-final` 先创建 child；同时提供已记录 runtime evidence 对应的 `--owner-receipt` 与 Sol-medium `--acceptor` 时签发 `REVIEW_1`。后续 repair ladder 到达 terminal 授权点后，owner 通过既有终局授权接口触发 Astra medium；兼容命令 ID `authorize_final_xhigh` 保持不变。
+生产 CLI 的零模型调度控制面是 `schedule-batch` → `schedule-result` → `schedule-receipt` → `schedule-final`。`schedule-result` 接收既有执行边界产出的 `ai-result-1`，由 controller 补齐并核对 `dispatch_id/task_id/step_id/attempt`，输出位置不能由调用方指定：controller 从已重放 dispatch 唯一确定 `<state_root>/<task_id>/scheduler-results/<dispatch_id>.json` 并原子冻结，再按该文件 bytes 生成 receipt。结果读取按已打开的目录 fd 定位，拒绝目录换绑、symlink、hardlink 和超限文件。`schedule-final` 先创建 child；同时提供已记录 runtime evidence 对应的 `--owner-receipt` 与 GPT-6 Sol xhigh `--acceptor` 时签发 `REVIEW_1`。后续 repair ladder 到达 terminal 授权点后，owner 通过既有终局授权接口触发 Astra medium；兼容命令 ID `authorize_final_xhigh` 保持不变。
 
 ### Final acceptance 返工路径
 
 ```text
-Sol medium REWORK
+GPT-6 Sol xhigh REWORK
   → 人工批准冻结 findings / paths / commands
-  → Sol-medium fixer 首轮有界返工
+  → GPT-6 Sol xhigh fixer 首轮有界返工
   → Astra low (`astra_low_reviewer`) 独立、只读 peer acceptance
   → 再次 REWORK 才可 owner-authorize Astra-medium terminal repair
 ```

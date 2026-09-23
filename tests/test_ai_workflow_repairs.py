@@ -421,7 +421,7 @@ class RepairProtocolTest(unittest.TestCase):
             "observed_agent_type": None,
             "native_agent_id": None,
             "native_thread_id": None,
-            "observed_model": "gpt-5.6-luna",
+            "observed_model": "gpt-6-luna",
             "observed_reasoning_effort": "max",
             "observed_sandbox_policy": "workspace-write",
             "observed_permission_profile": "workspace-write",
@@ -437,7 +437,7 @@ class RepairProtocolTest(unittest.TestCase):
             runtime_instance_id=owner_thread,
             attempt_id="owner-attempt-1",
             requested_role="luna",
-            observed_model="gpt-5.6-luna",
+            observed_model="gpt-6-luna",
             observed_reasoning_effort="max",
             observed_sandbox_policy="workspace-write",
             observed_permission_profile="workspace-write",
@@ -473,8 +473,8 @@ class RepairProtocolTest(unittest.TestCase):
             runtime_instance_id=reviewer_thread,
             attempt_id=assignment.attempt_id,
             requested_role="terra_xhigh_reviewer",
-            observed_model="gpt-5.6-terra",
-            observed_reasoning_effort="xhigh",
+            observed_model="gpt-6-sol",
+            observed_reasoning_effort="medium",
             observed_sandbox_policy="read-only",
             observed_permission_profile="read-only",
             observed_cwd=str(repository),
@@ -615,8 +615,8 @@ class AssignmentSideEffectObservationTest(unittest.TestCase):
             sessions,
             reviewer_thread,
             sandbox="read-only",
-            model="gpt-5.6-terra",
-            effort="xhigh",
+            model="gpt-6-sol",
+            effort="medium",
             permission="read-only",
         )
         snapshots: list[object] = []
@@ -685,8 +685,8 @@ class AssignmentSideEffectObservationTest(unittest.TestCase):
             sessions,
             reviewer_thread,
             sandbox="read-only",
-            model="gpt-5.6-terra",
-            effort="xhigh",
+            model="gpt-6-sol",
+            effort="medium",
             permission="read-only",
         )
 
@@ -726,8 +726,8 @@ class AssignmentSideEffectObservationTest(unittest.TestCase):
             sessions,
             reviewer_thread,
             sandbox="read-only",
-            model="gpt-5.6-terra",
-            effort="xhigh",
+            model="gpt-6-sol",
+            effort="medium",
             permission="read-only",
         )
 
@@ -769,8 +769,8 @@ class AssignmentSideEffectObservationTest(unittest.TestCase):
             sessions,
             reviewer_thread,
             sandbox="read-only",
-            model="gpt-5.6-terra",
-            effort="xhigh",
+            model="gpt-6-sol",
+            effort="medium",
             permission="read-only",
         )
         result = {
@@ -851,7 +851,7 @@ class AssignmentSideEffectObservationTest(unittest.TestCase):
             sessions,
             owner_thread,
             sandbox="workspace-write",
-            model="gpt-5.6-luna",
+            model="gpt-6-luna",
             effort="max",
             permission="workspace-write",
         )
@@ -967,8 +967,8 @@ class AssignmentDispatchGateTest(unittest.TestCase):
                 {
                     "thread_id": thread_id,
                     "agent_type": None,
-                    "model": "gpt-5.6-terra",
-                    "reasoning_effort": "xhigh",
+                    "model": "gpt-6-sol",
+                    "reasoning_effort": "medium",
                     "sandbox_policy": "read-only",
                     "permission_profile": "read-only",
                     "cwd": str(self.fx.repository_root),

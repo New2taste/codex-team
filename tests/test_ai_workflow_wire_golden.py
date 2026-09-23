@@ -955,8 +955,8 @@ class FourDirectPathMissingDeclarationTest(unittest.TestCase):
                     {
                         "thread_id": reviewer_thread,
                         "agent_type": None,
-                        "model": "gpt-5.6-terra",
-                        "reasoning_effort": "xhigh",
+                        "model": "gpt-6-sol",
+                        "reasoning_effort": "medium",
                         "sandbox_policy": "read-only",
                         "permission_profile": "read-only",
                         "cwd": str(fx.repository_root),

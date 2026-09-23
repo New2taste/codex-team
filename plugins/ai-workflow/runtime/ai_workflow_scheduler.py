@@ -1292,7 +1292,7 @@ def issue_final_acceptance(
     owner_receipt: object,
     acceptor_actor: object,
 ):
-    """Open the bound child once and issue the single Sol-medium REVIEW_1 assignment."""
+    """Open the bound child once and issue the single GPT-6 Sol xhigh REVIEW_1 assignment."""
 
     plan, _stored = _revalidate_plan(store, parent_plan)
     identifier = _acceptance_task_id(acceptance_task_id)
