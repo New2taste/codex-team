@@ -14,6 +14,7 @@ mode = "enforced"
 role_policy = "terra_os"
 
 [automation]
+max_active_subagents = 2
 max_parallel_read_only = 2
 max_active_writers = 1
 allow_decide_resume = true
@@ -27,9 +28,11 @@ compact_prompts = false
 fixer_role = "sol_medium_reviewer"
 fixer_permission_profile = "assignment-scoped-write"
 fixer_distinct_from_acceptor = true
-recheck_role = "astra_low_reviewer"
+recheck_role = "sol_medium_reviewer"
+optional_recheck_roles = ["astra_medium_reviewer"]
 recheck_distinct_from_fixer = true
-terminal_escalation_role = "sol_xhigh"
+terminal_escalation_role = "sol_reviewer"
+optional_terminal_roles = ["sol_xhigh"]
 terminal_review_required = false
 
 [roles.luna]
@@ -44,28 +47,28 @@ model = "gpt-6-luna"
 reasoning_effort = "max"
 sandbox = "workspace-write"
 allowed_statuses = ["IMPLEMENTED_CANDIDATE", "NEEDS_CLARIFICATION", "BLOCKED"]
-instructions = """Own only a locally verified bounded construction envelope with exact allowed paths, deterministic done_when, L0/L1/L2 evidence, negative or mutation checks, and runnable commands. Do not plan, review, widen scope, handle security work, merge, push, or self-approve."""
+instructions = """Own only a locally verified bounded construction envelope with exact allowed paths, deterministic done_when, L0/L1/L2 evidence, negative or mutation checks, and runnable commands. Batch related bounded work. On ambiguity or failed verification, return the evidence to the primary implementer rather than retrying repeatedly. Do not plan, review, widen scope, handle security work, merge, push, or self-approve."""
 
 [roles.terra]
-model = "gpt-6-sol"
+model = "gpt-6.1-sol"
 reasoning_effort = "medium"
 sandbox = "workspace-write"
 allowed_statuses = ["IMPLEMENTED_CANDIDATE", "NEEDS_CLARIFICATION", "BLOCKED"]
 instructions = """Own implementation only inside the authorized worktree and paths. Stop on semantic ambiguity. Never merge, push, or self-approve."""
 
 [roles.sol_planner]
-model = "gpt-6-sol"
-reasoning_effort = "xhigh"
+model = "gpt-6.1-sol"
+reasoning_effort = "medium"
 sandbox = "read-only"
 allowed_statuses = ["PLAN_READY", "NEEDS_OWNER_DECISION", "INSUFFICIENT_EVIDENCE"]
 instructions = """Convert evidence into a bounded plan with frozen invariants and decidable acceptance criteria. Do not implement. Do not over-design; make only the smallest change needed to satisfy the frozen objective and acceptance criteria."""
 
 [roles.sol_reviewer]
-model = "gpt-6-sol"
-reasoning_effort = "xhigh"
+model = "gpt-6.1-sol"
+reasoning_effort = "high"
 sandbox = "read-only"
 allowed_statuses = ["ACCEPTANCE_RECOMMENDED", "ACCEPTANCE_WITH_NOTES_RECOMMENDED", "REWORK_RECOMMENDED", "REJECT_RECOMMENDED", "ESCALATION_PROPOSED"]
-instructions = """Review the pinned candidate against the task contract and evidence. Recommend a verdict but never enact owner decisions. Do not over-design; require only the smallest change needed to satisfy the frozen objective and acceptance criteria."""
+instructions = """Perform concentrated, independent, read-only adversarial final acceptance after all sections complete. Analyze the frozen objective, actual diff, edge cases, failure paths and evidence; report all actionable violations together with impact and reproducible checks. Never enact owner decisions. An explicitly owner-authorized terminal assignment may grant bounded repair capability, never ambient write access. Do not over-design; require only the smallest change needed to satisfy the frozen objective and acceptance criteria."""
 
 [roles.sol_xhigh]
 model = "gpt-6-astra"
@@ -76,46 +79,46 @@ allowed_statuses = ["OPTION_A", "OPTION_B", "OPTION_C", "INSUFFICIENT_EVIDENCE"]
 instructions = """Decide only the closed-set dispute in the authorized case file. Do not implement or invent an unlisted option. Do not over-design; choose only the smallest change needed to satisfy the frozen objective and acceptance criteria."""
 
 [roles.terra_xhigh]
-model = "gpt-6-sol"
+model = "gpt-6.1-sol"
 reasoning_effort = "medium"
 sandbox = "workspace-write"
 allowed_statuses = ["IMPLEMENTED_CANDIDATE", "NEEDS_CLARIFICATION", "BLOCKED"]
 instructions = """Own complex construction, decomposition, integration, and open-ended debugging only inside the authorized worktree and paths. Stop on semantic ambiguity. Never merge, push, or self-approve."""
 
 [roles.terra_xhigh_planner]
-model = "gpt-6-sol"
+model = "gpt-6.1-sol"
 reasoning_effort = "medium"
 sandbox = "read-only"
 allowed_statuses = ["PLAN_READY", "NEEDS_OWNER_DECISION", "INSUFFICIENT_EVIDENCE"]
 instructions = """Produce only the bounded plan selected by a persisted terra_os read-only route. Do not implement, modify repository files, merge, push, or self-approve."""
 
 [roles.terra_xhigh_reviewer]
-model = "gpt-6-sol"
+model = "gpt-6.1-sol"
 reasoning_effort = "medium"
 sandbox = "read-only"
 allowed_statuses = ["ACCEPTANCE_RECOMMENDED", "ACCEPTANCE_WITH_NOTES_RECOMMENDED", "REWORK_RECOMMENDED", "REJECT_RECOMMENDED", "ESCALATION_PROPOSED"]
 instructions = """Review only the pinned acceptance candidate selected by a persisted terra_os read-only route. Recommend a verdict without modifying files or enacting owner decisions."""
 
 [roles.sol_medium_supervisor]
-model = "gpt-6-sol"
-reasoning_effort = "xhigh"
+model = "gpt-6.1-sol"
+reasoning_effort = "medium"
 sandbox = "read-only"
 allowed_statuses = ["PLAN_READY", "NEEDS_OWNER_DECISION", "INSUFFICIENT_EVIDENCE"]
 instructions = """Reserved for legacy compatibility only. Do not select this role for ordinary terra_os task planning, construction, or local acceptance. Do not over-design; make only the smallest change needed to satisfy the frozen objective and acceptance criteria."""
 
 [roles.sol_medium_reviewer]
-model = "gpt-6-sol"
-reasoning_effort = "xhigh"
+model = "gpt-6.1-sol"
+reasoning_effort = "medium"
 sandbox = "read-only"
 allowed_statuses = ["ACCEPTANCE_RECOMMENDED", "ACCEPTANCE_WITH_NOTES_RECOMMENDED", "REWORK_RECOMMENDED", "REJECT_RECOMMENDED", "ESCALATION_PROPOSED"]
 instructions = """Reserved for the scoped fallback repair and peer-review ladder. Do not select this role for ordinary terra_os task planning, construction, or local acceptance. Do not over-design; make or require only the smallest change needed to satisfy the frozen objective and acceptance criteria."""
 
-[roles.astra_low_reviewer]
+[roles.astra_medium_reviewer]
 model = "gpt-6-astra"
-reasoning_effort = "low"
+reasoning_effort = "medium"
 sandbox = "read-only"
 allowed_statuses = ["ACCEPTANCE_RECOMMENDED", "ACCEPTANCE_WITH_NOTES_RECOMMENDED", "REWORK_RECOMMENDED", "REJECT_RECOMMENDED", "ESCALATION_PROPOSED"]
-instructions = """Independently recheck only the scoped whole-project final repair after the GPT-6 Sol xhigh fixer. Do not implement, alter scope, merge, push, or self-approve. Do not over-design; require only the smallest change needed to satisfy the frozen objective and acceptance criteria."""
+instructions = """Independently recheck the scoped whole-project repair only when explicitly selected as the supplementary Astra medium reviewer. Analyze the frozen objective, diff, failure paths and evidence adversarially; report actionable contract violations, not preferences. Do not implement, alter scope, merge, push, or self-approve. Do not over-design; require only the smallest change needed to satisfy the frozen objective and acceptance criteria."""
 
 [roles.sol_xhigh_planner]
 model = "gpt-6-astra"
@@ -135,9 +138,9 @@ model = "gpt-6-luna"
 reasoning_effort = "max"
 
 [router_probe.models.sol]
-model = "gpt-6-sol"
-reasoning_effort = "xhigh"
+model = "gpt-6.1-sol"
+reasoning_effort = "high"
 
 [router_probe.models.terra]
-model = "gpt-6-sol"
+model = "gpt-6.1-sol"
 reasoning_effort = "medium"

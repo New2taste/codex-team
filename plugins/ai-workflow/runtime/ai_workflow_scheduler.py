@@ -209,18 +209,21 @@ def _scope_sha256(task: FrozenSubtask) -> str:
     )
 
 
-def _slot_limits(config: Mapping[str, object] | None = None) -> tuple[int, int]:
+def _slot_limits(config: Mapping[str, object] | None = None) -> tuple[int, int, int]:
     document = dict(config) if isinstance(config, Mapping) else _load_config()
     automation = document.get("automation")
     if not isinstance(automation, Mapping):
         _fail("CAPACITY_UNAVAILABLE", "automation configuration is required")
     read_only = automation.get("max_parallel_read_only")
     writers = automation.get("max_active_writers")
+    total = automation.get("max_active_subagents", 2)
     if isinstance(read_only, bool) or not isinstance(read_only, int) or read_only < 0:
         _fail("CAPACITY_UNAVAILABLE", "max_parallel_read_only must be a non-negative integer")
     if isinstance(writers, bool) or not isinstance(writers, int) or writers < 0:
         _fail("CAPACITY_UNAVAILABLE", "max_active_writers must be a non-negative integer")
-    return read_only, writers
+    if isinstance(total, bool) or not isinstance(total, int) or total < 1:
+        _fail("CAPACITY_UNAVAILABLE", "max_active_subagents must be a positive integer")
+    return read_only, writers, total
 
 
 def _ledger_path(store: object, task_id: str) -> Path:
@@ -633,12 +636,15 @@ def _select_ready(
     in_flight: Mapping[str, str],
     max_read_only: int,
     max_writers: int,
+    max_total: int = 2,
 ) -> tuple[str, ...]:
     tasks_by_id = {task.id: task for task in plan.tasks}
     read_used = sum(1 for role in in_flight.values() if role in SECTION_READ_ROLES)
     write_used = sum(1 for role in in_flight.values() if role in WRITE_ROLES)
     selected: list[str] = []
     for identifier in ready:
+        if len(in_flight) + len(selected) >= max_total:
+            break
         role = _require_role(tasks_by_id[identifier].owner_role)
         if role in WRITE_ROLES:
             if write_used >= max_writers:
@@ -783,6 +789,17 @@ def _reject_locked_dispatch(replay: SchedulerReplay, subtask_id: str) -> None:
         _fail("STEP_ALREADY_COMPLETED", "subtask already has an IMPLEMENTED_CANDIDATE receipt")
     if subtask_id in replay.in_flight:
         _fail("STEP_IN_FLIGHT", "subtask still has an open dispatch attempt")
+    for event in replay.events:
+        receipt = event.get("receipt")
+        if event.get("event_type") != "STEP_RECEIPTED" or not isinstance(receipt, Mapping):
+            continue
+        dispatch = replay.dispatches.get(receipt.get("dispatch_id"), {})
+        if (
+            receipt.get("subtask_id") == subtask_id
+            and dispatch.get("owner_role") in {"luna", "luna_construction"}
+            and receipt.get("status") != "IMPLEMENTED_CANDIDATE"
+        ):
+            _fail("LUNA_HANDOFF_REQUIRED", "failed Luna step requires primary-implementer handoff, not redispatch")
 
 
 def _dispatch_step_locked(
@@ -858,6 +875,9 @@ def dispatch_step(
         )
         if subtask_id not in ready:
             _fail("STEP_NOT_READY", "subtask dependencies or stage barrier are not satisfied")
+        limits = _slot_limits()
+        if not _select_ready(plan, (subtask_id,), replay.in_flight, *limits):
+            _fail("CAPACITY_UNAVAILABLE", "subtask exceeds the active agent or writer limit")
         return _dispatch_step_locked(store, plan, stored_task, subtask_id, attempt, replay)
 
 
@@ -871,7 +891,7 @@ def dispatch_ready_batch(
 
     plan, stored_task = _revalidate_plan(store, plan)
     _assert_section_roles(plan)
-    max_read_only, max_writers = _slot_limits(config)
+    max_read_only, max_writers, max_total = _slot_limits(config)
     lock = getattr(store, "lock", None)
     if not callable(lock):
         _fail("PLAN_INVALID", "scheduler requires the workflow parent lock")
@@ -886,14 +906,15 @@ def dispatch_ready_batch(
             set(replay.dispatched),
             len(plan.tasks),
         )
-        selected = _select_ready(plan, ready, replay.in_flight, max_read_only, max_writers)
+        selected = _select_ready(plan, ready, replay.in_flight, max_read_only, max_writers, max_total)
         if not selected:
             return ()
         declaration = load_route_declaration_locked(store, plan.task_id)
         if declaration is None:
             _fail("ROUTE_DECLARATION_MISSING", "route declaration is missing")
             raise AssertionError("unreachable")
-        for subtask_id in selected:
+        for subtask_id in ready:
+            _reject_locked_dispatch(replay, subtask_id)
             subtask = next(task for task in plan.tasks if task.id == subtask_id)
             if subtask.owner_role not in declaration.allowed_roles:
                 _fail("ROLE_NOT_ALLOWED", f"role {subtask.owner_role} is not allowed")
@@ -1292,13 +1313,13 @@ def issue_final_acceptance(
     owner_receipt: object,
     acceptor_actor: object,
 ):
-    """Open the bound child once and issue the single GPT-6 Sol xhigh REVIEW_1 assignment."""
+    """Open the bound child once and issue the independent Sol high final review."""
 
     plan, _stored = _revalidate_plan(store, parent_plan)
     identifier = _acceptance_task_id(acceptance_task_id)
     module = _repairs()
-    if not isinstance(acceptor_actor, module.ActorIdentity) or acceptor_actor.role != module._SOL_MEDIUM_REVIEWER:
-        _fail("ACCEPTANCE_SEQUENCE_INVALID", "acceptor must be sol_medium_reviewer")
+    if not isinstance(acceptor_actor, module.ActorIdentity) or acceptor_actor.role != "sol_reviewer":
+        _fail("ACCEPTANCE_SEQUENCE_INVALID", "acceptor must be sol_reviewer (Sol high)")
     module._final_acceptance_rework_policy()
     lock = getattr(store, "lock", None)
     if not callable(lock):

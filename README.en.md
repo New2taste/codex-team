@@ -13,10 +13,10 @@ It is intended for personal development, experiments, and local workflows that u
 | Plugin version | `0.4.0` |
 | Release posture | Public preview; self-use first, no production SLA |
 | Default Luna execution surface | Native `NATIVE_SUBAGENT`: `gpt-6-luna / max` |
-| Resident entry-route suggestion | Luna max; documentation-only suggestion, effective routing remains deterministic and user-selected |
-| Default construction OS | Terra OS: `gpt-6-sol / medium` |
-| Final acceptance | Concentrated, read-only, adversarial `gpt-6-sol / xhigh` review |
-| Last updated | 2026-09-23 |
+| Entry classification | Deterministic rules; no model call by default |
+| Primary implementer | `gpt-6.1-sol / medium` |
+| Final acceptance | Concentrated, read-only, adversarial `gpt-6.1-sol / high` review |
+| Last updated | 2026-09-30 |
 | License | Not declared; public visibility does not grant redistribution rights |
 
 ## What this is
@@ -25,51 +25,44 @@ Codex Team consists of standard-library implementations, schemas, a Plugin mirro
 
 ### Default role split
 
-| Role | Default model / effort | Primary responsibility | Explicit boundary |
+| Role | Model / effort | Responsibility | Boundary |
 |---|---|---|---|
-| Luna Max | `gpt-6-luna / max` | Mechanical coding inside a frozen envelope, deterministic checks, evidence extraction, and distribution sync | Never planning, reviewing, approving, or final acceptance |
-| Terra OS | `gpt-6-sol / medium` | Complex construction, debugging, integration, and open-ended problem decomposition | Never merge, push, or self-accept |
-| Sol xhigh | `gpt-6-sol / xhigh` | Supervise overall-plan execution, perform concentrated final acceptance, and perform the first bounded repair | Not resident construction; final acceptance stays read-only and adversarial, with no independent second recheck |
-| Astra low | `gpt-6-astra / low` | Independent, read-only recheck after the first GPT-6 Sol xhigh repair | Never planning, constructing, approving, or performing terminal repair |
-| Astra medium | `gpt-6-astra / medium` | Owner-authorized overall planning, closed-set decisions, or one-time terminal repair after the rework ladder | Never starts automatically or bypasses the owner gate or final acceptance |
+| Luna Max | `gpt-6-luna / max` | Batch bounded, mechanically verifiable tasks, checks and evidence extraction | Hand failures and evidence back; never plan, review, approve or retry repeatedly |
+| Primary implementer | `gpt-6.1-sol / medium` | Routine coordination, ordinary planning, construction, debugging, integration and first bounded repair | Never merge, push or self-accept |
+| Final reviewer and difficult-work escalation | `gpt-6.1-sol / high` | Independent, read-only, adversarial final acceptance; difficult work or authorized terminal repair | Review and scoped-write repair are separate phases |
+| Astra medium | `gpt-6-astra / medium` | Large-project planning, stubborn problems, supplementary independent recheck or authorized terminal repair | Optional; rechecks stay read-only and terminal repairs require owner authorization |
 
-For compatibility with existing ledgers and APIs, internal role IDs retain their historical names: for example, `sol_medium_reviewer` now binds to `gpt-6-sol / xhigh`, while `sol_xhigh` remains a compatibility ID for the Astra-medium terminal role. The dispatched identity is established by the model, reasoning effort, and runtime receipt.
+Ordinary plans stay with Sol medium. After Sol high final acceptance recommends rework, a distinct Sol medium fixer repairs the frozen findings. Another Sol medium independently rechecks; explicitly select Astra medium when an additional perspective is needed. A failed recheck permits only one owner-authorized Sol high or Astra medium terminal repair. Frozen functional checks and existing release gates remain mandatory, without additional task-level model review.
 
-Luna does not perform planning, review, approval, or final acceptance. Terra does not merge, push, or self-accept. Astra medium does not start automatically. Models and reasoning levels not explicitly listed in configuration are never silently injected into the workflow.
+Historical role/command IDs remain compatibility handles: `terra_xhigh` means the primary implementer, `sol_reviewer` means Sol high final acceptance, `sol_medium_reviewer` means Sol medium repair/recheck, and `astra_medium_reviewer` means Astra medium recheck. `sol_xhigh` and `authorize_final_xhigh` retain their compatibility IDs. Runtime receipts establish the actual model, effort and permissions.
 
-## Routing at a glance
+### Routing at a glance
 
-The diagram below shows the default production path: deterministic triage first, then a frozen envelope; intermediate engineering sections perform construction self-checks only, and GPT-6 Sol xhigh performs the concentrated final acceptance. Every write edge is constrained by task scope, runtime identity, evidence, and an owner gate.
+Deterministic intake selects the authorized envelope. Intermediate engineering sections use `section_self_check_only`; final acceptance runs only after all sections complete.
 
 ```mermaid
 flowchart TD
-    A[User objective] --> B{Deterministic intake}
-    B -->|Fixed safe command| C[DIRECT_L0<br/>Controller only<br/>No model]
-    B -->|Read-only file fact| D[DIRECT_L1<br/>Luna Max<br/>NATIVE_SUBAGENT]
-    B -->|Planning or construction| E[PLAN_REQUIRED]
-    B -->|Invalid input, lock, or evidence| X[BLOCKED<br/>Append blocking receipt]
-
-    E --> F{Plan and owner gate}
-    F -->|No executable plan| G[Astra medium<br/>Owner-authorized planning and decision]
-    F -->|Frozen envelope| H{Task complexity}
-    G --> H
-    H -->|Mechanical, low risk, bounded| I[Luna Max<br/>Low-cost tool process]
-    H -->|Complex construction, debug, integration| J[Terra OS<br/>GPT-6 Sol medium]
-    I --> K[Section self-check<br/>+ runtime evidence]
-    J --> K
-    K -->|Sections remain| H
-    K -->|All sections complete| L[Pin clean candidate<br/>Check scope and evidence]
-    L --> M[GPT-6 Sol xhigh<br/>Concentrated, read-only,<br/>adversarial final acceptance]
-    M -->|ACCEPT| N[Owner decision<br/>Close task]
-    M -->|REWORK| O[GPT-6 Sol xhigh<br/>First bounded repair]
-    O --> P[Astra low<br/>Independent, read-only recheck]
-    P -->|ACCEPT| N
-    P -->|REWORK again| Q[Owner authorization]
-    Q --> R[Astra medium<br/>One-time terminal repair]
-    R --> N
+    A[User objective] --> B{Deterministic intake and scope}
+    B -->|Fixed safe command| C[Controller<br/>No model]
+    B -->|Bounded facts or small tasks| D[Luna 6 max]
+    B -->|Planning and complex implementation| E[Sol 6.1 medium]
+    E -. Large plans or difficult problems .-> F[Astra medium / Sol high<br/>As authorized]
+    D --> G[Section self-check and evidence]
+    E --> G
+    G -->|Sections remain| B
+    G -->|All complete| H[Independent Sol 6.1 high<br/>Read-only adversarial final acceptance]
+    H -->|Accept| I[Existing release gates and owner decision]
+    H -->|Rework| J[Distinct Sol 6.1 medium<br/>One bounded repair]
+    J --> K[Another Sol medium<br/>or explicitly selected Astra medium recheck]
+    K -->|Accept| I
+    K -->|Rework again| L[Owner-authorized Sol high or Astra medium<br/>One terminal repair]
+    L --> M[Frozen functional checks and release gates<br/>No extra model review]
+    M -->|Checks pass| I
 ```
 
-The routing trade-off is deliberate: Luna 6 handles frequent, low-cost, mechanically verifiable work; Terra OS (GPT-6 Sol medium) handles construction that needs context and debugging; GPT-6 Sol xhigh enters only after all engineering sections are complete, looks for omissions, and performs the first bounded repair; Astra low independently rechecks that repair; Astra medium handles planning, closed-set decisions, and the terminal exception only after explicit owner authorization. `optimization` is shadow advice by default and never silently changes this deterministic production chain.
+At most two subagents run by default, with at most one writer and two readers; single-step dispatch also checks capacity. Team Call retains its single active receipt. Delegate only useful independent work, batch related bounded tasks, and pass relevant context with every required scope and identity field intact.
+
+Observe the next 10–20 real tasks using existing reports and cost evidence: total consumption, elapsed time, first-pass acceptance, reworks and missed defects. Savings are not yet measured; API costs and subscription usage are tracked separately.
 
 ## Quick start
 
@@ -130,7 +123,7 @@ The command does not modify, merge, push, or replace final acceptance. Failed ca
 ```text
 Objective → task envelope and deterministic evidence checks
 → DIRECT_L1 Luna fact extraction when needed
-→ Astra medium read-only planning only when an executable plan is missing
+→ Sol medium ordinary planning; Astra medium only for authorized large projects
 → owner decision
 ```
 
@@ -139,24 +132,24 @@ Objective → task envelope and deterministic evidence checks
 ```text
 Freeze envelope → bounded construction → target tests, negative checks, scope checks
 → all engineering sections complete → pin candidate commit
-→ GPT-6 Sol xhigh final acceptance → owner decision
+→ GPT-6.1 Sol high final acceptance → owner decision
 ```
 
 Intermediate engineering sections use `section_self_check_only`: the construction owner must run the frozen-envelope tests, negative checks, scope checks, and runtime-evidence gate, but no separate adversarial reviewer is dispatched per section. Self-check is not acceptance.
 
-The scheduler creates one whole-project `ACCEPTANCE` child after all section receipts are complete. The final candidate must be the current clean HEAD and a descendant of the FrozenPlan candidate; its diff must stay inside the step/parent write union. `FINAL_ACCEPTANCE_OPENED` binds the child task hash, and `scheduler-parent.json` points back to the unique parent, plan, event, and candidate. `schedule-final` issues only one GPT-6 Sol xhigh `REVIEW_1`; it does not run a model itself.
+The scheduler creates one whole-project `ACCEPTANCE` child after all section receipts are complete. The final candidate must be the current clean HEAD and a descendant of the FrozenPlan candidate; its diff must stay inside the step/parent write union. `FINAL_ACCEPTANCE_OPENED` binds the child task hash, and `scheduler-parent.json` points back to the unique parent, plan, event, and candidate. `schedule-final` issues only one GPT-6.1 Sol high `REVIEW_1`; it does not run a model itself.
 
 ### 3. Rework after acceptance
 
 ```text
-GPT-6 Sol xhigh REWORK
+GPT-6.1 Sol high REWORK
 → human approval of frozen findings, paths, and commands
-→ GPT-6 Sol xhigh fixer with bounded write access
-→ Astra low independent read-only recheck
-→ only a second REWORK may reach owner-authorized Astra-medium terminal repair
+→ GPT-6.1 Sol medium fixer with bounded write access
+→ another Sol medium independent read-only recheck, or explicitly selected Astra medium
+→ only a second REWORK may reach owner-authorized Sol-high or Astra-medium terminal repair
 ```
 
-Rework cannot expand the candidate, allowed paths, or verification commands. The Astra-medium terminal repair is a one-time exception and does not grant ordinary resident construction permission.
+Rework cannot expand the candidate, allowed paths, or verification commands. The owner-authorized Astra-medium terminal repair is a one-time exception and does not grant ordinary resident construction permission; the same bound applies to Sol high terminal repair.
 
 ## Identity and evidence
 
@@ -187,7 +180,7 @@ config/                         # Task, route, plan, result, runtime, cost, and 
 scripts/ai_workflow.py          # Main CLI, state machine, and Codex Team entry point
 scripts/ai_workflow_runtime.py  # Native/exec identity and runtime evidence
 scripts/ai_workflow_artifacts.py# Strict artifact validation and data classes
-scripts/ai_workflow_routing.py  # Terra OS closed-set routing; advice stays in a sidecar
+scripts/ai_workflow_routing.py  # 主施工角色 closed-set routing; advice stays in a sidecar
 scripts/ai_workflow_planning.py # Plan and construction envelopes
 scripts/ai_workflow_scheduler.py# Batch scheduling, receipts, and final ACCEPTANCE child
 scripts/ai_workflow_repairs.py  # Acceptance repair ledger v2
@@ -199,7 +192,7 @@ plugins/ai-workflow/             # Published Plugin; runtime/config mirror the r
 tests/                           # Fake runners, negative injection, and distribution tests
 ```
 
-The production scheduler sequence is `schedule-batch` → `schedule-result` → `schedule-receipt` → `schedule-final`. The controller derives the result path from the bound dispatch, validates `dispatch_id/task_id/step_id/attempt`, and rejects symlinks, hardlinks, directory replacement, and oversized output. After all receipts complete, `schedule-final` creates the concentrated acceptance child; providing a verified owner receipt and a GPT-6 Sol xhigh acceptor issues `REVIEW_1`.
+The production scheduler sequence is `schedule-batch` → `schedule-result` → `schedule-receipt` → `schedule-final`. The controller derives the result path from the bound dispatch, validates `dispatch_id/task_id/step_id/attempt`, and rejects symlinks, hardlinks, directory replacement, and oversized output. After all receipts complete, `schedule-final` creates the concentrated acceptance child; providing a verified owner receipt and a GPT-6.1 Sol high acceptor issues `REVIEW_1`.
 
 The router probe is deliberately separate from production routing. It is a shadow-only research tool for comparing Luna, Sol, and Terra on paired hot/cold prefixes. It does not write the task store or change `effective_route`; real cost claims remain unavailable until measured rates, complete paired cases, stable prefixes, and downstream counterfactual cost evidence exist. The documented resident entry suggestion is Luna max, not a measured cost winner.
 

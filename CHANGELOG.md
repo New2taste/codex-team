@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased — 2026-09-30 workflow optimization
+
+- 日常统筹、普通规划、主施工和优先返工使用 Sol 6.1 medium；集中终验使用独立 Sol 6.1 high，困难升级档统一为 high。
+- 首轮返工后默认由另一 Sol medium 复验；需要补充视角时由 Astra medium 复验。Astra low 退出生效角色配置。
+- 复验仍失败只允许一次 owner-authorized Sol high 或 Astra medium 终局修复；控制器须先通过冻结功能检查，既有交付门保持。
+- 默认最多两个子代理、一个写入者；批次与单步调度入口均检查容量。Luna 同类有界任务合并，失败携带证据回交。
+- 中英文首页、路由图、架构和编排说明同步；公开称呼改为主施工角色。成本效果通过后续真实任务观察，尚未宣称实测节省。
+
+## Unreleased — 2026-09-30
+
+默认 Sol 执行模型由 `gpt-6-sol` 切换为 `gpt-6.1-sol`，保留现有 reasoning effort、职责、权限和路由不变。Astra low 继续作为 Sol 返工后的独立、只读复验角色；Luna 与 Astra medium 的分工不变。
+
+### Changed
+
+- 更新活动角色配置、运行时收据契约、探针默认值及中英文说明；
+- 继续接受旧版 Sol 6.0 探针和身份记录，以便读取历史证据，不更改历史样例。
+
 ## Unreleased — 2026-09-23
 
 默认模型执行面升级：Terra OS 施工角色现绑定 `gpt-6-sol / medium`，原 Sol medium 规划监督与集中终验角色现绑定 `gpt-6-sol / xhigh`，原生 Luna 工具角色升级至 `gpt-6-luna / max`。职责、权限、Astra 角色和兼容用的角色 ID 保持不变；历史账本与研究样本继续保留其实际观测到的旧模型身份。

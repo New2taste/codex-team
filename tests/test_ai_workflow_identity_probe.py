@@ -49,7 +49,7 @@ def _build_kwargs(**overrides):
     payload = {
         "batch_id": "identity-batch-1",
         "arm": "NO_OP",
-        "model": "gpt-6-sol",
+        "model": "gpt-6.1-sol",
         "effort": "medium",
         "seed": 1,
         "max_calls": 3,
@@ -236,11 +236,11 @@ class IdentityProbeManifestContractTest(unittest.TestCase):
             ["NO_OP", "ONE_TURN", "TWO_TURN"],
             properties["arm"]["enum"],
         )
-        self.assertEqual({"gpt-6-luna", "gpt-6-sol", "gpt-6-astra"}, set(
+        self.assertEqual({"gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-astra"}, set(
             properties["requested_launch_intent"]["properties"]["model"]["enum"]
         ))
         self.assertEqual(
-            {"max", "medium", "xhigh"},
+            {"max", "medium", "high", "xhigh"},
             set(properties["requested_launch_intent"]["properties"]["effort"]["enum"]),
         )
         for field in probe.IDENTITY_PROBE_BUDGET_FIELDS:
@@ -267,7 +267,7 @@ class IdentityProbeManifestContractTest(unittest.TestCase):
         self.assertEqual(100, built["max_output_tokens"])
         self.assertEqual(40, built["max_output_tokens_per_call"])
         requested = built["requested_launch_intent"]
-        self.assertEqual("gpt-6-sol", requested["model"])
+        self.assertEqual("gpt-6.1-sol", requested["model"])
         self.assertEqual("medium", requested["effort"])
         observed = built["observed_runtime_identity"]
         self.assertIn(observed["identity_source"], probe.IDENTITY_FIELD_SOURCES)
@@ -282,7 +282,7 @@ class IdentityProbeManifestContractTest(unittest.TestCase):
         cases = (
             ("unknown arm", {"arm": "THREE_TURN"}),
             ("unknown model", {"model": "gpt-5.6-gpt"}),
-            ("unknown effort", {"effort": "high"}),
+            ("unknown effort", {"effort": "ultra"}),
         )
         for label, overrides in cases:
             with self.subTest(label=label):

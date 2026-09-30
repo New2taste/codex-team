@@ -311,8 +311,11 @@ class ContractFilesTest(unittest.TestCase):
         )
         self.assertEqual(
             (config["roles"]["terra"]["model"], config["roles"]["terra"]["reasoning_effort"]),
-            ("gpt-6-sol", "medium"),
+            ("gpt-6.1-sol", "medium"),
         )
+        for role_name in ("sol_planner", "sol_reviewer", "sol_medium_reviewer"):
+            with self.subTest(role=role_name):
+                self.assertEqual("gpt-6.1-sol", config["roles"][role_name]["model"])
         self.assertFalse(config["policy"]["automatic_xhigh"])
         self.assertFalse(config["policy"]["automatic_merge"])
         self.assertFalse(config["policy"]["automatic_push"])

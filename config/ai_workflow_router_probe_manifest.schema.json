@@ -89,11 +89,11 @@
           },
           "model": {
             "type": "string",
-            "enum": ["gpt-6-luna", "gpt-6-sol"]
+            "enum": ["gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol"]
           },
           "reasoning_effort": {
             "type": "string",
-            "enum": ["max", "medium", "xhigh"]
+            "enum": ["max", "medium", "high", "xhigh"]
           },
           "cache_condition": {
             "type": "string",

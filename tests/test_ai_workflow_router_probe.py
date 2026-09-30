@@ -42,7 +42,7 @@ class RouterProbeContractTest(unittest.TestCase):
             set(arm["properties"]["arm_id"]["enum"]),
         )
         self.assertEqual(
-            {"gpt-6-luna", "gpt-6-sol"},
+            {"gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol"},
             set(arm["properties"]["model"]["enum"]),
         )
         self.assertEqual(
@@ -90,11 +90,11 @@ class RouterProbeContractTest(unittest.TestCase):
                     "reasoning_effort": "max",
                 },
                 "sol": {
-                    "model": "gpt-6-sol",
-                    "reasoning_effort": "xhigh",
+                    "model": "gpt-6.1-sol",
+                    "reasoning_effort": "high",
                 },
                 "terra": {
-                    "model": "gpt-6-sol",
+                    "model": "gpt-6.1-sol",
                     "reasoning_effort": "medium",
                 },
             },
@@ -829,6 +829,7 @@ class RouterProbeCostLayersTest(unittest.TestCase):
             or [
                 self._valid_sku(),
                 self._valid_sku(sku="gpt-6-sol", model="gpt-6-sol"),
+                self._valid_sku(sku="gpt-6.1-sol", model="gpt-6.1-sol"),
                 self._valid_sku(sku="gpt-5.6-luna", model="gpt-5.6-luna"),
                 self._valid_sku(sku="gpt-5.6-sol", model="gpt-5.6-sol"),
                 self._valid_sku(sku="gpt-5.6-terra", model="gpt-5.6-terra"),

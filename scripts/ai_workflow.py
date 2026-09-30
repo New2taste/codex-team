@@ -108,7 +108,7 @@ READ_ONLY_ROLES = frozenset(
         "sol_xhigh",
         "sol_medium_supervisor",
         "sol_medium_reviewer",
-        "astra_low_reviewer",
+        "astra_medium_reviewer",
         "sol_xhigh_planner",
         "terra_xhigh_planner",
         "terra_xhigh_reviewer",
@@ -3153,7 +3153,7 @@ def _normalize_metric_run(
         "adopted_luna_finding_ids": adopted_ids,
         "luna_self_check": role == "luna"
         and (activity == "self_check" or workflow_state == "PRECHECK_RUNNING"),
-        "sol_verification": role in {"sol_reviewer", "sol_xhigh", "astra_low_reviewer"},
+        "sol_verification": role in {"sol_reviewer", "sol_xhigh", "astra_medium_reviewer"},
         "semantic_rework": run.get("semantic_rework") is True,
         "full_suite_run": run.get("full_suite_run") is True,
         "status": status if isinstance(status, str) else None,
@@ -3689,7 +3689,7 @@ FAKE_ROLE_RESULTS = {
     "sol_medium_supervisor": ("PLAN_READY", "AWAITING_OWNER_DECISION"),
     "sol_reviewer": ("ACCEPTANCE_RECOMMENDED", "AWAITING_OWNER_DECISION"),
     "sol_medium_reviewer": ("ACCEPTANCE_RECOMMENDED", "AWAITING_OWNER_DECISION"),
-    "astra_low_reviewer": ("ACCEPTANCE_RECOMMENDED", "AWAITING_OWNER_DECISION"),
+    "astra_medium_reviewer": ("ACCEPTANCE_RECOMMENDED", "AWAITING_OWNER_DECISION"),
     "sol_xhigh": ("OPTION_A", "ESCALATION_PROPOSED"),
     "sol_xhigh_planner": ("OPTION_A", "ESCALATION_PROPOSED"),
 }
@@ -5408,7 +5408,7 @@ def _role_state_after_result(
             target = "NEEDS_REPLAN"
     elif role in {"sol_planner", "sol_medium_supervisor", "terra_xhigh_planner"}:
         target = "PLAN_READY"
-    elif role in {"sol_reviewer", "sol_medium_reviewer", "astra_low_reviewer", "terra_xhigh_reviewer"}:
+    elif role in {"sol_reviewer", "sol_medium_reviewer", "astra_medium_reviewer", "terra_xhigh_reviewer"}:
         target = "ESCALATION_PROPOSED" if status == "ESCALATION_PROPOSED" else "REVIEW_READY"
     elif role in {"sol_xhigh", "sol_xhigh_planner"}:
         target = "ESCALATION_PROPOSED"

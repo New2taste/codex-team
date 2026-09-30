@@ -24,9 +24,11 @@ _FROZEN_FINAL_ACCEPTANCE_REWORK = {
     "fixer_role": "sol_medium_reviewer",
     "fixer_permission_profile": "assignment-scoped-write",
     "fixer_distinct_from_acceptor": True,
-    "recheck_role": "astra_low_reviewer",
+    "recheck_role": "sol_medium_reviewer",
+    "optional_recheck_roles": ["astra_medium_reviewer"],
     "recheck_distinct_from_fixer": True,
-    "terminal_escalation_role": "sol_xhigh",
+    "terminal_escalation_role": "sol_reviewer",
+    "optional_terminal_roles": ["sol_xhigh"],
     "terminal_review_required": False,
 }
 
@@ -64,7 +66,7 @@ class WholeProjectFinalAcceptanceTest(unittest.TestCase):
                 "luna_construction",
                 "sol_reviewer",
                 "sol_medium_reviewer",
-                "astra_low_reviewer",
+                "astra_medium_reviewer",
                 "sol_xhigh",
             ),
             active_roles=("terra", "luna_construction"),
@@ -149,7 +151,7 @@ class WholeProjectFinalAcceptanceTest(unittest.TestCase):
     def _record_fresh_verdict(self, *, verdict: str = "ACCEPT") -> object:
         return self.fx._record_fresh_verdict(
             verdict=verdict,
-            issuer_role="astra_low_reviewer",
+            issuer_role="astra_medium_reviewer",
         )
 
     def tearDown(self) -> None:
@@ -168,7 +170,7 @@ class WholeProjectFinalAcceptanceTest(unittest.TestCase):
     def _open_sol_review_one(self):
         owner_actor, owner_receipt = self._open_construction_owner()
         acceptor_actor, first, acceptor_receipt = self.fx._issue_with_receipt(
-            "REVIEW_1", "sol-acceptor", "sol_medium_reviewer"
+            "REVIEW_1", "sol-acceptor", "sol_reviewer"
         )
         return owner_actor, owner_receipt, acceptor_actor, first, acceptor_receipt
 
@@ -199,14 +201,14 @@ class WholeProjectFinalAcceptanceTest(unittest.TestCase):
         owner_candidate = self.fx._commit_file("src/alpha.py", "SOL_FIXER_ALPHA = 1\n")
         self.fx._complete(repair, fixer_receipt, owner_candidate, ("src/alpha.py",))
         recheck_actor, peer, recheck_receipt = self.fx._issue_with_receipt(
-            "SOL_MEDIUM_PEER_REVIEW", "astra-recheck", "astra_low_reviewer"
+            "SOL_MEDIUM_PEER_REVIEW", "astra-recheck", "astra_medium_reviewer"
         )
         self.fx._review(peer, recheck_receipt, "REWORK", self.fx.findings)
         return owner_actor, acceptor_actor, fixer_actor, recheck_actor
 
     def test_review_one_uses_sol_medium_acceptor(self):
         _, _, acceptor_actor, first, _ = self._open_sol_review_one()
-        self.assertEqual("sol_medium_reviewer", first.expected_actor.role)
+        self.assertEqual("sol_reviewer", first.expected_actor.role)
         self.assertEqual(acceptor_actor, first.expected_actor)
         self.assertEqual("REVIEW_1", first.phase)
 
@@ -218,6 +220,36 @@ class WholeProjectFinalAcceptanceTest(unittest.TestCase):
                 self.fx._expected_actor("terra-review-one", "terra_xhigh_reviewer"),
             )
         self.assertEqual("ACCEPTANCE_SEQUENCE_INVALID", raised.exception.code)
+
+    def test_default_medium_peer_rechecks_independently(self):
+        _, _, _, fixer, repair, receipt = self._advance_to_fixer()
+        candidate = self.fx._commit_file("src/alpha.py", "SOL_MEDIUM_FIX = 1\n")
+        self.fx._complete(repair, receipt, candidate, ("src/alpha.py",))
+        actor, peer, observed = self.fx._issue_with_receipt(
+            "SOL_MEDIUM_PEER_REVIEW", "sol-default-peer", "sol_medium_reviewer"
+        )
+        self.assertNotEqual(fixer.identity, actor.identity)
+        self.assertEqual("medium", observed.observed_reasoning_effort)
+        self.fx._record_fresh_verdict()
+        self.fx._review(peer, observed, "ACCEPT")
+        self.assertTrue(repairs.replay_acceptance_ledger(self.fx.store, self.fx.TASK_ID).terminal)
+
+    def test_sol_high_terminal_requires_existing_owner_ticket(self):
+        self._advance_to_peer_rework()
+        actor = self.fx._expected_actor("sol-high-terminal", "sol_reviewer")
+        with self.assertRaises(workflow.WorkflowError):
+            self.fx._issue("SOL_XHIGH_TERMINAL_REPAIR", actor)
+        self._record_fresh_verdict()
+        repairs.authorize_final_xhigh(self.fx.store, self.fx.TASK_ID, "owner")
+        _, assignment, receipt = self.fx._issue_with_receipt(
+            "SOL_XHIGH_TERMINAL_REPAIR", "sol-high-terminal", "sol_reviewer"
+        )
+        self.assertEqual("high", receipt.observed_reasoning_effort)
+        candidate = self.fx._commit_file("src/alpha.py", "SOL_HIGH_TERMINAL = 1\n")
+        self._record_fresh_verdict()
+        self.fx._complete(assignment, receipt, candidate, ("src/alpha.py",))
+        with self.assertRaises(workflow.WorkflowError):
+            self.fx._issue("SOL_XHIGH_TERMINAL_REPAIR", actor)
 
     def test_review_one_rework_skips_owner_repair_and_review_two(self):
         owner_actor, _, _, first, acceptor_receipt = self._open_sol_review_one()
@@ -267,13 +299,13 @@ class WholeProjectFinalAcceptanceTest(unittest.TestCase):
         with self.assertRaises(workflow.WorkflowError):
             self.fx._issue(
                 "SOL_MEDIUM_PEER_REVIEW",
-                self.fx._expected_actor("sol-recheck", "sol_medium_reviewer"),
+                self.fx._expected_actor("wrong-recheck", "terra_xhigh_reviewer"),
             )
         _, peer, _ = self.fx._issue_with_receipt(
-            "SOL_MEDIUM_PEER_REVIEW", "astra-recheck", "astra_low_reviewer"
+            "SOL_MEDIUM_PEER_REVIEW", "astra-recheck", "astra_medium_reviewer"
         )
         self.assertEqual("SOL_MEDIUM_PEER_REVIEW", peer.phase)
-        self.assertEqual("astra_low_reviewer", peer.expected_actor.role)
+        self.assertEqual("astra_medium_reviewer", peer.expected_actor.role)
 
     def test_peer_rework_without_owner_xhigh_authorization_leaves_ledger_bytes(self):
         self._advance_to_peer_rework()
@@ -686,7 +718,7 @@ class WholeProjectFinalAcceptanceTest(unittest.TestCase):
         candidate = self.fx._commit_file("src/alpha.py", "SOL_FIXER_ALPHA = 1\n")
         self.fx._complete(repair, fixer_receipt, candidate, ("src/alpha.py",))
         _, peer, recheck_receipt = self.fx._issue_with_receipt(
-            "SOL_MEDIUM_PEER_REVIEW", "astra-recheck", "astra_low_reviewer"
+            "SOL_MEDIUM_PEER_REVIEW", "astra-recheck", "astra_medium_reviewer"
         )
         with self.assertRaisesRegex(workflow.WorkflowError, "VERDICT_MISSING"):
             self.fx._review(peer, recheck_receipt, "ACCEPT")

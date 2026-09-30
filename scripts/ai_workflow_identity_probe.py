@@ -41,8 +41,10 @@ _PAIRED_DELTAS = (
     ("ONE_TURN_MINUS_NO_OP", "ONE_TURN", "NO_OP"),
     ("TWO_TURN_MINUS_ONE_TURN", "TWO_TURN", "ONE_TURN"),
 )
-IDENTITY_PROBE_MODELS = frozenset({"gpt-6-luna", "gpt-6-sol", "gpt-6-astra"})
-IDENTITY_PROBE_EFFORTS = frozenset({"max", "medium", "xhigh"})
+IDENTITY_PROBE_MODELS = frozenset(
+    {"gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-astra"}
+)
+IDENTITY_PROBE_EFFORTS = frozenset({"max", "medium", "high", "xhigh"})
 AUTHORITY_UNAVAILABLE = "AUTHORITY_UNAVAILABLE"
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _TOP_FIELDS = frozenset(

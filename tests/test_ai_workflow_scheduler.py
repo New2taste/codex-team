@@ -312,7 +312,37 @@ class SchedulerContractTest(SchedulerHarness):
         self.assertIn("ai_workflow_scheduler.py", sync_plugin.RUNTIME_FILES)
 
 
+class BalancedSchedulerCapacityTest(SchedulerHarness):
+    def test_failed_luna_step_cannot_be_automatically_or_manually_redispatched(self):
+        proposals = scheduler.dispatch_ready_batch(self.store, self.frozen)
+        scheduler.record_step_receipt(self.store, self.frozen, self.receipt(proposals[0], status="BLOCKED"))
+        for dispatch in (
+            lambda: scheduler.dispatch_ready_batch(self.store, self.frozen),
+            lambda: scheduler.dispatch_step(self.store, self.frozen, "read-a", attempt=2),
+        ):
+            with self.assertRaisesRegex(workflow.WorkflowError, "LUNA_HANDOFF_REQUIRED"):
+                dispatch()
+
+    def test_default_batch_and_single_dispatch_share_two_agent_limit(self):
+        proposals = scheduler.dispatch_ready_batch(self.store, self.frozen)
+        self.assertEqual(("read-a", "read-b"), tuple(p["subtask_id"] for p in proposals))
+        with self.assertRaisesRegex(workflow.WorkflowError, "CAPACITY_UNAVAILABLE"):
+            scheduler.dispatch_step(self.store, self.frozen, "write-c")
+        scheduler.record_step_receipt(self.store, self.frozen, self.receipt(proposals[0]))
+        writer = scheduler.dispatch_step(self.store, self.frozen, "write-c")
+        self.assertEqual("write-c", writer["subtask_id"])
+
+
 class SchedulerDispatchTest(SchedulerHarness):
+    def setUp(self):
+        super().setUp()
+        # Exercise the original three-slot ledger cases with an explicit override.
+        config = workflow._load_workflow_config()
+        config["automation"]["max_active_subagents"] = 3
+        patcher = mock.patch.object(scheduler, "_load_config", return_value=config)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_receipt_requires_controller_locatable_regular_result_with_exact_hash_and_identity(self):
         proposals = scheduler.dispatch_ready_batch(self.store, self.frozen)
         proposal = next(item for item in proposals if item["subtask_id"] == "write-c")
@@ -1383,7 +1413,7 @@ class FinalAcceptanceCaseTest(unittest.TestCase):
         runtime = str(uuid.uuid5(uuid.NAMESPACE_URL, "codex:sol-acceptor"))
         return repairs.ActorIdentity(
             identity=f"CODEX_EXEC_ROLE_CONTRACT:{runtime}",
-            role="sol_medium_reviewer",
+            role="sol_reviewer",
         )
 
     def test_incomplete_receipts_do_not_create_child_or_final_event(self):
@@ -1540,7 +1570,7 @@ class FinalAcceptanceCaseTest(unittest.TestCase):
             run.assert_not_called()
             workflow_run.assert_not_called()
         self.assertEqual("REVIEW_1", assignment.phase)
-        self.assertEqual("sol_medium_reviewer", assignment.expected_actor.role)
+        self.assertEqual("sol_reviewer", assignment.expected_actor.role)
         self.assertEqual(acceptor, assignment.expected_actor)
         replay = repairs.replay_acceptance_ledger(self.store, child["task_id"])
         issued = [

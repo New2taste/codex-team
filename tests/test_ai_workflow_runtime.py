@@ -130,8 +130,8 @@ class RuntimeIdentityTest(unittest.TestCase):
     def test_native_contract_is_controller_owned_and_rejects_self_consistent_wrong_model(self):
         with self.assertRaisesRegex(workflow.WorkflowError, "RUNTIME_IDENTITY_CONFLICT"):
             workflow.verify_runtime_identity(
-                runtime_expected(model="gpt-6-sol", reasoning_effort="high"),
-                runtime_observation(model="gpt-6-sol", reasoning_effort="high"),
+                runtime_expected(model="gpt-6.1-sol", reasoning_effort="high"),
+                runtime_observation(model="gpt-6.1-sol", reasoning_effort="high"),
             )
 
     def test_native_contract_rejects_non_luna_role_even_when_request_and_observation_agree(self):
@@ -183,7 +183,7 @@ class RuntimeIdentityTest(unittest.TestCase):
             "sol_medium_supervisor",
             "terra_xhigh",
             "sol_medium_reviewer",
-            "astra_low_reviewer",
+            "astra_medium_reviewer",
             "sol_xhigh",
             "sol_xhigh_planner",
         ):
@@ -247,7 +247,7 @@ class RuntimeIdentityTest(unittest.TestCase):
 
     def test_model_effort_and_cwd_are_exact_identity_matches(self):
         for field, value in (
-            ("model", "gpt-6-sol"),
+            ("model", "gpt-6.1-sol"),
             ("reasoning_effort", "xhigh"),
             ("cwd", "/different/worktree"),
         ):
@@ -307,11 +307,11 @@ class RuntimeIdentityTest(unittest.TestCase):
         with self.assertRaisesRegex(workflow.WorkflowError, "RUNTIME_IDENTITY_CONFLICT"):
             workflow.merge_runtime_observations(
                 runtime_observation(model="gpt-6-luna"),
-                runtime_observation(model="gpt-6-sol"),
+                runtime_observation(model="gpt-6.1-sol"),
             )
 
     def test_conflicting_canonical_and_observed_aliases_fail_closed(self):
-        observed = runtime_observation(observed_model="gpt-6-sol")
+        observed = runtime_observation(observed_model="gpt-6.1-sol")
         with self.assertRaisesRegex(workflow.WorkflowError, "RUNTIME_IDENTITY_CONFLICT"):
             workflow.verify_runtime_identity(runtime_expected(), observed)
 
@@ -490,7 +490,7 @@ class RuntimeInspectorTest(unittest.TestCase):
             records.append(
                 {
                     "type": "turn_context",
-                    "payload": {"model": "gpt-6-sol"},
+                    "payload": {"model": "gpt-6.1-sol"},
                 }
             )
 
@@ -665,7 +665,7 @@ class RuntimeLiveIntegrationTest(unittest.TestCase):
             store.create_task(task)
             _install_declaration(store, task, allowed_roles=("luna",), active_roles=("luna",))
             sessions = Path(temporary) / "sessions"
-            write_exec_rollout(sessions, model="gpt-6-sol")
+            write_exec_rollout(sessions, model="gpt-6.1-sol")
             paths = self._run_paths(temporary, state_root, sessions)
             with (
                 mock.patch(

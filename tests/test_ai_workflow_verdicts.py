@@ -100,8 +100,8 @@ def _issuer_evidence(**overrides: object) -> dict[str, object]:
         "observed_agent_type": None,
         "native_agent_id": None,
         "native_thread_id": None,
-        "observed_model": "gpt-6-sol",
-        "observed_reasoning_effort": "xhigh",
+        "observed_model": "gpt-6.1-sol",
+        "observed_reasoning_effort": "medium",
         "observed_sandbox_policy": "read-only",
         "observed_permission_profile": "read-only",
         "observed_cwd": str(ROOT),
@@ -350,7 +350,7 @@ class IssuerAttestationTest(_VerdictStoreMixin, unittest.TestCase):
     def test_identity_tuple_mismatch_each_field(self) -> None:
         mutations = (
             {"observed_model": "gpt-6-luna"},
-            {"observed_reasoning_effort": "medium"},
+            {"observed_reasoning_effort": "high"},
             {"observed_sandbox_policy": "workspace-write"},
             {"observed_permission_profile": "workspace-write"},
         )
@@ -399,38 +399,38 @@ class IssuerAttestationTest(_VerdictStoreMixin, unittest.TestCase):
     def test_issuer_role_contracts_match_acceptance_mapping(self) -> None:
         source = inspect.getsource(repairs._v2_validate_observed_receipt)
         self.assertIn(
-            '"sol_medium_reviewer": ("gpt-6-sol", "xhigh", "read-only", "read-only")',
+            '"sol_medium_reviewer": ("gpt-6.1-sol", "medium", "read-only", "read-only")',
             source,
         )
         self.assertEqual(
-            ("gpt-6-sol", "xhigh", "read-only", "read-only"),
+            ("gpt-6.1-sol", "medium", "read-only", "read-only"),
             verdicts.ISSUER_ROLE_CONTRACTS["sol_medium_reviewer"],
         )
         self.assertIn(
-            '"astra_low_reviewer": ("gpt-6-astra", "low", "read-only", "read-only")',
+            '"astra_medium_reviewer": ("gpt-6-astra", "medium", "read-only", "read-only")',
             source,
         )
         self.assertEqual(
-            ("gpt-6-astra", "low", "read-only", "read-only"),
-            verdicts.ISSUER_ROLE_CONTRACTS["astra_low_reviewer"],
+            ("gpt-6-astra", "medium", "read-only", "read-only"),
+            verdicts.ISSUER_ROLE_CONTRACTS["astra_medium_reviewer"],
         )
         self.assertEqual(
-            frozenset({"sol_medium_reviewer", "astra_low_reviewer"}),
+            frozenset({"sol_reviewer", "sol_medium_reviewer", "astra_medium_reviewer"}),
             verdicts.FINAL_VERDICT_ISSUER_ROLES,
         )
 
     def test_astra_low_issuer_is_accepted(self) -> None:
         evidence = _issuer_evidence(
             attempt_id="astra-low-issuer",
-            requested_role="astra_low_reviewer",
+            requested_role="astra_medium_reviewer",
             observed_model="gpt-6-astra",
-            observed_reasoning_effort="low",
+            observed_reasoning_effort="medium",
         )
         issuer_id = self._seed_issuer(evidence)
         state = replace(self.state, runtime_evidence_ids=(issuer_id,))
         self._record(state=state, issuer_id=issuer_id)
         history = verdicts.load_verdict_history(self.store, TASK_ID)
-        self.assertEqual("astra_low_reviewer", history[-1].verdict_source_role)
+        self.assertEqual("astra_medium_reviewer", history[-1].verdict_source_role)
 
 
 class FreshnessTest(_VerdictStoreMixin, unittest.TestCase):

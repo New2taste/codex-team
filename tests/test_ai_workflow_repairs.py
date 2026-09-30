@@ -473,7 +473,7 @@ class RepairProtocolTest(unittest.TestCase):
             runtime_instance_id=reviewer_thread,
             attempt_id=assignment.attempt_id,
             requested_role="terra_xhigh_reviewer",
-            observed_model="gpt-6-sol",
+            observed_model="gpt-6.1-sol",
             observed_reasoning_effort="medium",
             observed_sandbox_policy="read-only",
             observed_permission_profile="read-only",
@@ -615,7 +615,7 @@ class AssignmentSideEffectObservationTest(unittest.TestCase):
             sessions,
             reviewer_thread,
             sandbox="read-only",
-            model="gpt-6-sol",
+            model="gpt-6.1-sol",
             effort="medium",
             permission="read-only",
         )
@@ -685,7 +685,7 @@ class AssignmentSideEffectObservationTest(unittest.TestCase):
             sessions,
             reviewer_thread,
             sandbox="read-only",
-            model="gpt-6-sol",
+            model="gpt-6.1-sol",
             effort="medium",
             permission="read-only",
         )
@@ -726,7 +726,7 @@ class AssignmentSideEffectObservationTest(unittest.TestCase):
             sessions,
             reviewer_thread,
             sandbox="read-only",
-            model="gpt-6-sol",
+            model="gpt-6.1-sol",
             effort="medium",
             permission="read-only",
         )
@@ -769,7 +769,7 @@ class AssignmentSideEffectObservationTest(unittest.TestCase):
             sessions,
             reviewer_thread,
             sandbox="read-only",
-            model="gpt-6-sol",
+            model="gpt-6.1-sol",
             effort="medium",
             permission="read-only",
         )
@@ -967,7 +967,7 @@ class AssignmentDispatchGateTest(unittest.TestCase):
                 {
                     "thread_id": thread_id,
                     "agent_type": None,
-                    "model": "gpt-6-sol",
+                    "model": "gpt-6.1-sol",
                     "reasoning_effort": "medium",
                     "sandbox_policy": "read-only",
                     "permission_profile": "read-only",

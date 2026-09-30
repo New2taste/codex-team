@@ -27,7 +27,7 @@
     },
     "verdict_source_role": {
       "type": "string",
-      "enum": ["sol_medium_reviewer", "astra_low_reviewer"]
+      "enum": ["sol_reviewer", "sol_medium_reviewer", "astra_medium_reviewer"]
     },
     "issuer_evidence_id": {
       "type": "string",

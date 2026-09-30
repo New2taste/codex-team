@@ -510,7 +510,7 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
         runtime = runtime_instance_id or source_id
         effective_attempt_id = attempt_id or f"{label}-attempt-{attempt_number}"
         if role in {"luna", "luna_construction", "terra_xhigh"}:
-            model = "gpt-6-luna" if role.startswith("luna") else "gpt-6-sol"
+            model = "gpt-6-luna" if role.startswith("luna") else "gpt-6.1-sol"
             effort = "max" if role.startswith("luna") else "medium"
             sandbox = "workspace-write"
             permission = "workspace-write"
@@ -521,17 +521,17 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
                 "workspace-write",
                 "assignment-scoped-write",
             )
-        elif role == "astra_low_reviewer":
+        elif role == "astra_medium_reviewer":
             model, effort, sandbox, permission = (
                 "gpt-6-astra",
-                "low",
+                "medium",
                 "read-only",
                 "read-only",
             )
         else:
             model, effort, sandbox, permission = (
-                "gpt-6-sol",
-                "medium" if role.startswith("terra") else "xhigh",
+                "gpt-6.1-sol",
+                "high" if role == "sol_reviewer" else "medium",
                 "read-only",
                 "read-only",
             )
@@ -641,7 +641,7 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
                 "terra_xhigh",
                 "terra_xhigh_reviewer",
                 "sol_medium_reviewer",
-                "astra_low_reviewer",
+                "astra_medium_reviewer",
                 "sol_xhigh",
                 "luna_construction",
                 "sol_reviewer",
@@ -651,7 +651,7 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
                 "luna",
                 "terra_xhigh_reviewer",
                 "sol_medium_reviewer",
-                "astra_low_reviewer",
+                "astra_medium_reviewer",
                 "sol_xhigh",
             ),
             "max_dispatches": 64,
@@ -829,6 +829,7 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
                     "observed_permission_profile": "assignment-scoped-write",
                 }
                 if phase == "SOL_MEDIUM_REPAIR"
+                or (phase == "SOL_XHIGH_TERMINAL_REPAIR" and role == "sol_reviewer")
                 else receipt_kwargs
             ),
         )
@@ -847,9 +848,9 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
 
     def _seed_verdict_issuer(self, *, role: str = "sol_medium_reviewer") -> str:
         model, effort = (
-            ("gpt-6-astra", "low")
-            if role == "astra_low_reviewer"
-            else ("gpt-6-sol", "xhigh")
+            ("gpt-6-astra", "medium")
+            if role == "astra_medium_reviewer"
+            else ("gpt-6.1-sol", "high" if role == "sol_reviewer" else "medium")
         )
         evidence = {
             "schema_version": "runtime-evidence-1",
@@ -1728,7 +1729,7 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
                 {
                     "thread_id": reviewer_thread,
                     "agent_type": None,
-                    "model": "gpt-6-sol",
+                    "model": "gpt-6.1-sol",
                     "reasoning_effort": "medium",
                     "sandbox_policy": "read-only",
                     "permission_profile": "read-only",
@@ -1921,8 +1922,8 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
         self._write_controller_runtime(
             sessions,
             fixer_thread,
-            model="gpt-6-sol",
-            reasoning_effort="xhigh",
+            model="gpt-6.1-sol",
+            reasoning_effort="medium",
             sandbox_policy="workspace-write",
             permission_profile="assignment-scoped-write",
         )
@@ -1931,8 +1932,8 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
         self._write_controller_runtime(
             peer_sessions,
             peer_thread,
-            model="gpt-6-sol",
-            reasoning_effort="xhigh",
+            model="gpt-6.1-sol",
+            reasoning_effort="medium",
             sandbox_policy="read-only",
             permission_profile="read-only",
         )
@@ -2049,10 +2050,10 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
         }
         fixer_receipt = started[fixer.assignment_id]
         peer_receipt = started[peer.assignment_id]
-        self.assertEqual("gpt-6-sol", fixer_receipt["observed_model"])
-        self.assertEqual("xhigh", fixer_receipt["observed_reasoning_effort"])
-        self.assertEqual("gpt-6-sol", peer_receipt["observed_model"])
-        self.assertEqual("xhigh", peer_receipt["observed_reasoning_effort"])
+        self.assertEqual("gpt-6.1-sol", fixer_receipt["observed_model"])
+        self.assertEqual("medium", fixer_receipt["observed_reasoning_effort"])
+        self.assertEqual("gpt-6.1-sol", peer_receipt["observed_model"])
+        self.assertEqual("medium", peer_receipt["observed_reasoning_effort"])
         self.assertNotEqual(
             (
                 fixer_receipt["execution_surface"],
@@ -2071,10 +2072,10 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
         self._write_controller_runtime(
             sessions,
             fixer_thread,
-            model="gpt-6-sol",
+            model="gpt-6.1-sol",
             reasoning_effort="medium",
             sandbox_policy="workspace-write",
-            permission_profile="assignment-scoped-write",
+            permission_profile="workspace-write",
         )
         real_run = subprocess.run
         launches: list[list[str]] = []

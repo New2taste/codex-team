@@ -435,11 +435,11 @@ class DistributionContractTest(unittest.TestCase):
             "frozen envelope",
             "mechanical",
             "distribution",
-            "terra os",
-            "complex construction",
+            "primary implementer",
+            "complex implementation",
             "independent",
-            "adversarial review",
-            "gpt-6 sol xhigh",
+            "adversarial final acceptance",
+            "gpt-6.1 sol high",
             "final",
             "acceptance",
             "astra medium",
@@ -463,9 +463,9 @@ class DistributionContractTest(unittest.TestCase):
         for lifecycle_phrase in (
             "section_self_check_only",
             "intermediate engineering sections",
-            "different gpt-6 sol xhigh fixer",
-            "astra low",
-            "owner-authorized astra-medium terminal repair",
+            "different gpt-6.1 sol medium fixer",
+            "astra medium",
+            "terminal repair",
             "dual-key",
             "compact_prompts",
             "armed field projection",
@@ -474,8 +474,8 @@ class DistributionContractTest(unittest.TestCase):
             self.assertIn(lifecycle_phrase, published, lifecycle_phrase)
         self.assertRegex(
             published,
-            r"gpt-6 sol xhigh\s+final\s+acceptance",
-            "GPT-6 Sol xhigh final acceptance",
+            r"gpt-6\.1 sol high\s+final\s+acceptance",
+            "GPT-6.1 Sol high final acceptance",
         )
         self.assertRegex(
             published,
@@ -494,9 +494,11 @@ class DistributionContractTest(unittest.TestCase):
                     "fixer_role": "sol_medium_reviewer",
                     "fixer_permission_profile": "assignment-scoped-write",
                     "fixer_distinct_from_acceptor": True,
-                    "recheck_role": "astra_low_reviewer",
+                    "recheck_role": "sol_medium_reviewer",
+                    "optional_recheck_roles": ["astra_medium_reviewer"],
                     "recheck_distinct_from_fixer": True,
-                    "terminal_escalation_role": "sol_xhigh",
+                    "terminal_escalation_role": "sol_reviewer",
+                    "optional_terminal_roles": ["sol_xhigh"],
                     "terminal_review_required": False,
                 },
                 config["final_acceptance_rework"],
@@ -505,8 +507,8 @@ class DistributionContractTest(unittest.TestCase):
             for name, role in config["roles"].items():
                 if (
                     name.startswith("sol")
-                    and role["model"] == "gpt-6-sol"
-                    and role["reasoning_effort"] in {"medium", "xhigh"}
+                    and role["model"] == "gpt-6.1-sol"
+                    and role["reasoning_effort"] in {"medium", "high"}
                 ):
                     with self.subTest(role=name):
                         self.assertIn("Do not over-design", role["instructions"])
@@ -532,7 +534,7 @@ class DistributionContractTest(unittest.TestCase):
             self.assertIn("luna_construction", role_names)
             self.assertIn("terra_xhigh_reviewer", role_names)
             self.assertIn("sol_medium_reviewer", role_names)
-            self.assertIn("astra_low_reviewer", role_names)
+            self.assertIn("astra_medium_reviewer", role_names)
             self.assertIn("sol_xhigh_planner", role_names)
 
     def test_published_default_defers_adversarial_review_until_final_acceptance(self):
@@ -546,12 +548,12 @@ class DistributionContractTest(unittest.TestCase):
         for phrase in (
             "intermediate engineering sections",
             "section_self_check_only",
-            "different gpt-6 sol xhigh fixer",
-            "astra low",
-            "owner-authorized astra-medium terminal repair",
+            "different gpt-6.1 sol medium fixer",
+            "astra medium",
+            "terminal repair",
         ):
             self.assertIn(phrase, published, phrase)
-        self.assertRegex(published, r"gpt-6 sol xhigh\s+final\s+acceptance")
+        self.assertRegex(published, r"gpt-6\.1 sol high\s+final\s+acceptance")
         self.assertNotIn("every task needs an independent terra xhigh adversarial review", published)
         self.assertNotIn("第二次 terra xhigh 失败后的冻结梯级", published)
 

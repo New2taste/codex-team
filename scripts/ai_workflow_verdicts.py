@@ -57,10 +57,11 @@ FINAL_VERDICT_FIELDS = frozenset(
     }
 )
 VERDICT_VALUES = frozenset({"ACCEPT", "REJECT"})
-FINAL_VERDICT_ISSUER_ROLES = frozenset({"sol_medium_reviewer", "astra_low_reviewer"})
+FINAL_VERDICT_ISSUER_ROLES = frozenset({"sol_reviewer", "sol_medium_reviewer", "astra_medium_reviewer"})
 ISSUER_ROLE_CONTRACTS: Mapping[str, tuple[str, str, str, str]] = {
-    "sol_medium_reviewer": ("gpt-6-sol", "xhigh", "read-only", "read-only"),
-    "astra_low_reviewer": ("gpt-6-astra", "low", "read-only", "read-only"),
+    "sol_reviewer": ("gpt-6.1-sol", "high", "read-only", "read-only"),
+    "sol_medium_reviewer": ("gpt-6.1-sol", "medium", "read-only", "read-only"),
+    "astra_medium_reviewer": ("gpt-6-astra", "medium", "read-only", "read-only"),
 }
 FRESHNESS_VALUES = frozenset({"FRESH", "STALE", "MISSING"})
 RELEASE_COMPLETION_PHASES = frozenset({"SOL_XHIGH_TERMINAL_REPAIR"})

@@ -1,4 +1,4 @@
-"""Immutable, append-only repair assignments for the Terra OS workflow.
+"""Immutable, append-only repair assignments for the primary implementer workflow.
 
 This module deliberately owns only the repair ledger.  It does not widen any
 role's normal repository permissions or alter the versioned workflow wires.
@@ -81,7 +81,7 @@ _SHA_PATTERN = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 _ASSIGNMENT_ID_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _TERRA_XHIGH = "terra_xhigh"
 _SOL_MEDIUM_REVIEWER = "sol_medium_reviewer"
-_ASTRA_LOW_REVIEWER = "astra_low_reviewer"
+_ASTRA_MEDIUM_REVIEWER = "astra_medium_reviewer"
 _REPAIR_EVENT_TYPES = frozenset(
     {
         "REPAIR_ASSIGNED",
@@ -160,9 +160,11 @@ _FROZEN_FINAL_ACCEPTANCE_REWORK = {
     "fixer_role": "sol_medium_reviewer",
     "fixer_permission_profile": "assignment-scoped-write",
     "fixer_distinct_from_acceptor": True,
-    "recheck_role": "astra_low_reviewer",
+    "recheck_role": "sol_medium_reviewer",
+    "optional_recheck_roles": ["astra_medium_reviewer"],
     "recheck_distinct_from_fixer": True,
-    "terminal_escalation_role": "sol_xhigh",
+    "terminal_escalation_role": "sol_reviewer",
+    "optional_terminal_roles": ["sol_xhigh"],
     "terminal_review_required": False,
 }
 REPAIR_PROMPT_COMPACT_POLICY = "full_only"
@@ -327,7 +329,7 @@ def _assignment_fields(
     if not isinstance(repair_round, int) or isinstance(repair_round, bool) or repair_round < 1:
         _fail("REPAIR_INPUT_INVALID", "repair_round must be a positive integer")
     if repair_round > 3:
-        _fail("REPAIR_BUDGET_EXHAUSTED", "the Terra OS repair budget is exhausted")
+        _fail("REPAIR_BUDGET_EXHAUSTED", "the primary implementer repair budget is exhausted")
     fixer = _require_actor(fixer_identity, "fixer_identity")
     reviewer = _require_medium_reviewer(reviewer_identity, "reviewer_identity")
     peer = None if peer_reviewer_identity is None else _require_medium_reviewer(
@@ -338,12 +340,12 @@ def _assignment_fields(
         _fail("REPAIR_REVIEWER_CONFLICT", "a fixer must not review its own repair")
     if repair_round in {1, 2}:
         if fixer != ActorIdentity(_TERRA_XHIGH, _TERRA_XHIGH) or peer is not None:
-            _fail("REPAIR_ACTOR_MISMATCH", "rounds 1 and 2 require fixed Terra OS and no peer")
+            _fail("REPAIR_ACTOR_MISMATCH", "rounds 1 and 2 require fixed primary implementer and no peer")
     else:
         if fixer.role != _SOL_MEDIUM_REVIEWER or peer is None or reviewer != peer:
             _fail(
                 "REPAIR_REVIEWER_CONFLICT",
-                "round 3 requires the original GPT-6 Sol xhigh fixer and one distinct peer",
+                "round 3 requires the original GPT-6.1 Sol high fixer and one distinct peer",
             )
         if peer.identity == fixer.identity:
             _fail("REPAIR_REVIEWER_CONFLICT", "round 3 peer must differ from the fixer")
@@ -402,7 +404,7 @@ def assign_repair(
     elif not isinstance(round_number, int) or isinstance(round_number, bool) or round_number < 1:
         _fail("REPAIR_INPUT_INVALID", "round_number must be a positive integer")
     else:
-        _fail("REPAIR_BUDGET_EXHAUSTED", "the Terra OS repair budget is exhausted")
+        _fail("REPAIR_BUDGET_EXHAUSTED", "the primary implementer repair budget is exhausted")
     assignment_id = _assignment_id(round_number, fixer, reviewer, peer, findings)
     return RepairAssignment(assignment_id, round_number, fixer, reviewer, peer, findings)
 
@@ -1409,10 +1411,11 @@ def _v2_validate_observed_receipt(
     expected = expected_runtime or {
         "luna": ("gpt-6-luna", "max", "workspace-write", "workspace-write"),
         "luna_construction": ("gpt-6-luna", "max", "workspace-write", "workspace-write"),
-        "terra_xhigh": ("gpt-6-sol", "medium", "workspace-write", "workspace-write"),
-        "terra_xhigh_reviewer": ("gpt-6-sol", "medium", "read-only", "read-only"),
-        "sol_medium_reviewer": ("gpt-6-sol", "xhigh", "read-only", "read-only"),
-        "astra_low_reviewer": ("gpt-6-astra", "low", "read-only", "read-only"),
+        "terra_xhigh": ("gpt-6.1-sol", "medium", "workspace-write", "workspace-write"),
+        "terra_xhigh_reviewer": ("gpt-6.1-sol", "medium", "read-only", "read-only"),
+        "sol_medium_reviewer": ("gpt-6.1-sol", "medium", "read-only", "read-only"),
+        "sol_reviewer": ("gpt-6.1-sol", "high", "read-only", "read-only"),
+        "astra_medium_reviewer": ("gpt-6-astra", "medium", "read-only", "read-only"),
         "sol_xhigh": ("gpt-6-astra", "medium", "workspace-write", "assignment-scoped-write"),
     }.get(receipt.requested_role)
     if expected is None or (
@@ -1539,11 +1542,13 @@ def _v2_validate_assignment_receipt(
     expected_runtime = None
     if assignment.phase == "SOL_MEDIUM_REPAIR":
         expected_runtime = (
-            "gpt-6-sol",
-            "xhigh",
+            "gpt-6.1-sol",
+            "medium",
             "workspace-write",
             "assignment-scoped-write",
         )
+    elif assignment.phase == "SOL_XHIGH_TERMINAL_REPAIR" and assignment.expected_actor.role == "sol_reviewer":
+        expected_runtime = ("gpt-6.1-sol", "high", "workspace-write", "assignment-scoped-write")
     _v2_validate_observed_receipt(receipt, task, expected_runtime)
     if receipt.actor_identity != assignment.expected_actor:
         _fail("ACCEPTANCE_RECEIPT_MISMATCH", "receipt identity does not match the issued actor")
@@ -1934,7 +1939,7 @@ def open_task_acceptance(
         if _is_whole_project_final(stored, store=store):
             allowed_owners = {"luna", "terra_xhigh", "luna_construction"}
         if owner_receipt.requested_role not in allowed_owners:
-            _fail("ACCEPTANCE_RECEIPT_MISMATCH", "only Luna or Terra OS may own acceptance")
+            _fail("ACCEPTANCE_RECEIPT_MISMATCH", "only Luna or primary implementer may own acceptance")
         if _is_whole_project_final(stored, store=store):
             ensure_ownership_registry_for_paths_locked(
                 store,
@@ -2205,7 +2210,7 @@ def _v2_next_phase(replay: _AcceptanceReplay) -> tuple[str, tuple[RepairFinding,
         if "SOL_MEDIUM_PEER_REVIEW" not in outcomes:
             return "SOL_MEDIUM_PEER_REVIEW", replay.pending_findings
         if outcomes["SOL_MEDIUM_PEER_REVIEW"] != "REWORK":
-            _fail("ACCEPTANCE_SEQUENCE_INVALID", "Astra low peer acceptance already terminally closed the task")
+            _fail("ACCEPTANCE_SEQUENCE_INVALID", "independent peer acceptance already terminally closed the task")
         if "SOL_XHIGH_TERMINAL_REPAIR" not in outcomes:
             return "SOL_XHIGH_TERMINAL_REPAIR", replay.pending_findings
         _fail("ACCEPTANCE_SEQUENCE_INVALID", "terminal Astra medium repair already closed the task")
@@ -2238,8 +2243,8 @@ def _v2_validate_whole_project_phase_actor(
             "whole-project final does not use OWNER_REPAIR, REVIEW_2, or terra_xhigh_reviewer",
         )
     if phase == "REVIEW_1":
-        if actor.role != _SOL_MEDIUM_REVIEWER:
-            _fail("ACCEPTANCE_SEQUENCE_INVALID", "whole-project REVIEW_1 requires GPT-6 Sol xhigh acceptor")
+        if actor.role != "sol_reviewer" or actor.identity == replay.owner_actor.identity:
+            _fail("ACCEPTANCE_SEQUENCE_INVALID", "whole-project REVIEW_1 requires an independent GPT-6.1 Sol high acceptor")
         return
     if phase == "SOL_MEDIUM_REPAIR":
         if actor.role != policy["fixer_role"] or actor.identity in replay.reviewer_identities:
@@ -2248,17 +2253,18 @@ def _v2_validate_whole_project_phase_actor(
     if phase == "SOL_MEDIUM_PEER_REVIEW":
         fixer = replay.repairer_identities.get("SOL_MEDIUM_REPAIR")
         if (
-            actor.role != _ASTRA_LOW_REVIEWER
-            or actor.role != policy["recheck_role"]
+            actor.role not in {policy["recheck_role"], *policy["optional_recheck_roles"]}
             or actor.identity == fixer
             or actor.identity in replay.reviewer_identities
         ):
             _fail(
                 "ACCEPTANCE_SEQUENCE_INVALID",
-                "Astra low peer must be distinct from acceptor and fixer",
+                "peer reviewer must be Sol medium or Astra medium, distinct from acceptor and fixer",
             )
         return
-    if phase == "SOL_XHIGH_TERMINAL_REPAIR" and actor.role == policy["terminal_escalation_role"]:
+    if phase == "SOL_XHIGH_TERMINAL_REPAIR" and actor.role in {
+        policy["terminal_escalation_role"], *policy["optional_terminal_roles"]
+    }:
         return
     _fail("ACCEPTANCE_SEQUENCE_INVALID", "assignment role is not allowed for this ladder phase")
 
@@ -2277,7 +2283,7 @@ def _v2_validate_phase_actor(
         return
     if phase in {"REVIEW_1", "REVIEW_2"}:
         if actor.role != "terra_xhigh_reviewer":
-            _fail("ACCEPTANCE_SEQUENCE_INVALID", "Terra reviews require the Terra OS reviewer role")
+            _fail("ACCEPTANCE_SEQUENCE_INVALID", "Terra reviews require the primary implementer reviewer role")
         forbidden = set(replay.reviewer_identities) | {replay.owner_actor.identity}
         owner_repair = replay.repairer_identities.get("OWNER_REPAIR")
         if owner_repair is not None:
@@ -2720,16 +2726,20 @@ def _v2_controller_runtime_receipt(
         _fail("REPAIR_ADAPTER_REQUIRED", "controller runtime sessions directory is invalid")
     role_runtime = {
         "luna": ("gpt-6-luna", "max", "workspace-write"),
-        "terra_xhigh": ("gpt-6-sol", "medium", "workspace-write"),
-        "terra_xhigh_reviewer": ("gpt-6-sol", "medium", "read-only"),
+        "terra_xhigh": ("gpt-6.1-sol", "medium", "workspace-write"),
+        "terra_xhigh_reviewer": ("gpt-6.1-sol", "medium", "read-only"),
         "sol_medium_reviewer": (
-            "gpt-6-sol",
-            "xhigh",
+            "gpt-6.1-sol",
+            "medium",
             "assignment-scoped-write"
             if assignment.phase == "SOL_MEDIUM_REPAIR"
             else "read-only",
         ),
-        "astra_low_reviewer": ("gpt-6-astra", "low", "read-only"),
+        "sol_reviewer": (
+            "gpt-6.1-sol", "high",
+            "assignment-scoped-write" if assignment.phase == "SOL_XHIGH_TERMINAL_REPAIR" else "read-only",
+        ),
+        "astra_medium_reviewer": ("gpt-6-astra", "medium", "read-only"),
         "sol_xhigh": ("gpt-6-astra", "medium", "assignment-scoped-write"),
     }.get(assignment.expected_actor.role)
     if role_runtime is None:
@@ -2827,7 +2837,7 @@ def _v2_assignment_prompt(
     """Always emit the full assignment prompt; compact projection is not used here."""
 
     action = (
-        "Review the pinned candidate and return an acceptance or rework recommendation."
+        "Adversarially review the pinned candidate against the frozen objective, actual diff, edge cases, failure paths and evidence. Return all actionable contract violations together, with impact and a reproducible check. Do not request preference-only changes or expand scope."
         if assignment.phase in _REVIEW_PHASES
         else "Repair only the issued findings, commit one non-merge candidate, and report its files."
     )
@@ -3254,6 +3264,8 @@ def run_assignment(
             expected_task_id=stored_task["task_id"],
         )
         if assignment.phase in _REPAIR_PHASES:
+            if assignment.phase == "SOL_XHIGH_TERMINAL_REPAIR":
+                execute_adversarial_evidence(store, task_id, after.head)
             with store.lock(task_id):
                 completion_replay = replay_acceptance_ledger(store, task_id)
                 if completion_replay is None:

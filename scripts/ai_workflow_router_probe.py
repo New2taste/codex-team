@@ -62,11 +62,19 @@ _PROMPT_PREFIX = "\n".join(
 )
 ARM_CONTRACTS = {
     "luna_resident": ("gpt-6-luna", "max", "resident"),
-    "sol_resident": ("gpt-6-sol", "xhigh", "resident"),
-    "terra_resident": ("gpt-6-sol", "medium", "resident"),
+    "sol_resident": ("gpt-6.1-sol", "high", "resident"),
+    "terra_resident": ("gpt-6.1-sol", "medium", "resident"),
     "luna_control_fresh": ("gpt-6-luna", "max", "cold_control"),
-    "sol_control_fresh": ("gpt-6-sol", "xhigh", "cold_control"),
-    "terra_control_fresh": ("gpt-6-sol", "medium", "cold_control"),
+    "sol_control_fresh": ("gpt-6.1-sol", "high", "cold_control"),
+    "terra_control_fresh": ("gpt-6.1-sol", "medium", "cold_control"),
+}
+LEGACY_ARM_CONTRACTS = {
+    arm_id: (
+        "gpt-6-sol" if model == "gpt-6.1-sol" else model,
+        "xhigh" if arm_id.startswith("sol_") else effort,
+        condition,
+    )
+    for arm_id, (model, effort, condition) in ARM_CONTRACTS.items()
 }
 PROBE_SUMMARY_SCHEMA_VERSION = "router-probe-summary-2"
 USAGE_SOURCES = frozenset({"BILLING_USAGE", "TEXT_TOKEN_ESTIMATE"})
@@ -225,12 +233,20 @@ def validate_probe_manifest(value: object) -> dict[str, object]:
     raw_arms = manifest["arms"]
     if not isinstance(raw_arms, list) or len(raw_arms) != len(ARM_CONTRACTS):
         _fail("arms must contain the complete six-arm matrix")
+    contract_matrix = (
+        LEGACY_ARM_CONTRACTS
+        if any(
+            isinstance(raw_arm, Mapping) and raw_arm.get("model") == "gpt-6-sol"
+            for raw_arm in raw_arms
+        )
+        else ARM_CONTRACTS
+    )
     arms: list[dict[str, object]] = []
     arm_ids: set[str] = set()
     for index, raw_arm in enumerate(raw_arms):
         arm = _exact_fields(raw_arm, _ARM_FIELDS, f"arms[{index}]")
         arm_id = arm["arm_id"]
-        if not isinstance(arm_id, str) or arm_id not in ARM_CONTRACTS:
+        if not isinstance(arm_id, str) or arm_id not in contract_matrix:
             _fail("arm_id is invalid")
         if arm_id in arm_ids:
             _fail("arm_id must be unique")
@@ -239,7 +255,7 @@ def validate_probe_manifest(value: object) -> dict[str, object]:
             arm["model"],
             arm["reasoning_effort"],
             arm["cache_condition"],
-        ) != ARM_CONTRACTS[arm_id]:
+        ) != contract_matrix[arm_id]:
             _fail("arm does not match its closed model contract")
         arms.append(arm)
     if arm_ids != set(ARM_CONTRACTS):
@@ -887,7 +903,14 @@ def aggregate_probe_results(
         ):
             _fail("probe attempt identity is invalid")
         attempts[attempt_id] = row
-        expected_model, expected_effort, expected_condition = ARM_CONTRACTS[arm_id]
+        source_arm = source_arms.get(arm_id)
+        if source_arm is None:
+            row_contracts_valid = False
+            expected_model, expected_effort, expected_condition = ARM_CONTRACTS[arm_id]
+        else:
+            expected_model = source_arm["model"]
+            expected_effort = source_arm["reasoning_effort"]
+            expected_condition = source_arm["cache_condition"]
         allowed_conditions = (
             {"cold_start", "warm"}
             if expected_condition == "resident"
@@ -906,7 +929,6 @@ def aggregate_probe_results(
         ):
             row_contracts_valid = False
         source_case = source_cases.get(case_id)
-        source_arm = source_arms.get(arm_id)
         if source_case is None or source_arm is None:
             row_contracts_valid = False
         else:
@@ -1067,8 +1089,8 @@ def aggregate_probe_results(
             condition_complete = False
         arm_summaries[arm_id] = {
             "case_count": len(rows),
-            "model": ARM_CONTRACTS[arm_id][0],
-            "cache_condition": ARM_CONTRACTS[arm_id][2],
+            "model": source_arms[arm_id]["model"],
+            "cache_condition": source_arms[arm_id]["cache_condition"],
             "cache_hit_ratio": (
                 total_cached / total_input if total_input > 0 else None
             ),

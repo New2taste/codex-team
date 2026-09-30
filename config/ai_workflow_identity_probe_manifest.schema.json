@@ -44,11 +44,11 @@
       "properties": {
         "model": {
           "type": "string",
-          "enum": ["gpt-6-luna", "gpt-6-sol", "gpt-6-astra"]
+          "enum": ["gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-astra"]
         },
         "effort": {
           "type": "string",
-          "enum": ["max", "medium", "xhigh"]
+          "enum": ["max", "medium", "high", "xhigh"]
         }
       },
       "required": ["model", "effort"]

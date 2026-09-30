@@ -61,7 +61,7 @@ class ClosedSetRoutingTest(unittest.TestCase):
         self.assertEqual((), decision.effective_roles)
 
     def test_planning_only_routes_read_only_terra_xhigh_without_sol_medium(self):
-        """Enforced Terra OS planning never injects ordinary Sol-medium work."""
+        """Enforced primary implementer planning never injects ordinary Sol-medium work."""
 
         decision = workflow.decide_route(
             valid_task(), route_request("PLANNING_ONLY", "READ_ONLY"), "enforced"
