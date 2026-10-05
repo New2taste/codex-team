@@ -10,7 +10,7 @@ Codex Team 是一个面向 Codex 的本地、可恢复、可审计的半自动�
 
 | 项目状态 | 当前值 |
 |---|---|
-| Plugin 版本 | `0.4.0` |
+| Plugin 版本 | `0.4.1` |
 | 发布形态 | Public preview；自用优先，不承诺生产 SLA |
 | 默认 Luna 执行面 | 原生 `NATIVE_SUBAGENT`：`gpt-6-luna / max` |
 | 入口分类 | 确定性规则；默认不为分类启动模型 |
@@ -134,7 +134,7 @@ python3 "$CODEX_HOME/skills/.system/skill-creator/scripts/quick_validate.py" \
 
 ## Codex Team 调用
 
-工具名称是 `codex team`，最简单的消息指令是 `team call`。只解析消息开头的三种形式：
+在 Codex 聊天中使用 `team call` 触发本 Skill；原生 `codex` CLI 没有 `team` 子命令。只解析消息开头的三种形式：
 
 ```text
 team call <objective>
@@ -144,9 +144,9 @@ team call：<objective>
 
 示例：
 
-```sh
-codex team "team call 检查当前工作区状态"
-codex team "team call 核对文件 README.md"
+```text
+team call 检查当前工作区状态
+team call 核对文件 README.md
 ```
 
 仓库内的等价测试入口：
@@ -161,10 +161,18 @@ Codex Team 只有四种受限 disposition：
 
 - `DIRECT_L0`：控制器执行固定 allowlist argv，不调用模型；
 - `DIRECT_L1`：Luna 只读抽取一个安全的仓库相对文件；
-- `PLAN_REQUIRED`：回到需要人工 owner gate 的规划流程；
+- `PLAN_REQUIRED`：创建真实持久任务与 hash-bound handoff；默认/fake 只登记待派发，显式 live 调用 Sol medium 只读规划并停在既有 owner gate；
 - `BLOCKED`：输入、锁、权限或执行证据不满足要求。
 
 它不自动修改、合并、推送或替代最终整体验收。失败收据以退出码 `2` 返回，并保留 append-only 账本。
+
+一般任务不再返回空 `task_id`。在 Codex 中由 orchestration Skill 消费 `<state_root>/<task_id>/team-call-handoff.json`，实际派发 Sol medium 继续已授权规划/施工、运行功能验证，再集中 Sol high 终验；CLI 自身不声称完成施工。重复相同调用只回放，不新建任务或再次启动模型。native 模式记录实际 agent/thread、model/effort、cwd、权限和结果，不把分类或待派发文件当运行证据。权限/环境失败（例如 macOS Chrome 注册启动失败）不计作实现返工，不在相同沙箱反复启动；缺少执行能力或授权时明确阻塞。
+
+For general Team Call tasks, the CLI persists a bound planning task/handoff. Default/fake intake starts no model; explicitly authorized live mode runs real Sol medium read-only planning and stops at the owner gate. The orchestration Skill consumes that handoff and continues actual authorized implementation and verification with independent Sol high final acceptance. A task ID or handoff is not completion; native runtime evidence must establish the actual model, effort, agent/thread and permissions. Replay never launches a second task.
+
+真实对照复用现有 `cost.jsonl`、runtime evidence 和 `report`，两组各用独立 state root，对齐目标、起始版本、权限和验收标准。先观察 10–20 个真实任务，记录总消耗、耗时、首次通过、返工、漏检和环境阻塞；单 Sol medium 组须真实运行，缺失用量不记为零，不提前宣称节省。API 成本与订阅额度分开。低档 Luna 仅做单独有界试验，生产默认仍是 max。
+
+Compare real Team and single-Sol-medium tasks using existing cost/runtime/report records with separate state roots and matched starting revision, objective, permissions and acceptance criteria. Record 10–20 real cases; unknown usage stays unknown. Keep API cost separate from subscription quota and do not claim savings before measurement. Lower Luna efforts are experiments only, not production defaults.
 
 ## 工作流
 

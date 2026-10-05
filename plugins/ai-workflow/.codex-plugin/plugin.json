@@ -1,6 +1,6 @@
 {
   "name": "ai-workflow",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Codex Team: deterministic multi-model routing, evidence, and review workflow.",
   "author": {
     "name": "Codex Team maintainers"
@@ -9,7 +9,7 @@
   "interface": {
     "displayName": "Codex Team",
     "shortDescription": "Route bounded Codex work with evidence gates",
-    "longDescription": "Codex Team routes bounded work through native Luna Max, Terra construction, and Sol-medium final acceptance with runtime evidence and human gates.",
+    "longDescription": "Codex Team executes general tasks through Sol medium planning and construction, native Luna Max bounded work, and independent Sol high final acceptance with runtime evidence and human gates.",
     "developerName": "Codex Team maintainers",
     "category": "Developer Tools",
     "capabilities": ["Read", "Write"],

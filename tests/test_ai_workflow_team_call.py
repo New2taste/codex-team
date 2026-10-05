@@ -585,11 +585,126 @@ class TeamCallControllerTest(unittest.TestCase):
         )
 
         self.assertEqual("PLAN_REQUIRED", receipt.disposition)
-        self.assertIsNone(receipt.task_id)
-        self.assertIsNone(receipt.result_sha256)
+        self.assertIsNotNone(receipt.task_id)
+        self.assertIsNotNone(receipt.result_sha256)
+        task_dir = workflow.WorkflowStore(self.root)._require_task(receipt.task_id)
+        handoff = json.loads((task_dir / "team-call-handoff.json").read_text())
+        task = workflow.load_task(task_dir / "task.json")
+        self.assertEqual(workflow.artifact_sha256(task), handoff["task_sha256"])
+        self.assertEqual("PENDING_NATIVE_DISPATCH", handoff["planning_status"])
+        self.assertEqual("NOT_STARTED", handoff["execution_status"])
+        self.assertEqual([], task["allowed_write_paths"])
+        replay = workflow.run_team_call(
+            "team call 为 README 增加安装示例", repository_root=self.repo,
+            state_root=self.root, controller=self.controller,
+        )
+        self.assertEqual(receipt, replay)
         self.assertEqual(0, self.controller.execution_count)
         self.assertEqual(0, self.controller.dispatch_count)
         self.assertEqual("ROUTED", self._team_rows()[-1]["route_status"])
+
+    def test_live_general_call_reuses_owner_gated_planning_boundary_once(self):
+        controller = workflow.TeamCallProductionController(self.root, True, self.root)
+        with mock.patch.object(workflow.TeamCallProductionController, "run_plan", return_value="AWAITING_OWNER_DECISION") as planner:
+            receipt = workflow.run_team_call("team call 增加简单示例", repository_root=self.repo, state_root=self.root, controller=controller)
+            replay = workflow.run_team_call("team call 增加简单示例", repository_root=self.repo, state_root=self.root, controller=controller)
+        planner.assert_called_once_with(controller, receipt.task_id)
+        self.assertEqual(receipt, replay)
+        handoff = json.loads((self.root / receipt.task_id / "team-call-handoff.json").read_text())
+        self.assertEqual("AWAITING_OWNER_DECISION", handoff["planning_status"])
+        self.assertEqual("NOT_STARTED", handoff["execution_status"])
+
+    def test_planning_handoff_tamper_is_rejected_on_replay(self):
+        receipt = workflow.run_team_call("team call 增加示例", repository_root=self.repo, state_root=self.root, controller=self.controller)
+        path = self.root / receipt.task_id / "team-call-handoff.json"
+        handoff = json.loads(path.read_text())
+        handoff["task_sha256"] = "0" * 64
+        path.write_text(json.dumps(handoff))
+        with self.assertRaisesRegex(workflow.WorkflowError, "TEAM_CALL_IDENTITY_DRIFT"):
+            workflow.run_team_call("team call 增加示例", repository_root=self.repo, state_root=self.root, controller=self.controller)
+
+    def test_environment_classifier_does_not_hide_program_sigabrt(self):
+        self.assertTrue(workflow.execution_environment_failure("Chrome RegisterApplication failed SIGABRT"))
+        self.assertTrue(workflow.execution_environment_failure("sandbox denied: operation not permitted"))
+        self.assertFalse(workflow.execution_environment_failure("unit test assertion triggered SIGABRT"))
+
+    def test_unpreflighted_role_blocks_without_consuming_retry(self):
+        task = workflow._team_call_l1_task(task_id="AWF-20261005-999", repository=self.repo, objective="fixture", evidence_path="README.md")
+        store = workflow.WorkflowStore(self.root)
+        store.create_task(task)
+        runner = mock.Mock(is_live_model=False, owns_cost_attempt_accounting=False)
+        runner.run.side_effect = workflow.WorkflowError("ROLE_NOT_PREFLIGHTED", "role is not preflighted")
+        budget = workflow.RetryBudget()
+        with mock.patch.object(workflow, "require_dispatch_permit_locked", side_effect=workflow.WorkflowError("ROLE_NOT_PREFLIGHTED", "role is not preflighted")):
+            result, state = workflow._run_role_with_technical_retry(store, task["task_id"], task, "EVIDENCE_RUNNING", "luna", runner, budget, state_root=self.root)
+        self.assertIsNone(result)
+        self.assertEqual("BLOCKED", state)
+        runner.run.assert_not_called()
+        self.assertEqual(0, budget.technical_retries)
+
+    def test_missing_runtime_evidence_does_not_repeat_model_attempt(self):
+        errors = ("RUNTIME_EVIDENCE_MISSING", "RUNTIME_EVIDENCE_INVALID", "RUNTIME_EVIDENCE_STALE", "RUNTIME_IDENTITY_MISSING", "RUNTIME_IDENTITY_CONFLICT", "RUNTIME_PERMISSION_MISMATCH")
+        for index, error_code in enumerate(errors):
+            with self.subTest(error_code=error_code):
+                task = workflow._team_call_l1_task(task_id=f"AWF-20261005-{900 + index}", repository=self.repo, objective="fixture", evidence_path="README.md")
+                store = workflow.WorkflowStore(self.root)
+                store.create_task(task)
+                runner = mock.Mock(is_live_model=False, owns_cost_attempt_accounting=False)
+                runner.run.side_effect = workflow.WorkflowError(error_code, "runtime observation failed")
+                budget = workflow.RetryBudget()
+                with mock.patch.object(workflow, "require_dispatch_permit_locked"), mock.patch.object(workflow, "record_launch_intent"), mock.patch.object(workflow, "claim_permit_start_locked"):
+                    result, state = workflow._run_role_with_technical_retry(store, task["task_id"], task, "EVIDENCE_RUNNING", "luna", runner, budget, state_root=self.root)
+                self.assertIsNone(result)
+                self.assertEqual("BLOCKED", state)
+                runner.run.assert_called_once()
+                self.assertEqual(0, budget.technical_retries)
+                self.assertEqual(0, budget.implementation_reworks)
+
+    def test_runtime_inspector_resolves_actual_source_and_plugin_distribution(self):
+        expected = ROOT / "plugins" / "ai-workflow" / "scripts" / "inspect-agent-runtime.sh"
+        self.assertEqual(expected, workflow._runtime_inspector_path())
+        with mock.patch.object(workflow, "__file__", str(ROOT / "plugins" / "ai-workflow" / "runtime" / "ai_workflow.py")):
+            self.assertEqual(expected, workflow._runtime_inspector_path())
+        self.assertTrue(expected.is_file())
+
+    def test_failed_live_planning_preserves_blocked_handoff_and_never_relaunches(self):
+        controller = workflow.TeamCallProductionController(self.root, True, self.root)
+        with mock.patch.object(workflow.TeamCallProductionController, "run_plan", side_effect=workflow.WorkflowError("EXECUTION_ENVIRONMENT_BLOCKED", "sandbox denied")) as planner:
+            with self.assertRaisesRegex(workflow.WorkflowError, "EXECUTION_ENVIRONMENT_BLOCKED"):
+                workflow.run_team_call("team call 修正示例", repository_root=self.repo, state_root=self.root, controller=controller)
+            replay = workflow.run_team_call("team call 修正示例", repository_root=self.repo, state_root=self.root, controller=controller)
+        self.assertEqual(1, planner.call_count)
+        self.assertEqual("BLOCKED", replay.disposition)
+        handoff_path = next(self.root.glob("AWF-*/team-call-handoff.json"))
+        handoff = json.loads(handoff_path.read_text())
+        self.assertEqual("BLOCKED", handoff["planning_status"])
+        self.assertEqual("EXECUTION_ENVIRONMENT_BLOCKED", handoff["error_code"])
+
+    def test_quota_exhaustion_blocks_after_one_attempt_without_retry(self):
+        task = workflow._team_call_l1_task(task_id="AWF-20261005-998", repository=self.repo, objective="fixture", evidence_path="README.md")
+        store = workflow.WorkflowStore(self.root)
+        store.create_task(task)
+        runner = mock.Mock(is_live_model=False, owns_cost_attempt_accounting=False)
+        runner.run.side_effect = workflow.WorkflowError("MODEL_QUOTA_EXHAUSTED", "model usage quota is exhausted")
+        budget = workflow.RetryBudget()
+        with mock.patch.object(workflow, "require_dispatch_permit_locked"), mock.patch.object(workflow, "record_launch_intent"), mock.patch.object(workflow, "claim_permit_start_locked"):
+            result, state = workflow._run_role_with_technical_retry(store, task["task_id"], task, "EVIDENCE_RUNNING", "luna", runner, budget, state_root=self.root)
+        self.assertIsNone(result)
+        self.assertEqual("BLOCKED", state)
+        runner.run.assert_called_once()
+        self.assertEqual(0, budget.technical_retries)
+        self.assertEqual(0, budget.implementation_reworks)
+        failures = [event for event in store.read_task_ledger(task["task_id"], "events.jsonl") if event.get("event_type") == "ROLE_FAILURE"]
+        self.assertEqual(["MODEL_QUOTA_EXHAUSTED"], [event["error_code"] for event in failures])
+
+    def test_handoff_model_tamper_is_rejected(self):
+        receipt = workflow.run_team_call("team call 添加示例", repository_root=self.repo, state_root=self.root, controller=self.controller)
+        path = self.root / receipt.task_id / "team-call-handoff.json"
+        handoff = json.loads(path.read_text())
+        handoff["model"] = "wrong-model"
+        path.write_text(json.dumps(handoff))
+        with self.assertRaisesRegex(workflow.WorkflowError, "TEAM_CALL_IDENTITY_DRIFT"):
+            workflow.run_team_call("team call 添加示例", repository_root=self.repo, state_root=self.root, controller=self.controller)
 
     def test_missing_repository_fails_before_controller_execution(self):
         with self.assertRaisesRegex(workflow.WorkflowError, "REPOSITORY_NOT_FOUND"):

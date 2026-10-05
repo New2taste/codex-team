@@ -301,6 +301,31 @@ class PreflightStaticChecksTest(unittest.TestCase):
 
 
 class PreflightCacheKeyTest(_PreflightStoreMixin, unittest.TestCase):
+    def test_explicit_external_sessions_directory_is_used_and_bound(self) -> None:
+        external = Path(self.temporary.name) / "external-sessions"
+        external.mkdir()
+        (self.repo / ".codex" / "sessions").rmdir()
+        preflight.bind_runtime_sessions_directory(self.store, TASK_ID, external)
+        result = preflight.run_role_preflight(self.store, TASK_ID, "luna")
+        self.assertEqual("PASS", result["status"])
+        self.assertEqual(str(external.resolve()), result["runtime_sessions_dir"])
+        self.assertTrue(preflight.is_role_preflighted(self.store, TASK_ID, "luna"))
+        preflight.require_runtime_sessions_binding(self.store, TASK_ID, external)
+
+    def test_sessions_replacement_and_path_drift_are_rejected(self) -> None:
+        external = Path(self.temporary.name) / "external-sessions"
+        external.mkdir()
+        other = Path(self.temporary.name) / "other-sessions"
+        other.mkdir()
+        preflight.bind_runtime_sessions_directory(self.store, TASK_ID, external)
+        preflight.run_role_preflight(self.store, TASK_ID, "luna")
+        with self.assertRaisesRegex(artifacts.WorkflowError, "RUNTIME_SESSIONS_BINDING_MISMATCH"):
+            preflight.require_runtime_sessions_binding(self.store, TASK_ID, other)
+        external.rename(external.with_name("retained-original-sessions"))
+        external.mkdir()
+        with self.assertRaisesRegex(artifacts.WorkflowError, "RUNTIME_SESSIONS_BINDING_MISMATCH"):
+            preflight.is_role_preflighted(self.store, TASK_ID, "luna")
+
     def test_second_is_role_preflighted_hits_without_rerunning_checks(self) -> None:
         with mock.patch.object(
             preflight,

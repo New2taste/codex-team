@@ -272,7 +272,7 @@ class DistributionContractTest(unittest.TestCase):
         manifest = json.loads((PLUGIN / ".codex-plugin" / "plugin.json").read_text())
         marketplace = json.loads((ROOT / ".agents" / "plugins" / "marketplace.json").read_text())
         self.assertEqual("ai-workflow", manifest["name"])
-        self.assertEqual("0.4.0", manifest["version"])
+        self.assertEqual("0.4.1", manifest["version"])
         self.assertEqual("./skills/", manifest["skills"])
         self.assertEqual("ai-workflow", marketplace["name"])
         self.assertEqual(
@@ -346,6 +346,7 @@ class DistributionContractTest(unittest.TestCase):
                 (PLUGIN / "skills" / "orchestration" / "SKILL.md")
                 .read_text(encoding="utf-8")
                 .casefold(),
+                (PLUGIN / "skills" / "orchestration" / "references" / "advanced-contracts.md").read_text().casefold(),
             )
         )
         for grammar in (
@@ -422,7 +423,8 @@ class DistributionContractTest(unittest.TestCase):
         metadata = (PLUGIN / "skills" / "orchestration" / "agents" / "openai.yaml").read_text(
             encoding="utf-8"
         ).casefold()
-        published = "\n".join((readme, skill, metadata))
+        advanced = (PLUGIN / "skills" / "orchestration" / "references" / "advanced-contracts.md").read_text().casefold()
+        published = "\n".join((readme, skill, metadata, advanced))
 
         self.assertIn("luna max", published)
         self.assertIn("native_subagent", published)

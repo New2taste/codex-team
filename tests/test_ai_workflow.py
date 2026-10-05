@@ -2206,9 +2206,11 @@ class CodexRunnerTest(unittest.TestCase):
             prompt = workflow.build_role_prompt("luna", task, contract, [evidence])
         self.assertIn("Handle only bounded tasks.", prompt)
         prompt_lines = prompt.splitlines()
-        self.assertEqual(json.loads(prompt_lines[1].removeprefix("Task envelope: ")), task)
-        self.assertEqual(json.loads(prompt_lines[2].removeprefix("Task contract: ")), contract)
-        evidence_manifest = json.loads(prompt_lines[3].removeprefix("Named evidence: "))
+        fields = dict(line.split(": ", 1) for line in prompt_lines if ": " in line)
+        self.assertEqual(json.loads(fields["Task envelope"]), task)
+        self.assertEqual(json.loads(fields["Task contract"]), contract)
+        evidence_manifest = json.loads(fields["Named evidence"])
+        self.assertLess(prompt.index(workflow.RESULT_IDENTITY_PROMPT), prompt.index("Task envelope:"))
         self.assertEqual(evidence_manifest[0]["path"], str(evidence))
         self.assertEqual(
             evidence_manifest[0]["sha256"],
@@ -2597,6 +2599,38 @@ class CodexRunnerTest(unittest.TestCase):
         self.assertEqual(1, self._codex_run.call_count)
         self.assertGreaterEqual(len(document["runs"]), 1)
         self.assertEqual(first_log, second_log)
+
+    @mock.patch(
+        "scripts.ai_workflow.capture_repo",
+        return_value=workflow.RepoSnapshot("pinned-head", ()),
+    )
+    @mock.patch("scripts.ai_workflow.working_tree_paths", return_value=set())
+    @_with_run_popen_bridge
+    def test_codex_quota_event_stops_with_nonretryable_error(
+        self, _working_tree_paths, _capture_repo
+    ):
+        task = self.valid_task()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._declare_codex_task(task, root / "state")
+            paths = workflow.RunPaths(
+                repo=ROOT, output_path=root / "result.json",
+                schema_path=ROOT / "config/ai_workflow_result.schema.json",
+                logs_dir=root / "logs", state_root=root / "state",
+            )
+            self._codex_run.return_value = subprocess.CompletedProcess(
+                [], 1, stdout=json.dumps({"type": "turn.failed", "error": {
+                    "message": "You've hit your usage limit."
+                }}) + "\n", stderr="",
+            )
+            with self.assertRaises(workflow.WorkflowError) as caught:
+                workflow.run_codex("luna", task, "task contract", paths,
+                    attempt_context=self._bound_attempt_context(task, "quota-test"))
+        self.assertEqual("MODEL_QUOTA_EXHAUSTED", caught.exception.code)
+        self.assertIn(caught.exception.code, workflow.ROLE_GUARD_FAILURES)
+        self.assertFalse(workflow.model_quota_exhausted(json.dumps({
+            "type": "item.completed", "item": {"text": "You've hit your usage limit."}
+        }), ""))
 
     @mock.patch(
         "scripts.ai_workflow.capture_repo",
@@ -3180,13 +3214,14 @@ class LiveLunaCliTest(unittest.TestCase):
         self.assertEqual(paths.schema_path, ROOT / "config/ai_workflow_result.schema.json")
         self.assertEqual(paths.logs_dir, self.state_root / self.task["task_id"] / "logs")
         prompt_lines = prompt.splitlines()
-        self.assertEqual(json.loads(prompt_lines[1].removeprefix("Task envelope: ")), self.task)
+        fields = dict(line.split(": ", 1) for line in prompt_lines if ": " in line)
+        self.assertEqual(json.loads(fields["Task envelope"]), self.task)
         self.assertEqual(
-            json.loads(prompt_lines[2].removeprefix("Task contract: ")),
+            json.loads(fields["Task contract"]),
             {"acceptance_commands": [], "verification_level": "L1"},
         )
         self.assertEqual(
-            json.loads(prompt_lines[3].removeprefix("Named evidence: "))[0]["path"],
+            json.loads(fields["Named evidence"])[0]["path"],
             str(ROOT / "README.md"),
         )
         self.assertNotIn("registry/", prompt)

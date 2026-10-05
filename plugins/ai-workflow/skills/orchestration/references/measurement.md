@@ -1,0 +1,7 @@
+# Real task comparison
+
+Reuse `cost.jsonl`, runtime evidence and `report --root ROOT --output REPORT.md`; do not build a second accounting service. Keep one state root per comparison arm so `aggregate_metrics` remains attributable. Use the same actual objective, starting repository revision, acceptance criteria and permission profile for Team and single `gpt-6.1-sol / medium` runs. Single-Sol measurements must come from a real native/CLI run with observed identity/usage, not FakeRunner or a copied Team receipt. Preserve external single-Sol usage beside the reports if the native surface does not expose the existing cost adapter; unknown usage stays unknown.
+
+Start with 10–20 real matched tasks. Record case ID, arm, real model/effort, task/runtime IDs, total input/output/cached consumption, elapsed time, first-pass acceptance, reworks, missed defects, blocked environment runs and final checks. Separate API monetary cost from subscription quota; missing price/usage is not zero. Environment-blocked cases are not implementation reworks and do not demonstrate model quality.
+
+Reports describe measured consumption; do not claim savings without matched evidence. Existing optimization gates remain shadow by default and cannot be opened by narrative claims. Lower Luna efforts may be tried only in separately bounded, explicitly selected experiments with the same acceptance/evidence and stop conditions; keep production Luna max unchanged.

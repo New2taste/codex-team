@@ -130,6 +130,16 @@ ROLE_GUARD_FAILURES = frozenset(
         "TERRA_STATE_NOT_AUTHORIZED",
         "UNAUTHORIZED_SOURCE_WORKTREE",
         "WORKFLOW_STORE_REQUIRED",
+        "ROLE_NOT_PREFLIGHTED",
+        "MODEL_QUOTA_EXHAUSTED",
+        "RUNTIME_SESSIONS_BINDING_MISMATCH",
+        "RUNTIME_SESSIONS_DIR_INVALID",
+        "RUNTIME_EVIDENCE_MISSING",
+        "RUNTIME_EVIDENCE_INVALID",
+        "RUNTIME_EVIDENCE_STALE",
+        "RUNTIME_IDENTITY_MISSING",
+        "RUNTIME_IDENTITY_CONFLICT",
+        "RUNTIME_PERMISSION_MISMATCH",
     }
 )
 SAFE_ENVIRONMENT_KEYS = frozenset({"HOME", "PATH", "CODEX_HOME", "LANG", "LC_ALL", "TERM", "TMPDIR"})
@@ -273,7 +283,7 @@ try:
         require_write_ownership_locked,
         verify_actual_write_paths,
     )
-    from .ai_workflow_preflight import run_role_preflight
+    from .ai_workflow_preflight import run_role_preflight, bind_runtime_sessions_directory, require_runtime_sessions_binding
     from .ai_workflow_declarations import load_route_declaration_locked
     from .ai_workflow_evidence import append_runtime_evidence_v2, record_launch_intent
 except ImportError:  # direct script execution
@@ -301,7 +311,7 @@ except ImportError:  # direct script execution
         require_write_ownership_locked,
         verify_actual_write_paths,
     )
-    from ai_workflow_preflight import run_role_preflight
+    from ai_workflow_preflight import run_role_preflight, bind_runtime_sessions_directory, require_runtime_sessions_binding
     from ai_workflow_declarations import load_route_declaration_locked
     from ai_workflow_evidence import append_runtime_evidence_v2, record_launch_intent
 
@@ -699,12 +709,12 @@ def _render_full_role_prompt(
     return "\n".join(
         (
             f"Role instructions: {role_config['instructions']}",
-            f"Task envelope: {_canonical_json(dict(task))}",
-            f"Task contract: {_canonical_json(dict(contract))}",
-            f"Named evidence: {_canonical_json(list(evidence))}",
             *_role_prompt_suffix(role, role_config, task),
             RESULT_IDENTITY_PROMPT,
             "only output ai-result-1 JSON",
+            f"Task envelope: {_canonical_json(dict(task))}",
+            f"Task contract: {_canonical_json(dict(contract))}",
+            f"Named evidence: {_canonical_json(list(evidence))}",
         )
     )
 
@@ -791,11 +801,11 @@ def _render_compact_role_prompt(
     prompt = "\n".join(
         (
             f"Role instructions: {role_config['instructions']}",
-            f"Context: {context_json}",
-            f"Named evidence: {evidence_json}",
             *_role_prompt_suffix(role, role_config, task),
             RESULT_IDENTITY_PROMPT,
             "only output ai-result-1 JSON",
+            f"Context: {context_json}",
+            f"Named evidence: {evidence_json}",
         )
     )
     if not _compact_projection_is_faithful(prompt, role, role_config, task, contract):
@@ -1724,6 +1734,15 @@ def _require_self_consistent_prompt_result(
     return prompt_result
 
 
+def _runtime_inspector_path() -> Path:
+    """Resolve the one packaged inspector for root source or Plugin runtime."""
+
+    module_dir = Path(__file__).resolve().parent
+    if module_dir.name == "runtime":
+        return module_dir.parent / "scripts" / "inspect-agent-runtime.sh"
+    return module_dir.parent / "plugins" / "ai-workflow" / "scripts" / "inspect-agent-runtime.sh"
+
+
 def run_codex(
     role: str,
     task: dict,
@@ -1790,6 +1809,8 @@ def run_codex(
     if role in TERRA_WRITE_ROLES:
         _reject_dirty_input(repo, "DIRTY_TERRA_WORKTREE", "Terra requires a clean source_worktree")
     store = WorkflowStore(paths.state_root)
+    if paths.runtime_evidence_required:
+        require_runtime_sessions_binding(store, task["task_id"], _require_runtime_sessions_directory(paths.runtime_sessions_dir))
     runtime_sessions_dir: Path | None = None
     runtime_store: WorkflowStore | None = None
     runtime_task_dir: Path | None = None
@@ -1942,12 +1963,16 @@ def run_codex(
         spawned = proc is not None
         _write_role_events(attempt_events, completed.stdout)
         if completed.returncode != 0:
+            if model_quota_exhausted(completed.stdout, completed.stderr):
+                raise WorkflowError("MODEL_QUOTA_EXHAUSTED", "model usage quota is exhausted; wait for reset or an authorized account change before retrying")
             message = f"{role} exited with code {completed.returncode}"
             # Redact before truncating: a cut through a raw secret would
             # leave a fragment too short for the redaction patterns.
             stderr_tail = _redact_log_text(str(completed.stderr or ""))[-2000:].strip()
             if stderr_tail:
                 message = f"{message}; stderr tail: {stderr_tail}"
+            if execution_environment_failure(message):
+                raise WorkflowError("EXECUTION_ENVIRONMENT_BLOCKED", message)
             raise WorkflowError("CODEX_EXIT_NONZERO", message)
         try:
             output_stat = attempt_output.stat()
@@ -2120,11 +2145,7 @@ def run_codex(
                 runtime_sessions_dir,
                 thread_id,
                 CODEX_EXEC_ROLE_CONTRACT,
-                Path(__file__).resolve().parents[1]
-                / "plugins"
-                / "ai-workflow"
-                / "scripts"
-                / "inspect-agent-runtime.sh",
+                _runtime_inspector_path(),
             )
             observed_runtime = merge_runtime_observations(
                 controller_observation, rollout_observation
@@ -3897,6 +3918,21 @@ class TeamCallProductionController:
         _verify_team_call_evidence_snapshot(evidence_snapshot, execution)  # type: ignore[arg-type]
         return result
 
+    def run_plan(self, task_id: str) -> str:
+        """Use the existing read-only route and owner-gated state machine."""
+
+        if not self.allow_live_model:
+            _fail("LIVE_MODEL_NOT_AUTHORIZED", "--allow-live-model is required")
+        sessions = self.runtime_sessions_dir
+        if sessions is None or not sessions.is_absolute() or not sessions.is_dir():
+            _fail("RUNTIME_SESSIONS_DIR_INVALID", "live planning requires an existing absolute sessions directory")
+        return run_until_gate(
+            task_id,
+            runner=CodexPlanningRunner(self.state_root, sessions),
+            allow_live_model=True,
+            state_root=self.state_root,
+        )
+
 
 def _team_call_error_as_workflow(error: TeamCallError) -> WorkflowError:
     """Preserve the pure Team Call code and message at the controller boundary."""
@@ -4564,13 +4600,49 @@ def run_team_call(
         raise _team_call_error_as_workflow(exc) from exc
 
     repository: Path | None = None
-    if intent.disposition in {"DIRECT_L0", "DIRECT_L1"}:
+    if intent.disposition in {"DIRECT_L0", "DIRECT_L1", "PLAN_REQUIRED"}:
         repository = _resolve_team_call_repository(repository_root)
     registry = TeamCallRegistry(Path(state_root))
 
     def execute(receipt: TeamCallReceipt) -> TeamCallRoute:
         if intent.disposition == "PLAN_REQUIRED":
-            return TeamCallRoute(task_id=None, result_sha256=None)
+            assert repository is not None
+            store = WorkflowStore(Path(state_root))
+            task = _team_call_l1_task(
+                task_id=_next_team_call_task_id(store), repository=repository,
+                objective=call.objective, evidence_path="README.md",
+            )
+            task.update(objective=call.objective, authoritative_files=git(repository, "ls-files").splitlines(),
+                        verification_level="L0", base_commit=git(repository, "rev-parse", "HEAD"))
+            stored = store.create_task(task)
+            handoff = {
+                "schema_version": "team-call-handoff-1", "call_id": receipt.call_id,
+                "task_id": task["task_id"], "task_path": str(stored.resolve()),
+                "task_sha256": artifact_sha256(task), "repository_root": str(repository),
+                "state_root": str(Path(state_root).resolve()),
+                "model": "gpt-6.1-sol", "reasoning_effort": "medium",
+                "planning_status": "PENDING_NATIVE_DISPATCH", "execution_status": "NOT_STARTED",
+                "next_action": "CONSUME_WITH_ORCHESTRATION_SKILL",
+            }
+            handoff_path = stored.parent / "team-call-handoff.json"
+            atomic_write_json(handoff_path, handoff)
+            if type(trusted_controller) is TeamCallProductionController:
+                try:
+                    state = TeamCallProductionController.run_plan(trusted_controller, str(task["task_id"]))
+                except BaseException as exc:
+                    handoff["planning_status"] = "BLOCKED"
+                    handoff["error_code"] = str(getattr(exc, "code", type(exc).__name__))
+                    atomic_write_json(handoff_path, handoff)
+                    raise
+                handoff["planning_status"] = state
+                handoff["execution_surface"] = CODEX_EXEC_ROLE_CONTRACT
+                atomic_write_json(handoff_path, handoff)
+                if state == "BLOCKED":
+                    _fail("TEAM_CALL_PLAN_BLOCKED", f"planning blocked; inspect {handoff_path}")
+            digest = _team_call_result_digest(Path(state_root), receipt, {
+                key: value for key, value in handoff.items() if key != "schema_version"
+            })
+            return TeamCallRoute(task_id=str(task["task_id"]), result_sha256=digest)
         if intent.disposition == "DIRECT_L0":
             if repository is None or intent.l0_action is None:
                 _fail("TEAM_CALL_L0_INVALID", "parsed L0 action is incomplete")
@@ -4661,9 +4733,54 @@ def run_team_call(
         raise AssertionError("unreachable")
 
     try:
-        return registry.execute_once(call, intent, execute)
+        receipt = registry.execute_once(call, intent, execute)
+        if intent.disposition == "PLAN_REQUIRED" and receipt.task_id is not None:
+            task_dir = WorkflowStore(Path(state_root))._require_task(receipt.task_id)
+            task = load_task(task_dir / "task.json")
+            handoff = load_artifact(task_dir / "team-call-handoff.json")
+            result_record = load_artifact(Path(state_root) / "team-call-results" / f"{receipt.call_id}.json")
+            if (task["repository_root"] != str(repository)
+                or handoff.get("call_id") != receipt.call_id
+                or handoff.get("task_id") != receipt.task_id
+                or handoff.get("task_sha256") != artifact_sha256(task)
+                or handoff.get("state_root") != str(Path(state_root).resolve())
+                or handoff.get("repository_root") != str(repository)
+                or handoff.get("task_path") != str((task_dir / "task.json").resolve())
+                or result_record != {**handoff, "schema_version": "team-call-result-1"}
+                or hashlib.sha256(_canonical_json(result_record).encode("utf-8")).hexdigest() != receipt.result_sha256):
+                _fail("TEAM_CALL_IDENTITY_DRIFT", "stored planning handoff does not match this call")
+        return receipt
     except TeamCallError as exc:
         raise _team_call_error_as_workflow(exc) from exc
+
+
+class CodexPlanningRunner:
+    """Actual Sol-medium planning only; never grants construction authority."""
+
+    is_live_model = True
+    owns_cost_attempt_accounting = True
+
+    def __init__(self, state_root: Path, runtime_sessions_dir: Path):
+        self.state_root = Path(state_root)
+        self.runtime_sessions_dir = runtime_sessions_dir
+
+    def run(self, role: str, task: dict[str, object], **kwargs: object) -> Mapping[str, object]:
+        if role not in {"sol_planner", "terra_xhigh_planner"} or task["task_type"] != "PLAN":
+            _fail("TEAM_CALL_ROLE_INVALID", "planning runner accepts only Sol medium PLAN roles")
+        task_dir = WorkflowStore(self.state_root)._require_task(str(task["task_id"]))
+        contract = {
+            "acceptance_commands": task["acceptance_commands"],
+            "verification_level": task["verification_level"],
+            "planning_deliverable": "Return a minimal actionable plan in summary: exact scopes, acceptance commands, dependencies and owner decisions needed. Do not implement or grant authority.",
+        }
+        prompt = build_role_prompt_result(role, task, contract, (), state_root=self.state_root)
+        paths = RunPaths(
+            repo=Path(str(task["repository_root"])), output_path=task_dir / f"{role}-result.json",
+            schema_path=ROLE_CONFIG_PATH.parent / "ai_workflow_result.schema.json",
+            logs_dir=task_dir / "logs", state_root=self.state_root,
+            runtime_evidence_required=True, runtime_sessions_dir=self.runtime_sessions_dir,
+        )
+        return run_codex(role, task, prompt.prompt, paths, prompt_result=prompt, **kwargs)
 
 
 class CodexConstructionRunner:
@@ -5044,6 +5161,41 @@ def _role_for_plan_or_review(
     return "sol_reviewer"
 
 
+def model_quota_exhausted(stdout: str | None, stderr: str | None) -> bool:
+    """Inspect provider error events, not arbitrary model output or quoted text."""
+
+    messages = [str(stderr or "")]
+    for line in str(stdout or "").splitlines():
+        try:
+            event = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "error":
+            messages.append(str(event.get("message", "")))
+        elif event.get("type") == "turn.failed" and isinstance(event.get("error"), dict):
+            messages.append(str(event["error"].get("message", "")))
+    return any(
+        marker in message.lower()
+        for message in messages
+        for marker in ("hit your usage limit", "usage limit has been reached", "insufficient_quota")
+    )
+
+
+def execution_environment_failure(message: str) -> bool:
+    """Recognize concrete launch/permission blockers, never implementation defects."""
+
+    lowered = message.lower()
+    chrome_registration = ("chrome" in lowered or "chromium" in lowered) and any(
+        marker in lowered for marker in ("registerapplication", "launchservices")
+    )
+    return chrome_registration or any(marker in lowered for marker in (
+        "sandbox denied", "operation not permitted",
+        "permission denied", "approval required", "execution_environment_blocked",
+    ))
+
+
 def _run_role_with_technical_retry(
     store: WorkflowStore,
     task_id: str,
@@ -5324,6 +5476,7 @@ def _run_role_with_technical_retry(
             return result, state
         except (WorkflowError, ValueError, json.JSONDecodeError) as exc:
             error_code = exc.code if isinstance(exc, WorkflowError) else "INVALID_ROLE_RESULT"
+            environment_blocked = execution_environment_failure(str(exc))
             _append_state_event(
                 store,
                 task_id,
@@ -5334,14 +5487,14 @@ def _run_role_with_technical_retry(
                 role=role,
                 error_code=error_code,
             )
-            if error_code in ROLE_GUARD_FAILURES:
+            if environment_blocked or error_code in ROLE_GUARD_FAILURES:
                 return None, _transition(
                     store,
                     task_id,
                     state,
                     "BLOCKED",
                     budget,
-                    event_type="ROLE_GUARD_BLOCKED",
+                    event_type="EXECUTION_ENVIRONMENT_BLOCKED" if environment_blocked else "ROLE_GUARD_BLOCKED",
                 )
             try:
                 budget.consume_technical()
@@ -6073,6 +6226,8 @@ def run_until_gate(
         _fail("LIVE_MODEL_NOT_AUTHORIZED", "live model execution requires explicit authorization")
     task_path = store._require_task(task_id) / "task.json"
     task = load_task(task_path)
+    if getattr(runner, "is_live_model", False) and getattr(runner, "runtime_sessions_dir", None) is not None:
+        bind_runtime_sessions_directory(store, task_id, runner.runtime_sessions_dir)
     _ensure_task_declaration(store, task_id, task)
     while True:
         pending_role: str | None = None
@@ -6886,6 +7041,8 @@ def _run_command(args: argparse.Namespace) -> int:
             "task_id": receipt.task_id,
             "created_at_utc": receipt.created_at_utc,
             "result_sha256": receipt.result_sha256,
+            **({"handoff_path": str((state_root / receipt.task_id / "team-call-handoff.json").resolve())}
+               if receipt.disposition == "PLAN_REQUIRED" and receipt.task_id is not None else {}),
         }))
         return 2 if receipt.disposition == "BLOCKED" else 0
     if args.command == "report":

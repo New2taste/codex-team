@@ -1,0 +1,17 @@
+# General Team Call continuation
+
+## Durable intake
+
+Use the Plugin runtime `ai_workflow.py team-call MESSAGE --repository-root ABSOLUTE_REPO`. Default/fake mode is zero-model intake, not planning or execution. It returns a task ID; inspect `<state_root>/<task_id>/team-call-handoff.json` and `task.json`. The default state root is outside the repository; use an explicit absolute `--root` when continuity matters. Repeating the exact call replays its receipt without a second task or launch. Re-run intake before consumption to validate receipt, task, repository, root and handoff digest. Do not change or reuse a handoff for another objective/repository.
+
+`--runner live --allow-live-model --runtime-sessions-dir ABSOLUTE_DIR` uses actual Sol medium read-only planning through the existing route, dispatch permit, cost accounting, runtime identity and state machine. It requires configured runtime evidence/preflight and a clean read-only repository. It stops at `AWAITING_OWNER_DECISION`; inspect the stored planner result. Missing authority or runtime evidence fails closed. Failed calls remain terminal `BLOCKED`; inspect the preserved task/handoff and evidence, do not replay to silently relaunch.
+
+## Native continuation
+
+If `planning_status=PENDING_NATIVE_DISPATCH`, dispatch a real `gpt-6.1-sol / medium` native agent with the user's objective, repository context, authoritative task and handoff. Ask it for the smallest bounded plan and authorized implementation, exact write paths, forbidden actions, relevant acceptance commands and evidence. Use fresh context with stable instructions before dynamic task data. Do not send only a routing label. Record observed agent/thread ID, model, effort, cwd and actual permissions from tools/runtime; requested identity alone is not evidence. Preserve output and real status in a separate continuation record alongside the handoff, never rewrite the immutable intake/result binding or label a pending task complete.
+
+If CLI planning already ran, consume its actual result and owner decisions instead of dispatching a second planner. For implementation, create the existing remediation task and `ai-plan-1` frozen construction/request bindings from the actual plan. Exact scopes, done conditions, verification commands, permissions and owner decisions must survive the transfer. Use the existing owner-authorized construction/worktree path and scheduler receipts described in [advanced-contracts.md](advanced-contracts.md), or an available native controller with equivalent evidence/authority bindings; native dispatch is not permission to bypass CLI gates. A PLAN task with no write paths cannot become a writer by changing a field in place.
+
+The user may already authorize routine implementation in their request. Do not ask again merely because work moved to another agent or stage; record that authorization through the actual supported owner boundary where required. Ask only for missing scope, new authority or platform approval. If a required controller capability is unavailable, report that limitation rather than manufacture an owner receipt, runtime evidence or success result.
+
+Run the real functional checks and inspect actual behavior and changes. Sections use self-check only. After all work completes, dispatch independent Sol high read-only final acceptance within the two-agent/one-writer bound. Return the verified result and remaining limitations. Do not claim the CLI alone performs end-to-end construction, merging or publication.

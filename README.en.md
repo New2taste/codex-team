@@ -10,7 +10,7 @@ It is intended for personal development, experiments, and local workflows that u
 
 | Project status | Current value |
 |---|---|
-| Plugin version | `0.4.0` |
+| Plugin version | `0.4.1` |
 | Release posture | Public preview; self-use first, no production SLA |
 | Default Luna execution surface | Native `NATIVE_SUBAGENT`: `gpt-6-luna / max` |
 | Entry classification | Deterministic rules; no model call by default |
@@ -84,7 +84,7 @@ python3 "$CODEX_HOME/skills/.system/skill-creator/scripts/quick_validate.py" \
 
 ## Codex Team invocation
 
-The tool name is `codex team`; the shortest natural-language command is `team call`. Only a leading directive in one of these forms is parsed:
+Use `team call` in Codex chat to invoke this Skill; the native `codex` CLI has no `team` subcommand. Only a leading directive in one of these forms is parsed:
 
 ```text
 team call <objective>
@@ -94,9 +94,9 @@ team call：<objective>
 
 Examples:
 
-```sh
-codex team "team call inspect the current workspace"
-codex team "team call check README.md"
+```text
+team call 检查当前工作区状态
+team call 核对文件 README.md
 ```
 
 Equivalent repository entry point:
@@ -111,10 +111,14 @@ Codex Team has four constrained dispositions:
 
 - `DIRECT_L0`: the controller runs a fixed allowlist argv; no model is called;
 - `DIRECT_L1`: Luna performs a bounded, read-only extraction of one safe repository-relative file;
-- `PLAN_REQUIRED`: return to the planning workflow and its human owner gate;
+- `PLAN_REQUIRED`: persist a real task and hash-bound planning handoff; default/fake mode starts no model, explicitly authorized live mode runs Sol medium read-only planning and stops at its owner gate;
 - `BLOCKED`: input, lock, permission, or execution evidence is insufficient.
 
 The command does not modify, merge, push, or replace final acceptance. Failed calls return exit code `2` and retain an append-only receipt ledger.
+
+General calls return a durable task ID. In Codex, the orchestration Skill consumes `team-call-handoff.json`, dispatches actual Sol medium authorized planning/construction, verifies behavior, then invokes independent Sol high final acceptance. The CLI alone does not implement. Repeating the same call replays its receipt without creating or launching another task. Native identity and results must be observed, not fabricated from a label or pending handoff. Platform permission and macOS Chrome registration launch failures are environment blockers; do not repeat the same sandboxed launch or count them as implementation reworks.
+
+Reuse existing `cost.jsonl`, runtime evidence and reports for 10–20 real matched Team/single-Sol-medium tasks with separate state roots. Match objective, starting revision, permissions and acceptance criteria. Record usage, time, first-pass acceptance, reworks, missed defects and environment blockers. Unknown usage is not zero; API cost and subscription quota are separate. Do not claim savings before measurement. Lower Luna efforts are bounded experiments only; production remains max.
 
 ## Lifecycle
 

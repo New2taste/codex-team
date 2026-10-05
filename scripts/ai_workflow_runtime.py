@@ -62,6 +62,8 @@ _RUNTIME_ROLES = frozenset(
         "sol_xhigh",
         "sol_medium_supervisor",
         "terra_xhigh",
+        "terra_xhigh_planner",
+        "terra_xhigh_reviewer",
         "sol_medium_reviewer",
         "astra_medium_reviewer",
         "sol_xhigh_planner",

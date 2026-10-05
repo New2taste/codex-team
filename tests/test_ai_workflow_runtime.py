@@ -178,15 +178,7 @@ class RuntimeIdentityTest(unittest.TestCase):
             )
 
     def test_each_pinned_terra_os_role_has_a_verifiable_runtime_identity(self):
-        for role in (
-            "luna_construction",
-            "sol_medium_supervisor",
-            "terra_xhigh",
-            "sol_medium_reviewer",
-            "astra_medium_reviewer",
-            "sol_xhigh",
-            "sol_xhigh_planner",
-        ):
+        for role in workflow._load_workflow_config()["roles"]:
             with self.subTest(role=role):
                 pinned = workflow._load_role_config(role)
                 expected = runtime_expected(

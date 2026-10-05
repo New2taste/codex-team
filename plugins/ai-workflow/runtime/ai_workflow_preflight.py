@@ -21,6 +21,8 @@ try:
         WorkflowError,
         canonical_json,
         load_artifact,
+        artifact_sha256,
+        write_json_once,
     )
     from .ai_workflow_declarations import load_route_declaration_locked
 except ImportError:  # direct script execution
@@ -32,6 +34,8 @@ except ImportError:  # direct script execution
         WorkflowError,
         canonical_json,
         load_artifact,
+        artifact_sha256,
+        write_json_once,
     )
     from ai_workflow_declarations import load_route_declaration_locked
 
@@ -55,6 +59,8 @@ PREFLIGHT_RECORD_FIELDS = frozenset(
         "cwd",
         "worktree_id",
         "process_generation",
+        "runtime_sessions_dir",
+        "runtime_sessions_binding_sha256",
     }
 )
 REQUIRED_SCHEMA_FILES = frozenset(
@@ -94,6 +100,8 @@ class PreflightContext:
     cwd: str
     worktree_id: str
     process_generation: str
+    runtime_sessions_dir: str | None = None
+    runtime_sessions_binding_sha256: str | None = None
 
     def cache_key(self) -> str:
         payload = {
@@ -105,6 +113,9 @@ class PreflightContext:
             "worktree_id": self.worktree_id,
             "process_generation": self.process_generation,
         }
+        if self.runtime_sessions_dir is not None:
+            payload["runtime_sessions_dir"] = self.runtime_sessions_dir
+            payload["runtime_sessions_binding_sha256"] = self.runtime_sessions_binding_sha256
         return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
 
 
@@ -236,6 +247,56 @@ def _sessions_directory_usable(worktree_id: str) -> bool:
         return False
 
 
+def _sessions_binding(task_id: str, task: Mapping[str, object], path: Path) -> dict[str, object]:
+    """Recapture one explicitly selected directory; never create a substitute."""
+    if not path.is_absolute() or path.is_symlink():
+        _fail("RUNTIME_SESSIONS_DIR_INVALID", "sessions must be an existing absolute non-symlink directory")
+    try:
+        resolved = path.resolve(strict=True)
+        stat = resolved.stat()
+        if not resolved.is_dir():
+            raise OSError("not a directory")
+    except OSError as exc:
+        raise WorkflowError("RUNTIME_SESSIONS_DIR_INVALID", "sessions directory is unavailable") from exc
+    return {"task_id": task_id, "task_sha256": artifact_sha256(task),
+            "runtime_sessions_dir": str(resolved), "device": stat.st_dev, "inode": stat.st_ino}
+
+
+def bind_runtime_sessions_directory(store: TaskStoreProtocol, task_id: str, path: Path) -> None:
+    """Pin the configured runtime evidence directory before preflight/permits."""
+    with store.lock(task_id):
+        task_dir = store._require_task(task_id)
+        task = load_artifact(task_dir / "task.json")
+        binding = _sessions_binding(task_id, task, Path(path))
+        write_json_once(task_dir / "runtime-sessions-binding.json", binding,
+                        conflict_code="RUNTIME_SESSIONS_BINDING_MISMATCH")
+
+
+def _bound_sessions(store: TaskStoreProtocol, task_id: str, task: Mapping[str, object]) -> Mapping[str, object] | None:
+    path = store._require_task(task_id) / "runtime-sessions-binding.json"
+    if not path.exists():
+        return None
+    binding = load_artifact(path)
+    raw = binding.get("runtime_sessions_dir")
+    if not isinstance(raw, str) or binding != _sessions_binding(task_id, task, Path(raw)):
+        _fail("RUNTIME_SESSIONS_BINDING_MISMATCH", "runtime evidence directory binding changed")
+    return binding
+
+
+def require_runtime_sessions_binding(store: TaskStoreProtocol, task_id: str, path: Path) -> None:
+    with store.lock(task_id):
+        task = load_artifact(store._require_task(task_id) / "task.json")
+        binding = _bound_sessions(store, task_id, task)
+        if binding is not None and binding != _sessions_binding(task_id, task, Path(path)):
+            _fail("RUNTIME_SESSIONS_BINDING_MISMATCH", "runtime observation must use preflight's sessions directory")
+
+
+def _preflight_sessions_usable(context: PreflightContext) -> bool:
+    if context.runtime_sessions_dir is not None:
+        return Path(context.runtime_sessions_dir).is_dir()
+    return _sessions_directory_usable(context.worktree_id)
+
+
 def compute_preflight_context(
     store: TaskStoreProtocol, task_id: str, *, role: str
 ) -> PreflightContext:
@@ -250,6 +311,7 @@ def compute_preflight_context(
         raise WorkflowError(
             "WORKTREE_UNAVAILABLE", "cannot read stored task envelope"
         ) from exc
+    binding = _bound_sessions(store, task_id, task)
     return PreflightContext(
         task_id=task_id,
         route_config_hash=_string(declaration.route_config_hash, "route_config_hash"),
@@ -259,6 +321,8 @@ def compute_preflight_context(
         cwd=os.getcwd(),
         worktree_id=_git_toplevel(_envelope_repo(task)),
         process_generation=PROCESS_GENERATION,
+        runtime_sessions_dir=str(binding["runtime_sessions_dir"]) if binding is not None else None,
+        runtime_sessions_binding_sha256=artifact_sha256(binding) if binding is not None else None,
     )
 
 
@@ -337,6 +401,9 @@ def _append_preflight_record(
         "process_generation": context.process_generation,
     }
     extra = set(record) - PREFLIGHT_RECORD_FIELDS
+    if context.runtime_sessions_dir is not None:
+        record["runtime_sessions_dir"] = context.runtime_sessions_dir
+        record["runtime_sessions_binding_sha256"] = context.runtime_sessions_binding_sha256
     if extra:
         _fail("UNKNOWN_FIELD", f"unsupported field {sorted(extra)[0]}")
     store.append_task_ledger(task_id, PREFLIGHT_LEDGER, record)
@@ -349,7 +416,7 @@ def run_role_preflight_locked(
     store._assert_lock_held(task_id)
     context = compute_preflight_context(store, task_id, role=role)
     result = dict(_run_preflight_checks(role, context))
-    if not _schema_files_present() or not _sessions_directory_usable(context.worktree_id):
+    if not _schema_files_present() or not _preflight_sessions_usable(context):
         result["status"] = "FAIL"
     return _append_preflight_record(store, task_id, role, context, result)
 
@@ -366,7 +433,7 @@ def is_role_preflighted_locked(
 ) -> bool:
     store._assert_lock_held(task_id)
     context = compute_preflight_context(store, task_id, role=role)
-    if not _sessions_directory_usable(context.worktree_id):
+    if not _preflight_sessions_usable(context):
         return False
     records = _read_preflight_records(store, task_id)
     return _preflight_record_matches(records, role, context.cache_key())
@@ -383,7 +450,7 @@ def require_role_preflighted_locked(
     store._assert_lock_held(task_id)
     context = compute_preflight_context(store, task_id, role=role)
     records = _read_preflight_records(store, task_id)
-    if not _sessions_directory_usable(context.worktree_id) or not _preflight_record_matches(
+    if not _preflight_sessions_usable(context) or not _preflight_record_matches(
         records, role, context.cache_key()
     ):
         _fail("ROLE_NOT_PREFLIGHTED", f"role {role} is not preflighted")
