@@ -45,7 +45,64 @@ except ImportError:  # direct script execution
     from ai_workflow_costs import evaluate_optimization_gate
 
 
-ROLE_POLICIES = frozenset({"legacy", "terra_os"})
+ROLE_POLICIES = frozenset({"legacy", "terra_os", "balanced_terra61"})
+# Distinct persisted rules retain model selection across upgrades and resume.
+TERRA61_PLAN_RULE = "BALANCED_TERRA61_ROUTINE_PLAN"
+TERRA61_WRITE_RULE = "BALANCED_TERRA61_ROUTINE_WRITE"
+BALANCED_FINAL_RULE = "BALANCED_SOL_HIGH_FINAL_ACCEPTANCE"
+
+
+def stored_role_policy(decision: Mapping[str, object]) -> str:
+    if decision.get("rule_id") in {TERRA61_PLAN_RULE, TERRA61_WRITE_RULE, BALANCED_FINAL_RULE}:
+        return "balanced_terra61"
+    return "terra_os" if decision.get("routing_mode") == "enforced" else "legacy"
+
+
+def routine_terra61_eligible(task: Mapping[str, object], request: Mapping[str, object]) -> bool:
+    """Explicit frozen classification, never inferred from task wording.
+
+    ROUTINE_LOCAL_CONFIRMED asserts source inspection found a local routine
+    change, not cross-module/state-machine/permission/concurrency/migration work.
+    Missing, contradictory or risky classification always retains Sol.
+    """
+    reasons = set(request.get("reason_codes", ()))
+    return bool(
+        not task.get("risk_flags") and not request.get("risk_flags")
+        and request.get("decomposable") is True
+        and request.get("work_class") in {"PLANNING_ONLY", "BOUNDED"}
+        and "ROUTINE_LOCAL_CONFIRMED" in reasons
+        and "SOURCE_INSPECTION_REQUIRED" in reasons
+        and not reasons.intersection({"DEPENDENT_STEPS_REQUIRED", "INDEPENDENT_WORKSTREAMS_PRESENT", "MATERIAL_CONSEQUENCE_PRESENT"})
+        and task.get("task_type") in {"PLAN", "REMEDIATION"}
+        and (
+            (task.get("task_type") == "PLAN" and request.get("execution_need") == "READ_ONLY"
+             and request.get("work_class") == "PLANNING_ONLY")
+            or (task.get("task_type") == "REMEDIATION" and request.get("execution_need") == "WRITE"
+                and request.get("work_class") == "BOUNDED")
+        )
+    )
+
+
+def _has_verified_terra61_step(task: Mapping[str, object], plan: object, step_id: object) -> bool:
+    """Routine writes require an existing frozen-plan contract, not just a label."""
+    try:
+        try:
+            from .ai_workflow_planning import validate_plan
+        except ImportError:
+            from ai_workflow_planning import validate_plan
+        frozen = validate_plan(plan, task)
+        if len(frozen.tasks) != 1:
+            return False
+        step = frozen.tasks[0]
+        return bool(
+            step.id == step_id and step.owner_role == "terra61_worker"
+            and not step.depends_on and len(step.write_scope) == 1
+            and step.write_scope[0] in step.read_scope
+            and step.write_scope[0] in task.get("authoritative_files", ())
+            and (Path(str(task["repository_root"])) / step.write_scope[0]).is_file()
+        )
+    except Exception:
+        return False
 # This is an in-memory policy marker only.  It is deliberately not a route
 # artifact value: selecting it requires verified local owner-decision context,
 # which the public routing facade does not yet receive.
@@ -247,12 +304,20 @@ def roles_for_policy(
     if route_name in {"direct", "blocked"}:
         return ()
     if route_name == "sol_only":
+        if policy_value == "balanced_terra61":
+            if task.get("task_type") == "ACCEPTANCE":
+                return ("sol_reviewer",)
+            if routine_terra61_eligible(task, request):
+                return ("terra61_planner",)
         return (terra_os_read_only_role(task),)
     if route_name == "delegated":
         if _has_verified_luna_construction_envelope(
             task, request, construction_plan, construction_step_id
         ):
             return ("luna_construction",)
+        if (policy_value == "balanced_terra61" and routine_terra61_eligible(task, request)
+                and _has_verified_terra61_step(task, construction_plan, construction_step_id)):
+            return ("terra61_worker",)
         return ("terra_xhigh",)
     if route_name == OWNER_AUTHORIZED_LARGE_PROJECT_ROUTE:
         if request.get("execution_need") != "WRITE":
@@ -354,7 +419,9 @@ def decide_route(
     else:
         risky = bool(task_value["risk_flags"]) or request_value["work_class"] == "HIGH_CONSEQUENCE"
         bounded_or_multi_stage = request_value["work_class"] in {"BOUNDED", "MULTI_STAGE"}
-        if bounded_or_multi_stage and not request_value["decomposable"]:
+        if policy == "balanced_terra61" and task_value.get("task_type") == "ACCEPTANCE":
+            selected = "sol_only"
+        elif bounded_or_multi_stage and not request_value["decomposable"]:
             selected = "blocked"
         elif risky and request_value["execution_need"] == "WRITE" and not request_value["decomposable"]:
             _fail(
@@ -392,6 +459,13 @@ def decide_route(
             construction_step_id=construction_step_id,
         )
     )
+    if mode == "enforced" and policy == "balanced_terra61":
+        if roles == ("terra61_planner",):
+            rule_id = TERRA61_PLAN_RULE
+        elif roles == ("terra61_worker",):
+            rule_id = TERRA61_WRITE_RULE
+        elif roles == ("sol_reviewer",):
+            rule_id = BALANCED_FINAL_RULE
     wire = RouteDecision(
         task_id=str(task_value["task_id"]),
         route=selected,

@@ -3229,6 +3229,22 @@ class LiveLunaCliTest(unittest.TestCase):
 
 
 class GitSafetyTest(unittest.TestCase):
+    def test_first_unstaged_porcelain_path_retains_its_first_character(self):
+        (self.repo / "tracked.txt").write_text("changed\n", encoding="utf-8")
+        self.assertEqual({"tracked.txt"}, workflow.working_tree_paths(self.repo))
+        raw = workflow.git(self.repo, "status", "--porcelain=v1", "-z")
+        self.assertTrue(raw.startswith(" M tracked.txt\0"))
+        workflow.assert_allowed_changes(workflow.working_tree_paths(self.repo), ["tracked.txt"])
+
+    def test_null_porcelain_multiple_records_preserve_whitespace_filenames(self):
+        (self.repo / "tracked.txt").write_text("changed\n", encoding="utf-8")
+        (self.repo / " leading space.txt").write_text("new\n", encoding="utf-8")
+        (self.repo / "untracked.txt").write_text("new\n", encoding="utf-8")
+        paths = workflow.working_tree_paths(self.repo)
+        self.assertEqual({"tracked.txt", " leading space.txt", "untracked.txt"}, paths)
+        with self.assertRaisesRegex(workflow.WorkflowError, "OUT_OF_SCOPE_CHANGE"):
+            workflow.assert_allowed_changes(paths, ["tracked.txt"])
+
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.repo = Path(self.temporary_directory.name) / "repository"

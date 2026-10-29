@@ -64,6 +64,11 @@ RISK_FLAGS = frozenset(
         "DATA_CONTAMINATION",
         "PUBLIC_API",
         "CROSS_CARD_CONTRACT",
+        "CROSS_MODULE",
+        "STATE_MACHINE",
+        "PERMISSIONS",
+        "CONCURRENCY",
+        "MIGRATION",
     }
 )
 HUMAN_GATES = frozenset(
@@ -111,10 +116,11 @@ READ_ONLY_ROLES = frozenset(
         "astra_medium_reviewer",
         "sol_xhigh_planner",
         "terra_xhigh_planner",
+        "terra61_planner",
         "terra_xhigh_reviewer",
     }
 )
-TERRA_WRITE_ROLES = frozenset({"luna_construction", "terra", "terra_xhigh"})
+TERRA_WRITE_ROLES = frozenset({"luna_construction", "terra", "terra_xhigh", "terra61_worker"})
 ROLE_GUARD_FAILURES = frozenset(
     {
         "ACCEPTANCE_CANDIDATE_HEAD_MISMATCH",
@@ -132,6 +138,8 @@ ROLE_GUARD_FAILURES = frozenset(
         "WORKFLOW_STORE_REQUIRED",
         "ROLE_NOT_PREFLIGHTED",
         "MODEL_QUOTA_EXHAUSTED",
+        "MODEL_UNAVAILABLE",
+        "CREDENTIALS_UNAVAILABLE",
         "RUNTIME_SESSIONS_BINDING_MISMATCH",
         "RUNTIME_SESSIONS_DIR_INVALID",
         "RUNTIME_EVIDENCE_MISSING",
@@ -404,6 +412,10 @@ def git(repo: Path, *args: str) -> str:
     )
     if completed.returncode != 0:
         raise WorkflowError("GIT_COMMAND_FAILED", completed.stderr.strip())
+    # NUL-delimited Git output is a record protocol: leading porcelain status
+    # spaces and filename whitespace are data, not presentation padding.
+    if "-z" in args:
+        return completed.stdout
     return completed.stdout.strip()
 
 
@@ -1784,7 +1796,7 @@ def run_codex(
             != validate_plan(construction_plan, task).plan_sha256
         ):
             _fail("LUNA_ENVELOPE_INVALID", "luna construction context does not bind the supplied step")
-    if construction_context is not None and role in {"luna_construction", "terra_xhigh"}:
+    if construction_context is not None and role in {"luna_construction", "terra_xhigh", "terra61_worker"}:
         _reconcile_construction_prompt(
             task,
             construction_context,
@@ -1965,6 +1977,9 @@ def run_codex(
         if completed.returncode != 0:
             if model_quota_exhausted(completed.stdout, completed.stderr):
                 raise WorkflowError("MODEL_QUOTA_EXHAUSTED", "model usage quota is exhausted; wait for reset or an authorized account change before retrying")
+            blocker = provider_access_blocker(completed.stdout, completed.stderr)
+            if blocker:
+                raise WorkflowError(blocker, "configured model access is blocked; restore access without substituting models")
             message = f"{role} exited with code {completed.returncode}"
             # Redact before truncating: a cut through a raw secret would
             # leave a fragment too short for the redaction patterns.
@@ -2675,6 +2690,7 @@ try:
         resolve_optimization_policy as _resolve_optimization_policy,
         resolve_role_policy as _resolve_role_policy,
         roles_for_policy as _roles_for_policy,
+        stored_role_policy as _stored_role_policy,
         terra_os_read_only_role as _terra_os_read_only_role,
     )
 except ImportError:  # direct script execution
@@ -2691,6 +2707,7 @@ except ImportError:  # direct script execution
         resolve_optimization_policy as _resolve_optimization_policy,
         resolve_role_policy as _resolve_role_policy,
         roles_for_policy as _roles_for_policy,
+        stored_role_policy as _stored_role_policy,
         terra_os_read_only_role as _terra_os_read_only_role,
     )
 
@@ -2787,7 +2804,7 @@ def _runtime_decision_from_stored(
     """Rebuild a runtime decision from a frozen wire without re-selecting the route."""
 
     validate_route_decision(stored)
-    policy = "terra_os" if stored.get("routing_mode") == "enforced" else "legacy"
+    policy = _stored_role_policy(stored)
     roles = _roles_for_policy(
         task,
         request if request is not None else _default_route_request(task),
@@ -2796,6 +2813,17 @@ def _runtime_decision_from_stored(
         construction_plan=construction_plan,
         construction_step_id=construction_step_id,
     )
+    # The original request is not available on generic read-only resume. The
+    # immutable rule and append-only event pin the selected model, not defaults.
+    pinned = {
+        "BALANCED_TERRA61_ROUTINE_PLAN": ("terra61_planner",),
+        "BALANCED_TERRA61_ROUTINE_WRITE": ("terra61_worker",),
+        "BALANCED_SOL_HIGH_FINAL_ACCEPTANCE": ("sol_reviewer",),
+    }.get(str(stored.get("rule_id")))
+    if pinned is not None:
+        if request is not None and roles != pinned:
+            _fail("ROUTE_CONFLICT", "request conflicts with the frozen model route")
+        roles = pinned
     wire = RouteDecision(
         schema_version=str(stored["schema_version"]),
         task_id=str(stored["task_id"]),
@@ -3013,6 +3041,25 @@ except ImportError:  # direct script execution
     )
 
 
+def _routine_classification_contract(
+    rule_id: str, task_sha256: str, request_sha256: str
+) -> dict[str, object]:
+    """Expose the positive classifier assertion already bound by the route rule."""
+
+    if rule_id not in {"BALANCED_TERRA61_ROUTINE_PLAN", "BALANCED_TERRA61_ROUTINE_WRITE"}:
+        _fail("ROUTE_CONFLICT", "routine classification requires a frozen Terra routine rule")
+    return {
+        "classification": "ROUTINE_LOW_RISK_LOCAL",
+        "route_rule_id": rule_id,
+        "task_sha256": task_sha256,
+        "request_sha256": request_sha256,
+        "reason_codes": ["ROUTINE_LOCAL_CONFIRMED", "SOURCE_INSPECTION_REQUIRED"],
+        "basis": "Controller source-inspection classification, validated by the frozen route; no risk flags, dependent workstreams or material-consequence classification.",
+        "boundary": "Routine local work only; not cross-module engineering, state machines, permissions, concurrency or migrations. Existing owner and permission gates remain in force.",
+        "instruction": "This task is already explicitly classified routine low-risk. Use that frozen classification rather than requiring it to be repeated in the objective. Inspect the authoritative sources and report any actual contradiction or ambiguity; this assertion is not proof of completion or permission to expand scope.",
+    }
+
+
 @dataclass(frozen=True)
 class ConstructionExecutionContext:
     """One hash-bound construction launch derived solely from frozen artifacts."""
@@ -3027,7 +3074,7 @@ class ConstructionExecutionContext:
     def contract(self) -> dict[str, object]:
         """Return the complete immutable role contract, with no route-wire policy."""
 
-        return {
+        contract = {
             "schema_version": "construction-contract-1",
             "dispatch_id": self.dispatch_id,
             "plan_sha256": self.plan.plan_sha256,
@@ -3046,6 +3093,11 @@ class ConstructionExecutionContext:
                 else None
             ),
         }
+        if self.role == "terra61_worker":
+            contract["routine_classification"] = _routine_classification_contract(
+                "BALANCED_TERRA61_ROUTINE_WRITE", self.task_sha256, self.request_sha256
+            )
+        return contract
 
 
 def build_construction_role_prompt_result(
@@ -3058,7 +3110,7 @@ def build_construction_role_prompt_result(
 
     if not isinstance(context, ConstructionExecutionContext):
         _fail("CONSTRUCTION_CONTEXT_INVALID", "construction execution requires a frozen context")
-    if context.role not in {"luna_construction", "terra_xhigh"}:
+    if context.role not in {"luna_construction", "terra_xhigh", "terra61_worker"}:
         _fail("CONSTRUCTION_CONTEXT_INVALID", "construction context has an invalid owner role")
     if context.role == "luna_construction" and context.step.construction_envelope is None:
         _fail("LUNA_ENVELOPE_INVALID", "luna construction context lacks its envelope")
@@ -3704,6 +3756,8 @@ FAKE_ROLE_RESULTS = {
     "luna_construction": ("IMPLEMENTED_CANDIDATE", "PRECHECK_RUNNING"),
     "terra": ("IMPLEMENTED_CANDIDATE", "PRECHECK_RUNNING"),
     "terra_xhigh": ("IMPLEMENTED_CANDIDATE", "PRECHECK_RUNNING"),
+    "terra61_worker": ("IMPLEMENTED_CANDIDATE", "PRECHECK_RUNNING"),
+    "terra61_planner": ("PLAN_READY", "AWAITING_OWNER_DECISION"),
     "terra_xhigh_planner": ("PLAN_READY", "AWAITING_OWNER_DECISION"),
     "terra_xhigh_reviewer": ("ACCEPTANCE_RECOMMENDED", "AWAITING_OWNER_DECISION"),
     "sol_planner": ("PLAN_READY", "AWAITING_OWNER_DECISION"),
@@ -4615,12 +4669,16 @@ def run_team_call(
             task.update(objective=call.objective, authoritative_files=git(repository, "ls-files").splitlines(),
                         verification_level="L0", base_commit=git(repository, "rev-parse", "HEAD"))
             stored = store.create_task(task)
+            planning_decision = decide_route(task, _default_route_request(task))
+            planning_role = planning_decision.effective_roles[-1]
+            planning_config = _load_workflow_config()["roles"][planning_role]
             handoff = {
                 "schema_version": "team-call-handoff-1", "call_id": receipt.call_id,
                 "task_id": task["task_id"], "task_path": str(stored.resolve()),
                 "task_sha256": artifact_sha256(task), "repository_root": str(repository),
                 "state_root": str(Path(state_root).resolve()),
-                "model": "gpt-6.1-sol", "reasoning_effort": "medium",
+                "role": planning_role, "route_rule_id": planning_decision.rule_id,
+                "model": planning_config["model"], "reasoning_effort": planning_config["reasoning_effort"],
                 "planning_status": "PENDING_NATIVE_DISPATCH", "execution_status": "NOT_STARTED",
                 "next_action": "CONSUME_WITH_ORCHESTRATION_SKILL",
             }
@@ -4755,7 +4813,7 @@ def run_team_call(
 
 
 class CodexPlanningRunner:
-    """Actual Sol-medium planning only; never grants construction authority."""
+    """Actual selected read-only planning; never grants construction authority."""
 
     is_live_model = True
     owns_cost_attempt_accounting = True
@@ -4765,14 +4823,22 @@ class CodexPlanningRunner:
         self.runtime_sessions_dir = runtime_sessions_dir
 
     def run(self, role: str, task: dict[str, object], **kwargs: object) -> Mapping[str, object]:
-        if role not in {"sol_planner", "terra_xhigh_planner"} or task["task_type"] != "PLAN":
-            _fail("TEAM_CALL_ROLE_INVALID", "planning runner accepts only Sol medium PLAN roles")
+        if role not in {"sol_planner", "terra_xhigh_planner", "terra61_planner"} or task["task_type"] != "PLAN":
+            _fail("TEAM_CALL_ROLE_INVALID", "planning runner accepts only configured PLAN roles")
         task_dir = WorkflowStore(self.state_root)._require_task(str(task["task_id"]))
         contract = {
             "acceptance_commands": task["acceptance_commands"],
             "verification_level": task["verification_level"],
             "planning_deliverable": "Return a minimal actionable plan in summary: exact scopes, acceptance commands, dependencies and owner decisions needed. Do not implement or grant authority.",
         }
+        if role == "terra61_planner":
+            store = WorkflowStore(self.state_root)
+            if _load_enforced_read_only_route_role(store, str(task["task_id"]), task) != role:
+                _fail("ROUTE_CONFLICT", "planner differs from the verified frozen route")
+            decision = load_artifact(task_dir / "route-decision.json")
+            contract["routine_classification"] = _routine_classification_contract(
+                str(decision["rule_id"]), str(decision["task_sha256"]), str(decision["request_sha256"])
+            )
         prompt = build_role_prompt_result(role, task, contract, (), state_root=self.state_root)
         paths = RunPaths(
             repo=Path(str(task["repository_root"])), output_path=task_dir / f"{role}-result.json",
@@ -4813,7 +4879,7 @@ class CodexConstructionRunner:
         paths = RunPaths(
             repo=repository,
             output_path=task_dir / f"{role}-result.json",
-            schema_path=Path(task["repository_root"]) / "config" / "ai_workflow_result.schema.json",
+            schema_path=ROLE_CONFIG_PATH.parent / "ai_workflow_result.schema.json",
             logs_dir=task_dir / "logs",
             state_root=self.state_root,
             runtime_evidence_required=True,
@@ -5161,7 +5227,7 @@ def _role_for_plan_or_review(
     return "sol_reviewer"
 
 
-def model_quota_exhausted(stdout: str | None, stderr: str | None) -> bool:
+def _provider_error_messages(stdout: str | None, stderr: str | None) -> list[str]:
     """Inspect provider error events, not arbitrary model output or quoted text."""
 
     messages = [str(stderr or "")]
@@ -5176,11 +5242,31 @@ def model_quota_exhausted(stdout: str | None, stderr: str | None) -> bool:
             messages.append(str(event.get("message", "")))
         elif event.get("type") == "turn.failed" and isinstance(event.get("error"), dict):
             messages.append(str(event["error"].get("message", "")))
+    return messages
+
+
+def model_quota_exhausted(stdout: str | None, stderr: str | None) -> bool:
     return any(
         marker in message.lower()
-        for message in messages
-        for marker in ("hit your usage limit", "usage limit has been reached", "insufficient_quota")
+        for message in _provider_error_messages(stdout, stderr)
+        for marker in ("hit your usage limit", "usage limit has been reached", "insufficient_quota", "workspace is out of credits")
     )
+
+
+def provider_access_blocker(stdout: str | None, stderr: str | None) -> str | None:
+    for message in _provider_error_messages(stdout, stderr):
+        lowered = message.lower()
+        if any(marker in lowered for marker in (
+            "invalid_api_key", "authentication failed", "not authenticated",
+            "please log in", "missing credentials", "unauthorized: 401",
+        )):
+            return "CREDENTIALS_UNAVAILABLE"
+        if any(marker in lowered for marker in (
+            "model_not_found", "model is not available", "model is not supported",
+            "does not exist or you do not have access", "not supported with your account",
+        )):
+            return "MODEL_UNAVAILABLE"
+    return None
 
 
 def execution_environment_failure(message: str) -> bool:
@@ -5218,7 +5304,7 @@ def _run_role_with_technical_retry(
         )
     if construction_context is not None and (
         construction_context.role != role
-        or role not in {"luna_construction", "terra_xhigh"}
+        or role not in {"luna_construction", "terra_xhigh", "terra61_worker"}
     ):
         _fail("CONSTRUCTION_CONTEXT_INVALID", "construction role does not match its frozen context")
 
@@ -5559,7 +5645,7 @@ def _role_state_after_result(
                     event_type="IMPLEMENTATION_REWORK_EXHAUSTED",
                 )
             target = "NEEDS_REPLAN"
-    elif role in {"sol_planner", "sol_medium_supervisor", "terra_xhigh_planner"}:
+    elif role in {"sol_planner", "sol_medium_supervisor", "terra_xhigh_planner", "terra61_planner"}:
         target = "PLAN_READY"
     elif role in {"sol_reviewer", "sol_medium_reviewer", "astra_medium_reviewer", "terra_xhigh_reviewer"}:
         target = "ESCALATION_PROPOSED" if status == "ESCALATION_PROPOSED" else "REVIEW_READY"
@@ -5647,6 +5733,8 @@ def _load_enforced_read_only_route_role(
             "HIGH_RISK_READ_ONLY_ROUTE",
             "DECOMPOSABLE_READ_ONLY_ROUTE",
             "DECOMPOSABLE_SOL_ONLY_ROUTE",
+            "BALANCED_TERRA61_ROUTINE_PLAN",
+            "BALANCED_SOL_HIGH_FINAL_ACCEPTANCE",
         }
     ):
         _fail(
@@ -5672,7 +5760,7 @@ def _load_enforced_read_only_route_role(
             "TERRA_OS_ROUTE_MISMATCH",
             "persisted route decision does not match its append-only event",
         )
-    role = _terra_os_read_only_role(task)
+    role = _runtime_decision_from_stored(decision, task).effective_roles[0]
     if role not in READ_ONLY_ROLES or role in TERRA_WRITE_ROLES:
         _fail("INVALID_ROLE", "terra_os route resolved to a non-read-only role")
     return role
@@ -5700,10 +5788,12 @@ def _load_enforced_construction_artifacts(
     except ArtifactError as exc:
         raise WorkflowError("CONSTRUCTION_ROUTE_MISSING", "enforced construction requires a stored route decision") from exc
     validate_route_decision(stored_decision)
-    recomputed = decide_route(
+    # Restoring an old construction must not apply the new installation default.
+    recomputed = _decide_route(
         task,
         request_value,
         "enforced",
+        role_policy=_stored_role_policy(stored_decision),
         construction_plan=construction_plan,
         construction_step_id=step_id,
     )
@@ -5714,7 +5804,7 @@ def _load_enforced_construction_artifacts(
     selected = next((candidate for candidate in frozen.tasks if candidate.id == step_id), None)
     if selected is None:
         _fail("CONSTRUCTION_CONTEXT_INVALID", "construction step is not present in the frozen plan")
-    if selected.owner_role not in {"luna_construction", "terra_xhigh"}:
+    if selected.owner_role not in {"luna_construction", "terra_xhigh", "terra61_worker"}:
         _fail("CONSTRUCTION_OWNER_INVALID", "enforced construction owner is not executable")
     expected_role = selected.owner_role
     if recomputed.effective_roles != (expected_role,):
@@ -6030,6 +6120,8 @@ def run_enforced_construction(
         _fail("DISPATCH_IDENTITY_DRIFT", "construction attempt must be a positive integer")
     store = WorkflowStore(state_root or WORKFLOW_STATE_ROOT)
     task = load_task(store._require_task(task_id) / "task.json")
+    if getattr(runner, "is_live_model", False) and getattr(runner, "runtime_sessions_dir", None) is not None:
+        bind_runtime_sessions_directory(store, task_id, runner.runtime_sessions_dir)
     _ensure_task_declaration(
         store,
         task_id,
@@ -6155,6 +6247,9 @@ def run_enforced_construction(
             request_sha256=str(route_wire["request_sha256"]),
             role=role,
         )
+    if getattr(runner, "is_live_model", False):
+        # The created worktree/runtime binding replaces the intake anchor.
+        run_role_preflight(store, task_id, role)
     result, state_after_retry = _run_role_with_technical_retry(
         store,
         task_id,
@@ -6229,6 +6324,11 @@ def run_until_gate(
     if getattr(runner, "is_live_model", False) and getattr(runner, "runtime_sessions_dir", None) is not None:
         bind_runtime_sessions_directory(store, task_id, runner.runtime_sessions_dir)
     _ensure_task_declaration(store, task_id, task)
+    if type(runner) is CodexPlanningRunner:
+        # The production planning controller explicitly refreshes its own
+        # preflight after binding the runtime directory/process generation.
+        role = _load_enforced_read_only_route_role(store, task_id, task)
+        run_role_preflight(store, task_id, role)
     while True:
         pending_role: str | None = None
         pending_state: str | None = None
@@ -6245,7 +6345,7 @@ def run_until_gate(
             enforced_read_only_role: str | None = None
             if (
                 _configured_routing_mode(config) == "enforced"
-                and _resolve_role_policy(config) == "terra_os"
+                and _resolve_role_policy(config) in {"terra_os", "balanced_terra61"}
             ):
                 if state == "IMPLEMENTATION_RUNNING" and has_active_repair_assignment(store, task_id):
                     return _transition(
@@ -6697,6 +6797,8 @@ def build_parser() -> argparse.ArgumentParser:
     route_command = sub.add_parser("route")
     route_command.add_argument("--task", type=Path, required=True)
     route_command.add_argument("--request", type=Path, required=True)
+    route_command.add_argument("--construction-plan", type=Path)
+    route_command.add_argument("--construction-step")
     route_command.add_argument(
         "--mode",
         choices=("legacy", "shadow", "enforced"),
@@ -7076,7 +7178,13 @@ def _run_command(args: argparse.Namespace) -> int:
             request = load_artifact(args.request)
         except ArtifactError as exc:
             raise WorkflowError(exc.code, exc.message) from exc
-        computed = decide_route(task, request, args.mode)
+        if (args.construction_plan is None) != (args.construction_step is None):
+            _fail("CONSTRUCTION_CONTEXT_INVALID", "route construction plan and step are required together")
+        construction_plan = load_artifact(args.construction_plan) if args.construction_plan else None
+        computed = decide_route(
+            task, request, args.mode, construction_plan=construction_plan,
+            construction_step_id=args.construction_step,
+        )
         store = WorkflowStore(args.root)
         decision = persist_or_reuse_route_decision(store, task["task_id"], computed)
         config = _load_workflow_config()
@@ -7096,6 +7204,8 @@ def _run_command(args: argparse.Namespace) -> int:
                 state_root=args.root,
                 task=task,
                 request=request,
+                construction_plan=construction_plan,
+                construction_step_id=args.construction_step,
             ),
             request_sha256=artifact_sha256(request),
         )
@@ -7202,9 +7312,22 @@ def _run_command(args: argparse.Namespace) -> int:
         if args.runner == "live":
             if not args.allow_live_model:
                 _fail("LIVE_MODEL_NOT_AUTHORIZED", "--allow-live-model is required for the live runner")
+            task = load_task(_task_path_from_args(args))
+            if task["task_type"] == "PLAN" and args.role in {"sol_planner", "terra_xhigh_planner", "terra61_planner"}:
+                sessions = args.runtime_sessions_dir
+                if sessions is None or not sessions.is_absolute() or not sessions.is_dir():
+                    _fail("RUNTIME_SESSIONS_DIR_INVALID", "live planning requires an existing absolute sessions directory")
+                store = WorkflowStore(args.root)
+                selected = _load_enforced_read_only_route_role(store, task["task_id"], task)
+                if selected != args.role:
+                    _fail("LIVE_ROLE_NOT_ALLOWED", "requested planner differs from the frozen route")
+                print(run_until_gate(
+                    task["task_id"], runner=CodexPlanningRunner(args.root, sessions),
+                    allow_live_model=True, state_root=args.root,
+                ))
+                return 0
             if args.role != "luna":
                 _fail("LIVE_ROLE_NOT_ALLOWED", "the live CLI runner is limited to luna")
-            task = load_task(_task_path_from_args(args))
             print(_canonical_json(_run_live_luna(task, args)))
             return 0
         if args.runner != "fake":

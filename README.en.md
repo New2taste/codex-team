@@ -8,15 +8,17 @@ It addresses three common failure modes in multi-model work: assigning a low-cos
 
 It is intended for personal development, experiments, and local workflows that use different model capabilities while retaining an audit trail. It is not a background service, does not promise to make product decisions for the user, and never implicitly merges, pushes, or deletes a workspace.
 
+The [official capability frame](https://developers.openai.com/api/docs/guides/latest-model) defines role boundaries; [community ratings](https://codexradar.com/#model-ratings) and public evaluations only prioritize bounded trials. Four tasks, small samples and different efforts are not an engineering ranking. Terra max remains an opt-in visual/computer-use trial candidate, Luna stays max, and Astra remains selective. Sources, checked dates and limitations are consolidated in [measurement.md](plugins/ai-workflow/skills/orchestration/references/measurement.md).
+
 | Project status | Current value |
 |---|---|
-| Plugin version | `0.4.1` |
+| Plugin version | `0.5.0` |
 | Release posture | Public preview; self-use first, no production SLA |
 | Default Luna execution surface | Native `NATIVE_SUBAGENT`: `gpt-6-luna / max` |
 | Entry classification | Deterministic rules; no model call by default |
-| Primary implementer | `gpt-6.1-sol / medium` |
+| Routine / complex implementation | Terra 6.1 medium / Sol 6.1 medium |
 | Final acceptance | Concentrated, read-only, adversarial `gpt-6.1-sol / high` review |
-| Last updated | 2026-09-30 |
+| Last updated | 2026-10-29 |
 | License | Not declared; public visibility does not grant redistribution rights |
 
 ## What this is
@@ -28,13 +30,14 @@ Codex Team consists of standard-library implementations, schemas, a Plugin mirro
 | Role | Model / effort | Responsibility | Boundary |
 |---|---|---|---|
 | Luna Max | `gpt-6-luna / max` | Batch bounded, mechanically verifiable tasks, checks and evidence extraction | Hand failures and evidence back; never plan, review, approve or retry repeatedly |
-| Primary implementer | `gpt-6.1-sol / medium` | Routine coordination, ordinary planning, construction, debugging, integration and first bounded repair | Never merge, push or self-accept |
+| Routine executor | `gpt-6.1-terra / medium` | Routine automation, information work, simple planning and clearly local development | Requires reliable classification; no open-ended complex coordination or acceptance |
+| Engineering owner | `gpt-6.1-sol / medium` | Engineering decisions, complex/cross-module code, state machines, permissions, concurrency, migrations and first final-acceptance repair | Conservative fallback for uncertainty; never merge, push or self-accept |
 | Final reviewer and difficult-work escalation | `gpt-6.1-sol / high` | Independent, read-only, adversarial final acceptance; difficult work or authorized terminal repair | Review and scoped-write repair are separate phases |
 | Astra medium | `gpt-6-astra / medium` | Large-project planning, stubborn problems, supplementary independent recheck or authorized terminal repair | Optional; rechecks stay read-only and terminal repairs require owner authorization |
 
-Ordinary plans stay with Sol medium. After Sol high final acceptance recommends rework, a distinct Sol medium fixer repairs the frozen findings. Another Sol medium independently rechecks; explicitly select Astra medium when an additional perspective is needed. A failed recheck permits only one owner-authorized Sol high or Astra medium terminal repair. Frozen functional checks and existing release gates remain mandatory, without additional task-level model review.
+Choose the owner directly by risk and complexity, not a mandatory model sequence. Terra medium handles evidenced simple plans; complex or unclassified work stays with Sol medium. After Sol high final acceptance recommends rework, a distinct Sol medium fixer repairs the frozen findings. Another Sol medium independently rechecks; explicitly select Astra medium when an additional perspective is needed. A failed recheck permits only one owner-authorized Sol high or Astra medium terminal repair. Frozen functional checks and existing release gates remain mandatory, without additional task-level model review.
 
-Historical role/command IDs remain compatibility handles: `terra_xhigh` means the primary implementer, `sol_reviewer` means Sol high final acceptance, `sol_medium_reviewer` means Sol medium repair/recheck, and `astra_medium_reviewer` means Astra medium recheck. `sol_xhigh` and `authorize_final_xhigh` retain their compatibility IDs. Runtime receipts establish the actual model, effort and permissions.
+The new `balanced_terra61` policy uses distinct `terra61_planner` / `terra61_worker` identities for real Terra. Historical `terra` / `terra_xhigh` and related planner/reviewer IDs remain Sol compatibility handles; frozen old tasks never silently switch models. The `sol_reviewer` means Sol high final acceptance, `sol_medium_reviewer` means Sol medium repair/recheck, and `astra_medium_reviewer` means Astra medium recheck. `sol_xhigh` and `authorize_final_xhigh` retain their compatibility IDs. Runtime receipts establish the actual model, effort and permissions.
 
 ### Routing at a glance
 
@@ -45,9 +48,11 @@ flowchart TD
     A[User objective] --> B{Deterministic intake and scope}
     B -->|Fixed safe command| C[Controller<br/>No model]
     B -->|Bounded facts or small tasks| D[Luna 6 max]
-    B -->|Planning and complex implementation| E[Sol 6.1 medium]
+    B -->|Evidenced routine work and local development| T[Terra 6.1 medium]
+    B -->|Engineering decisions, complex or uncertain work| E[Sol 6.1 medium]
     E -. Large plans or difficult problems .-> F[Astra medium / Sol high<br/>As authorized]
     D --> G[Section self-check and evidence]
+    T --> G
     E --> G
     G -->|Sections remain| B
     G -->|All complete| H[Independent Sol 6.1 high<br/>Read-only adversarial final acceptance]
@@ -127,7 +132,7 @@ Reuse existing `cost.jsonl`, runtime evidence and reports for 10–20 real match
 ```text
 Objective → task envelope and deterministic evidence checks
 → DIRECT_L1 Luna fact extraction when needed
-→ Sol medium ordinary planning; Astra medium only for authorized large projects
+→ Terra medium evidenced simple planning; Sol medium for complex/uncertain work; Astra medium only for authorized large projects
 → owner decision
 ```
 

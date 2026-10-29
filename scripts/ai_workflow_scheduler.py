@@ -97,7 +97,7 @@ EVENT_FIELDS = {
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 SAFE_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
-WRITE_ROLES = frozenset({"luna_construction", "terra", "terra_xhigh"})
+WRITE_ROLES = frozenset({"luna_construction", "terra", "terra_xhigh", "terra61_worker"})
 SECTION_READ_ROLES = frozenset({"luna"})
 SECTION_ROLES = WRITE_ROLES | SECTION_READ_ROLES
 

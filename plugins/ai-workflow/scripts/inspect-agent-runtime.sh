@@ -65,18 +65,28 @@ jq -cse --arg requested_thread "$thread_id" --argjson issued_native_agent_id "$(
           else unique
                | if length == 1 then .[0] else error("invalid runtime rollout") end
           end;
+      # Model messages/tool schemas are not runtime authority. Current rollouts
+      # carry identity in these typed records; untyped legacy fixtures retain
+      # their original object contract.
+      def identity_objects:
+        $records[]
+        | if (.type == "session_meta" or .type == "turn_context")
+             and (.payload | type == "object")
+          then .payload | .. | objects
+          elif (has("type") | not)
+          then .. | objects
+          else empty
+          end;
       def field($name):
         one_string([
-          $records[]
-          | .. | objects
+          identity_objects
           | select(has($name))
           | .[$name]
         ]);
       def rollout_thread:
         one_string(
           [
-            $records[]
-            | .. | objects
+            identity_objects
             | select(has("thread_id"))
             | .thread_id
           ]
@@ -91,8 +101,7 @@ jq -cse --arg requested_thread "$thread_id" --argjson issued_native_agent_id "$(
         );
       def nullable_agent_type:
         [
-          $records[]
-          | .. | objects
+          identity_objects
           | select(has("agent_type"))
           | .agent_type
         ] as $values
@@ -119,10 +128,28 @@ jq -cse --arg requested_thread "$thread_id" --argjson issued_native_agent_id "$(
             else empty
             end
         ]);
+      # Recent Codex versions store the canonical effort as payload.effort.
+      # Only a trusted turn_context record may supply this alias. Include all
+      # canonical observations too so dual fields or turns cannot disagree.
+      def runtime_effort:
+        one_string(
+          [
+            identity_objects
+            | select(has("reasoning_effort"))
+            | .reasoning_effort
+          ]
+          +
+          [
+            $records[]
+            | select(.type == "turn_context" and (.payload | type == "object"))
+            | .payload
+            | select(has("effort"))
+            | .effort
+          ]
+        );
       def sandbox_policy:
         [
-          $records[]
-          | .. | objects
+          identity_objects
           | select(has("sandbox_policy"))
           | .sandbox_policy
           | if type == "string" and length > 0
@@ -131,14 +158,37 @@ jq -cse --arg requested_thread "$thread_id" --argjson issued_native_agent_id "$(
                  and (keys == ["type"])
                  and .type == "read-only"
             then "read-only"
+            elif type == "object"
+                 and (keys == ["exclude_slash_tmp", "exclude_tmpdir_env_var", "network_access", "type"])
+                 and .type == "workspace-write"
+                 and .network_access == false
+                 and .exclude_tmpdir_env_var == false
+                 and .exclude_slash_tmp == false
+            then "workspace-write"
             else error("invalid runtime rollout")
             end
         ]
         | one_string(.);
+      def managed_workspace_profile($cwd):
+        (keys == ["file_system", "network", "type"])
+        and .type == "managed"
+        and .network == "restricted"
+        and (.file_system | type == "object")
+        and (.file_system | keys == ["entries", "type"])
+        and .file_system.type == "restricted"
+        and (.file_system.entries | type == "array")
+        and ((.file_system.entries | sort_by(.path | tojson)) == ([
+          {path: {type: "special", value: {kind: "root"}}, access: "read"},
+          {path: {type: "path", path: $cwd}, access: "write"},
+          {path: {type: "special", value: {kind: "slash_tmp"}}, access: "write"},
+          {path: {type: "special", value: {kind: "tmpdir"}}, access: "write"},
+          ([".git", ".agents", ".codex", ".aws"][] |
+            {path: {type: "path", path: ($cwd + "/" + .)}, access: "read", missing_path_behavior: "skip"})
+        ] | sort_by(.path | tojson)));
       def permission_profile:
+        runtime_cwd as $cwd |
         [
-          $records[]
-          | .. | objects
+          identity_objects
           | select(has("permission_profile"))
           | .permission_profile
           | if type == "string" and length > 0
@@ -164,6 +214,8 @@ jq -cse --arg requested_thread "$thread_id" --argjson issued_native_agent_id "$(
                    and .path.value.kind == "root"
                  )
             then "read-only"
+            elif type == "object" and managed_workspace_profile($cwd)
+            then "workspace-write"
             else error("invalid runtime rollout")
             end
         ]
@@ -183,7 +235,7 @@ jq -cse --arg requested_thread "$thread_id" --argjson issued_native_agent_id "$(
         native_agent_id: $native_agent_id,
         agent_type: nullable_agent_type,
         model: field("model"),
-        reasoning_effort: field("reasoning_effort"),
+        reasoning_effort: runtime_effort,
         sandbox_policy: sandbox_policy,
         permission_profile: permission_profile,
         cwd: runtime_cwd

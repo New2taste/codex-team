@@ -113,6 +113,7 @@ class ReadOnlyRouteRunner:
     def run(self, role: str, task: dict[str, object]) -> dict[str, object]:
         self.calls.append(role)
         statuses = {
+            "sol_reviewer": ("ACCEPTANCE_RECOMMENDED", "REVIEW_READY"),
             "terra_xhigh_planner": ("PLAN_READY", "PLAN_READY"),
             "terra_xhigh_reviewer": (
                 "ACCEPTANCE_RECOMMENDED",
@@ -140,7 +141,7 @@ class FinalFixReadOnlyRouteTest(unittest.TestCase):
         for index, (task_type, expected_role) in enumerate(
             (
                 ("PLAN", "terra_xhigh_planner"),
-                ("ACCEPTANCE", "terra_xhigh_reviewer"),
+                ("ACCEPTANCE", "sol_reviewer"),
             ),
             start=1,
         ):
@@ -158,7 +159,7 @@ class FinalFixReadOnlyRouteTest(unittest.TestCase):
         for index, (task_type, expected_role) in enumerate(
             (
                 ("PLAN", "terra_xhigh_planner"),
-                ("ACCEPTANCE", "terra_xhigh_reviewer"),
+                ("ACCEPTANCE", "sol_reviewer"),
             ),
             start=11,
         ):

@@ -1412,6 +1412,7 @@ def _v2_validate_observed_receipt(
         "luna": ("gpt-6-luna", "max", "workspace-write", "workspace-write"),
         "luna_construction": ("gpt-6-luna", "max", "workspace-write", "workspace-write"),
         "terra_xhigh": ("gpt-6.1-sol", "medium", "workspace-write", "workspace-write"),
+        "terra61_worker": ("gpt-6.1-terra", "medium", "workspace-write", "workspace-write"),
         "terra_xhigh_reviewer": ("gpt-6.1-sol", "medium", "read-only", "read-only"),
         "sol_medium_reviewer": ("gpt-6.1-sol", "medium", "read-only", "read-only"),
         "sol_reviewer": ("gpt-6.1-sol", "high", "read-only", "read-only"),
@@ -1937,7 +1938,7 @@ def open_task_acceptance(
         )
         allowed_owners = {"luna", "terra_xhigh"}
         if _is_whole_project_final(stored, store=store):
-            allowed_owners = {"luna", "terra_xhigh", "luna_construction"}
+            allowed_owners = {"luna", "terra_xhigh", "luna_construction", "terra61_worker"}
         if owner_receipt.requested_role not in allowed_owners:
             _fail("ACCEPTANCE_RECEIPT_MISMATCH", "only Luna or primary implementer may own acceptance")
         if _is_whole_project_final(stored, store=store):

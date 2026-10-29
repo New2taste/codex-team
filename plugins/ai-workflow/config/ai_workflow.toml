@@ -11,7 +11,7 @@ automatic_push = false
 
 [routing]
 mode = "enforced"
-role_policy = "terra_os"
+role_policy = "balanced_terra61"
 
 [automation]
 max_active_subagents = 2
@@ -55,6 +55,21 @@ reasoning_effort = "medium"
 sandbox = "workspace-write"
 allowed_statuses = ["IMPLEMENTED_CANDIDATE", "NEEDS_CLARIFICATION", "BLOCKED"]
 instructions = """Own implementation only inside the authorized worktree and paths. Stop on semantic ambiguity. Never merge, push, or self-approve."""
+
+# New identities: historical terra/terra_xhigh roles remain Sol compatibility handles.
+[roles.terra61_worker]
+model = "gpt-6.1-terra"
+reasoning_effort = "medium"
+sandbox = "workspace-write"
+allowed_statuses = ["IMPLEMENTED_CANDIDATE", "NEEDS_CLARIFICATION", "BLOCKED"]
+instructions = """Execute only explicitly classified low-risk local routine construction inside the frozen authorized paths. Self-check sections; return ambiguity, cross-module engineering, state machines, permissions, concurrency or migrations to Sol medium. Never merge, push, or self-approve. Environment, quota and credential blockers are not reasons to retry another model."""
+
+[roles.terra61_planner]
+model = "gpt-6.1-terra"
+reasoning_effort = "medium"
+sandbox = "read-only"
+allowed_statuses = ["PLAN_READY", "NEEDS_OWNER_DECISION", "INSUFFICIENT_EVIDENCE"]
+instructions = """Produce the smallest simple plan only for an explicitly classified routine low-risk task. Do not implement. Return complex or uncertain engineering to Sol medium; never widen scope or bypass owner gates."""
 
 [roles.sol_planner]
 model = "gpt-6.1-sol"

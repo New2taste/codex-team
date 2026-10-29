@@ -69,7 +69,12 @@
           "SECURITY",
           "DATA_CONTAMINATION",
           "PUBLIC_API",
-          "CROSS_CARD_CONTRACT"
+          "CROSS_CARD_CONTRACT",
+          "CROSS_MODULE",
+          "STATE_MACHINE",
+          "PERMISSIONS",
+          "CONCURRENCY",
+          "MIGRATION"
         ]
       },
       "uniqueItems": true

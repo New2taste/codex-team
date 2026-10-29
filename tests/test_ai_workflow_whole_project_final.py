@@ -604,7 +604,7 @@ class WholeProjectFinalAcceptanceTest(unittest.TestCase):
             "risk_flags": [],
             "reason_codes": ["PLAN_IS_DELIVERABLE"],
         }
-        decision = workflow.decide_route(task, request, "enforced")
+        decision = workflow._decide_route(task, request, "enforced", role_policy="terra_os")
         self.assertEqual(("terra_xhigh_reviewer",), decision.roles)
         self.assertNotIn("sol_medium_reviewer", decision.roles)
 

@@ -236,7 +236,7 @@ class IdentityProbeManifestContractTest(unittest.TestCase):
             ["NO_OP", "ONE_TURN", "TWO_TURN"],
             properties["arm"]["enum"],
         )
-        self.assertEqual({"gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-astra"}, set(
+        self.assertEqual({"gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-astra"}, set(
             properties["requested_launch_intent"]["properties"]["model"]["enum"]
         ))
         self.assertEqual(

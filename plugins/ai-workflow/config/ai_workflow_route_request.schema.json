@@ -35,7 +35,12 @@
           "SECURITY",
           "DATA_CONTAMINATION",
           "PUBLIC_API",
-          "CROSS_CARD_CONTRACT"
+          "CROSS_CARD_CONTRACT",
+          "CROSS_MODULE",
+          "STATE_MACHINE",
+          "PERMISSIONS",
+          "CONCURRENCY",
+          "MIGRATION"
         ]
       },
       "uniqueItems": true
@@ -48,6 +53,7 @@
         "enum": [
           "PROMPT_SUFFICIENT",
           "PLAN_IS_DELIVERABLE",
+          "ROUTINE_LOCAL_CONFIRMED",
           "SOURCE_INSPECTION_REQUIRED",
           "STATE_CHANGE_REQUIRED",
           "DEPENDENT_STEPS_REQUIRED",

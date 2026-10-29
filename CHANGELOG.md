@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.0 — 2026-10-30
+
+新增 `balanced_terra61` 风险/复杂度直接选负责人策略：真实 `gpt-6.1-terra / medium` 使用独立的 `terra61_planner` / `terra61_worker` 角色，负责有可靠分类证据的简单规划、日常自动化/资料工作及明确局部常规开发。复杂工程和分类不明保守使用 Sol medium；独立 Sol high 集中终验、Sol medium 修复/另 Sol medium 复验、既有终局修复、Luna max、Astra 授权规划/争议与两子代理/一写入者边界保持不变。
+
+旧 `terra` / `terra_xhigh` 等角色仍是 Sol，不批量重绑；新冻结规则区分真实 Terra 身份，旧任务按原规则恢复。施工入口复用 ai-plan-1、owner authority、preflight、runtime/cost evidence 和 scheduler，并补充单步单文件例行施工门。模型不可用、凭证、额度与环境阻塞不通过换模型或重复调用掩盖。官方能力定位决定职责，社区小样本仅用于候选档位试验排序，不宣称已验证的成本/质量收益。
+
+补齐真实运行兼容性：受信运行记录的 `effort` 字段和严格 managed workspace-write 权限解析、重复会话绑定的幂等校验、冻结例行分类向规划/施工 prompt 的传递，以及 Git porcelain 首条未暂存路径解析。真实 Terra medium 只读规划与隔离单文件施工已通过身份、写域及四项功能检查，并经独立复核；这不代表已完成成本收益对照实验。
+
 ## Unreleased — 2026-09-30 workflow optimization
 
 - 日常统筹、普通规划、主施工和优先返工使用 Sol 6.1 medium；集中终验使用独立 Sol 6.1 high，困难升级档统一为 high。

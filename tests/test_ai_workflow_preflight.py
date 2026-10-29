@@ -301,6 +301,20 @@ class PreflightStaticChecksTest(unittest.TestCase):
 
 
 class PreflightCacheKeyTest(_PreflightStoreMixin, unittest.TestCase):
+    def test_repeated_identical_sessions_binding_is_read_only_and_idempotent(self) -> None:
+        external = Path(self.temporary.name) / "external-sessions"
+        external.mkdir()
+        preflight.bind_runtime_sessions_directory(self.store, TASK_ID, external)
+        target = self.store._require_task(TASK_ID) / "runtime-sessions-binding.json"
+        before = (target.read_bytes(), target.stat().st_ino, target.stat().st_mtime_ns)
+        preflight.bind_runtime_sessions_directory(self.store, TASK_ID, external)
+        self.assertEqual(before, (target.read_bytes(), target.stat().st_ino, target.stat().st_mtime_ns))
+        other = Path(self.temporary.name) / "other-sessions"
+        other.mkdir()
+        with self.assertRaisesRegex(artifacts.WorkflowError, "RUNTIME_SESSIONS_BINDING_MISMATCH"):
+            preflight.bind_runtime_sessions_directory(self.store, TASK_ID, other)
+        self.assertEqual(before, (target.read_bytes(), target.stat().st_ino, target.stat().st_mtime_ns))
+
     def test_explicit_external_sessions_directory_is_used_and_bound(self) -> None:
         external = Path(self.temporary.name) / "external-sessions"
         external.mkdir()

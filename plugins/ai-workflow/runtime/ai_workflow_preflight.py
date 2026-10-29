@@ -218,6 +218,13 @@ def _git_toplevel(repo: Path) -> str:
 def _envelope_repo(task: Mapping[str, object]) -> Path:
     if task.get("task_type") == "REMEDIATION":
         raw = task.get("source_worktree")
+        # Before execution approval the task-scoped worktree does not exist.
+        # Preflight may inspect the original repo, but this grants no launch or
+        # write authority. Once created, the normal worktree identity takes over.
+        original = Path(str(task.get("repository_root", ""))).resolve()
+        expected = original / ".codex-worktrees" / str(task.get("task_id", "")).lower()
+        if isinstance(raw, str) and Path(raw).resolve() == expected and not expected.exists():
+            return original
     else:
         raw = task.get("repository_root")
     if not isinstance(raw, str) or not raw.strip():
@@ -268,7 +275,14 @@ def bind_runtime_sessions_directory(store: TaskStoreProtocol, task_id: str, path
         task_dir = store._require_task(task_id)
         task = load_artifact(task_dir / "task.json")
         binding = _sessions_binding(task_id, task, Path(path))
-        write_json_once(task_dir / "runtime-sessions-binding.json", binding,
+        target = task_dir / "runtime-sessions-binding.json"
+        if target.exists() or target.is_symlink():
+            if target.is_symlink() or not target.is_file():
+                _fail("RUNTIME_SESSIONS_BINDING_MISMATCH", "runtime evidence binding is not a regular artifact")
+            if _bound_sessions(store, task_id, task) != binding:
+                _fail("RUNTIME_SESSIONS_BINDING_MISMATCH", "runtime evidence directory binding changed")
+            return
+        write_json_once(target, binding,
                         conflict_code="RUNTIME_SESSIONS_BINDING_MISMATCH")
 
 

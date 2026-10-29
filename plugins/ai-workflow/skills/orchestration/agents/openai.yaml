@@ -1,4 +1,4 @@
 interface:
   display_name: "AI Workflow Orchestration"
-  short_description: "Execute Team Call tasks with Sol and evidence gates"
-  default_prompt: "Use $ai-workflow:orchestration to execute this authorized task: consume the durable Team Call handoff, dispatch actual Sol medium planning and construction, use native Luna Max only for bounded work, and verify runtime identity and the independent GPT-6.1 Sol high final acceptance gate. Do not stop at classification or claim a pending handoff is a model run."
+  short_description: "Route Terra and Sol work with verified evidence gates"
+  default_prompt: "Use $ai-workflow:orchestration to execute this authorized task with evidence-based Terra medium routine work, Sol medium complex engineering, bounded Luna Max work, and independent Sol high final acceptance; preserve frozen identities and owner gates."

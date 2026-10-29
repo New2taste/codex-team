@@ -94,8 +94,9 @@ class TerraOSConfigTest(unittest.TestCase):
             self.config = tomllib.load(handle)
 
     def test_terra_os_is_the_enforced_default_with_final_rework_policy(self):
+        """Historical baseline test ID retained; 0.5 opts new tasks into balanced routing."""
         self.assertEqual(
-            {"mode": "enforced", "role_policy": "terra_os"},
+            {"mode": "enforced", "role_policy": "balanced_terra61"},
             self.config["routing"],
         )
         self.assertEqual(1, self.config["policy"]["max_implementation_reworks"])
@@ -206,7 +207,8 @@ class TerraOSConfigTest(unittest.TestCase):
                 )
 
     def test_role_policy_resolution_is_closed_and_honors_explicit_override(self):
-        self.assertEqual("terra_os", routing.resolve_role_policy(self.config))
+        self.assertEqual("balanced_terra61", routing.resolve_role_policy(self.config))
+        self.assertEqual("terra_os", routing.resolve_role_policy(self.config, override="terra_os"))
         self.assertEqual("legacy", routing.resolve_role_policy(self.config, override="legacy"))
         with self.assertRaisesRegex(workflow.WorkflowError, "ROLE_POLICY_INVALID"):
             routing.resolve_role_policy(self.config, override="unreviewed")

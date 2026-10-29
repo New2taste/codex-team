@@ -10,13 +10,13 @@ Codex Team 是一个面向 Codex 的本地、可恢复、可审计的半自动�
 
 | 项目状态 | 当前值 |
 |---|---|
-| Plugin 版本 | `0.4.1` |
+| Plugin 版本 | `0.5.0` |
 | 发布形态 | Public preview；自用优先，不承诺生产 SLA |
 | 默认 Luna 执行面 | 原生 `NATIVE_SUBAGENT`：`gpt-6-luna / max` |
 | 入口分类 | 确定性规则；默认不为分类启动模型 |
-| 默认主施工角色 | GPT-6.1 Sol：`gpt-6.1-sol / medium` |
+| 日常 / 复杂施工 | Terra 6.1 medium（明确局部常规工作）/ Sol 6.1 medium（复杂工程）|
 | 集中整体终验 | 独立的 GPT-6.1 Sol：`gpt-6.1-sol / high`，只读、对抗式 |
-| 最近更新 | 2026-09-30 |
+| 最近更新 | 2026-10-29 |
 | 许可证 | 尚未声明；公开可见不等于授予再分发许可 |
 
 ## 这是什么
@@ -28,13 +28,14 @@ Codex Team 由标准库实现、Schema、Plugin 镜像、CLI 和测试组成。�
 | 角色 | 默认模型 / 档位 | 主要职责 | 明确边界 |
 |---|---|---|---|
 | Luna Max | `gpt-6-luna / max` | 同类合并、范围明确、机械可验证的小任务，以及检查和证据整理 | 失败携带证据交回主施工角色；不反复试错、不规划、不验收 |
-| 主施工角色 | `gpt-6.1-sol / medium` | 日常统筹、普通项目规划、复杂施工、调试、集成和首轮有界返工 | 不 merge、push 或自我验收 |
+| 日常执行 | `gpt-6.1-terra / medium` | 日常自动化、资料处理、简单规划及明确局部开发 | 必须有可靠分类依据；不负责开放复杂统筹或终验 |
+| 工程负责人 | `gpt-6.1-sol / medium` | 工程决策、复杂/跨模块施工、状态机、权限、并发、迁移及首轮终验返工 | 分类不明保守选 Sol；不 merge、push 或自我验收 |
 | 集中验收与困难升级 | `gpt-6.1-sol / high` | 全部小节完成后的独立、只读、对抗式终验；困难问题与授权终局修复 | 按需调用；只读终验与授权修复分属不同阶段 |
 | Astra medium | `gpt-6-astra / medium` | 大型规划、顽固难题、审查分歧的补充独立复验，或授权终局修复 | 非普通项目必经步骤；复验只读，终局修复须 owner 授权 |
 
-普通计划不固定转交 Astra。首轮返工由 Sol medium 优先承担，再由另一 Sol medium 独立复验；需要补充视角时显式选择 Astra medium。复验仍失败，只允许经既有 owner 授权执行一次 Sol high 或 Astra medium 终局修复，随后必须通过冻结功能检查和既有交付门。
+按风险与复杂度直接选负责人，不依次经过所有模型；可靠的日常简单规划可由 Terra medium 完成，复杂或分类不明时用 Sol medium。普通计划不固定转交 Astra。首轮返工由 Sol medium 优先承担，再由另一 Sol medium 独立复验；需要补充视角时显式选择 Astra medium。复验仍失败，只允许经既有 owner 授权执行一次 Sol high 或 Astra medium 终局修复，随后必须通过冻结功能检查和既有交付门。
 
-内部历史 role/command ID 仅用于兼容：主施工仍使用 `terra_xhigh`，集中 Sol high 终验使用 `sol_reviewer`，Sol medium 返工/复验使用 `sol_medium_reviewer`，Astra medium 复验使用 `astra_medium_reviewer`；`sol_xhigh` 与 `authorize_final_xhigh` 是 Astra/终局授权的兼容句柄。实际身份以配置、模型、档位和运行时收据为准。
+新策略名为 `balanced_terra61`，新角色 `terra61_planner` / `terra61_worker` 才绑定真实 Terra。内部历史 role/command ID 保持兼容：`terra` / `terra_xhigh` 及旧 planner/reviewer 仍绑定 Sol；旧任务恢复按冻结规则，不因升级改模型。集中 Sol high 终验使用 `sol_reviewer`，Sol medium 返工/复验使用 `sol_medium_reviewer`，Astra medium 复验使用 `astra_medium_reviewer`；`sol_xhigh` 与 `authorize_final_xhigh` 是 Astra/终局授权的兼容句柄。实际身份以配置、模型、档位和运行时收据为准。
 
 ## 路由工作示意
 
@@ -45,9 +46,11 @@ flowchart TD
     A[用户目标] --> B{确定性分类与任务边界}
     B -->|固定安全命令| C[控制器执行<br/>不调用模型]
     B -->|只读事实或有界小任务| D[Luna 6 max]
-    B -->|规划、复杂施工与调试| E[Sol 6.1 medium]
+    B -->|明确日常工作、简单规划与局部开发| T[Terra 6.1 medium]
+    B -->|工程决策、复杂代码或分类不明| E[Sol 6.1 medium]
     E -. 大型规划或顽固难题 .-> F[Astra medium / Sol high<br/>按需授权]
     D --> G[小节自检与证据]
+    T --> G
     E --> G
     G -->|尚有小节| B
     G -->|全部完工| H[独立 Sol 6.1 high<br/>集中只读对抗式终验]
@@ -64,6 +67,8 @@ flowchart TD
 
 成本与提速效果尚待实测：观察后续 10–20 个真实任务的总消耗、耗时、首次通过率、返工次数和验收后遗漏。使用既有 report/cost evidence，不新增评测框架；API 成本与订阅额度分开记录。
 
+分工采用双依据：[官方能力定位](https://developers.openai.com/api/docs/guides/latest-model)决定职责边界，[社区评分](https://codexradar.com/#model-ratings)及公开评测仅调整候选试验优先级；四题、小样本与不同档位不能当作工程排名。Terra max 仅作为复杂视觉/电脑操作的按需试验候选，Luna 默认仍 max，Astra 不扩大常规职责。来源、核验日期与局限集中记录在 [measurement.md](plugins/ai-workflow/skills/orchestration/references/measurement.md)。
+
 ## English overview
 
 Codex Team is a local, resumable, auditable, semi-automated multi-model workflow for Codex. It turns “who acts, what they may change, when they must stop, and who accepts the result” into explicit task envelopes, deterministic routing, runtime identity, evidence chains, and human gates.
@@ -75,13 +80,14 @@ It is designed for personal development, experiments, and local workflows that c
 | Role | Model / effort | Responsibility | Boundary |
 |---|---|---|---|
 | Luna Max | `gpt-6-luna / max` | Batch bounded, mechanically verifiable tasks, checks and evidence extraction | Hand failures and evidence back; never plan, review, approve or retry repeatedly |
-| Primary implementer | `gpt-6.1-sol / medium` | Routine coordination, ordinary planning, construction, debugging, integration and first bounded repair | Never merge, push or self-accept |
+| Routine executor | `gpt-6.1-terra / medium` | Routine automation, information work, simple planning and clearly local development | Requires reliable classification; no open-ended complex coordination or acceptance |
+| Engineering owner | `gpt-6.1-sol / medium` | Engineering decisions, complex/cross-module code, state machines, permissions, concurrency, migrations and first final-acceptance repair | Conservative fallback for uncertainty; never merge, push or self-accept |
 | Final reviewer and difficult-work escalation | `gpt-6.1-sol / high` | Independent, read-only, adversarial final acceptance; difficult work or authorized terminal repair | Review and scoped-write repair are separate phases |
 | Astra medium | `gpt-6-astra / medium` | Large-project planning, stubborn problems, supplementary independent recheck or authorized terminal repair | Optional; rechecks stay read-only and terminal repairs require owner authorization |
 
-Ordinary plans stay with Sol medium. After Sol high final acceptance recommends rework, a distinct Sol medium fixer repairs the frozen findings. Another Sol medium independently rechecks; explicitly select Astra medium when an additional perspective is needed. A failed recheck permits only one owner-authorized Sol high or Astra medium terminal repair. Frozen functional checks and existing release gates remain mandatory, without additional task-level model review.
+Choose the owner directly by risk and complexity, not a mandatory model sequence. Terra medium handles evidenced simple plans; complex or unclassified work stays with Sol medium. After Sol high final acceptance recommends rework, a distinct Sol medium fixer repairs the frozen findings. Another Sol medium independently rechecks; explicitly select Astra medium when an additional perspective is needed. A failed recheck permits only one owner-authorized Sol high or Astra medium terminal repair. Frozen functional checks and existing release gates remain mandatory, without additional task-level model review.
 
-Historical role/command IDs remain compatibility handles: `terra_xhigh` means the primary implementer, `sol_reviewer` means Sol high final acceptance, `sol_medium_reviewer` means Sol medium repair/recheck, and `astra_medium_reviewer` means Astra medium recheck. `sol_xhigh` and `authorize_final_xhigh` retain their compatibility IDs. Runtime receipts establish the actual model, effort and permissions.
+The new `balanced_terra61` policy uses distinct `terra61_planner` / `terra61_worker` identities for real Terra. Historical `terra` / `terra_xhigh` and related planner/reviewer IDs remain Sol compatibility handles; frozen old tasks never silently switch models. The `sol_reviewer` means Sol high final acceptance, `sol_medium_reviewer` means Sol medium repair/recheck, and `astra_medium_reviewer` means Astra medium recheck. `sol_xhigh` and `authorize_final_xhigh` retain their compatibility IDs. Runtime receipts establish the actual model, effort and permissions.
 
 ### Routing at a glance
 
@@ -92,9 +98,11 @@ flowchart TD
     A[User objective] --> B{Deterministic intake and scope}
     B -->|Fixed safe command| C[Controller<br/>No model]
     B -->|Bounded facts or small tasks| D[Luna 6 max]
-    B -->|Planning and complex implementation| E[Sol 6.1 medium]
+    B -->|Evidenced routine work and local development| T[Terra 6.1 medium]
+    B -->|Engineering decisions, complex or uncertain work| E[Sol 6.1 medium]
     E -. Large plans or difficult problems .-> F[Astra medium / Sol high<br/>As authorized]
     D --> G[Section self-check and evidence]
+    T --> G
     E --> G
     G -->|Sections remain| B
     G -->|All complete| H[Independent Sol 6.1 high<br/>Read-only adversarial final acceptance]
@@ -181,7 +189,7 @@ Compare real Team and single-Sol-medium tasks using existing cost/runtime/report
 ```text
 目标 → 任务信封/确定性证据校验
 → 必要时用 DIRECT_L1 Luna 做有界事实抽取
-→ 普通项目缺少计划时由 Sol medium 补齐；大型规划按需选 Astra medium
+→ 有证据的简单规划用 Terra medium；复杂或不明确时 Sol medium；大型规划按需选 Astra medium
 → owner decision
 ```
 
@@ -195,7 +203,7 @@ Compare real Team and single-Sol-medium tasks using existing cost/runtime/report
 
 中间工程小节采用 `section_self_check_only`：施工 owner 必须完成信封内的测试、负向检查、范围核对和运行时证据门，但不再逐小节派发独立对抗式审查。自检不等于验收。
 
-通用 `ACCEPTANCE` task 保留 主施工角色 reviewer，供显式的本地审查使用；它不是全工程 final acceptance。正常计划执行不会为每个中间小节创建这类 task。scheduler 在全部小节 receipt 完成后创建唯一 `ACCEPTANCE` child：final candidate 必须是当前 clean HEAD，且是 FrozenPlan 初始 candidate 的后代，diff 不得越出 step/parent write union；`FINAL_ACCEPTANCE_OPENED` 绑定 child task hash，child 的 `scheduler-parent.json` 定向绑定唯一 parent/plan/event/candidate。`schedule-final` 只签发一次 GPT-6.1 Sol high `REVIEW_1`；不为中间小节调 reviewer，也不自动跑模型。
+新策略的显式 `ACCEPTANCE` task 直接选择独立 Sol high；历史 `terra_os` 本地审查角色只为旧任务恢复保留，不冒充全工程 final acceptance。正常计划执行不会为每个中间小节创建这类 task。scheduler 在全部小节 receipt 完成后创建唯一 `ACCEPTANCE` child：final candidate 必须是当前 clean HEAD，且是 FrozenPlan 初始 candidate 的后代，diff 不得越出 step/parent write union；`FINAL_ACCEPTANCE_OPENED` 绑定 child task hash，child 的 `scheduler-parent.json` 定向绑定唯一 parent/plan/event/candidate。`schedule-final` 只签发一次 GPT-6.1 Sol high `REVIEW_1`；不为中间小节调 reviewer，也不自动跑模型。
 
 ### 3. 验收后返工
 

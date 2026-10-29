@@ -42,7 +42,7 @@ _PAIRED_DELTAS = (
     ("TWO_TURN_MINUS_ONE_TURN", "TWO_TURN", "ONE_TURN"),
 )
 IDENTITY_PROBE_MODELS = frozenset(
-    {"gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-astra"}
+    {"gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-astra"}
 )
 IDENTITY_PROBE_EFFORTS = frozenset({"max", "medium", "high", "xhigh"})
 AUTHORITY_UNAVAILABLE = "AUTHORITY_UNAVAILABLE"

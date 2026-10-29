@@ -62,6 +62,8 @@ _RUNTIME_ROLES = frozenset(
         "sol_xhigh",
         "sol_medium_supervisor",
         "terra_xhigh",
+        "terra61_worker",
+        "terra61_planner",
         "terra_xhigh_planner",
         "terra_xhigh_reviewer",
         "sol_medium_reviewer",
@@ -427,13 +429,18 @@ def verify_runtime_identity(requested: object, observed: object) -> RuntimeEvide
     if actual.execution_surface != expected_surface:
         _fail("RUNTIME_IDENTITY_CONFLICT", "execution_surface")
     if expected_surface == NATIVE_SUBAGENT:
-        if role != "luna":
-            _fail("RUNTIME_IDENTITY_CONFLICT", "native subagent role must be luna")
+        pinned = {
+            "luna": ("gpt-6-luna", "max"),
+            "terra61_planner": ("gpt-6.1-terra", "medium"),
+            "terra61_worker": ("gpt-6.1-terra", "medium"),
+        }.get(role)
+        if pinned is None:
+            _fail("RUNTIME_IDENTITY_CONFLICT", "native subagent role is not configured")
         if expected["agent_type"] is not None or actual.agent_type is not None:
             _fail("RUNTIME_IDENTITY_CONFLICT", "native subagent agent_type must be null")
-        if expected["model"] != "gpt-6-luna" or actual.model != "gpt-6-luna":
+        if expected["model"] != pinned[0] or actual.model != pinned[0]:
             _fail("RUNTIME_IDENTITY_CONFLICT", "native subagent model is controller-pinned")
-        if expected["reasoning_effort"] != "max" or actual.reasoning_effort != "max":
+        if expected["reasoning_effort"] != pinned[1] or actual.reasoning_effort != pinned[1]:
             _fail("RUNTIME_IDENTITY_CONFLICT", "native subagent effort is controller-pinned")
         for field in ("native_agent_id", "native_thread_id"):
             expected_uuid = _canonical_uuid(expected[field], field)

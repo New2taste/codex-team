@@ -429,6 +429,49 @@ class RuntimeUsageTest(unittest.TestCase):
 
 
 class RuntimeInspectorTest(unittest.TestCase):
+    def test_real_managed_workspace_write_shape_reaches_identity_verifier(self):
+        fixture = FIXTURES / "codex-managed-workspace-write"
+        observed = workflow.inspect_agent_runtime(fixture, THREAD_ID, "CODEX_EXEC_ROLE_CONTRACT", INSPECTOR)
+        expected = workflow.codex_exec_contract(
+            attempt_id="offline-workspace-replay", requested_role="terra61_worker",
+            model="gpt-6.1-terra", reasoning_effort="medium", sandbox_policy="workspace-write",
+            cwd="/tmp/ai-workflow-runtime-fixture",
+        )
+        evidence = workflow.verify_runtime_identity(expected, observed)
+        self.assertEqual("VERIFIED", evidence.verification_status)
+        self.assertEqual("workspace-write", evidence.observed_sandbox_policy)
+        self.assertEqual("workspace-write", evidence.observed_permission_profile)
+
+    def test_managed_workspace_write_unknown_or_broader_permissions_fail_closed(self):
+        source = next((FIXTURES / "codex-managed-workspace-write").glob("*.jsonl"))
+        original = [json.loads(line) for line in source.read_text().splitlines()]
+        for case in ("extra-write", "root-write", "different-cwd", "network", "unknown-sandbox", "unrestricted-network", "protected-write", "missing-protection"):
+            records = json.loads(json.dumps(original))
+            payload = records[1]["payload"]
+            entries = payload["permission_profile"]["file_system"]["entries"]
+            if case == "extra-write":
+                entries.append({"path": {"type": "path", "path": "/tmp/PROMPT_SECRET"}, "access": "write"})
+            elif case == "root-write":
+                entries[0]["access"] = "write"
+            elif case == "different-cwd":
+                entries[1]["path"]["path"] = "/tmp/PROMPT_SECRET"
+            elif case == "network":
+                payload["sandbox_policy"]["network_access"] = True
+            elif case == "unknown-sandbox":
+                payload["sandbox_policy"]["PROMPT_SECRET"] = True
+            elif case == "unrestricted-network":
+                payload["permission_profile"]["network"] = "enabled"
+            elif case == "protected-write":
+                entries[-1]["access"] = "write"
+            else:
+                entries.pop()
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                sessions = Path(temporary)
+                (sessions / f"rollout-{THREAD_ID}.jsonl").write_text("\n".join(json.dumps(record) for record in records) + "\n")
+                completed = self.run_inspector(sessions)
+            self.assertNotEqual(0, completed.returncode)
+            self.assertNotIn("PROMPT_SECRET", completed.stdout + completed.stderr)
+
     def run_inspector(self, sessions: Path, thread_id=THREAD_ID):
         return subprocess.run(
             ["sh", str(INSPECTOR), "--sessions-dir", str(sessions), thread_id],
@@ -465,6 +508,65 @@ class RuntimeInspectorTest(unittest.TestCase):
             },
             json.loads(completed.stdout),
         )
+
+    def test_real_turn_context_effort_alias_is_normalized_without_widening_identity(self):
+        source = next((FIXTURES / "codex-0.150-real").glob("*.jsonl"))
+        original = [json.loads(line) for line in source.read_text().splitlines()]
+        for dual_field in (False, True):
+            records = json.loads(json.dumps(original))
+            for record in records:
+                payload = record.get("payload", {})
+                if record.get("type") == "turn_context":
+                    payload.pop("reasoning_effort", None)
+                    payload.update(model="gpt-6.1-terra", effort="medium")
+                    if dual_field:
+                        payload["reasoning_effort"] = "medium"
+            # Arbitrary task/output JSON may mention effort; it is not identity.
+            records.append({"type": "response_item", "payload": {
+                "effort": "PROMPT_SECRET-untrusted",
+                "tools": [{"parameters": {"properties": {
+                    "model": {"type": "string"},
+                    "reasoning_effort": {"type": "string"},
+                    "sandbox_policy": {"type": "object"},
+                    "permission_profile": {"type": "object"},
+                }}}],
+            }})
+            with self.subTest(dual_field=dual_field), tempfile.TemporaryDirectory() as temporary:
+                sessions = Path(temporary)
+                (sessions / f"rollout-{THREAD_ID}.jsonl").write_text("\n".join(json.dumps(record) for record in records) + "\n")
+                completed = self.run_inspector(sessions)
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            observed = json.loads(completed.stdout)
+            self.assertEqual("medium", observed["reasoning_effort"])
+            self.assertEqual("gpt-6.1-terra", observed["model"])
+            self.assertEqual("read-only", observed["sandbox_policy"])
+            self.assertEqual("read-only", observed["permission_profile"])
+            self.assertNotIn("PROMPT_SECRET", completed.stdout + completed.stderr)
+
+    def test_turn_context_effort_conflicts_and_untrusted_alias_fail_closed(self):
+        source = next((FIXTURES / "codex-0.150-real").glob("*.jsonl"))
+        original = [json.loads(line) for line in source.read_text().splitlines()]
+        for case in ("conflict", "untrusted-only", "null", "unknown-record-type"):
+            records = json.loads(json.dumps(original))
+            for record in records:
+                if record.get("type") == "turn_context":
+                    payload = record["payload"]
+                    if case == "conflict":
+                        payload.update(reasoning_effort="max", effort="medium")
+                    else:
+                        payload.pop("reasoning_effort", None)
+                        if case == "null":
+                            payload["effort"] = None
+                        if case == "unknown-record-type":
+                            payload["effort"] = "medium"
+                            record["type"] = "untrusted_runtime_claim"
+            records.append({"type": "response_item", "payload": {"effort": "PROMPT_SECRET"}})
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                sessions = Path(temporary)
+                (sessions / f"rollout-{THREAD_ID}.jsonl").write_text("\n".join(json.dumps(record) for record in records) + "\n")
+                completed = self.run_inspector(sessions)
+            self.assertNotEqual(0, completed.returncode)
+            self.assertNotIn("PROMPT_SECRET", completed.stdout + completed.stderr)
 
     def test_real_jsonl_shape_mutations_fail_closed_without_leaking(self):
         fixture = FIXTURES / "codex-0.150-real"

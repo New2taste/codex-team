@@ -373,6 +373,7 @@ REASON_CODES = frozenset(
     {
         "PROMPT_SUFFICIENT",
         "PLAN_IS_DELIVERABLE",
+        "ROUTINE_LOCAL_CONFIRMED",
         "SOURCE_INSPECTION_REQUIRED",
         "STATE_CHANGE_REQUIRED",
         "DEPENDENT_STEPS_REQUIRED",
@@ -391,6 +392,11 @@ RISK_FLAGS = frozenset(
         "DATA_CONTAMINATION",
         "PUBLIC_API",
         "CROSS_CARD_CONTRACT",
+        "CROSS_MODULE",
+        "STATE_MACHINE",
+        "PERMISSIONS",
+        "CONCURRENCY",
+        "MIGRATION",
     }
 )
 ROUTES = frozenset({"direct", "sol_only", "delegated", "blocked"})
@@ -414,6 +420,8 @@ ROLES = frozenset(
         "sol_xhigh",
         "sol_medium_supervisor",
         "terra_xhigh",
+        "terra61_worker",
+        "terra61_planner",
         "terra_xhigh_planner",
         "terra_xhigh_reviewer",
         "sol_medium_reviewer",
