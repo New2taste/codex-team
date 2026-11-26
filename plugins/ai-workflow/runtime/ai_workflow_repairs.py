@@ -41,7 +41,10 @@ try:
     from .ai_workflow_dispatch_policy import (
         claim_permit_start_locked,
         derive_assignment_dispatch_identity,
+        permit_latest_states,
+        precheck_dispatch_permit_locked,
         release_permit_if_never_spawned,
+        replay_permit_ledger,
         require_dispatch_permit_locked,
     )
     from .ai_workflow_ownership import (
@@ -50,7 +53,13 @@ try:
         require_write_ownership_locked,
         verify_actual_write_paths,
     )
-    from .ai_workflow_evidence import append_runtime_evidence_v2, record_launch_intent
+    from .ai_workflow_evidence import LAUNCH_INTENT_EVENT_TYPE, append_runtime_evidence_v2, record_launch_intent
+    from .ai_workflow_preflight import (
+        bind_runtime_sessions_directory_locked,
+        capture_runtime_sessions_binding_locked,
+        is_role_preflighted_locked,
+        run_role_preflight_locked,
+    )
 except ImportError:  # direct script execution
     from ai_workflow_side_effects import (
         capture_fs_snapshot,
@@ -65,7 +74,10 @@ except ImportError:  # direct script execution
     from ai_workflow_dispatch_policy import (
         claim_permit_start_locked,
         derive_assignment_dispatch_identity,
+        permit_latest_states,
+        precheck_dispatch_permit_locked,
         release_permit_if_never_spawned,
+        replay_permit_ledger,
         require_dispatch_permit_locked,
     )
     from ai_workflow_ownership import (
@@ -74,7 +86,13 @@ except ImportError:  # direct script execution
         require_write_ownership_locked,
         verify_actual_write_paths,
     )
-    from ai_workflow_evidence import append_runtime_evidence_v2, record_launch_intent
+    from ai_workflow_evidence import LAUNCH_INTENT_EVENT_TYPE, append_runtime_evidence_v2, record_launch_intent
+    from ai_workflow_preflight import (
+        bind_runtime_sessions_directory_locked,
+        capture_runtime_sessions_binding_locked,
+        is_role_preflighted_locked,
+        run_role_preflight_locked,
+    )
 
 
 _SHA_PATTERN = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
@@ -107,12 +125,14 @@ _ACCEPTANCE_EVENT_TYPES = frozenset(
     {
         "ACCEPTANCE_OPENED",
         "ASSIGNMENT_ISSUED",
+        "ASSIGNMENT_REBOUND",
         "ASSIGNMENT_ATTEMPT_STARTED",
         "ASSIGNMENT_ATTEMPT_FAILED",
         "REPAIR_COMPLETED",
         "REVIEW_COMPLETED",
     }
 )
+_MODEL_UPGRADES = {"gpt-6.1-sol": "gpt-6.2-sol", "gpt-6-astra": "gpt-6.2-astra"}
 _ACCEPTANCE_PHASES = frozenset(
     {
         "REVIEW_1",
@@ -1238,6 +1258,7 @@ class _AcceptanceReplay:
     started_receipts: dict[str, VerifiedActorReceipt]
     started_attestations: dict[str, ControllerExecutionAttestation]
     finished_assignment_ids: set[str]
+    rebound_assignment_ids: set[str]
     repairer_identities: dict[str, str]
     whole_project_final: bool = False
 
@@ -1419,12 +1440,15 @@ def _v2_validate_observed_receipt(
         "astra_medium_reviewer": ("gpt-6-astra", "medium", "read-only", "read-only"),
         "sol_xhigh": ("gpt-6-astra", "medium", "workspace-write", "assignment-scoped-write"),
     }.get(receipt.requested_role)
-    if expected is None or (
-        receipt.observed_model,
+    # Stored receipts keep their original identity. New controller launches
+    # separately require the exact installed model before minting a receipt.
+    if expected is None or receipt.observed_model not in {
+        expected[0], _MODEL_UPGRADES.get(expected[0], expected[0])
+    } or (
         receipt.observed_reasoning_effort,
         receipt.observed_sandbox_policy,
         receipt.observed_permission_profile,
-    ) != expected:
+    ) != expected[1:]:
         _fail("ACCEPTANCE_RECEIPT_MISMATCH", "receipt observed runtime does not match the assigned role")
     if (
         receipt.execution_surface == "NATIVE_SUBAGENT"
@@ -2026,6 +2050,7 @@ def replay_acceptance_ledger(store: WorkflowStore, task_id: str) -> _AcceptanceR
                 {},
                 {},
                 set(),
+                set(),
                 {},
                 whole_project_final=_is_whole_project_final(stored_task, store=store),
             )
@@ -2041,6 +2066,30 @@ def replay_acceptance_ledger(store: WorkflowStore, task_id: str) -> _AcceptanceR
                 if assignment.phase != expected_phase or assignment.findings != expected_findings:
                     _fail("ACCEPTANCE_LEDGER_INVALID", "issued phase or findings bypassed the repair ladder")
                 _v2_validate_phase_actor(replay, assignment)
+                replay.assignments[assignment.assignment_id] = assignment
+                replay.active_assignment_id = assignment.assignment_id
+            elif event_type == "ASSIGNMENT_REBOUND":
+                original = _v2_unstarted_assignment(
+                    store, task_id, replay, event.get("supersedes_assignment_id")
+                )
+                assignment = _v2_assignment_from_event(event, context, task_id, previous_id or "")
+                expected, ticket_digest = _v2_rebound_assignment(
+                    store, task_id, replay, context, original, assignment.expected_actor
+                )
+                stored_task = _workflow().load_task(store._require_task(task_id) / "task.json")
+                if (
+                    assignment != expected
+                    or event.get("candidate_commit") != original.input_candidate_commit
+                    or event.get("original_terminal_ticket_sha256") != ticket_digest
+                ):
+                    _fail("ACCEPTANCE_LEDGER_INVALID", "rebind changed the issued scope or original authorization")
+                _nonempty(event.get("authorized_by"), "authorized_by", code="ACCEPTANCE_LEDGER_INVALID")
+                _v2_validate_rebind_runtimes(
+                    stored_task, original, assignment,
+                    event.get("previous_runtime"), event.get("replacement_runtime")
+                )
+                replay.finished_assignment_ids.add(original.assignment_id)
+                replay.rebound_assignment_ids.add(assignment.assignment_id)
                 replay.assignments[assignment.assignment_id] = assignment
                 replay.active_assignment_id = assignment.assignment_id
             elif event_type == "ASSIGNMENT_ATTEMPT_STARTED":
@@ -2326,7 +2375,11 @@ def issue_acceptance_assignment(
         stored = _workflow().load_task(store._require_task(task_id) / "task.json")
         _v2_assert_findings_within_task(findings, stored)
         forbidden = _v2_task_forbidden_actions(stored)
-        attempt_id = f"{phase.lower()}-attempt-{sum(a.phase == phase for a in replay.assignments.values()) + 1}"
+        issued_count = sum(
+            a.phase == phase and a.assignment_id not in replay.rebound_assignment_ids
+            for a in replay.assignments.values()
+        )
+        attempt_id = f"{phase.lower()}-attempt-{issued_count + 1}"
         assignment = _v2_make_assignment(
             context,
             task_id,
@@ -2384,6 +2437,8 @@ def _final_xhigh_ticket_is_valid(
     store: WorkflowStore,
     task_id: str,
     replay: _AcceptanceReplay,
+    *,
+    acceptance_event_id: str,
 ) -> bool:
     if set(record) != _FINAL_XHIGH_TICKET_FIELDS:
         return False
@@ -2403,15 +2458,20 @@ def _final_xhigh_ticket_is_valid(
     return (
         record.get("task_sha256") == _workflow()._task_sha256(store, task_id)
         and record.get("candidate_commit") == replay.current_candidate_commit
-        and record.get("acceptance_event_id") == replay.last_event_id
+        and record.get("acceptance_event_id") == acceptance_event_id
     )
 
 
 def _require_one_final_xhigh_ticket(
-    store: WorkflowStore, task_id: str, replay: _AcceptanceReplay
+    store: WorkflowStore, task_id: str, replay: _AcceptanceReplay,
+    *, acceptance_event_id: str | None = None,
 ) -> Mapping[str, object]:
     tickets = _final_xhigh_decision_records(store, task_id)
-    if any(not _final_xhigh_ticket_is_valid(ticket, store, task_id, replay) for ticket in tickets):
+    event_id = acceptance_event_id if acceptance_event_id is not None else replay.last_event_id
+    if any(
+        not _final_xhigh_ticket_is_valid(ticket, store, task_id, replay, acceptance_event_id=event_id)
+        for ticket in tickets
+    ):
         _fail("ACCEPTANCE_SEQUENCE_INVALID", "Astra medium terminal-authorization ticket is invalid")
     if len(tickets) != 1:
         _fail("ACCEPTANCE_SEQUENCE_INVALID", "exactly one Astra medium terminal-authorization ticket is required")
@@ -2475,6 +2535,123 @@ def _v2_require_issued_assignment(
     stored = replay.assignments.get(assignment.assignment_id)
     if stored != assignment:
         _fail("ACCEPTANCE_LEDGER_INVALID", "assignment differs from its immutable issuance")
+
+
+def _v2_unstarted_assignment(
+    store: WorkflowStore, task_id: str, replay: _AcceptanceReplay, assignment_id: object
+) -> AcceptanceAssignment:
+    if (
+        replay.terminal
+        or not isinstance(assignment_id, str)
+        or replay.active_assignment_id != assignment_id
+        or assignment_id in replay.started_receipts
+    ):
+        _fail("ACCEPTANCE_SEQUENCE_INVALID", "rebind requires the active, unstarted assignment")
+    assignment = replay.assignments[assignment_id]
+    if assignment_id in replay.rebound_assignment_ids:
+        _fail("ACCEPTANCE_SEQUENCE_INVALID", "assignment attempt has already been rebound")
+    dispatch_id = derive_assignment_dispatch_identity(
+        task_sha256=assignment.capability.task_sha256,
+        assignment_id=assignment_id,
+        attempt_id=assignment.attempt_id,
+    )
+    permits = permit_latest_states(replay_permit_ledger(store, task_id))
+    if permits.get(dispatch_id) in {"RESERVED", "STARTED"} or any(
+        event.get("event_type") == LAUNCH_INTENT_EVENT_TYPE and event.get("permit_id") == dispatch_id
+        for event in _workflow()._load_event_records(store, task_id)
+    ):
+        _fail("ACCEPTANCE_SEQUENCE_INVALID", "assignment already has a dispatch reservation or launch intent")
+    return assignment
+
+
+def _v2_rebound_assignment(
+    store: WorkflowStore,
+    task_id: str,
+    replay: _AcceptanceReplay,
+    context: _TaskContext,
+    original: AcceptanceAssignment,
+    replacement_actor: ActorIdentity,
+) -> tuple[AcceptanceAssignment, str | None]:
+    if original.phase == "OWNER_REPAIR":
+        _fail("ACCEPTANCE_SEQUENCE_INVALID", "OWNER_REPAIR is bound to the original owner session and cannot be rebound")
+    if replacement_actor.role != original.expected_actor.role:
+        _fail("ACCEPTANCE_SEQUENCE_INVALID", "replacement must keep the issued role")
+    thread = _v2_codex_thread(replacement_actor)
+    prior_actors = [replay.owner_actor, *(item.expected_actor for item in replay.assignments.values())]
+    if any(actor.identity.rsplit(":", 1)[-1].lower() == thread.lower() for actor in prior_actors):
+        _fail("ACCEPTANCE_SEQUENCE_INVALID", "replacement requires a distinct, unused acceptance session")
+    replacement = _v2_make_assignment(
+        context, task_id, original.phase, f"{original.attempt_id}-rebound", replacement_actor,
+        original.input_candidate_commit, original.findings, replay.last_event_id,
+        original.capability.forbidden_actions,
+    )
+    _v2_validate_phase_actor(replay, replacement)
+    ticket_digest = None
+    if replay.whole_project_final and original.phase == "SOL_XHIGH_TERMINAL_REPAIR":
+        ticket_digest = _v2_sha256(_require_one_final_xhigh_ticket(
+            store, task_id, replay, acceptance_event_id=original.capability.issuing_event_id
+        ))
+    return replacement, ticket_digest
+
+
+def rebind_pending_acceptance_assignment(
+    store: WorkflowStore,
+    task_id: str,
+    assignment_id: str,
+    replacement_actor: ActorIdentity,
+    runtime_sessions_dir: Path,
+    *,
+    authorized_by: str,
+) -> AcceptanceAssignment:
+    """Owner-only administrative action: replace a pending older-model Codex session."""
+
+    owner = _nonempty(authorized_by, "authorized_by", code="INVALID_ACTOR")
+    if not isinstance(replacement_actor, ActorIdentity):
+        _fail("ACCEPTANCE_SEQUENCE_INVALID", "replacement actor is invalid")
+    workflow = _workflow()
+    with store.lock(task_id):
+        replay = replay_acceptance_ledger(store, task_id)
+        if replay is None:
+            _fail("ACCEPTANCE_SEQUENCE_INVALID", "acceptance must be opened before rebinding")
+        original = _v2_unstarted_assignment(store, task_id, replay, assignment_id)
+        context = _v2_context(store, task_id)
+        replacement, ticket_digest = _v2_rebound_assignment(
+            store, task_id, replay, context, original, replacement_actor
+        )
+        installed = workflow._load_role_config(original.expected_actor.role)
+        previous_model, effort, _, _ = _v2_assignment_runtime(original)
+        if (
+            installed.get("model") != _MODEL_UPGRADES.get(previous_model)
+            or previous_model not in _MODEL_UPGRADES
+            or installed.get("reasoning_effort") != effort
+        ):
+            _fail("ACCEPTANCE_RECEIPT_MISMATCH", "installed role has no supported model upgrade")
+        stored_task = workflow.load_task(store._require_task(task_id) / "task.json")
+        sessions_binding = capture_runtime_sessions_binding_locked(
+            store, task_id, runtime_sessions_dir, capture_unbound=True,
+        )
+        assert sessions_binding is not None  # capture_unbound also captures the initial directory
+        sessions = Path(str(sessions_binding["runtime_sessions_dir"]))
+        previous_runtime = _v2_inspect_assignment_runtime(original, sessions)
+        replacement_runtime = _v2_inspect_assignment_runtime(replacement, sessions)
+        _v2_validate_rebind_runtimes(
+            stored_task, original, replacement, previous_runtime, replacement_runtime
+        )
+        bind_runtime_sessions_directory_locked(
+            store, task_id, runtime_sessions_dir, expected_binding=sessions_binding,
+        )
+        _v2_append(
+            store, task_id, replay, context, "ASSIGNMENT_REBOUND", replay.current_candidate_commit,
+            {
+                **_v2_assignment_payload_for_event(replacement),
+                "supersedes_assignment_id": original.assignment_id,
+                "authorized_by": owner,
+                "previous_runtime": previous_runtime,
+                "replacement_runtime": replacement_runtime,
+                "original_terminal_ticket_sha256": ticket_digest,
+            },
+        )
+        return replacement
 
 
 def _v2_start_attempt(
@@ -2702,18 +2879,9 @@ def _v2_controller_snapshot(
     return repository, snapshot
 
 
-def _v2_controller_runtime_receipt(
-    store: WorkflowStore,
-    task_id: str,
-    assignment: AcceptanceAssignment,
-    task: Mapping[str, object],
-    runtime_sessions_dir: Path,
-) -> VerifiedActorReceipt:
-    """Inspect and record the already-issued Codex runtime before resuming it."""
-
-    workflow = _workflow()
+def _v2_codex_thread(actor: ActorIdentity) -> str:
     try:
-        execution_surface, runtime_instance_id = assignment.expected_actor.identity.split(":", 1)
+        execution_surface, runtime_instance_id = actor.identity.split(":", 1)
         parsed = uuid.UUID(runtime_instance_id)
     except (ValueError, AttributeError):
         _fail("REPAIR_ADAPTER_REQUIRED", "issued actor is not a canonical Codex runtime")
@@ -2722,9 +2890,24 @@ def _v2_controller_runtime_receipt(
         or str(parsed) != runtime_instance_id.lower()
     ):
         _fail("REPAIR_ADAPTER_REQUIRED", "fixed executor requires an issued Codex thread")
+    return runtime_instance_id
+
+
+def _v2_inspect_assignment_runtime(
+    assignment: AcceptanceAssignment, runtime_sessions_dir: Path
+) -> dict[str, object]:
+    workflow = _workflow()
+    thread_id = _v2_codex_thread(assignment.expected_actor)
     sessions = Path(runtime_sessions_dir)
     if not sessions.is_absolute() or not sessions.is_dir() or sessions.is_symlink():
         _fail("REPAIR_ADAPTER_REQUIRED", "controller runtime sessions directory is invalid")
+    observed = workflow.inspect_agent_runtime(
+        sessions, thread_id, "CODEX_EXEC_ROLE_CONTRACT", workflow._runtime_inspector_path()
+    )
+    return {**observed, "thread_id": thread_id}
+
+
+def _v2_assignment_runtime(assignment: AcceptanceAssignment) -> tuple[str, str, str, str]:
     role_runtime = {
         "luna": ("gpt-6-luna", "max", "workspace-write"),
         "terra_xhigh": ("gpt-6.1-sol", "medium", "workspace-write"),
@@ -2745,35 +2928,81 @@ def _v2_controller_runtime_receipt(
     }.get(assignment.expected_actor.role)
     if role_runtime is None:
         _fail("REPAIR_ADAPTER_REQUIRED", "issued role has no fixed controller runtime")
-    model, effort, permission_profile = role_runtime
+    previous_model, effort, permission_profile = role_runtime
     sandbox = "read-only" if assignment.phase in _REVIEW_PHASES else "workspace-write"
-    inspector = (
-        Path(__file__).resolve().parents[1]
-        / "plugins"
-        / "ai-workflow"
-        / "scripts"
-        / "inspect-agent-runtime.sh"
-    )
-    observed = workflow.inspect_agent_runtime(
-        sessions, runtime_instance_id, execution_surface, inspector
-    )
+    return previous_model, effort, sandbox, permission_profile
+
+
+def _v2_check_assignment_runtime(
+    task: Mapping[str, object], assignment: AcceptanceAssignment,
+    model: str, observed: object,
+) -> Path:
+    _, effort, sandbox, permission_profile = _v2_assignment_runtime(assignment)
     expected = {
-        "execution_surface": execution_surface,
+        "thread_id": _v2_codex_thread(assignment.expected_actor),
+        "execution_surface": "CODEX_EXEC_ROLE_CONTRACT",
         "agent_type": None,
+        "native_agent_id": None,
+        "native_thread_id": None,
         "model": model,
         "reasoning_effort": effort,
         "sandbox_policy": sandbox,
         "permission_profile": permission_profile,
+        "evidence_source": "LOCAL_ROLLOUT",
     }
-    if any(observed.get(field) != value for field, value in expected.items()):
+    if not isinstance(observed, Mapping) or any(
+        field not in observed or observed[field] != value for field, value in expected.items()
+    ):
         _fail("ACCEPTANCE_RECEIPT_MISMATCH", "issued runtime does not match its capability")
     try:
-        observed_cwd = Path(str(observed.get("cwd"))).resolve()
+        observed_cwd = Path(observed.get("cwd"))
+        if not observed_cwd.is_absolute():
+            _fail("ACCEPTANCE_RECEIPT_MISMATCH", "issued runtime cwd is invalid")
+        observed_cwd = observed_cwd.resolve()
         task_cwd = Path(str(task["repository_root"])).resolve()
     except (OSError, TypeError):
         _fail("ACCEPTANCE_RECEIPT_MISMATCH", "issued runtime cwd is invalid")
     if observed_cwd != task_cwd:
         _fail("ACCEPTANCE_RECEIPT_MISMATCH", "issued runtime does not match its capability")
+    return observed_cwd
+
+
+def _v2_validate_rebind_runtimes(
+    task: Mapping[str, object], original: AcceptanceAssignment, replacement: AcceptanceAssignment,
+    previous_runtime: object, replacement_runtime: object,
+) -> None:
+    previous_model, _, _, _ = _v2_assignment_runtime(original)
+    model = _MODEL_UPGRADES.get(previous_model)
+    if model is None:
+        _fail("ACCEPTANCE_RECEIPT_MISMATCH", "issued role has no supported model upgrade")
+    _v2_check_assignment_runtime(task, original, previous_model, previous_runtime)
+    _v2_check_assignment_runtime(task, replacement, model, replacement_runtime)
+
+
+def _v2_controller_runtime_receipt(
+    store: WorkflowStore,
+    task_id: str,
+    assignment: AcceptanceAssignment,
+    task: Mapping[str, object],
+    runtime_sessions_dir: Path,
+    *,
+    observed: dict[str, object] | None = None,
+) -> VerifiedActorReceipt:
+    """Inspect and record the already-issued Codex runtime before resuming it."""
+
+    workflow = _workflow()
+    runtime_instance_id = _v2_codex_thread(assignment.expected_actor)
+    execution_surface = "CODEX_EXEC_ROLE_CONTRACT"
+    _, effort, sandbox, permission_profile = _v2_assignment_runtime(assignment)
+    model = workflow._load_role_config(assignment.expected_actor.role)["model"]
+    if observed is None:
+        observed = _v2_inspect_assignment_runtime(assignment, runtime_sessions_dir)
+    if _MODEL_UPGRADES.get(observed.get("model")) == model:
+        _fail(
+            "ACCEPTANCE_RECEIPT_MISMATCH",
+            "issued actor is bound to a previous model; an owner-authorized rebind-assignment is required",
+        )
+    observed_cwd = _v2_check_assignment_runtime(task, assignment, model, observed)
     evidence = {
         "schema_version": "runtime-evidence-1",
         "attempt_id": assignment.attempt_id,
@@ -3021,6 +3250,7 @@ def run_assignment(
     workflow = _workflow()
     started = False
     before_fs = None
+    observed = None
     with store.lock(task_id):
         replay = replay_acceptance_ledger(store, task_id)
         if replay is None:
@@ -3041,8 +3271,20 @@ def run_assignment(
                 "REPAIR_ADAPTER_REQUIRED",
                 "callers cannot supply an executable v2 assignment boundary",
             )
+        _v2_require_issued_assignment(replay, assignment)
         if not isinstance(runtime_sessions_dir, (str, os.PathLike)):
             _fail("REPAIR_ADAPTER_REQUIRED", "fixed executor requires controller runtime sessions")
+        sessions = Path(runtime_sessions_dir)
+        sessions_binding = capture_runtime_sessions_binding_locked(store, task_id, sessions)
+        if assignment.assignment_id in replay.rebound_assignment_ids:
+            if sessions_binding is None:
+                _fail("RUNTIME_SESSIONS_BINDING_MISMATCH", "rebound assignment requires its frozen sessions directory")
+            role = assignment.expected_actor.role
+            if not is_role_preflighted_locked(store, task_id, role):
+                run_role_preflight_locked(store, task_id, role)
+            precheck_dispatch_permit_locked(
+                store, task_id, role, config=workflow._load_workflow_config(),
+            )
         repository, before = _v2_controller_snapshot(stored_task, replay)
         before_fs = capture_fs_snapshot(
             repository, exclusions=observation_exclusions(repository)
@@ -3052,12 +3294,14 @@ def run_assignment(
         if output_path.exists():
             _fail("REPAIR_ADAPTER_REQUIRED", "controller assignment output path is not fresh")
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        if sessions_binding is not None:
+            observed = _v2_inspect_assignment_runtime(
+                assignment, Path(str(sessions_binding["runtime_sessions_dir"])),
+            )
+            if capture_runtime_sessions_binding_locked(store, task_id, sessions) != sessions_binding:
+                _fail("RUNTIME_SESSIONS_BINDING_MISMATCH", "runtime evidence directory changed during inspection")
     receipt = _v2_controller_runtime_receipt(
-        store,
-        task_id,
-        assignment,
-        stored_task,
-        Path(runtime_sessions_dir),
+        store, task_id, assignment, stored_task, sessions, observed=observed,
     )
     attestation = ControllerExecutionAttestation(
         task_id=task_id,
@@ -3074,6 +3318,12 @@ def run_assignment(
             replay = replay_acceptance_ledger(store, task_id)
             if replay is None:
                 _fail("REPAIR_ADAPTER_REQUIRED", "v2 acceptance ledger is not open")
+            _v2_require_issued_assignment(replay, assignment)
+            if (
+                sessions_binding is not None
+                and capture_runtime_sessions_binding_locked(store, task_id, sessions) != sessions_binding
+            ):
+                _fail("RUNTIME_SESSIONS_BINDING_MISMATCH", "runtime evidence directory changed before dispatch")
             context = _v2_context(store, task_id)
             if replay.whole_project_final:
                 ensure_ownership_registry_for_paths_locked(
@@ -3118,8 +3368,8 @@ def run_assignment(
             role_config = workflow._load_role_config(assignment.expected_actor.role)
             model = role_config.get("model")
             effort = role_config.get("reasoning_effort")
-            if not isinstance(model, str) or not isinstance(effort, str):
-                _fail("REPAIR_ADAPTER_REQUIRED", "issued role runtime configuration is incomplete")
+            if (model, effort) != (receipt.observed_model, receipt.observed_reasoning_effort):
+                _fail("ACCEPTANCE_RECEIPT_MISMATCH", "installed role changed after runtime verification")
             codex = shutil.which("codex", path=os.environ.get("PATH", os.defpath))
             if not isinstance(codex, str):
                 _fail("REPAIR_ADAPTER_REQUIRED", "controller Codex executable is unavailable")

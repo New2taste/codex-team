@@ -603,6 +603,35 @@ class TeamCallControllerTest(unittest.TestCase):
         self.assertEqual(0, self.controller.dispatch_count)
         self.assertEqual("ROUTED", self._team_rows()[-1]["route_status"])
 
+    def test_old_queued_plan_selects_new_model_without_rewriting_receipt(self):
+        import contextlib
+        import io
+
+        args = ["team-call", "team call 修改安装流程", "--repository-root", str(self.repo),
+                "--root", str(self.root)]
+        current = workflow._load_workflow_config()
+        old = {**current, "roles": {
+            role: {**config, "model": "gpt-6.1-sol"}
+            if config["model"] == "gpt-6.2-sol" else config
+            for role, config in current["roles"].items()
+        }}
+        first = io.StringIO()
+        with mock.patch.object(workflow, "_load_workflow_config", return_value=old), contextlib.redirect_stdout(first):
+            self.assertEqual(0, workflow.main(args))
+        original = json.loads(first.getvalue())
+        handoff_path = Path(original["handoff_path"])
+        original_bytes = handoff_path.read_bytes()
+        self.assertEqual("gpt-6.1-sol", original["next_dispatch"]["model"])
+
+        second = io.StringIO()
+        with contextlib.redirect_stdout(second):
+            self.assertEqual(0, workflow.main(args))
+        later = json.loads(second.getvalue())
+        self.assertEqual(original["call_id"], later["call_id"])
+        self.assertEqual(original["result_sha256"], later["result_sha256"])
+        self.assertEqual(original_bytes, handoff_path.read_bytes())
+        self.assertEqual({**original["next_dispatch"], "model": "gpt-6.2-sol"}, later["next_dispatch"])
+
     def test_live_general_call_reuses_owner_gated_planning_boundary_once(self):
         controller = workflow.TeamCallProductionController(self.root, True, self.root)
         with mock.patch.object(workflow.TeamCallProductionController, "run_plan", return_value="AWAITING_OWNER_DECISION") as planner:

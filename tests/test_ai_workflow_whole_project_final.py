@@ -9,6 +9,7 @@ from __future__ import annotations
 import inspect
 import json
 import hashlib
+import subprocess
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
@@ -16,9 +17,11 @@ from pathlib import Path
 from unittest import mock
 
 from scripts import ai_workflow as workflow
+from scripts import ai_workflow_dispatch_policy as dispatch
+from scripts import ai_workflow_preflight as preflight
 from scripts import ai_workflow_repairs as repairs
 from scripts import ai_workflow_scheduler as scheduler
-from tests.test_ai_workflow import _install_declaration
+from tests.test_ai_workflow import _compat_popen, _install_declaration
 
 _FROZEN_FINAL_ACCEPTANCE_REWORK = {
     "fixer_role": "sol_medium_reviewer",
@@ -95,6 +98,7 @@ class WholeProjectFinalAcceptanceTest(unittest.TestCase):
             "stages": [["section-final"]],
         }
         frozen = workflow.validate_plan(plan, parent)
+        self.frozen = frozen
         proposal = scheduler.dispatch_ready_batch(self.fx.store, frozen)[0]
         result = workflow.FakeRunner().run("terra", parent)
         result.update(
@@ -250,6 +254,299 @@ class WholeProjectFinalAcceptanceTest(unittest.TestCase):
         self.fx._complete(assignment, receipt, candidate, ("src/alpha.py",))
         with self.assertRaises(workflow.WorkflowError):
             self.fx._issue("SOL_XHIGH_TERMINAL_REPAIR", actor)
+
+    def _issue_pending_scheduler_review(self):
+        owner = self.fx._open_owner_receipt("luna-construction-owner", "luna_construction")
+        self.fx._record_runtime_evidence(owner)
+        actor = self.fx._expected_actor("old-acceptor", "sol_reviewer")
+        original = scheduler.issue_final_acceptance(
+            self.fx.store, self.frozen, self.fx.TASK_ID, owner, actor
+        )
+        return original, owner
+
+    def _rebind_sessions(self, original, replacement, *, sandbox, permission):
+        sessions = self.fx.repository_root.parent / "rebind-sessions"
+        old_thread = original.expected_actor.identity.split(":")[1]
+        new_thread = replacement.identity.split(":")[1]
+        self.fx._write_controller_runtime(
+            sessions, old_thread, model="gpt-6.1-sol", reasoning_effort="high",
+            sandbox_policy=sandbox, permission_profile=permission,
+        )
+        self.fx._write_controller_runtime(
+            sessions, new_thread, model="gpt-6.2-sol", reasoning_effort="high",
+            sandbox_policy=sandbox, permission_profile=permission,
+        )
+        return sessions, new_thread
+
+    def test_scheduler_pending_review_one_rebinds_via_cli_then_runs_once(self):
+        original, owner = self._issue_pending_scheduler_review()
+        replacement = self.fx._expected_actor("new-acceptor", "sol_reviewer")
+        sessions, new_thread = self._rebind_sessions(
+            original, replacement, sandbox="read-only", permission="read-only"
+        )
+        store, task_id = self.fx.store, self.fx.TASK_ID
+        root = str(store.root)
+        role = original.expected_actor.role
+        with mock.patch.object(preflight, "compute_install_version", return_value="a" * 64):
+            _install_declaration(store, self.fx.task, allowed_roles=(role,), max_dispatches=1)
+        self.assertFalse(preflight.is_role_preflighted(store, task_id, role))
+        with self.assertRaisesRegex(workflow.WorkflowError, "previous model"):
+            self.fx._original_run_assignment(store, task_id, original, sessions)
+        self.fx._record_runtime_evidence(self.fx._receipt_for(
+            original, "old-acceptor", role,
+        ))
+        before = self._ledger_bytes()
+        stdout = StringIO()
+        with redirect_stdout(stdout):
+            code = workflow.main([
+                "rebind-assignment", task_id, "--root", root,
+                "--assignment-id", original.assignment_id, "--by", "owner",
+                "--replacement-thread", new_thread, "--runtime-sessions-dir", str(sessions),
+            ])
+        self.assertEqual(0, code)
+        receipt = json.loads(stdout.getvalue())
+        bound = repairs.replay_acceptance_ledger(store, task_id).assignments[receipt["assignment_id"]]
+        self.assertEqual(("REVIEW_1", replacement), (bound.phase, bound.expected_actor))
+        self.assertEqual(original.input_candidate_commit, bound.input_candidate_commit)
+        self.assertEqual(original.capability.write_authority, bound.capability.write_authority)
+        after = self._ledger_bytes()
+        self.assertTrue(after.startswith(before))
+        self.assertEqual("ASSIGNMENT_REBOUND", json.loads(after[len(before):])["event_type"])
+        self.assertEqual((), dispatch.replay_permit_ledger(store, task_id))
+        with self.assertRaisesRegex(workflow.WorkflowError, "not the active"):
+            self.fx._original_run_assignment(store, task_id, original, sessions)
+        with self.assertRaisesRegex(workflow.WorkflowError, "already been issued"):
+            scheduler.issue_final_acceptance(store, self.frozen, task_id, owner, replacement)
+
+        launches = []
+        real_run = subprocess.run
+
+        def controller(command, *args, **kwargs):
+            if Path(command[0]).name != "codex":
+                return real_run(command, *args, **kwargs)
+            launches.append(command)
+            self.assertEqual(new_thread, command[-2])
+            self.assertIn("gpt-6.2-sol", command)
+            output = workflow.FakeRunner().run("sol_reviewer", self.fx.task)
+            output["status"] = "ACCEPTANCE_RECOMMENDED"
+            Path(command[command.index("-o") + 1]).write_text(json.dumps(output), encoding="utf-8")
+            return subprocess.CompletedProcess(
+                command, 0, stdout=json.dumps({"type": "thread.started", "thread_id": new_thread}) + "\n",
+                stderr="",
+            )
+
+        # The retired rollout is not required to replay or execute the replacement.
+        old_thread = original.expected_actor.identity.split(":")[1]
+        (sessions / f"rollout-{old_thread}").unlink()
+        with mock.patch.object(repairs.subprocess, "Popen", _compat_popen(controller)), self.fx._controller_codex_lookup():
+            self.fx._original_run_assignment(store, task_id, bound, sessions)
+        self.assertEqual(1, len(launches))
+        self.assertTrue(preflight.is_role_preflighted(store, task_id, role))
+        self.assertEqual(["STARTED"], list(dispatch.permit_latest_states(
+            dispatch.replay_permit_ledger(store, task_id)
+        ).values()))
+        self.assertTrue(repairs.replay_acceptance_ledger(store, task_id).terminal)
+
+    def test_rebind_and_resume_reject_other_sessions_before_evidence_or_dispatch(self):
+        original, _ = self._issue_pending_scheduler_review()
+        replacement = self.fx._expected_actor("new-acceptor", "sol_reviewer")
+        sessions, _ = self._rebind_sessions(
+            original, replacement, sandbox="read-only", permission="read-only"
+        )
+        other = sessions.with_name("other-sessions")
+        other.mkdir()
+        for rollout in sessions.iterdir():
+            (other / rollout.name).write_bytes(rollout.read_bytes())
+        store, task_id = self.fx.store, self.fx.TASK_ID
+        task_dir = store._require_task(task_id)
+        preflight.bind_runtime_sessions_directory(store, task_id, sessions)
+        binding = task_dir / "runtime-sessions-binding.json"
+        original_binding = binding.read_bytes(), binding.stat().st_ino
+        _install_declaration(store, self.fx.task, allowed_roles=("sol_reviewer",), max_dispatches=1)
+
+        def rebind(path):
+            return repairs.rebind_pending_acceptance_assignment(
+                store, task_id, original.assignment_id, replacement, path, authorized_by="owner"
+            )
+
+        def assert_no_side_effects(action):
+            before = self._ledger_bytes()
+            real_popen = repairs.subprocess.Popen
+
+            def no_codex(command, *args, **kwargs):
+                self.assertNotEqual("codex", Path(command[0]).name, "unexpected model launch")
+                return real_popen(command, *args, **kwargs)
+
+            with (
+                mock.patch.object(repairs, "_v2_inspect_assignment_runtime") as inspect_runtime,
+                mock.patch.object(repairs, "run_role_preflight_locked") as preflight_role,
+                mock.patch.object(repairs, "require_dispatch_permit_locked") as reserve,
+                mock.patch.object(workflow, "write_runtime_evidence") as write_evidence,
+                mock.patch.object(repairs.subprocess, "Popen", side_effect=no_codex),
+                self.fx._controller_codex_lookup(),
+                self.assertRaisesRegex(workflow.WorkflowError, "RUNTIME_SESSIONS_BINDING_MISMATCH"),
+            ):
+                action()
+            for call in (inspect_runtime, preflight_role, reserve, write_evidence):
+                call.assert_not_called()
+            self.assertEqual(before, self._ledger_bytes())
+            self.assertEqual((), dispatch.replay_permit_ledger(store, task_id))
+            self.assertEqual(original_binding, (binding.read_bytes(), binding.stat().st_ino))
+
+        assert_no_side_effects(lambda: rebind(other))
+        self.assertEqual(original.assignment_id, repairs.replay_acceptance_ledger(store, task_id).active_assignment_id)
+        rebound = rebind(sessions)
+        assert_no_side_effects(lambda: self.fx._original_run_assignment(store, task_id, rebound, other))
+
+        # A different inode at the original path is not the frozen directory either.
+        sessions.rename(sessions.with_name("retained-sessions"))
+        other.rename(sessions)
+        assert_no_side_effects(lambda: self.fx._original_run_assignment(store, task_id, rebound, sessions))
+        self.assertEqual(rebound.assignment_id, repairs.replay_acceptance_ledger(store, task_id).active_assignment_id)
+
+    def test_rebind_of_unbound_task_freezes_verified_sessions(self):
+        original, _ = self._issue_pending_scheduler_review()
+        replacement = self.fx._expected_actor("new-acceptor", "sol_reviewer")
+        sessions, new_thread = self._rebind_sessions(
+            original, replacement, sandbox="read-only", permission="read-only"
+        )
+        store, task_id = self.fx.store, self.fx.TASK_ID
+        binding_path = store._require_task(task_id) / "runtime-sessions-binding.json"
+        rollout = sessions / f"rollout-{new_thread}"
+        original_rollout = rollout.read_bytes()
+        rollout.write_text(json.dumps({**json.loads(original_rollout), "model": "gpt-6.1-sol"}), encoding="utf-8")
+        before = self._ledger_bytes()
+
+        def rebind():
+            return repairs.rebind_pending_acceptance_assignment(
+                store, task_id, original.assignment_id, replacement, sessions, authorized_by="owner"
+            )
+
+        with self.assertRaisesRegex(workflow.WorkflowError, "ACCEPTANCE_RECEIPT_MISMATCH"):
+            rebind()
+        self.assertFalse(binding_path.exists())
+        self.assertEqual(before, self._ledger_bytes())
+        rollout.write_bytes(original_rollout)
+        rebound = rebind()
+        binding = json.loads(binding_path.read_bytes())
+        self.assertEqual(str(sessions.resolve()), binding["runtime_sessions_dir"])
+        self.assertEqual((sessions.stat().st_dev, sessions.stat().st_ino), (binding["device"], binding["inode"]))
+        self.assertEqual(rebound.assignment_id, repairs.replay_acceptance_ledger(store, task_id).active_assignment_id)
+
+    def test_rebind_rejects_unverified_scope_identity_or_dispatch_history(self):
+        original, owner = self._issue_pending_scheduler_review()
+        replacement = self.fx._expected_actor("new-acceptor", "sol_reviewer")
+        sessions, new_thread = self._rebind_sessions(
+            original, replacement, sandbox="read-only", permission="read-only"
+        )
+        store, task_id = self.fx.store, self.fx.TASK_ID
+        role = original.expected_actor.role
+
+        def rebind(actor=replacement, approver="owner"):
+            return repairs.rebind_pending_acceptance_assignment(
+                store, task_id, original.assignment_id, actor, sessions, authorized_by=approver
+            )
+
+        before = self._ledger_bytes()
+        for actor, approver, error in (
+            (replacement, "", "INVALID_ACTOR"),
+            (original.expected_actor, "owner", "distinct"),
+            (repairs.ActorIdentity(owner.actor_identity.identity, role), "owner", "distinct"),
+            (repairs.ActorIdentity(replacement.identity, "sol_medium_reviewer"), "owner", "keep the issued role"),
+        ):
+            with self.subTest(error=error), self.assertRaisesRegex(workflow.WorkflowError, error):
+                rebind(actor, approver)
+        for thread, field, value in (
+            (original.expected_actor.identity.split(":")[1], "model", "gpt-6.2-sol"),
+            (new_thread, "model", "gpt-6.1-sol"),
+            (new_thread, "reasoning_effort", "medium"),
+            (new_thread, "permission_profile", "workspace-write"),
+            (new_thread, "cwd", str(sessions)),
+            (new_thread, "thread_id", owner.runtime_instance_id),
+        ):
+            with self.subTest(thread=thread, field=field):
+                rollout = sessions / f"rollout-{thread}"
+                observed = rollout.read_text(encoding="utf-8")
+                rollout.write_text(json.dumps({**json.loads(observed), field: value}), encoding="utf-8")
+                with self.assertRaises(workflow.WorkflowError):
+                    rebind()
+                rollout.write_text(observed, encoding="utf-8")
+        with store.lock(task_id), self.assertRaisesRegex(workflow.WorkflowError, "TASK_ALREADY_RUNNING"):
+            rebind()
+        self.assertEqual(before, self._ledger_bytes())
+
+        _install_declaration(store, self.fx.task, allowed_roles=(role,))
+        dispatch_id = dispatch.derive_assignment_dispatch_identity(
+            task_sha256=original.capability.task_sha256, assignment_id=original.assignment_id,
+            attempt_id=original.attempt_id,
+        )
+        with store.lock(task_id):
+            permit = dispatch.require_dispatch_permit_locked(
+                store, task_id, role, dispatch_identity=dispatch_id, config=workflow._load_workflow_config()
+            )
+        with self.assertRaisesRegex(workflow.WorkflowError, "dispatch reservation or launch intent"):
+            rebind()
+        dispatch.release_permit_before_start(store, permit, reason="not spawned")
+        with store.lock(task_id):
+            repairs.record_launch_intent(
+                store, task_id, permit=permit, role=role, argv=["test-codex"], tool_mapping={}
+            )
+        with self.assertRaisesRegex(workflow.WorkflowError, "dispatch reservation or launch intent"):
+            rebind()
+        self.assertEqual(original.assignment_id, repairs.replay_acceptance_ledger(store, task_id).active_assignment_id)
+        old_receipt = self.fx._receipt_for(original, "old-acceptor", role)
+        self.fx._record_runtime_evidence(old_receipt)
+        with store.lock(task_id):
+            repairs._v2_start_attempt(
+                store, task_id, repairs.replay_acceptance_ledger(store, task_id),
+                repairs._v2_context(store, task_id), original, old_receipt, self.fx.task,
+            )
+        before = self._ledger_bytes()
+        with self.assertRaisesRegex(workflow.WorkflowError, "active, unstarted"):
+            rebind()
+        self.assertEqual(before, self._ledger_bytes())
+
+    def test_pending_terminal_rebind_retains_the_original_owner_ticket(self):
+        self._advance_to_peer_rework()
+        self._record_fresh_verdict()
+        store, task_id = self.fx.store, self.fx.TASK_ID
+        repairs.authorize_final_xhigh(store, task_id, "owner")
+        original = self.fx._issue(
+            "SOL_XHIGH_TERMINAL_REPAIR", self.fx._expected_actor("old-terminal", "sol_reviewer")
+        )
+        replacement = self.fx._expected_actor("new-terminal", "sol_reviewer")
+        sessions, _ = self._rebind_sessions(
+            original, replacement, sandbox="workspace-write", permission="assignment-scoped-write"
+        )
+        old_decisions = self._decisions_path().read_bytes()
+        before = self._ledger_bytes()
+        bound = repairs.rebind_pending_acceptance_assignment(
+            store, task_id, original.assignment_id, replacement, sessions, authorized_by="owner"
+        )
+        after = self._ledger_bytes()
+        self.assertTrue(after.startswith(before))
+        self.assertEqual(old_decisions, self._decisions_path().read_bytes())
+        self.assertEqual(original.phase, bound.phase)
+        self.assertEqual(original.findings, bound.findings)
+        self.assertEqual(original.allowed_paths, bound.allowed_paths)
+        self.assertEqual(original.capability.write_authority, bound.capability.write_authority)
+        self.assertEqual(original.input_candidate_commit, bound.input_candidate_commit)
+        with self.assertRaisesRegex(workflow.WorkflowError, "already been used"):
+            repairs.authorize_final_xhigh(store, task_id, "owner")
+        with self.assertRaises(workflow.WorkflowError):
+            self.fx._issue(original.phase, replacement)
+        with self.assertRaisesRegex(workflow.WorkflowError, "already been rebound"):
+            repairs.rebind_pending_acceptance_assignment(
+                store, task_id, bound.assignment_id,
+                self.fx._expected_actor("another-terminal", "sol_reviewer"), sessions, authorized_by="owner",
+            )
+        receipt = repairs._v2_controller_runtime_receipt(store, task_id, bound, self.fx.task, sessions)
+        candidate = self.fx._commit_file("src/alpha.py", "REBOUND_TERMINAL = 1\n")
+        self._record_fresh_verdict()
+        self.fx._complete(bound, receipt, candidate, ("src/alpha.py",))
+        self.assertTrue(repairs.replay_acceptance_ledger(store, task_id).terminal)
+        with self.assertRaises(workflow.WorkflowError):
+            self.fx._issue(original.phase, replacement)
 
     def test_review_one_rework_skips_owner_repair_and_review_two(self):
         owner_actor, _, _, first, acceptor_receipt = self._open_sol_review_one()

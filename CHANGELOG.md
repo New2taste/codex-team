@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.0 — 2026-11-26
+
+- 6.2 试运行：Sol 6.2 medium 负责工程和返工，Sol 6.2 high 集中终验，Astra 6.2 medium 按需负责全局规划和疑难裁决。Terra 6.1 medium、Luna 6 max 和验收梯不变。
+- 旧任务下一次允许派发时使用新模型。已完成证据继续按原身份验证；排队中的 Team Call 显示独立的 `next_dispatch`，不改原 handoff 或收据。已绑定旧会话的验收/修复不原地换模型。
+- 已签发但未启动的旧版验收或修复可由 owner 用 `rebind-assignment` 换发到独立、已核验的 6.2 会话；冻结范围、原授权和执行预算不变。已启动的任务和绑定原 owner 的 `OWNER_REPAIR` 不可换发。
+- 试运行不代表已验证整体成本或质量收益；参见[设计与测量口径](docs/workflow-design-2026-11-26.md)。
+
 ## 0.5.0 — 2026-10-30
 
 新增 `balanced_terra61` 风险/复杂度直接选负责人策略：真实 `gpt-6.1-terra / medium` 使用独立的 `terra61_planner` / `terra61_worker` 角色，负责有可靠分类证据的简单规划、日常自动化/资料工作及明确局部常规开发。复杂工程和分类不明保守使用 Sol medium；独立 Sol high 集中终验、Sol medium 修复/另 Sol medium 复验、既有终局修复、Luna max、Astra 授权规划/争议与两子代理/一写入者边界保持不变。

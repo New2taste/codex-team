@@ -45,9 +45,9 @@ level, human owner gates, or the final-acceptance boundary.
 - **Luna Max (`gpt-6-luna / max`)** owns only exact frozen envelopes for mechanically verifiable work. Batch related tasks. Return failures and evidence to the primary implementer; never plan, review, approve, self-accept or retry repeatedly.
   Luna must never review, approve, or perform final acceptance.
 - **Routine executor (`gpt-6.1-terra / medium`)** uses new `terra61_planner` / `terra61_worker` roles for evidenced simple planning and clearly local routine work. The structured routine entry in [task-continuation.md](task-continuation.md) defines the narrow frozen-plan gate; risk or uncertainty retains Sol. No mandatory sequential passage through models.
-- **Engineering owner (`gpt-6.1-sol / medium`)** handles complex/cross-module engineering decisions, state machines, permissions, concurrency, migrations, integration and debugging. Missing ordinary plans do not require Astra. Historical `terra` / `terra_xhigh` identities remain Sol; preserve stored task/route/identity bindings or block explicitly.
+- **Engineering owner (`gpt-6.2-sol / medium`)** handles complex/cross-module engineering decisions, state machines, permissions, concurrency, migrations, integration and debugging. Missing ordinary plans do not require Astra. Historical `terra` / `terra_xhigh` identities remain Sol; preserve stored task/route/identity bindings or block explicitly.
 - **Intermediate engineering sections** use `section_self_check_only`: complete frozen checks and runtime evidence, then advance. Do not dispatch adversarial review for each section.
-- **Sol high (`gpt-6.1-sol / high`, role `sol_reviewer`)** performs one independent, read-only, adversarial final acceptance after all receipts complete. Inspect the objective, actual diff, edge cases, failure paths and evidence; report all actionable violations together with impact and reproducible checks, not preference-only changes.
+- **Sol high (`gpt-6.2-sol / high`, role `sol_reviewer`)** performs one independent, read-only, adversarial final acceptance after all receipts complete. Inspect the objective, actual diff, edge cases, failure paths and evidence; report all actionable violations together with impact and reproducible checks, not preference-only changes.
 - A `REWORK` permits one distinct **Sol medium fixer** (`sol_medium_reviewer`) with owner-authorized, assignment-scoped write access. Another Sol medium independently rechecks; explicitly select **Astra medium** (`astra_medium_reviewer`) for supplementary review. Every recheck is read-only, independent of the acceptor and fixer, and stays within the immutable scope.
 - A second `REWORK` permits only one existing owner-authorized **Sol high or Astra medium terminal repair**, without task-level review. Frozen functional commands and existing release gates must pass; no automatic success claim. The compatibility command `decide <task_id> authorize_final_xhigh` cannot be combined with `--resume`.
 - **Astra medium** also handles authorized large-project planning and closed-set disputes. It never starts automatically and never bypasses authority or final acceptance.
@@ -70,11 +70,40 @@ hash-bound receipt consumed by `schedule-receipt`.
 
 After all receipts complete, `schedule-final` creates the unique acceptance
 child and its directed `scheduler-parent.json` binding. Supplying both a
-verified `--owner-receipt` and a GPT-6.1 Sol high `--acceptor` issues the single
+verified `--owner-receipt` and a GPT-6.2 Sol high `--acceptor` issues the single
 `REVIEW_1`. If the bounded repair ladder later reaches terminal escalation, the
 owner uses the compatibility command `decide <child_id> authorize_final_xhigh`
 to authorize one Sol high or Astra medium repair; no scheduler command starts a model, merges, or
 pushes.
+
+### Recover an unstarted older-model assignment
+
+An authorized owner can replace only the active, unstarted assignment that is
+bound to a previous-generation Codex session. Use the acceptance task ID
+(the scheduler child ID, if applicable), the old assignment ID, and a fresh
+independent Codex thread. Both session records must still be available for
+inspection.
+
+```sh
+python3.11 scripts/ai_workflow.py rebind-assignment TASK_ID --root STATE \
+  --assignment-id OLD_ASSIGNMENT_ID --replacement-thread NEW_THREAD_UUID \
+  --runtime-sessions-dir ABSOLUTE_SESSIONS_DIR --by OWNER
+```
+
+This records explicit owner approval and replaces the session binding in one
+append-only event. It starts no model and grants no write authority. The phase,
+role, candidate, findings, permissions and original authorizations stay fixed.
+The new assignment has its own receipt ID but takes the old assignment’s
+unspent execution slot. An attempt that has started, has a launch intent or
+an occupied permit, or is bound to the original owner as `OWNER_REPAIR`
+cannot be rebound. A terminal repair still uses its original one-time ticket.
+
+The controller loads the returned assignment ID from
+`replay_acceptance_ledger(store, task_id).assignments` and, if execution is
+authorized, passes that assignment to the existing
+`run_assignment(store, task_id, assignment, sessions_dir)` boundary.
+It refreshes preflight when necessary and still requires an active declared
+role, a dispatch permit and any required ownership authorization.
 
 ## Codex Team natural-language contract
 

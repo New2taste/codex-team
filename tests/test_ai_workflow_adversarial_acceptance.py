@@ -1365,7 +1365,7 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
         sandbox_policy: str,
         permission_profile: str,
     ) -> None:
-        sessions.mkdir()
+        sessions.mkdir(exist_ok=True)
         (sessions / f"rollout-{thread_id}").write_text(
             json.dumps(
                 {
@@ -1729,7 +1729,7 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
                 {
                     "thread_id": reviewer_thread,
                     "agent_type": None,
-                    "model": "gpt-6.1-sol",
+                    "model": "gpt-6.2-sol",
                     "reasoning_effort": "medium",
                     "sandbox_policy": "read-only",
                     "permission_profile": "read-only",
@@ -1922,7 +1922,7 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
         self._write_controller_runtime(
             sessions,
             fixer_thread,
-            model="gpt-6.1-sol",
+            model="gpt-6.2-sol",
             reasoning_effort="medium",
             sandbox_policy="workspace-write",
             permission_profile="assignment-scoped-write",
@@ -1932,7 +1932,7 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
         self._write_controller_runtime(
             peer_sessions,
             peer_thread,
-            model="gpt-6.1-sol",
+            model="gpt-6.2-sol",
             reasoning_effort="medium",
             sandbox_policy="read-only",
             permission_profile="read-only",
@@ -2050,9 +2050,9 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
         }
         fixer_receipt = started[fixer.assignment_id]
         peer_receipt = started[peer.assignment_id]
-        self.assertEqual("gpt-6.1-sol", fixer_receipt["observed_model"])
+        self.assertEqual("gpt-6.2-sol", fixer_receipt["observed_model"])
         self.assertEqual("medium", fixer_receipt["observed_reasoning_effort"])
-        self.assertEqual("gpt-6.1-sol", peer_receipt["observed_model"])
+        self.assertEqual("gpt-6.2-sol", peer_receipt["observed_model"])
         self.assertEqual("medium", peer_receipt["observed_reasoning_effort"])
         self.assertNotEqual(
             (
@@ -2072,7 +2072,7 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
         self._write_controller_runtime(
             sessions,
             fixer_thread,
-            model="gpt-6.1-sol",
+            model="gpt-6.2-sol",
             reasoning_effort="medium",
             sandbox_policy="workspace-write",
             permission_profile="workspace-write",
@@ -2251,7 +2251,7 @@ class AcceptanceLedgerV2ContractTest(unittest.TestCase):
                 {
                     "thread_id": terminal_thread,
                     "agent_type": None,
-                    "model": "gpt-6-astra",
+                    "model": "gpt-6.2-astra",
                     "reasoning_effort": "medium",
                     "sandbox_policy": "workspace-write",
                     "permission_profile": "assignment-scoped-write",

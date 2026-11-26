@@ -272,7 +272,7 @@ class DistributionContractTest(unittest.TestCase):
         manifest = json.loads((PLUGIN / ".codex-plugin" / "plugin.json").read_text())
         marketplace = json.loads((ROOT / ".agents" / "plugins" / "marketplace.json").read_text())
         self.assertEqual("ai-workflow", manifest["name"])
-        self.assertEqual("0.5.0", manifest["version"])
+        self.assertEqual("0.6.0", manifest["version"])
         self.assertEqual("./skills/", manifest["skills"])
         self.assertEqual("ai-workflow", marketplace["name"])
         self.assertEqual(
@@ -441,7 +441,7 @@ class DistributionContractTest(unittest.TestCase):
             "complex implementation",
             "independent",
             "adversarial final acceptance",
-            "gpt-6.1 sol high",
+            "gpt-6.2 sol high",
             "final",
             "acceptance",
             "astra medium",
@@ -465,7 +465,7 @@ class DistributionContractTest(unittest.TestCase):
         for lifecycle_phrase in (
             "section_self_check_only",
             "intermediate engineering sections",
-            "different gpt-6.1 sol medium fixer",
+            "different gpt-6.2 sol medium fixer",
             "astra medium",
             "terminal repair",
             "dual-key",
@@ -476,8 +476,8 @@ class DistributionContractTest(unittest.TestCase):
             self.assertIn(lifecycle_phrase, published, lifecycle_phrase)
         self.assertRegex(
             published,
-            r"gpt-6\.1 sol high\s+final\s+acceptance",
-            "GPT-6.1 Sol high final acceptance",
+            r"gpt-6\.2 sol high\s+final\s+acceptance",
+            "GPT-6.2 Sol high final acceptance",
         )
         self.assertRegex(
             published,
@@ -509,7 +509,7 @@ class DistributionContractTest(unittest.TestCase):
             for name, role in config["roles"].items():
                 if (
                     name.startswith("sol")
-                    and role["model"] == "gpt-6.1-sol"
+                    and role["model"] == "gpt-6.2-sol"
                     and role["reasoning_effort"] in {"medium", "high"}
                 ):
                     with self.subTest(role=name):
@@ -550,12 +550,12 @@ class DistributionContractTest(unittest.TestCase):
         for phrase in (
             "intermediate engineering sections",
             "section_self_check_only",
-            "different gpt-6.1 sol medium fixer",
+            "different gpt-6.2 sol medium fixer",
             "astra medium",
             "terminal repair",
         ):
             self.assertIn(phrase, published, phrase)
-        self.assertRegex(published, r"gpt-6\.1 sol high\s+final\s+acceptance")
+        self.assertRegex(published, r"gpt-6\.2 sol high\s+final\s+acceptance")
         self.assertNotIn("every task needs an independent terra xhigh adversarial review", published)
         self.assertNotIn("第二次 terra xhigh 失败后的冻结梯级", published)
 

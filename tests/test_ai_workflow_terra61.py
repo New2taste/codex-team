@@ -49,7 +49,7 @@ class Terra61PolicyTest(unittest.TestCase):
             self.assertEqual("gpt-6.1-terra", config["roles"][role]["model"])
             self.assertEqual("medium", config["roles"][role]["reasoning_effort"])
         for role in ("terra", "terra_xhigh", "terra_xhigh_planner", "terra_xhigh_reviewer"):
-            self.assertEqual("gpt-6.1-sol", config["roles"][role]["model"])
+            self.assertEqual("gpt-6.2-sol", config["roles"][role]["model"])
 
     def test_local_write_needs_real_validated_step_not_a_routine_label(self):
         task, plan, request = routine_construction()

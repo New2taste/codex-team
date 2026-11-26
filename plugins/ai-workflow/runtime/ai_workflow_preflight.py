@@ -272,22 +272,32 @@ def _sessions_binding(task_id: str, task: Mapping[str, object], path: Path) -> d
 def bind_runtime_sessions_directory(store: TaskStoreProtocol, task_id: str, path: Path) -> None:
     """Pin the configured runtime evidence directory before preflight/permits."""
     with store.lock(task_id):
-        task_dir = store._require_task(task_id)
-        task = load_artifact(task_dir / "task.json")
-        binding = _sessions_binding(task_id, task, Path(path))
-        target = task_dir / "runtime-sessions-binding.json"
-        if target.exists() or target.is_symlink():
-            if target.is_symlink() or not target.is_file():
-                _fail("RUNTIME_SESSIONS_BINDING_MISMATCH", "runtime evidence binding is not a regular artifact")
-            if _bound_sessions(store, task_id, task) != binding:
-                _fail("RUNTIME_SESSIONS_BINDING_MISMATCH", "runtime evidence directory binding changed")
-            return
-        write_json_once(target, binding,
-                        conflict_code="RUNTIME_SESSIONS_BINDING_MISMATCH")
+        bind_runtime_sessions_directory_locked(store, task_id, path)
+
+
+def bind_runtime_sessions_directory_locked(
+    store: TaskStoreProtocol, task_id: str, path: Path,
+    *, expected_binding: Mapping[str, object] | None = None,
+) -> None:
+    store._assert_lock_held(task_id)
+    task_dir = store._require_task(task_id)
+    task = load_artifact(task_dir / "task.json")
+    binding = _sessions_binding(task_id, task, Path(path))
+    if expected_binding is not None and binding != expected_binding:
+        _fail("RUNTIME_SESSIONS_BINDING_MISMATCH", "runtime evidence directory changed during inspection")
+    existing = _bound_sessions(store, task_id, task)
+    if existing is not None:
+        if existing != binding:
+            _fail("RUNTIME_SESSIONS_BINDING_MISMATCH", "runtime evidence directory binding changed")
+        return
+    write_json_once(task_dir / "runtime-sessions-binding.json", binding,
+                    conflict_code="RUNTIME_SESSIONS_BINDING_MISMATCH")
 
 
 def _bound_sessions(store: TaskStoreProtocol, task_id: str, task: Mapping[str, object]) -> Mapping[str, object] | None:
     path = store._require_task(task_id) / "runtime-sessions-binding.json"
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        _fail("RUNTIME_SESSIONS_BINDING_MISMATCH", "runtime evidence binding is not a regular artifact")
     if not path.exists():
         return None
     binding = load_artifact(path)
@@ -297,12 +307,24 @@ def _bound_sessions(store: TaskStoreProtocol, task_id: str, task: Mapping[str, o
     return binding
 
 
+def capture_runtime_sessions_binding_locked(
+    store: TaskStoreProtocol, task_id: str, path: Path, *, capture_unbound: bool = False,
+) -> Mapping[str, object] | None:
+    """Verify the selected directory, optionally capturing its identity for a first binding."""
+    store._assert_lock_held(task_id)
+    task = load_artifact(store._require_task(task_id) / "task.json")
+    binding = _bound_sessions(store, task_id, task)
+    if binding is None and not capture_unbound:
+        return None
+    selected = _sessions_binding(task_id, task, Path(path))
+    if binding is not None and binding != selected:
+        _fail("RUNTIME_SESSIONS_BINDING_MISMATCH", "runtime observation must use preflight's sessions directory")
+    return selected
+
+
 def require_runtime_sessions_binding(store: TaskStoreProtocol, task_id: str, path: Path) -> None:
     with store.lock(task_id):
-        task = load_artifact(store._require_task(task_id) / "task.json")
-        binding = _bound_sessions(store, task_id, task)
-        if binding is not None and binding != _sessions_binding(task_id, task, Path(path)):
-            _fail("RUNTIME_SESSIONS_BINDING_MISMATCH", "runtime observation must use preflight's sessions directory")
+        capture_runtime_sessions_binding_locked(store, task_id, path)
 
 
 def _preflight_sessions_usable(context: PreflightContext) -> bool:

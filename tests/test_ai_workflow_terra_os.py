@@ -135,7 +135,7 @@ class TerraOSConfigTest(unittest.TestCase):
             name: role
             for name, role in self.config["roles"].items()
             if name.startswith("sol")
-            and role["model"] == "gpt-6.1-sol"
+            and role["model"] == "gpt-6.2-sol"
             and role["reasoning_effort"] in {"medium", "high"}
         }
         self.assertTrue(sol_roles)
@@ -172,25 +172,25 @@ class TerraOSConfigTest(unittest.TestCase):
             ),
         )
         self.assertEqual(
-            ("gpt-6.1-sol", "medium", "workspace-write"),
+            ("gpt-6.2-sol", "medium", "workspace-write"),
             tuple(roles["terra_xhigh"][key] for key in ("model", "reasoning_effort", "sandbox")),
         )
         self.assertEqual(
-            ("gpt-6-astra", "medium", "read-only"),
+            ("gpt-6.2-astra", "medium", "read-only"),
             tuple(
                 roles["sol_xhigh"][key]
                 for key in ("model", "reasoning_effort", "sandbox")
             ),
         )
         self.assertEqual(
-            ("gpt-6-astra", "medium", "read-only"),
+            ("gpt-6.2-astra", "medium", "read-only"),
             tuple(
                 roles["astra_medium_reviewer"][key]
                 for key in ("model", "reasoning_effort", "sandbox")
             ),
         )
         self.assertEqual(
-            ("gpt-6-astra", "medium", "read-only"),
+            ("gpt-6.2-astra", "medium", "read-only"),
             tuple(
                 roles["sol_xhigh_planner"][key]
                 for key in ("model", "reasoning_effort", "sandbox")
@@ -199,7 +199,7 @@ class TerraOSConfigTest(unittest.TestCase):
         for role in ("terra_xhigh_planner", "terra_xhigh_reviewer"):
             with self.subTest(role=role):
                 self.assertEqual(
-                    ("gpt-6.1-sol", "medium", "read-only"),
+                    ("gpt-6.2-sol", "medium", "read-only"),
                     tuple(
                         roles[role][key]
                         for key in ("model", "reasoning_effort", "sandbox")

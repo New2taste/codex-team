@@ -6841,6 +6841,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--root", type=Path, default=Path("data/state/ai-workflow")
     )
 
+    rebind = sub.add_parser(
+        "rebind-assignment", help="owner-authorized replacement of a pending older-model acceptance session"
+    )
+    rebind.add_argument("task_id")
+    rebind.add_argument("--assignment-id", required=True)
+    rebind.add_argument("--replacement-thread", required=True, metavar="UUID")
+    rebind.add_argument("--by", required=True, metavar="OWNER")
+    rebind.add_argument("--runtime-sessions-dir", type=Path, required=True, metavar="ABSOLUTE_DIR")
+    rebind.add_argument("--root", type=Path, default=Path("data/state/ai-workflow"))
+
     resume = sub.add_parser("resume")
     resume.add_argument("task_id")
     resume.add_argument("--runner", choices=("fake", "live"), default="fake")
@@ -7096,6 +7106,30 @@ def _run_command(args: argparse.Namespace) -> int:
             return 0
         print(_canonical_json(child))
         return 0
+    if args.command == "rebind-assignment":
+        store = WorkflowStore(args.root)
+        replay = replay_acceptance_ledger(store, args.task_id)
+        original = replay.assignments.get(args.assignment_id) if replay is not None else None
+        if original is None:
+            _fail("ACCEPTANCE_SEQUENCE_INVALID", "rebind requires an issued assignment ID")
+        assignment = rebind_pending_acceptance_assignment(
+            store,
+            args.task_id,
+            args.assignment_id,
+            ActorIdentity(
+                identity=f"CODEX_EXEC_ROLE_CONTRACT:{args.replacement_thread}",
+                role=original.expected_actor.role,
+            ),
+            args.runtime_sessions_dir,
+            authorized_by=args.by,
+        )
+        print(_canonical_json({
+            "task_id": assignment.task_id,
+            "assignment_id": assignment.assignment_id,
+            "phase": assignment.phase,
+            "supersedes_assignment_id": args.assignment_id,
+        }))
+        return 0
     if args.command == "resume":
         store = WorkflowStore(args.root)
         runner, context = _prepare_resume(store, args.task_id, args)
@@ -7134,6 +7168,32 @@ def _run_command(args: argparse.Namespace) -> int:
             state_root=state_root,
             controller=controller,
         )
+        continuation = {}
+        if receipt.disposition == "PLAN_REQUIRED" and receipt.task_id is not None:
+            handoff_path = (state_root / receipt.task_id / "team-call-handoff.json").resolve()
+            continuation["handoff_path"] = str(handoff_path)
+            # run_team_call already checked the immutable receipt/handoff pair.
+            # A queued handoff describes intake, not a started model invocation.
+            handoff = load_artifact(handoff_path)
+            task_store = WorkflowStore(state_root)
+            if (
+                handoff["planning_status"] == "PENDING_NATIVE_DISPATCH"
+                and _current_state(task_store, receipt.task_id) == "DRAFT"
+            ):
+                role = handoff.get("role", "terra_xhigh_planner")
+                if role not in {"sol_planner", "terra_xhigh_planner"}:
+                    _fail("TEAM_CALL_IDENTITY_DRIFT", "unrecognized queued planning role")
+                configured = _load_role_config(role)
+                if handoff.get("reasoning_effort") != configured["reasoning_effort"] or (
+                    handoff.get("model") not in {configured["model"], "gpt-6.1-sol"}
+                ):
+                    _fail("TEAM_CALL_IDENTITY_DRIFT", "queued planning identity cannot be migrated")
+                continuation["next_dispatch"] = {
+                    "role": role,
+                    "model": configured["model"],
+                    "reasoning_effort": configured["reasoning_effort"],
+                    "sandbox": configured["sandbox"],
+                }
         print(_canonical_json({
             "call_id": receipt.call_id,
             "raw_request_sha256": receipt.raw_request_sha256,
@@ -7143,8 +7203,7 @@ def _run_command(args: argparse.Namespace) -> int:
             "task_id": receipt.task_id,
             "created_at_utc": receipt.created_at_utc,
             "result_sha256": receipt.result_sha256,
-            **({"handoff_path": str((state_root / receipt.task_id / "team-call-handoff.json").resolve())}
-               if receipt.disposition == "PLAN_REQUIRED" and receipt.task_id is not None else {}),
+            **continuation,
         }))
         return 2 if receipt.disposition == "BLOCKED" else 0
     if args.command == "report":
@@ -7378,6 +7437,7 @@ try:
         has_active_repair_assignment,
         issue_acceptance_assignment,
         open_task_acceptance,
+        rebind_pending_acceptance_assignment,
         record_adversarial_review,
         record_repair_assignment,
         record_repair_completion,
@@ -7405,6 +7465,7 @@ except ImportError:  # direct script execution
         has_active_repair_assignment,
         issue_acceptance_assignment,
         open_task_acceptance,
+        rebind_pending_acceptance_assignment,
         record_adversarial_review,
         record_repair_assignment,
         record_repair_completion,

@@ -255,7 +255,9 @@ def _attest_issuer(
         evidence.get("observed_sandbox_policy"),
         evidence.get("observed_permission_profile"),
     )
-    if observed != ISSUER_ROLE_CONTRACTS[role]:
+    previous = ISSUER_ROLE_CONTRACTS[role]
+    upgraded_model = {"gpt-6.1-sol": "gpt-6.2-sol", "gpt-6-astra": "gpt-6.2-astra"}[previous[0]]
+    if observed not in (previous, (upgraded_model, *previous[1:])):
         _fail(
             "VERDICT_ISSUER_IDENTITY_MISMATCH",
             "issuer observed identity does not match the role contract",
